@@ -490,29 +490,34 @@ static void revalidateMappings(void) {
         offset += page;
     }
 
-    NxusProcessMetadata md;
-    if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) {
-        g_Session.main_base = md.main_nso_base;
-        g_Session.main_size = md.main_nso_size;
-    }
+    /* A refine can follow a game restart, so refresh all four identity fields, not
+       just the main NSO range (the mapping revalidation above tolerated this). */
+    (void)nxusSessionRefreshIdentity();
     free(raw);
 }
 
-static void cacheProcessInfo(void) {
+/* Refresh the cached target identity from dmnt:cht.  Every main-relative scope,
+   hit address and cheat export is derived from these four fields, so they must
+   follow a ForceOpen / game restart even when no scan runs in between. */
+Result nxusSessionRefreshIdentity(void) {
     /* While attached, dmnt is closed and svcQueryDebugProcessMemory cannot produce
        the metadata struct, so the values cached from the last dmnt session (or the
-       first scan) are kept - the client is told to scan before attaching.  Do not
-       even call nxusDmntGetMetadata() here: it auto-reopens dmnt after a failure,
-       which would fight with the debug session that owns the process. */
-    if (nxusDebugIsAttached()) return;
+       attach hand-off) are kept.  Do not even call nxusDmntGetMetadata() here: it
+       auto-reopens dmnt after a failure, which would fight with the debug session
+       that owns the process. */
+    if (nxusDebugIsAttached()) return 0;
     NxusProcessMetadata md;
     memset(&md, 0, sizeof(md));
-    if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) {
-        g_Session.process_id = md.process_id;
-        g_Session.program_id = md.program_id;
-        g_Session.main_base = md.main_nso_base;
-        g_Session.main_size = md.main_nso_size;
-    }
+    Result rc = nxusDmntGetMetadata(&md);
+    if (R_FAILED(rc)) return rc;   /* no target / dmnt gone: keep the last known */
+    nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
+                                    md.main_nso_base, md.main_nso_size);
+    return 0;
+}
+
+static void cacheProcessInfo(void) {
+    /* A missing target is normal (boot, game closed), so the result is ignored here. */
+    (void)nxusSessionRefreshIdentity();
 }
 
 /* ---- regions ----------------------------------------------------------- */

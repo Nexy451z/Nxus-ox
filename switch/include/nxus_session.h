@@ -62,6 +62,14 @@ void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size);
    read from dmnt just before taking the process. */
 void nxusSessionSetProcessIdentityEx(u64 pid, u64 program_id, u64 main_base, u64 main_size);
 
+/* Re-read pid / program id / main NSO range from dmnt:cht and cache it.
+   Returns 0 when the identity was refreshed, the dmnt failure otherwise.
+   No-op returning 0 while a debug session owns the process: dmnt is closed, so
+   the values cached at attach time are the only (and correct) ones.  Call it
+   after ForceOpen and from the server tick so Status never reports a zeroed
+   target just because no scan has snapshotted the metadata yet. */
+Result nxusSessionRefreshIdentity(void);
+
 /* Range list for NxusScope_Ranges (copied; truncated to NXUS_MAX_SCAN_RANGES).
    NULL/0 clears it. */
 void nxusSessionSetScanRanges(const NxusRangeEntry *ranges, u32 count);

@@ -22,6 +22,21 @@ static volatile bool g_CommandActive;
 static volatile u64  g_CommandStartedMs;
 #define NXUS_COMMAND_GRACE_MS 30000u
 
+/* ---- pause / resume state ---------------------------------------------- */
+
+/* True while Pause holds the target through Nxus's own debug session
+   (nxusDebugAttach + svcBreakDebugProcess).  dmnt does not own the process then,
+   so Resume has to continue and detach instead of asking dmnt for anything. */
+static bool g_PauseViaDebug = false;
+/* Pause/Resume arrive from the connection thread AND from the HID hotkey thread;
+   attach/detach is a multi-step hand-off (ForceClose -> svcDebugActiveProcess ->
+   event thread) and must not interleave. */
+static Mutex g_PauseLock;
+static bool   g_PauseLockReady = false;
+
+static Result serverPause(void);
+static Result serverResume(void);
+
 /* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
 #define NXUS_PTRSCAN_MAX_RESULTS 64
 static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
@@ -30,17 +45,17 @@ static NxusPtrScanStats g_PtrStats;
 static u64              g_PtrTarget;
 static u64              g_PtrModuleBase;
 
-/* Fired from the HID thread: freeze the target without touching the PC. */
+/* Fired from the HID thread: freeze the target without touching the PC.
+   dmnt's 65004 answered success and froze nothing (hardware-verified), so the
+   hotkey now goes through the same real stop the Pause command uses. */
 static void onHotkeyFired(void *user) {
     (void)user;
-    if (nxusDebugIsAttached()) {
-        NXUS_LOG("hotkey: ignored while debug mode owns the process");
-        return;
+    if (g_CommandActive) {
+        NXUS_LOG("hotkey: a command is running - in-flight reads may be dropped by the pause");
     }
-    Result rc = nxusDmntPause();
+    Result rc = serverPause();
     NXUS_RESULT("hotkey pause", rc);
     if (R_SUCCEEDED(rc)) {
-        nxusSessionSetPaused(true);
         nxusNetSendEvent(NxusEvent_HotkeyPaused, NULL, 0);
     }
 }
@@ -52,6 +67,13 @@ void nxusServerInit(void) {
     g_Config.watchdog_timeout_ms = 15000;
     g_Config.heartbeat_interval_ms = 5000;
     g_Config.log_level = 1;
+
+    /* Before the HID thread can exist: nxusHidStart() is only called from the
+       config handler, long after this. */
+    if (!g_PauseLockReady) {
+        mutexInit(&g_PauseLock);
+        g_PauseLockReady = true;
+    }
 
     nxusHidInit();
     nxusHidSetCallback(onHotkeyFired, NULL);
@@ -109,9 +131,142 @@ static void fillStatus(NxusStatus *st) {
             flags |= NXUS_ST_HAS_PROCESS;
         }
     }
-    if (nxusSessionIsPaused()) flags |= NXUS_ST_PAUSED;
+    /* A pause that went through the debug session keeps the target held with dmnt
+       closed, so nxusSessionIsPaused() alone would under-report it.  A debugger
+       stop (breakpoint/watchpoint/GDB-style hold) is the same thing from the
+       client's point of view and must light the same flag, otherwise the GUI shows
+       "running" while the title is frozen. */
+    if (g_PauseViaDebug || nxusSessionIsPaused()) flags |= NXUS_ST_PAUSED;
+    if (nxusDebugIsStopped()) flags |= NXUS_ST_PAUSED;
     if (nxusSessionScanState() == NxusScanState_Running) flags |= NXUS_ST_SCANNING;
     st->status_flags = flags;
+}
+
+/* ---- real pause / resume ----------------------------------------------- */
+
+static void pauseLock(void) {
+    if (g_PauseLockReady) mutexLock(&g_PauseLock);
+}
+
+static void pauseUnlock(void) {
+    if (g_PauseLockReady) mutexUnlock(&g_PauseLock);
+}
+
+/* Freeze every thread of the target.
+ *
+ * dmnt:cht 65004 (PauseCheatProcess) is not a kernel process-suspension command:
+ * it answers success and nothing stops (measured on hardware - a "paused" title
+ * kept writing memory, so two captures 2 s apart diffed to 0 blocks).  The only
+ * real stop available to a sysmodule is svcBreakDebugProcess on a debug session
+ * we own, so Pause attaches first when dmnt still has the process. */
+static Result pauseTargetLocked(void) {
+    if (nxusDebugIsAttached()) {
+        /* Our session already owns the process (DebugAttach, or a repeated
+           Pause): one kernel call is enough. */
+        Result rc = nxusDebugBreak();
+        if (R_SUCCEEDED(rc)) {
+            nxusSessionSetPaused(true);
+            NXUS_LOG("pause: stopped the owned debug session");
+        }
+        return rc;
+    }
+
+    /* The pid must be read BEFORE the attach: svcDebugActiveProcess makes dmnt
+       close the cheat process, and after that GetMetadata has nothing to report
+       (and auto-reopen would fight the session we just created). */
+    NxusProcessMetadata md;
+    memset(&md, 0, sizeof(md));
+    Result rc = nxusDmntGetMetadata(&md);
+    if (R_FAILED(rc) || md.process_id == 0) {
+        /* Nothing to attach to.  Keep dmnt's old call as the fallback so the
+           client still sees dmnt's own Result, but never report success for a
+           no-op: an ineffective "pause" is what made the PC continue scanning a
+           live game. */
+        Result fallback = nxusDmntPause();
+        NXUS_LOG("pause: no dmnt target (metadata rc=0x%08X pid=%llu); dmnt fallback rc=0x%08X",
+                 (unsigned)rc, (unsigned long long)md.process_id, (unsigned)fallback);
+        if (R_FAILED(rc)) return rc;
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+    }
+
+    rc = nxusDebugAttach(md.process_id);
+    if (R_FAILED(rc)) {
+        NXUS_LOG("pause: debug attach to pid=%llu failed rc=0x%08X - target not stopped",
+                 (unsigned long long)md.process_id, (unsigned)rc);
+        /* Hands the process back to dmnt and re-enables its auto-reopen. */
+        nxusDebugDetach();
+        return rc;
+    }
+
+    /* svcDebugActiveProcess itself continues the title, so the stop has to follow
+       the attach; auto_continue would release it again on the next debug event. */
+    nxusDebugSetAutoContinue(0);
+    rc = nxusDebugBreak();
+    if (R_FAILED(rc)) {
+        NXUS_LOG("pause: svcBreakDebugProcess failed rc=0x%08X - detaching", (unsigned)rc);
+        nxusDebugDetach();
+        return rc;
+    }
+
+    /* dmnt is closed now, so the metadata read above is the only source for
+       pid / title / main NSO base.  It describes exactly the process we just
+       attached to, so adopt it wholesale: Status and every main-relative scope
+       read the session cache, and a stale value from an earlier run would point
+       them at the wrong memory. */
+    nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
+                                    md.main_nso_base, md.main_nso_size);
+
+    g_PauseViaDebug = true;
+    nxusSessionSetPaused(true);
+    NXUS_LOG("pause: debug session attached to pid=%llu - every thread stopped",
+             (unsigned long long)md.process_id);
+    return 0;
+}
+
+static Result resumeTargetLocked(void) {
+    if (g_PauseViaDebug) {
+        /* The pause owns the process through the debug session: release the stop,
+           then detach, which ForceOpens dmnt again so scans/cheats go back to the
+           normal path.  Detaching even when the continue failed matters: closing
+           the debug handle resumes the target, so the title must never be left
+           frozen because one IPC failed. */
+        Result cont_rc = nxusDebugContinueAll();
+        Result detach_rc = nxusDebugDetach();
+        g_PauseViaDebug = false;
+        nxusSessionSetPaused(false);
+        NXUS_LOG("resume: debug pause released (continue rc=0x%08X, detach rc=0x%08X)",
+                 (unsigned)cont_rc, (unsigned)detach_rc);
+        /* Detaching is what actually releases the target: closing the debug
+           handle resumes every thread even when the explicit Continue failed, so
+           reporting that failure would tell the PC "still frozen" about a game
+           that is running again.  The rcs above keep it visible in the log. */
+        return detach_rc;
+    }
+
+    if (nxusDebugIsAttached()) {
+        /* Debug mode was started explicitly: continue it, keep the session. */
+        Result rc = nxusDebugContinueAll();
+        if (R_SUCCEEDED(rc)) nxusSessionSetPaused(false);
+        return rc;
+    }
+
+    Result rc = nxusDmntResume();
+    nxusSessionSetPaused(false);
+    return rc;
+}
+
+static Result serverPause(void) {
+    pauseLock();
+    Result rc = pauseTargetLocked();
+    pauseUnlock();
+    return rc;
+}
+
+static Result serverResume(void) {
+    pauseLock();
+    Result rc = resumeTargetLocked();
+    pauseUnlock();
+    return rc;
 }
 
 /* ---- module detection -------------------------------------------------- */
@@ -388,35 +543,27 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             break;
 
         case NxusCmd_Pause:
-            /* While a debug session owns the process dmnt is closed, so Pause is
-               mapped onto the debug session itself: svcBreakDebugProcess suspends
-               every thread and publishes a stop.  This is what lets the user stop
-               the game BEFORE a scan instead of receiving BAD_STATE. */
-            if (nxusDebugIsAttached()) {
-                rc = nxusDebugBreak();
-                if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
-                break;
-            }
-            rc = nxusDmntPause();
-            if (R_SUCCEEDED(rc)) nxusSessionSetPaused(true);
+            /* A real stop: svcBreakDebugProcess suspends every thread.  If dmnt
+               still owns the process, Pause attaches to it first (see
+               pauseTargetLocked); 65004 is not a kernel stop and froze nothing. */
+            rc = serverPause();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_Resume:
-            /* Same mapping: resume the held debug session (drain, acknowledge,
-               re-arm) instead of a dmnt call that cannot work while we own it. */
-            if (nxusDebugIsAttached()) {
-                rc = nxusDebugContinueAll();
-                if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
-                break;
-            }
-            rc = nxusDmntResume();
-            nxusSessionSetPaused(false);
+            /* Reverses whichever pause is in effect: continue + detach for a
+               debug-session pause, plain continue while the PC holds a debugger,
+               dmnt's call otherwise. */
+            rc = serverResume();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_ForceOpen:
             rc = nxusDmntForceOpen();
+            /* dmnt owns the process now: publish pid/title/main immediately.  Status
+               (and every main-relative scope the client derives from it) reads the
+               session cache, which otherwise only a scan snapshot would fill. */
+            if (R_SUCCEEDED(rc)) (void)nxusSessionRefreshIdentity();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
@@ -447,7 +594,14 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             rc = nxusDmntGetMetadata(&md);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
-            else reply(fd, type, seq, &md, sizeof(md));
+            else {
+                /* The reply carries the authoritative values, so cache them here too:
+                   GetStatus derives pid/program id/main from the session, and a client
+                   that only asks for metadata must not leave it zeroed. */
+                nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
+                                                md.main_nso_base, md.main_nso_size);
+                reply(fd, type, seq, &md, sizeof(md));
+            }
             break;
         }
 
@@ -847,7 +1001,18 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (length >= sizeof(NxusConfig) + sizeof(NxusDebugConfig)) {
                 NxusDebugConfig dbg;
                 memcpy(&dbg, payload + sizeof(NxusConfig), sizeof(dbg));
+                /* A pause that went through the debug session must survive a
+                   settings round-trip: auto_continue=1 releases a held target at
+                   once (that is what the setter is for), which would thaw the game
+                   behind the PC's back while it still believes it is frozen.
+                   Resume is the only way out of a debug-session pause. */
+                pauseLock();
+                if (g_PauseViaDebug && dbg.auto_continue != 0) {
+                    NXUS_LOG("debug config: auto_continue kept at 0 while a debug-session pause holds the target");
+                    dbg.auto_continue = 0;
+                }
                 nxusDebugConfigure(&dbg);
+                pauseUnlock();
                 NXUS_LOG("debug config: watch style=%u auto_continue=%u",
                          (unsigned)dbg.style, (unsigned)dbg.auto_continue);
             }
@@ -945,7 +1110,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_DebugDetach:
+            pauseLock();
             rc = nxusDebugDetach();
+            if (R_SUCCEEDED(rc) && g_PauseViaDebug) {
+                /* Detaching ends a pause that went through the session: keep the
+                   reported pause flag in step with the released target. */
+                g_PauseViaDebug = false;
+                nxusSessionSetPaused(false);
+                NXUS_LOG("debug detach released a debug-session pause");
+            }
+            pauseUnlock();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
@@ -1081,13 +1255,41 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
 /* If the PC vanishes while a debug session is open, hand the process back:
    dmnt stays closed (the game's own cheats are dead) until someone reopens it,
-   so a stale attach must not survive an idle client. */
+   so a stale attach must not survive an idle client.  A pause that went through
+   the session is released the same way, and the client is told with the same
+   event the watchdog uses, so its "paused" state cannot go stale. */
 static void reapStaleDebugSession(void) {
     if (!nxusDebugIsAttached()) return;
     if (!nxusSessionIdleExpired(NXUS_DEBUG_IDLE_TIMEOUT_MS)) return;
     NXUS_LOG("no client activity for %u ms - detaching the debug session",
              (unsigned)NXUS_DEBUG_IDLE_TIMEOUT_MS);
+    pauseLock();
     nxusDebugDetach();
+    if (g_PauseViaDebug) {
+        g_PauseViaDebug = false;
+        nxusSessionSetPaused(false);
+        NXUS_LOG("stale debug-session pause released");
+        nxusNetSendEvent(NxusEvent_AutoResume, NULL, 0);
+    }
+    pauseUnlock();
+}
+
+/* Keep the session's cached identity in step with dmnt, at most once a second.
+   ForceOpen from the PC and a game restart both change pid / main base without any
+   scan snapshotting the metadata, while Status, main-relative scopes and the GUI's
+   "main+offset" all read that cache.  The hasCheatProcess probe gates the metadata
+   read (no target = no need to refresh, and GetMetadata's auto-reopen must not run
+   blind), and a debug session is skipped entirely because dmnt is closed then. */
+static void refreshTargetIdentityThrottled(void) {
+    static u64 last_ms = 0;
+    const u64 now = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    if (last_ms != 0 && now - last_ms < 1000ull) return;
+    last_ms = now;
+
+    if (nxusDebugIsAttached()) return;
+    bool has_process = false;
+    if (R_FAILED(nxusDmntHasCheatProcess(&has_process)) || !has_process) return;
+    (void)nxusSessionRefreshIdentity();
 }
 
 void nxusServerTick(void) {
@@ -1106,6 +1308,7 @@ void nxusServerTick(void) {
         g_CommandActive = false;
     }
     reapStaleDebugSession();
+    refreshTargetIdentityThrottled();
     if (nxusSessionWatchdogExpired(nxusSessionWatchdogTimeout())) {
         if (nxusDebugIsAttached()) {
             /* dmnt is closed while we hold a debug session: resuming here would fail

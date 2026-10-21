@@ -10,8 +10,8 @@
  *   65001 GetCheatProcessEvent       -> copy handle
  *   65002 GetCheatProcessMetadata    -> CheatProcessMetadata (0x70)
  *   65003 ForceOpenCheatProcess
- *   65004 PauseCheatProcess
- *   65005 ResumeCheatProcess
+ *   65004 PauseCheatProcess          <- answers 0, freezes NOTHING (not a kernel stop)
+ *   65005 ResumeCheatProcess         <- likewise
  *   65006 ForceCloseCheatProcess     <- hands the process to another debugger
  *   65100 GetCheatProcessMappingCount-> u64
  *   65101 GetCheatProcessMappings    -> sf::OutArray<svc::MemoryInfo> + u64 count, in u64 offset
@@ -41,9 +41,11 @@ Result nxusDmntInitialize(void);
 void   nxusDmntExit(void);
 bool   nxusDmntIsActive(void);
 
-/* Read/Write/Metadata reopen dmnt automatically once after a failed dispatch.
-   Disable that while the Nxus debug session owns the process: a concurrent read
-   failure must not re-open dmnt and steal the process back mid-attach. */
+/* Read/Write/Metadata and the other commands reopen dmnt automatically once after
+   a failed dispatch (0x0032C80D ResultCheatNotAttached, plus any failure for the
+   three legacy ones).  Disable that while the Nxus debug session owns the process:
+   a concurrent read failure must not re-open dmnt and steal the process back
+   mid-attach. */
 void   nxusDmntSetAutoReopen(bool enabled);
 
 Result nxusDmntHasCheatProcess(bool *out);
@@ -51,6 +53,9 @@ Result nxusDmntGetCheatProcessEvent(Handle *out_handle);
 Result nxusDmntGetMetadata(NxusProcessMetadata *out);
 Result nxusDmntForceOpen(void);
 Result nxusDmntForceClose(void);
+/* Kept for the probe and as the no-metadata fallback.  These are NOT a process
+   suspension API: dmnt accepts them and the title keeps running.  The server
+   freezes the target with svcBreakDebugProcess through its debug session. */
 Result nxusDmntPause(void);
 Result nxusDmntResume(void);
 
