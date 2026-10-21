@@ -25,8 +25,11 @@ static volatile u64  g_CommandStartedMs;
 /* ---- pause / resume state ---------------------------------------------- */
 
 /* True while Pause holds the target through Nxus's own debug session
-   (nxusDebugAttach + svcBreakDebugProcess).  dmnt does not own the process then,
-   so Resume has to continue and detach instead of asking dmnt for anything. */
+   (nxusDebugAttach + svcBreakDebugProcess).  Only set when dmnt could not stop
+   the process itself: the normal pause goes through dmnt's 65004, which keeps
+   dmnt as the debugger (and therefore keeps scans/snapshots alive).  While this
+   is set dmnt does not own the process, so Resume has to continue and detach
+   instead of asking dmnt. */
 static bool g_PauseViaDebug = false;
 /* Pause/Resume arrive from the connection thread AND from the HID hotkey thread;
    attach/detach is a multi-step hand-off (ForceClose -> svcDebugActiveProcess ->
@@ -46,8 +49,9 @@ static u64              g_PtrTarget;
 static u64              g_PtrModuleBase;
 
 /* Fired from the HID thread: freeze the target without touching the PC.
-   dmnt's 65004 answered success and froze nothing (hardware-verified), so the
-   hotkey now goes through the same real stop the Pause command uses. */
+   Goes through the same serverPause() as the PC command: dmnt stops the cheat
+   process first (65004 is a real svc::BreakDebugProcess and keeps the dmnt
+   session usable), with the own-debug-session stop only as a fallback. */
 static void onHotkeyFired(void *user) {
     (void)user;
     if (g_CommandActive) {
@@ -154,11 +158,16 @@ static void pauseUnlock(void) {
 
 /* Freeze every thread of the target.
  *
- * dmnt:cht 65004 (PauseCheatProcess) is not a kernel process-suspension command:
- * it answers success and nothing stops (measured on hardware - a "paused" title
- * kept writing memory, so two captures 2 s apart diffed to 0 blocks).  The only
- * real stop available to a sysmodule is svcBreakDebugProcess on a debug session
- * we own, so Pause attaches first when dmnt still has the process. */
+ * Preferred path: dmnt's own stop.  dmnt:cht 65004 PauseCheatProcess is
+ * svc::BreakDebugProcess on the debug handle dmnt already owns, so the title
+ * really stops while dmnt keeps the process - reads, mappings, snapshots and
+ * frozen addresses keep working through the same session, and no attach/detach
+ * churn is needed.
+ *
+ * Fallback: when dmnt cannot stop it (no cheat process open, another debugger
+ * took the process over, ...), take the process over with Nxus's own debug
+ * session and break it there.  That closes dmnt for the duration of the pause,
+ * which is why it is only the second choice. */
 static Result pauseTargetLocked(void) {
     if (nxusDebugIsAttached()) {
         /* Our session already owns the process (DebugAttach, or a repeated
@@ -171,6 +180,20 @@ static Result pauseTargetLocked(void) {
         return rc;
     }
 
+    /* dmnt still owns the cheat process: let it break the process.  The dmnt
+       session stays open, so scans/snapshots/frozen addresses keep working while
+       the target is held. */
+    Result dmnt_rc = nxusDmntPause();
+    if (R_SUCCEEDED(dmnt_rc)) {
+        g_PauseViaDebug = false;
+        nxusSessionSetPaused(true);
+        NXUS_LOG("pause: dmnt stopped the cheat process (65004) - dmnt session kept");
+        return 0;
+    }
+
+    NXUS_LOG("pause: dmnt stop failed rc=0x%08X - falling back to an own debug session",
+             (unsigned)dmnt_rc);
+
     /* The pid must be read BEFORE the attach: svcDebugActiveProcess makes dmnt
        close the cheat process, and after that GetMetadata has nothing to report
        (and auto-reopen would fight the session we just created). */
@@ -178,14 +201,12 @@ static Result pauseTargetLocked(void) {
     memset(&md, 0, sizeof(md));
     Result rc = nxusDmntGetMetadata(&md);
     if (R_FAILED(rc) || md.process_id == 0) {
-        /* Nothing to attach to.  Keep dmnt's old call as the fallback so the
-           client still sees dmnt's own Result, but never report success for a
-           no-op: an ineffective "pause" is what made the PC continue scanning a
-           live game. */
-        Result fallback = nxusDmntPause();
-        NXUS_LOG("pause: no dmnt target (metadata rc=0x%08X pid=%llu); dmnt fallback rc=0x%08X",
-                 (unsigned)rc, (unsigned long long)md.process_id, (unsigned)fallback);
-        if (R_FAILED(rc)) return rc;
+        /* Nothing to attach to either.  Never report success for a no-op: an
+           ineffective "pause" is what made the PC continue scanning a live game.
+           dmnt_rc is the pause failure itself, so it is what the client needs. */
+        NXUS_LOG("pause: no dmnt target (metadata rc=0x%08X pid=%llu); dmnt stop rc=0x%08X",
+                 (unsigned)rc, (unsigned long long)md.process_id, (unsigned)dmnt_rc);
+        if (R_FAILED(rc)) return dmnt_rc;
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
     }
 
@@ -250,8 +271,24 @@ static Result resumeTargetLocked(void) {
         return rc;
     }
 
+    /* The target is held by dmnt's own break (65004): continue it through dmnt.
+       That keeps the cheat process open, so the normal scan/read path is ready
+       again the moment the title runs. */
     Result rc = nxusDmntResume();
-    nxusSessionSetPaused(false);
+    if (R_SUCCEEDED(rc)) {
+        nxusSessionSetPaused(false);
+        return 0;
+    }
+
+    NXUS_LOG("resume: dmnt continue failed rc=0x%08X", (unsigned)rc);
+    /* dmnt lost the cheat process while it was stopped (the title was closed, or
+       another debugger took it over).  If a debug session we own exists, it is
+       the only remaining way to release the target. */
+    if (nxusDebugIsAttached()) {
+        Result debug_rc = nxusDebugContinueAll();
+        if (R_SUCCEEDED(debug_rc)) nxusSessionSetPaused(false);
+        return debug_rc;
+    }
     return rc;
 }
 
@@ -543,17 +580,18 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             break;
 
         case NxusCmd_Pause:
-            /* A real stop: svcBreakDebugProcess suspends every thread.  If dmnt
-               still owns the process, Pause attaches to it first (see
-               pauseTargetLocked); 65004 is not a kernel stop and froze nothing. */
+            /* Real stop: dmnt breaks the cheat process it owns (65004 ->
+               svc::BreakDebugProcess) while keeping the session, so scans and
+               snapshots keep working.  Only if dmnt cannot stop it does
+               pauseTargetLocked take the process over with an own debug session. */
             rc = serverPause();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_Resume:
-            /* Reverses whichever pause is in effect: continue + detach for a
-               debug-session pause, plain continue while the PC holds a debugger,
-               dmnt's call otherwise. */
+            /* Reverses whichever pause is in effect: dmnt's continue for a
+               dmnt-held stop, continue + detach for a debug-session pause, plain
+               continue while the PC holds a debugger. */
             rc = serverResume();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;

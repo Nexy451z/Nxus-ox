@@ -174,6 +174,26 @@ Result nxusDmntForceClose(void) {
     return rc;
 }
 
+/* Pause/Resume are real process stops, implemented inside dmnt itself.
+ *
+ * The command ids are fixed by Atmosphère's ICheatInterface
+ * (stratosphere/dmnt/source/cheat/dmnt_cheat_service.hpp; libstratosphere's
+ * dmntcht.os.horizon.c and the EdiZon-SE / ldn_mitm copies of that client
+ * dispatch the same numbers):
+ *
+ *   65004 PauseCheatProcess  -> svc::BreakDebugProcess(dmnt's cheat process handle)
+ *   65005 ResumeCheatProcess -> svc::ContinueDebugProcess(same handle)
+ *
+ * dmnt owns the debug handle of the cheat process, so breaking it suspends every
+ * thread of the title while dmnt keeps the handle: reads, mappings and snapshots
+ * continue to work through the same session.  Its debug-events thread parks on
+ * m_unsafe_break_event for as long as m_broken_unsafe is set, so nothing
+ * auto-continues behind our back.
+ *
+ * There is no 65007/65008: the interface jumps from 65006 ForceCloseCheatProcess
+ * straight to 65100 GetCheatProcessMappingCount, so dispatching those ids only
+ * yields an unknown-command Result and freezes nothing.  Do not "fix" these two
+ * ids to anything else without re-reading the header above. */
 static Result opPause(void *ctx) {
     (void)ctx;
     dmntLock();
@@ -192,15 +212,14 @@ static Result opResume(void *ctx) {
 
 Result nxusDmntPause(void) {
     if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    /* Kept for the probe and as a fallback only.  65004 is NOT a kernel process
-       suspension: it answers 0 and freezes nothing (verified on hardware).  The
-       server freezes the target by owning the debug session instead. */
+    /* Normal path for Pause: stops the target without losing the dmnt session, so
+       scans / snapshots / frozen addresses keep working while it is held. */
     return dmntRunCommand(opPause, NULL, false, "Pause");
 }
 
 Result nxusDmntResume(void) {
     if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    /* Same: 65005 resumes a cheat-process "pause" that does not exist. */
+    /* Continues the stop issued by 65004 (also used by the pause watchdog). */
     return dmntRunCommand(opResume, NULL, false, "Resume");
 }
 

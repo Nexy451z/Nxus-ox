@@ -10,8 +10,8 @@
  *   65001 GetCheatProcessEvent       -> copy handle
  *   65002 GetCheatProcessMetadata    -> CheatProcessMetadata (0x70)
  *   65003 ForceOpenCheatProcess
- *   65004 PauseCheatProcess          <- answers 0, freezes NOTHING (not a kernel stop)
- *   65005 ResumeCheatProcess         <- likewise
+ *   65004 PauseCheatProcess          -> svc::BreakDebugProcess on dmnt's debug handle (real stop)
+ *   65005 ResumeCheatProcess         -> svc::ContinueDebugProcess on it
  *   65006 ForceCloseCheatProcess     <- hands the process to another debugger
  *   65100 GetCheatProcessMappingCount-> u64
  *   65101 GetCheatProcessMappings    -> sf::OutArray<svc::MemoryInfo> + u64 count, in u64 offset
@@ -53,9 +53,12 @@ Result nxusDmntGetCheatProcessEvent(Handle *out_handle);
 Result nxusDmntGetMetadata(NxusProcessMetadata *out);
 Result nxusDmntForceOpen(void);
 Result nxusDmntForceClose(void);
-/* Kept for the probe and as the no-metadata fallback.  These are NOT a process
-   suspension API: dmnt accepts them and the title keeps running.  The server
-   freezes the target with svcBreakDebugProcess through its debug session. */
+/* Pause/Resume the cheat process through dmnt itself.  These are the real
+   commands (65004/65005): Atmosphère implements them as svc::BreakDebugProcess /
+   svc::ContinueDebugProcess on the debug handle dmnt already owns.  The title
+   genuinely stops and dmnt keeps the process, so reads, mappings, snapshots and
+   frozen addresses keep working while it is held.  The server tries this path
+   first and only falls back to an own debug session when dmnt cannot stop it. */
 Result nxusDmntPause(void);
 Result nxusDmntResume(void);
 
