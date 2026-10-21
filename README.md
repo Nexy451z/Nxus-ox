@@ -152,6 +152,31 @@ nxus write <CODE_ADDR> "00 00 A0 E1"
 nxus detach
 ```
 
+### 5. MHXX CTRPF Mod Menu (`mhxx_ctrpf/`, `mhxxctrpf.nro`)
+
+An on-device cheat menu for **Monster Hunter XX** (`0100C3800049C000`, build
+`9D4C86E6EF74504A`), shipped alongside Nxus. It runs as a normal homebrew
+`.nro` and uses **`dmnt:cht` only** (a `.nro` has no debug capability), so it
+never competes for a debug session with Nxus, EdiZon or the Atmosphère cheat
+engine.
+
+- **15 one-word AArch32 code patches** (money/points max & freeze, shop ignores
+  price, infinite health/stamina, sharpness, art/brave/alchemy gauges, pouch
+  items, bomb/trap placement) — no trampoline, no extra page, no allocation.
+- **6 pointer-chain values** (zenny, Bherna points, attack, defence, FPS cap,
+  game speed) with a built-in numeric keypad.
+- **Pad and touch** input, CTRPF-style boot log, and `[safe]`/`[med]`/`[high]`
+  risk tags per cheat.
+- **Safety**: build-id gate, original-word check per site, read-back
+  verification, revert-all, and `dmnt`-native freeze (stays frozen after exit).
+
+```text
+SD:/switch/mhxxctrpf/mhxxctrpf.nro
+```
+
+Build with `cd mhxx_ctrpf && make` (devkitA64 + libnx). Details:
+[`mhxx_ctrpf/README.md`](mhxx_ctrpf/README.md).
+
 ---
 
 ## Repository Structure
@@ -162,6 +187,7 @@ Nxus-ox/
   shared/     Switch shared modules (dmnt:cht IPC wrapper, zero-copy TCP server, HID hotkey, logging)
   switch/     Main Switch sysmodule (Title ID: 0x4200000000004E58, kernel debugger in nxus_debug.c)
   probe/      Hardware diagnostic probe sysmodule (Title ID: 0x4200000000004E59)
+  mhxx_ctrpf/ MHXX CTRPF-style on-device mod menu (.nro, dmnt:cht cheat engine)
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
