@@ -44,6 +44,10 @@ static u8             *g_RxBuffer = NULL;
 /* Set by nxusNetRequestReset() (any thread) and consumed by the server thread.
    volatile: the polling loops re-read it every slice. */
 static volatile bool   g_ResetRequested = false;
+/* Last armGetSystemTick() at which a packet was received or sent completely.
+   Written by the server/sender threads and read by the watchdog in main.c; an
+   aligned 64-bit store is atomic on AArch64, so no lock is needed. */
+static volatile u64    g_LastActivityTick = 0;
 
 static int setClientFd(int fd) {
     mutexLock(&g_ClientMutex);
@@ -57,6 +61,10 @@ int nxusNetClientFd(void) {
     int fd = g_ClientFd;
     mutexUnlock(&g_ClientMutex);
     return fd;
+}
+
+u64 nxusNetLastActivityTick(void) {
+    return g_LastActivityTick;
 }
 
 /* Milliseconds elapsed since `from`.  armGetSystemTick() keeps counting across a
@@ -258,6 +266,9 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
             if (n > 0) {
                 got += (u32)n;
                 last_progress = armGetSystemTick();
+                /* A byte on the wire is a live PC: the sleep/wake heuristic in
+                   main.c must never reset the network while traffic flows. */
+                g_LastActivityTick = last_progress;
             } else if (n == 0) {
                 return false;               /* orderly shutdown by the peer */
             } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -342,6 +353,8 @@ Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, 
            returning an error that leaves the stream permanently desynced. */
         if (sent_total > 0) shutdown(fd, SHUT_RDWR);
         rc = MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen);
+    } else {
+        g_LastActivityTick = armGetSystemTick();
     }
 
     mutexUnlock(&g_SendMutex);
@@ -525,6 +538,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     g_HandlerUser = user;
     g_Port = port;
     g_ResetRequested = false;
+    g_LastActivityTick = armGetSystemTick();
 
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);

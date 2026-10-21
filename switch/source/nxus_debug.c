@@ -19,6 +19,12 @@ typedef struct {
     u32 enabled;
     u64 address;
     u64 ctrl;
+    /* Hot-breakpoint burst guard: a breakpoint that fires every frame (or in a
+       hot loop) must not keep the target stopped for a whole burst.  Hits are
+       counted in a sliding one-second window and the slot is auto-disarmed
+       after a small number of hits (see recordHit()). */
+    u32 hits_in_window;
+    u64 window_start_tick;
 } BreakSlot;
 
 static Handle g_Debug = INVALID_HANDLE;
@@ -88,6 +94,33 @@ static Result setHardwareBreakPointAllCores(u32 slot, u64 ctrl, u64 value) {
         svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
     }
     return first_err;
+}
+
+/* Wipe every hardware breakpoint/watchpoint register on every core.
+   Slots 0..5 are the instruction breakpoints (4 and 5 double as the ContextID
+   link sources) and 0x10..0x13 are the four watchpoints.  A stale register left
+   armed from a previous session fires into whatever process runs next - the
+   kernel does not reset the debug breakpoint/watchpoint registers on handle
+   close - so both attach and detach clear the entire set, unconditionally. */
+static void clearAllHardwareSlots(void) {
+    for (u32 slot = 0; slot <= 5; slot++) {
+        setHardwareBreakPointAllCores(slot, 0, 0);
+    }
+    for (u32 slot = 0x10; slot <= 0x13; slot++) {
+        setHardwareBreakPointAllCores(slot, 0, 0);
+    }
+}
+
+/* svcContinueDebugEvent returns ResultBusy (0xF401) while even one queued debug
+   event is unread, and then it resumes nothing at all.  The value shows up both
+   as the bare kernel frame (module 1, description 122) and with the 0xE0000000
+   marker, so match either form. */
+#define NXUS_DEBUG_RESULT_BUSY_LOW   0x0000F401u
+#define NXUS_DEBUG_RESULT_BUSY_FULL  0xE000F401u
+
+static bool isDebugBusyResult(Result rc) {
+    const u32 value = (u32)rc;
+    return value == NXUS_DEBUG_RESULT_BUSY_LOW || value == NXUS_DEBUG_RESULT_BUSY_FULL;
 }
 
 /* A 32-bit process reports zeros in the SP/LR/FP header fields of ThreadContext
@@ -268,13 +301,53 @@ static void recordHit(const DebugEventInfo *event) {
         }
     }
 
+    const u64 now = armGetSystemTick();
+
+    /* Burst auto-disarm guard (see the comment above the threshold): an
+       execution breakpoint that hits 8 times, or a watchpoint that hits 16
+       times, inside one second is attached to a per-frame instruction or a hot
+       loop.  Keeping it armed would stop the title on every iteration for the
+       whole session; disable it after the burst has been recorded and clear the
+       hardware register immediately. */
+    bool auto_disarmed = false;
+    u32  auto_slot = 0;
+    u64  auto_addr = 0;
+    u32  auto_hits = 0;
+
     mutexLock(&g_Mutex);
     hit.index = g_HitTotal++;
-    hit.tick = armGetSystemTick();
+    hit.tick = now;
     g_Hits[g_HitNext] = hit;
     g_HitNext = (g_HitNext + 1) % NXUS_DEBUG_MAX_HITS;
     if (g_HitCount < NXUS_DEBUG_MAX_HITS) g_HitCount++;
+
+    if (g_Config.auto_continue != 0 && hit.slot != 0xFFFFFFFFu) {
+        BreakSlot *bp = findBreakBySlot(hit.slot);
+        if (bp != NULL && bp->enabled) {
+            if (bp->window_start_tick == 0 ||
+                armTicksToNs(now - bp->window_start_tick) >= 1000000000ull) {
+                bp->window_start_tick = now;
+                bp->hits_in_window = 0;
+            }
+            bp->hits_in_window++;
+            const u32 limit = (bp->kind == NxusBp_Execute) ? 8u : 16u;
+            if (bp->hits_in_window >= limit) {
+                auto_disarmed = true;
+                auto_slot = bp->slot;
+                auto_addr = bp->address;
+                auto_hits = bp->hits_in_window;
+                bp->enabled = 0;
+                bp->hits_in_window = 0;
+                setHardwareBreakPointAllCores(bp->slot, 0, 0);
+            }
+        }
+    }
     mutexUnlock(&g_Mutex);
+
+    if (auto_disarmed) {
+        NXUS_LOG("debug: auto-disarmed hot break slot=%u after %u hits at %08llX",
+                 (unsigned)auto_slot, (unsigned)auto_hits, (unsigned long long)auto_addr);
+    }
 
     /* A hot watchpoint fires hundreds of times per second.  One SD-card append
        per hit (fopen/fwrite/fclose) plus one socket send under the shared mutex
@@ -286,7 +359,6 @@ static void recordHit(const DebugEventInfo *event) {
     static u64 log_window = 0;
     static u32 event_count = 0;
     static u64 event_window = 0;
-    const u64 now = armGetSystemTick();
 
     log_hits++;
     if (log_window == 0 || armTicksToNs(now - log_window) > 1000000000ull) {
@@ -343,8 +415,21 @@ static void disarmAllBreaks(void) {
     mutexUnlock(&g_Mutex);
 }
 
+/* Re-arm only while the session is alive.  nxusDebugDetach() stops and joins the
+   event thread BEFORE it clears the hardware slots, so this guard makes it
+   physically impossible for a late rearm to reprogram a core after the detach
+   has wiped the registers. */
 static void rearmAllBreaks(void) {
+    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+        atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        return;
+    }
     mutexLock(&g_Mutex);
+    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+        atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        mutexUnlock(&g_Mutex);
+        return;
+    }
     const u64 ctx_ctrl = (0x3ull << 20) | 0x1E1ull;
     setHardwareBreakPointAllCores(styleLinkSlot(g_Config.style), ctx_ctrl, (u64)g_Debug);
     for (u32 i = 0; i < g_BreakCount; i++) {
@@ -356,47 +441,84 @@ static void rearmAllBreaks(void) {
     mutexUnlock(&g_Mutex);
 }
 
+/* True while at least one breakpoint is still armed after a hit.  A hot slot
+   that recordHit() auto-disarmed must not be re-armed by the event loop. */
+static bool anyBreakEnabled(void) {
+    bool any = false;
+    mutexLock(&g_Mutex);
+    for (u32 i = 0; i < g_BreakCount; i++) {
+        if (g_Breaks[i].enabled) { any = true; break; }
+    }
+    mutexUnlock(&g_Mutex);
+    return any;
+}
+
+/* One debug event.  Returns true for a breakpoint/watchpoint exception, i.e.
+   the events that must be acknowledged before the target can run again. */
+static bool handleDebugEvent(const DebugEventInfo *event) {
+    bool is_break = false;
+    switch (event->type) {
+        case DebugEventType_CreateProcess:
+            /* The flags bit 0 tells whether the process is AArch64; the
+               32-bit view keeps SP/LR/FP in r13/r14/r11. */
+            g_Is64Bit = (event->info.create_process.flags & 1u) != 0;
+            NXUS_LOG("debug: process created (pid=%llu, %s)",
+                     (unsigned long long)event->info.create_process.process_id,
+                     g_Is64Bit ? "AArch64" : "AArch32");
+            break;
+        case DebugEventType_CreateThread:
+            noteThread(event->thread_id);
+            break;
+        case DebugEventType_Exception:
+            if (event->info.exception.type == DebugException_BreakPoint) {
+                recordHit(event);
+                is_break = true;
+            } else {
+                NXUS_LOG("debug: exception type %u at %p",
+                         (unsigned)event->info.exception.type, event->info.exception.address);
+            }
+            break;
+        case DebugEventType_ExitProcess:
+            NXUS_LOG("debug: process exited");
+            break;
+        default:
+            break;
+    }
+    return is_break;
+}
+
+/* svcContinueDebugEvent() refuses to resume anything while one debug event is
+   still queued (ResultBusy / 0xF401).  The loop below always drains the whole
+   queue first for exactly that reason.  A bounded drain is used so a process
+   that produces events faster than they are consumed cannot starve anything
+   else on this thread forever. */
+static u32 drainDebugEvents(bool *had_break) {
+    u32 processed = 0;
+    for (u32 n = 0; n < 64; n++) {
+        DebugEventInfo event;
+        memset(&event, 0, sizeof(event));
+        if (R_FAILED(svcGetDebugEvent(&event, g_Debug))) break;
+        processed++;
+        if (handleDebugEvent(&event) && had_break != NULL) *had_break = true;
+    }
+    return processed;
+}
+
 static void eventThread(void *arg) {
     (void)arg;
     while (!atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
-        if (!g_Attached) break;
+        if (!g_Attached || g_Debug == INVALID_HANDLE) break;
 
-        DebugEventInfo event;
-        memset(&event, 0, sizeof(event));
-        Result rc = svcGetDebugEvent(&event, g_Debug);
-        if (R_FAILED(rc)) {
+        /* Take EVERY queued event before calling ContinueDebugEvent: one unread
+           event is enough for the kernel to return 0xF401 and leave all threads
+           stopped.  Processing them all also means no breakpoint hit is lost in
+           the CreateProcess/CreateThread burst. */
+        bool had_break = false;
+        const u32 processed = drainDebugEvents(&had_break);
+        if (processed == 0) {
             /* no event pending (or the session ended): yield and retry */
             svcSleepThread(2000000ull);
             continue;
-        }
-
-        bool is_break = false;
-        switch (event.type) {
-            case DebugEventType_CreateProcess:
-                /* The flags bit 0 tells whether the process is AArch64; the
-                   32-bit view keeps SP/LR/FP in r13/r14/r11. */
-                g_Is64Bit = (event.info.create_process.flags & 1u) != 0;
-                NXUS_LOG("debug: process created (pid=%llu, %s)",
-                         (unsigned long long)event.info.create_process.process_id,
-                         g_Is64Bit ? "AArch64" : "AArch32");
-                break;
-            case DebugEventType_CreateThread:
-                noteThread(event.thread_id);
-                break;
-            case DebugEventType_Exception:
-                if (event.info.exception.type == DebugException_BreakPoint) {
-                    recordHit(&event);
-                    is_break = true;
-                } else {
-                    NXUS_LOG("debug: exception type %u at %p",
-                             (unsigned)event.info.exception.type, event.info.exception.address);
-                }
-                break;
-            case DebugEventType_ExitProcess:
-                NXUS_LOG("debug: process exited");
-                break;
-            default:
-                break;
         }
 
         /* With auto_continue == 0 a breakpoint hit is meant to HOLD the target
@@ -404,31 +526,51 @@ static void eventThread(void *arg) {
            the PC asks for it.  Everything else - the initial CreateProcess /
            CreateThread burst in particular - is always continued, otherwise attach
            itself would freeze the title. */
-        if (is_break && g_Config.auto_continue == 0) {
+        if (had_break && g_Config.auto_continue == 0) {
             NXUS_LOG("debug: breakpoint hit while auto_continue=0, target held");
             continue;
         }
 
-        /* 4|2|1 = ContinueAll | ContinueOthers | IgnoreException: the form the
-           working reference implementation uses on hardware (noexs,
-           server/source/noexs/source/debug.cpp:74).  flags = 0 with a tid list is
-           not proven to resume anything, and a stopped target looks like a frozen
-           game. */
-        u64 tid = event.thread_id;
-        if (is_break) {
-            /* Step past the trapping instruction: disarm, continue, give the core
-               1 ms to retire it, then re-arm what the PC still has enabled. */
+        /* 4|2|1 = ContinueAll | ContinueOthers | IgnoreException, with no tid
+           list: the form the working reference implementation uses on hardware
+           (noexs, server/source/noexs/source/debug.cpp:74).  When it still
+           reports ResultBusy, extra events arrived between the drain and the
+           call; drain again and retry instead of leaving the title stopped. */
+        if (had_break) {
             disarmAllBreaks();
-            Result crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, &tid, 1);
-            if (R_FAILED(crc)) NXUS_RESULT("ContinueDebugEvent", crc);
-            svcSleepThread(1000000ull);
-            rearmAllBreaks();
-        } else {
-            Result crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, &tid, 1);
-            if (R_FAILED(crc)) NXUS_RESULT("ContinueDebugEvent", crc);
+        }
+
+        Result crc = 0;
+        bool continued = false;
+        for (int retry = 0; retry < 8; retry++) {
+            crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
+            if (R_SUCCEEDED(crc)) {
+                continued = true;
+                break;
+            }
+            if (!isDebugBusyResult(crc)) break;
+
+            bool extra_break = false;
+            if (drainDebugEvents(&extra_break) == 0) {
+                svcSleepThread(1000000ull);
+            }
+            had_break = had_break || extra_break;
+        }
+        if (!continued && R_FAILED(crc)) NXUS_RESULT("ContinueDebugEvent", crc);
+
+        /* Step past the trapping instruction: give the core 1 ms to retire it,
+           then re-arm what the PC still has enabled.  Skipped when the hit was a
+           hot slot that recordHit() auto-disarmed (nothing left to re-arm) and
+           whenever a detach has already started. */
+        if (had_break && g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+            if (anyBreakEnabled()) {
+                svcSleepThread(1000000ull);
+                if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+                    rearmAllBreaks();
+                }
+            }
         }
     }
-    g_EventThreadLive = false;
 }
 
 /* ---- public API -------------------------------------------------------- */
@@ -456,10 +598,22 @@ Result nxusDebugAttach(u64 pid) {
     if (g_Attached) return 0;
     if (pid == 0) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
 
+    /* While we take the process over, a concurrent scan read that fails must not
+       auto-reopen dmnt and race the hand-off.  Restored on every failure path and
+       on detach. */
+    nxusDmntSetAutoReopen(false);
+
     /* Only one debugger may own the process: ask dmnt to detach first. */
     Result rc = nxusDmntForceClose();
     NXUS_RESULT("dmnt ForceCloseCheatProcess", rc);
     svcSleepThread(200000000ull);
+
+    /* The kernel does not reset the breakpoint/watchpoint registers when a
+       previous debug handle is closed.  A breakpoint left over from an earlier
+       attach would trap into
+       this title (or make svcDebugActiveProcess itself fail), so wipe all ten
+       slots before asking for the process. */
+    clearAllHardwareSlots();
 
     Handle debug = INVALID_HANDLE;
     rc = svcDebugActiveProcess(&debug, pid);
@@ -467,6 +621,7 @@ Result nxusDebugAttach(u64 pid) {
     NXUS_RESULT("svcDebugActiveProcess", rc);
     if (R_FAILED(rc)) {
         nxusDmntForceOpen();
+        nxusDmntSetAutoReopen(true);
         return rc;
     }
 
@@ -481,10 +636,15 @@ Result nxusDebugAttach(u64 pid) {
     alignas(0x1000) static u8 eventStack[0x8000];
     rc = threadCreate(&g_EventThread, eventThread, NULL, eventStack, sizeof(eventStack), 0x2A, -2);
     if (R_FAILED(rc)) {
+        atomic_store_explicit(&g_StopLoop, true, memory_order_relaxed);
         svcCloseHandle(g_Debug);
         g_Debug = INVALID_HANDLE;
         g_Attached = false;
+        /* armContextIdBreakpoint() already programmed the link slot: do not
+           leave it behind when the event thread cannot be created. */
+        clearAllHardwareSlots();
         nxusDmntForceOpen();
+        nxusDmntSetAutoReopen(true);
         return rc;
     }
     g_EventThreadLive = true;
@@ -495,23 +655,16 @@ Result nxusDebugAttach(u64 pid) {
 }
 
 Result nxusDebugDetach(void) {
-    if (!g_Attached) return 0;
+    if (!g_Attached && !g_EventThreadLive) {
+        nxusDmntSetAutoReopen(true);
+        return 0;
+    }
 
+    /* Stop and JOIN the event thread FIRST.  Once threadWaitForExit() returns,
+       no thread can be inside rearmAllBreaks()/disarmAllBreaks() any more, so the
+       register wipe below can never race with an in-flight re-arm that would put
+       a breakpoint back after detach. */
     atomic_store_explicit(&g_StopLoop, true, memory_order_relaxed);
-
-    for (u32 i = 0; i < g_BreakCount; i++) {
-        if (g_Breaks[i].enabled) setHardwareBreakPointAllCores(g_Breaks[i].slot, 0, 0);
-    }
-    /* Unconditional: armContextIdBreakpoint() arms the link slot for every style
-       (an execution breakpoint cannot be armed without it), so a stale context
-       breakpoint would otherwise stay armed for the rest of the session. */
-    setHardwareBreakPointAllCores(styleLinkSlot(g_Config.style), 0, 0);
-
-    if (g_Debug != INVALID_HANDLE) {
-        svcCloseHandle(g_Debug);   /* detaches and resumes the target */
-        g_Debug = INVALID_HANDLE;
-    }
-    g_Attached = false;
 
     if (g_EventThreadLive) {
         threadWaitForExit(&g_EventThread);
@@ -519,9 +672,52 @@ Result nxusDebugDetach(void) {
         g_EventThreadLive = false;
     }
 
-    svcSleepThread(100000000ull);
+    mutexLock(&g_Mutex);
+    for (u32 i = 0; i < NXUS_DEBUG_MAX_BREAKS; i++) {
+        g_Breaks[i].enabled = 0;
+        g_Breaks[i].hits_in_window = 0;
+        g_Breaks[i].window_start_tick = 0;
+    }
+    g_BreakCount = 0;
+    g_Attached = false;
+    mutexUnlock(&g_Mutex);
+
+    /* All ten slots (0..5 plus 0x10..0x13) on all four cores: the ContextID link
+       source (4/5) included, because armContextIdBreakpoint() programs it for
+       every style.  No conditional "if enabled" here: a stale register is
+       invisible to the break table but still fires. */
+    clearAllHardwareSlots();
+
+    if (g_Debug != INVALID_HANDLE) {
+        /* Drain the queue and acknowledge every pending exception as handled
+           before closing: unread breakpoint events would otherwise be delivered
+           as fatal exceptions when the process is resumed by the close. */
+        DebugEventInfo ev;
+        for (u32 n = 0; n < 256; n++) {
+            memset(&ev, 0, sizeof(ev));
+            if (R_FAILED(svcGetDebugEvent(&ev, g_Debug))) break;
+        }
+        Result crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
+        if (R_FAILED(crc) && !isDebugBusyResult(crc)) {
+            NXUS_RESULT("ContinueDebugEvent (detach ack)", crc);
+        }
+
+        svcCloseHandle(g_Debug);   /* detaches and resumes the target */
+        g_Debug = INVALID_HANDLE;
+    }
+
+    /* dmnt may still be tearing the old cheat process down: give it 50 ms, then
+       one 100 ms retry instead of leaving the cheat VM closed for the session. */
+    svcSleepThread(50000000ull);
     Result rc = nxusDmntForceOpen();
+    if (R_FAILED(rc)) {
+        NXUS_LOG("dmnt ForceOpenCheatProcess first attempt rc=0x%08X - retrying in 100 ms",
+                 (unsigned)rc);
+        svcSleepThread(100000000ull);
+        rc = nxusDmntForceOpen();
+    }
     NXUS_RESULT("dmnt ForceOpenCheatProcess (restore)", rc);
+    nxusDmntSetAutoReopen(true);
     NXUS_LOG("debug mode released");
     return 0;
 }
@@ -582,8 +778,17 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
         existing->enabled = 1;
         existing->address = request->address;
         existing->ctrl = ctrl;
+        existing->hits_in_window = 0;
+        existing->window_start_tick = 0;
     }
     mutexUnlock(&g_Mutex);
+
+    /* Every execution breakpoint and watchpoint links to the ContextID slot.  If
+       the last breakpoint was auto-disarmed, that slot is clear too; without
+       re-arming it here the newly set breakpoint silently never fires. */
+    if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        armContextIdBreakpoint();
+    }
     return 0;
 }
 
@@ -602,6 +807,26 @@ Result nxusDebugClearBreak(u32 slot) {
         }
     }
     mutexUnlock(&g_Mutex);
+
+    /* A thread may be stopped on the exception this slot produced.  Clearing the
+       hardware register does not resume it, so acknowledge any queued event and
+       continue once: without this the target stays frozen until another Continue
+       command happens to arrive (and the next Continue hits ResultBusy 0xF401). */
+    if (g_Attached && g_Debug != INVALID_HANDLE) {
+        drainDebugEvents(NULL);
+        for (int retry = 0; retry < 4; retry++) {
+            Result crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
+            if (R_SUCCEEDED(crc)) break;
+            if (!isDebugBusyResult(crc)) {
+                NXUS_RESULT("ContinueDebugEvent (break clear)", crc);
+                break;
+            }
+            bool extra_break = false;
+            if (drainDebugEvents(&extra_break) == 0) {
+                svcSleepThread(1000000ull);
+            }
+        }
+    }
     return rc;
 }
 
@@ -741,19 +966,36 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
 }
 
 Result nxusDebugContinueAll(void) {
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
-
-    u64 ids[NXUS_DEBUG_MAX_THREADS];
-    s32 num = 0;
-    if (R_FAILED(svcGetThreadList(&num, ids, NXUS_DEBUG_MAX_THREADS, g_Debug)) || num <= 0) {
-        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    if (!g_Attached || g_Debug == INVALID_HANDLE) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
+
+    /* Drain first: with one unread event in m_event_info_list the kernel refuses
+       ContinueDebugEvent with ResultBusy (0xF401) and resumes NOTHING, which
+       left the title frozen after a manual continue. */
+    drainDebugEvents(NULL);
+
     /* Same flags as the per-event path above, and the same step discipline: an armed
        breakpoint would trap on the instruction it already trapped on, so disarm,
        let the core make progress, then re-arm. */
     disarmAllBreaks();
-    Result rc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, ids, (u32)num);
-    if (R_SUCCEEDED(rc)) svcSleepThread(1000000ull);
+
+    Result rc = 0;
+    bool continued = false;
+    for (int retry = 0; retry < 8; retry++) {
+        rc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
+        if (R_SUCCEEDED(rc)) {
+            continued = true;
+            break;
+        }
+        if (!isDebugBusyResult(rc)) break;
+
+        bool extra_break = false;
+        if (drainDebugEvents(&extra_break) == 0) {
+            svcSleepThread(1000000ull);
+        }
+    }
+    if (continued) svcSleepThread(1000000ull);
     rearmAllBreaks();
     g_LastResult = (s32)rc;
     return rc;
@@ -794,7 +1036,9 @@ void nxusDebugConfigure(const NxusDebugConfig *config) {
     if (config == NULL) return;
     if (config->style <= NXUS_WATCH_STYLE_LINK6) g_Config.style = config->style;
     g_Config.auto_continue = config->auto_continue;
-    if (g_Attached) armContextIdBreakpoint();
+    if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        armContextIdBreakpoint();
+    }
 }
 
 void nxusDebugGetConfig(NxusDebugConfig *out) {

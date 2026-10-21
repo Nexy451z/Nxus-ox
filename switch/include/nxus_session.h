@@ -42,6 +42,11 @@ void nxusSessionExit(void);
 /* ---- status ---- */
 u32  nxusSessionId(void);
 u32  nxusSessionScanState(void);
+/* True while the background scan worker is running.  Used by the main loop to
+   distinguish a busy console from a real sleep/wake. */
+static inline bool nxusSessionIsRunning(void) {
+    return nxusSessionScanState() == NxusScanState_Running;
+}
 u32  nxusSessionProgress(void);
 s32  nxusSessionLastResult(void);
 u32  nxusSessionHitCount(void);
@@ -53,6 +58,9 @@ u64  nxusSessionMainSize(void);
 /* Replace the cached process identity (used when attaching to an explicit pid, where
    dmnt's metadata no longer describes the process we hold). */
 void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size);
+/* Same, but carries the program id too: DebugAttach preserves the metadata it
+   read from dmnt just before taking the process. */
+void nxusSessionSetProcessIdentityEx(u64 pid, u64 program_id, u64 main_base, u64 main_size);
 
 /* Range list for NxusScope_Ranges (copied; truncated to NXUS_MAX_SCAN_RANGES).
    NULL/0 clears it. */

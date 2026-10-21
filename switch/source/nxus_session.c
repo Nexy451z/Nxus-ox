@@ -258,11 +258,15 @@ void nxusSessionSetScanRanges(const NxusRangeEntry *ranges, u32 count) {
 
 /* Attaching to another process invalidates the identity cached from dmnt: keeping the
    old main base would make every main-relative scan read the wrong process. */
-void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size) {
+void nxusSessionSetProcessIdentityEx(u64 pid, u64 program_id, u64 main_base, u64 main_size) {
     g_Session.process_id = pid;
-    g_Session.program_id = 0;
+    g_Session.program_id = program_id;
     g_Session.main_base = main_base;
     g_Session.main_size = main_size;
+}
+
+void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size) {
+    nxusSessionSetProcessIdentityEx(pid, 0, main_base, main_size);
 }
 u64  nxusSessionProgramId(void)     { return g_Session.program_id; }
 u64  nxusSessionMainBase(void)      { return g_Session.main_base; }
@@ -497,7 +501,10 @@ static void revalidateMappings(void) {
 static void cacheProcessInfo(void) {
     /* While attached, dmnt is closed and svcQueryDebugProcessMemory cannot produce
        the metadata struct, so the values cached from the last dmnt session (or the
-       first scan) are kept - the client is told to scan before attaching. */
+       first scan) are kept - the client is told to scan before attaching.  Do not
+       even call nxusDmntGetMetadata() here: it auto-reopens dmnt after a failure,
+       which would fight with the debug session that owns the process. */
+    if (nxusDebugIsAttached()) return;
     NxusProcessMetadata md;
     memset(&md, 0, sizeof(md));
     if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) {

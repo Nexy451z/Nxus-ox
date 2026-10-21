@@ -1,9 +1,18 @@
 #include "nxus_dmntcht.h"
+#include "nxus_log.h"
 
 #include <string.h>
 
 static Service g_DmntSrv;
 static bool    g_DmntActive = false;
+/* The automatic ForceOpen retry in Read/Write/GetMetadata is only valid while
+   dmnt is supposed to own the target.  The Nxus debug session turns it off for
+   the duration of its attach/detach hand-off. */
+static volatile bool g_AutoReopen = true;
+
+void nxusDmntSetAutoReopen(bool enabled) {
+    g_AutoReopen = enabled;
+}
 
 /*
  * Every dmnt:cht dispatch goes through this lock.
@@ -80,6 +89,19 @@ Result nxusDmntGetMetadata(NxusProcessMetadata *out) {
     dmntLock();
     Result rc = serviceDispatchOut(&g_DmntSrv, 65002, *out);
     dmntUnlock();
+
+    /* Right after a debug detach (or when the cheat process was torn down by
+       sleep/attach churn) dmnt answers with a "process not open" result even
+       though the target is alive.  Reopening once and retrying keeps the
+       caller from surfacing 0x8003C806 (BAD_STATE) to the PC. */
+    if (R_FAILED(rc) && g_AutoReopen) {
+        Result open_rc = nxusDmntForceOpen();
+        NXUS_LOG("dmnt: GetMetadata failed rc=0x%08X; ForceOpen rc=0x%08X - retrying once",
+                 (unsigned)rc, (unsigned)open_rc);
+        dmntLock();
+        rc = serviceDispatchOut(&g_DmntSrv, 65002, *out);
+        dmntUnlock();
+    }
     return rc;
 }
 
@@ -162,6 +184,20 @@ Result nxusDmntRead(u64 address, void *buffer, size_t size) {
         .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
         .buffers = { { buffer, size } });
     dmntUnlock();
+
+    /* A read issued in the window between a debug detach and dmnt's cheat
+       process coming back fails with "not open" (e.g. 0x0032C80D).  Reopen the
+       cheat process once and retry before reporting an error to the caller. */
+    if (R_FAILED(rc) && g_AutoReopen) {
+        Result open_rc = nxusDmntForceOpen();
+        NXUS_LOG("dmnt: Read(%08llX,%u) failed rc=0x%08X; ForceOpen rc=0x%08X - retrying once",
+                 (unsigned long long)address, (unsigned)size, (unsigned)rc, (unsigned)open_rc);
+        dmntLock();
+        rc = serviceDispatchIn(&g_DmntSrv, 65102, args,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
+            .buffers = { { buffer, size } });
+        dmntUnlock();
+    }
     return rc;
 }
 
@@ -174,6 +210,17 @@ Result nxusDmntWrite(u64 address, const void *buffer, size_t size) {
         .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcMapAlias },
         .buffers = { { buffer, size } });
     dmntUnlock();
+
+    if (R_FAILED(rc) && g_AutoReopen) {
+        Result open_rc = nxusDmntForceOpen();
+        NXUS_LOG("dmnt: Write(%08llX,%u) failed rc=0x%08X; ForceOpen rc=0x%08X - retrying once",
+                 (unsigned long long)address, (unsigned)size, (unsigned)rc, (unsigned)open_rc);
+        dmntLock();
+        rc = serviceDispatchIn(&g_DmntSrv, 65103, args,
+            .buffer_attrs = { SfBufferAttr_In | SfBufferAttr_HipcMapAlias },
+            .buffers = { { buffer, size } });
+        dmntUnlock();
+    }
     return rc;
 }
 

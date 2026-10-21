@@ -856,30 +856,74 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (length >= sizeof(u64)) {
                 memcpy(&pid, payload, sizeof(pid));
             }
+
+            /* Attaching twice is a no-op (only one debug handle exists), and it
+               must not query dmnt: the metadata getter auto-reopens dmnt on
+               failure, which would fight the session that already owns the
+               process. */
+            if (nxusDebugIsAttached()) {
+                NxusDebugStatus st;
+                nxusDebugGetStatus(&st);
+                reply(fd, type, seq, &st, sizeof(st));
+                break;
+            }
+
+            /* Read dmnt's metadata BEFORE taking the process.  After
+               svcDebugActiveProcess dmnt is closed and this is the only source of
+               program_id / main NSO base, so losing it here would make --scope main
+               fail until a later dmnt session. */
+            NxusProcessMetadata md;
+            memset(&md, 0, sizeof(md));
+            const bool have_md = R_SUCCEEDED(nxusDmntGetMetadata(&md));
+
             if (pid == 0) {
                 pid = nxusSessionProcessId();
             }
-            if (pid == 0) {
-                NxusProcessMetadata md;
-                memset(&md, 0, sizeof(md));
-                if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) pid = md.process_id;
+            if (pid == 0 && have_md) {
+                pid = md.process_id;
             }
+
             rc = nxusDebugAttach(pid);
             if (R_FAILED(rc)) {
                 replyError(fd, type, seq, rc);
             } else {
-                /* The metadata cached from dmnt describes the PREVIOUS process.  We
-                   cannot ask dmnt for the new one (it is closed while attached), so
-                   reset the identity: an unknown main base makes --scope main fail
-                   visibly instead of quietly scanning another process's address. */
                 /* Only a DIFFERENT process invalidates the cached identity: attaching
                    to the current game keeps main_base, which the day-1 flow (scan
-                   first, attach afterwards) relies on. */
-                if (pid != nxusSessionProcessId()) {
-                    nxusSessionSetProcessIdentity(pid, 0, 0);
+                   first, attach afterwards) relies on.  When dmnt still describes the
+                   process we just attached to, carry all four fields over instead of
+                   zeroing main_base. */
+                const bool same_process = (pid == nxusSessionProcessId());
+                const bool md_matches = have_md && (md.process_id == pid);
+                if (!same_process) {
+                    if (md_matches) {
+                        nxusSessionSetProcessIdentityEx(pid, md.program_id,
+                                                        md.main_nso_base, md.main_nso_size);
+                        NXUS_LOG("attached to pid=%llu: identity kept from dmnt "
+                                 "(title=%016llX main=%08llX+%08llX)",
+                                 (unsigned long long)pid, (unsigned long long)md.program_id,
+                                 (unsigned long long)md.main_nso_base,
+                                 (unsigned long long)md.main_nso_size);
+                    } else {
+                        nxusSessionSetProcessIdentity(pid, 0, 0);
+                        NXUS_LOG("attached to pid=%llu: dmnt metadata unavailable - "
+                                 "main base unknown until the next dmnt session",
+                                 (unsigned long long)pid);
+                    }
+                } else if (md_matches && nxusSessionMainBase() == 0 && md.main_nso_base != 0) {
+                    nxusSessionSetProcessIdentityEx(pid, md.program_id,
+                                                    md.main_nso_base, md.main_nso_size);
+                    NXUS_LOG("attached to pid=%llu: filled missing main base from dmnt "
+                             "(%08llX+%08llX)",
+                             (unsigned long long)pid,
+                             (unsigned long long)md.main_nso_base,
+                             (unsigned long long)md.main_nso_size);
+                } else {
+                    NXUS_LOG("attached to pid=%llu: process identity preserved "
+                             "(main=%08llX+%08llX)",
+                             (unsigned long long)pid,
+                             (unsigned long long)nxusSessionMainBase(),
+                             (unsigned long long)nxusSessionMainSize());
                 }
-                NXUS_LOG("attached to pid=%llu: process info reset (main base unknown "
-                         "until the next dmnt session)", (unsigned long long)pid);
                 NxusDebugStatus st;
                 nxusDebugGetStatus(&st);
                 reply(fd, type, seq, &st, sizeof(st));

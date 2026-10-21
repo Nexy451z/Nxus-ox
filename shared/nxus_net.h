@@ -31,6 +31,11 @@ bool   nxusNetIsRunning(void);
 /* -1 when no client is connected. */
 int    nxusNetClientFd(void);
 
+/* armGetSystemTick() of the last packet byte received or of the last complete
+   send.  The main loop uses this to tell a real sleep/wake (no traffic for a long
+   time) from a long handler that merely starved the watchdog thread. */
+u64    nxusNetLastActivityTick(void);
+
 /* Thread-safe.  Returns an error if no client is connected or the write fails. */
 Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length);
 Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length);

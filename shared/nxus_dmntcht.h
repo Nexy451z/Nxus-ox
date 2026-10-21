@@ -41,6 +41,11 @@ Result nxusDmntInitialize(void);
 void   nxusDmntExit(void);
 bool   nxusDmntIsActive(void);
 
+/* Read/Write/Metadata reopen dmnt automatically once after a failed dispatch.
+   Disable that while the Nxus debug session owns the process: a concurrent read
+   failure must not re-open dmnt and steal the process back mid-attach. */
+void   nxusDmntSetAutoReopen(bool enabled);
+
 Result nxusDmntHasCheatProcess(bool *out);
 Result nxusDmntGetCheatProcessEvent(Handle *out_handle);
 Result nxusDmntGetMetadata(NxusProcessMetadata *out);

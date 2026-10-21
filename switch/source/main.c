@@ -163,11 +163,15 @@ int main(int argc, char *argv[]) {
     NXUS_LOG("ready - connect with the PC client on port %u", (unsigned)NXUS_DEFAULT_PORT);
 
     /* Sleep/wake detection.  armGetSystemTick() keeps counting while the console
-       is suspended, so one "100 ms" sleep that took 3 s or more can only mean the
-       Switch was asleep.  Every socket the sysmodule holds is stale by then (the
-       PC client has timed out too), so drop the old connection and rebuild the
-       listener - the PC reconnects to a live :7332 instead of hitting
-       "connection refused" or a half-open session. */
+       is suspended, so one "100 ms" sleep that took many seconds can mean the
+       Switch was asleep.  It can also mean this thread was merely starved while a
+       snapshot/pointer scan ran, so a gap alone is NO LONGER enough:
+         - 15 s instead of 3 s (a heavy handler can block for several seconds),
+         - no reset while a packet was received/sent within the same 15 s window,
+         - no reset while a scan is running or a debug session holds the process.
+       Only a long gap with no traffic and no active work is a real sleep; then
+       every socket is stale (the PC client has timed out too), so drop the old
+       connection and rebuild the listener so the PC reconnects to a live :7332. */
     u64 last_tick = armGetSystemTick();
     while (true) {
         nxusServerTick();
@@ -175,10 +179,22 @@ int main(int argc, char *argv[]) {
 
         const u64 now_tick = armGetSystemTick();
         const u64 gap_ns = armTicksToNs(now_tick - last_tick);
-        if (gap_ns > 3000000000ull) {
-            NXUS_LOG("sleep/wake detected (%llu ms in one 100 ms tick) - resetting network",
-                     (unsigned long long)(gap_ns / 1000000ull));
-            nxusNetRequestReset("sleep-wake");
+        if (gap_ns > 15000000000ull) {
+            const u64 activity = nxusNetLastActivityTick();
+            const bool recent_net =
+                (activity != 0) &&
+                ((activity >= now_tick) ||
+                 (armTicksToNs(now_tick - activity) <= 15000000000ull));
+            const bool busy = nxusSessionIsRunning() || nxusDebugIsAttached();
+            if (recent_net || busy) {
+                NXUS_LOG("long tick (%llu ms) with %s - keeping the network",
+                         (unsigned long long)(gap_ns / 1000000ull),
+                         recent_net ? "recent network traffic" : "a scan/debug session");
+            } else {
+                NXUS_LOG("sleep/wake detected (%llu ms in one 100 ms tick) - resetting network",
+                         (unsigned long long)(gap_ns / 1000000ull));
+                nxusNetRequestReset("sleep-wake");
+            }
         }
         last_tick = now_tick;
     }
