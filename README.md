@@ -179,6 +179,15 @@ Build with `cd mhxx_ctrpf && make` (devkitA64 + libnx). Details:
 
 ---
 
+## Companion project: Smithy
+
+The **MHXX CTRPF-style on-device mod menu** lives in its own repository:
+**[Nexy451z/Smithy](https://github.com/Nexy451z/Smithy)** — 15 one-word AArch32
+code patches, 6 pointer-chain values, a touch + D-pad numeric keypad, and a
+`dmnt:cht`-only cheat engine (no debug session stolen from Nxus).
+
+---
+
 ## Repository Structure
 
 ```text
@@ -187,7 +196,6 @@ Nxus-ox/
   shared/     Switch shared modules (dmnt:cht IPC wrapper, zero-copy TCP server, HID hotkey, logging)
   switch/     Main Switch sysmodule (Title ID: 0x4200000000004E58, kernel debugger in nxus_debug.c)
   probe/      Hardware diagnostic probe sysmodule (Title ID: 0x4200000000004E59)
-  mhxx_ctrpf/ MHXX CTRPF-style on-device mod menu (.nro, dmnt:cht cheat engine)
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
