@@ -41,6 +41,10 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 - **Data Types**: `u8`, `u16`, `u32`, `u64`, `i8..i64` (`--signed`), `f32`, `f64` (with `±Inf` and epsilon support), `utf8`, `utf16`, raw byte arrays with wildcards (`AA ?? BB`), and `All` multi-type scan.
 - **Comparisons**: `Equal`, `NotEqual`, `Greater`, `Less`, `GreaterOrEqual`, `LessOrEqual`, `Between`, `FuzzyEqual`, `Increased`, `Decreased`, `Changed`, `Unchanged`, `Different`, and `Unknown` initial state.
 - **Type-Specialized Fast Paths**: Constant-width unrolled inner loops for 1st-pass and refinement scans, chunk-boundary overlap tracking (zero missed cross-boundary patterns), automatic read-halving fallback down to `4 KiB` pages, and zero-allocation 1-step **Undo**.
+- **Uncapped Unknown Initial Scan (Dense Baseline + Zero-Block Skip + 16 KiB Hash Skip)**:
+  - Instead of pushing every address into the hit list on Pass 1 (which would truncate at 150k hits), `Unknown` scans use a **2-stage Dense Baseline → Lazy Hit Materialization** pipeline on both the Switch (`sdmc:/nxus/scan_base.bin` + RAM hybrid) and the PC (`pcscan.rs`).
+  - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
+  - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `341k` hits for `u8`, `307k` for `u16`, `256k` for `u32`).
 - **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps peak RAM usage well within the Switch `System` pool partition.
 
 ### 2. Multi-Core Kernel Hardware Debugger (Watchpoints & Breakpoints) (`switch/source/nxus_debug.c`)
@@ -59,7 +63,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 - **Live RX Code Patching**: Write directly to executable `.text` (`RX`) pages via `svcWriteDebugProcessMemory` (which performs full-system instruction cache invalidation across all cores). Includes 1-click **[NOP]** patching in the GUI (`00 00 A0 E1` for ARM32, `00 BF` / `AF F3 00 80` for Thumb, `1F 20 03 D5` for AArch64).
 
 ### 4. Pointer Scanner, Cross-Tool Dump Compatibility (`Jnoexs` & `EdiZon-SE`), & Snapshot Diff
-- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
+- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, **8-way set-associative Dead-End Subtree Memoization (`dead_set`) + 64-slot direct-mapped dereference window cache** (up to **132× fewer IPC reads** on shared heap graphs with zero false negatives), automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
 - **Full Jnoexs (`NDMP`) & EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN`) Dump Interoperability**:
   - **Jnoexs (`NDMP` `.dmp`)**: 100% byte-for-byte compatible with Jnoexs (`MemoryDump.java`) and Takumi4685's PointerSearcher.
   - **EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN` / `FDZN` / `fFZN` `.dmp*`)**: Directly loads and decompresses (LZ8) EdiZon-SE pointer dumps (`nxus dump info <file>`, `nxus ptrscan auto --dump <file>`, or via the GUI **Scan dump...** button), and can export/convert any `NDMP` dump into a PointerSearcher-SE compatible `EDZN` dump (`nxus dump export-edizon <in.dmp> <out.dmp1> --target <ADDR>`).
@@ -185,10 +189,10 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,010 checks: scanner, fast paths, chunk boundaries, ptrscan, snapshot, hotkey)
+# 1. Host C Core Tests (1,083 checks: scanner, dense baseline, fast paths, chunk boundaries, ptrscan memoization, snapshot, hotkey)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (34 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (42 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
 # 3. Python + Rust CLI End-to-End Tests against MockSwitch (75 tests)

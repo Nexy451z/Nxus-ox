@@ -6,6 +6,24 @@
 //! wire once, keeps the candidates locally and refines them without ever asking
 //! the console to remember anything.
 //!
+//! ## Dense baseline
+//!
+//! Remembering a `PcHit` (16 bytes) for every candidate explodes on big scopes:
+//! a 512 MB heap stepped in 4-byte words is 134 M candidates = 2.1 GB, which is
+//! why the old code bailed out at `DEFAULT_MAX_HITS`.  The first pass therefore
+//! no longer turns values into hits at all: it keeps the raw bytes it read plus
+//! one FNV-1a hash per 16 KiB block ([`BaselineSegment`]).  That is 4x-16x
+//! smaller than the hit vector, so the first pass is effectively uncapped.
+//!
+//! The candidate values are materialised lazily by the first [`refine`]:
+//!   * every segment is re-read and hashed block by block;
+//!   * for the change-based comparisons (`Changed` / `Increased` / `Decreased`
+//!     and `Different` with a non-zero target) a block whose hash still matches
+//!     the baseline cannot contain a matching candidate, so the whole 16 KiB
+//!     block is skipped in O(1);
+//!   * only the surviving candidates become [`PcHit`] entries, and the baseline
+//!     bytes are released immediately afterwards.
+//!
 //! Reads are chunked and coalesced so a whole-module pass is a few dozen round
 //! trips instead of millions.
 
@@ -24,6 +42,18 @@ const GAP_MAX: u32 = 16 * 1024;
 
 pub const DEFAULT_MAX_HITS: usize = 8_000_000;
 
+/// Block granularity of the dense baseline.  16 KiB keeps the hash overhead at
+/// 8 bytes per 16 KiB (0.05 %) while still skipping large untouched spans.
+pub const BASELINE_BLOCK: usize = 16 * 1024;
+
+/// Scans at or below this many candidates are materialised immediately.
+///
+/// Callers that walk `PcScan::hits` directly (the CLI candidate list, the GUI
+/// hit view) need the vector to be there, and for a small scope the hit vector
+/// is cheaper than keeping both representations.  Bigger scans stay dense and
+/// are materialised by the first refine, which is where the memory win lives.
+pub const EAGER_MATERIALIZE_CANDIDATES: usize = 16_000_000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     pub base: u64,
@@ -36,7 +66,25 @@ pub struct PcHit {
     pub value: u64,
 }
 
-#[derive(Clone, Debug)]
+/// One raw chunk of the target's memory captured by the first pass.
+///
+/// `address` is the absolute address the chunk was read from; `data` is exactly
+/// what came back over the wire and `block_hashes` is [`fnv1a`] over each
+/// [`BASELINE_BLOCK`]-sized slice of `data` (the last block may be shorter).
+#[derive(Debug, Clone)]
+pub struct BaselineSegment {
+    /// Index of the scan region this chunk came from (not the mapping index:
+    /// the region list is what the caller asked for).
+    pub map_idx: u16,
+    /// Offset of this chunk inside its scan region.
+    pub base_offset: u32,
+    /// Absolute address the chunk was read from (needed to re-read it).
+    pub address: u64,
+    pub data: Vec<u8>,
+    pub block_hashes: Vec<u64>, // 16KB ブロックごとの FNV-1a ハッシュ
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct PcScan {
     pub value_size: u32,
     pub hits: Vec<PcHit>,
@@ -44,6 +92,154 @@ pub struct PcScan {
     pub bytes_read: u64,
     pub reads: u64,
     pub failed_reads: u64,
+    /// Dense candidate storage; empty once the candidates are materialised.
+    pub baseline: Vec<BaselineSegment>,
+    /// Number of candidates held in `baseline` (0 when `hits` is authoritative).
+    pub baseline_candidates: usize,
+}
+
+/// FNV-1a (64 bit): the same hash the snapshot engine uses, cheap enough to run
+/// over every byte of the scan and stable across builds.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+#[inline]
+fn align_up(value: u64, step: u64) -> u64 {
+    if step <= 1 {
+        return value;
+    }
+    let remainder = value % step;
+    if remainder == 0 {
+        value
+    } else {
+        value + (step - remainder)
+    }
+}
+
+/// Number of candidates a chunk of `len` bytes read at `address` yields.
+fn candidate_count(address: u64, len: usize, value_size: u32) -> usize {
+    let size = value_size as usize;
+    if size == 0 || len < size {
+        return 0;
+    }
+    let first = (align_up(address, size as u64) - address) as usize;
+    if first + size > len {
+        return 0;
+    }
+    (len - first - size) / size + 1
+}
+
+/// Index of the first candidate inside a chunk read at `address`.
+fn first_candidate_index(address: u64, size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    (align_up(address, size as u64) - address) as usize
+}
+
+/// Walks the candidates of one dense segment.
+struct BaselineHits<'a> {
+    segment: &'a BaselineSegment,
+    size: usize,
+    index: usize,
+    address: u64,
+}
+
+impl<'a> BaselineHits<'a> {
+    fn new(segment: &'a BaselineSegment, value_size: u32) -> Self {
+        let size = value_size as usize;
+        BaselineHits {
+            segment,
+            size,
+            index: first_candidate_index(segment.address, size),
+            address: align_up(segment.address, size.max(1) as u64),
+        }
+    }
+}
+
+impl Iterator for BaselineHits<'_> {
+    type Item = PcHit;
+
+    fn next(&mut self) -> Option<PcHit> {
+        if self.size == 0 || self.index + self.size > self.segment.data.len() {
+            return None;
+        }
+        let hit = PcHit {
+            address: self.address,
+            value: load_value(&self.segment.data[self.index..], self.size as u32),
+        };
+        self.index += self.size;
+        self.address += self.size as u64;
+        Some(hit)
+    }
+}
+
+impl PcScan {
+    /// Candidate count, whichever representation currently holds them.
+    pub fn len(&self) -> usize {
+        if !self.baseline.is_empty() {
+            self.baseline_candidates
+        } else {
+            self.hits.len()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// True while the candidates live in the dense baseline.
+    pub fn is_dense(&self) -> bool {
+        !self.baseline.is_empty()
+    }
+
+    /// Every candidate, in scan order, without materialising the baseline.
+    ///
+    /// This is the allocation-free-of-hits view: a dense scan is walked segment
+    /// by segment, a materialised one straight out of `hits`.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = PcHit> + '_> {
+        if self.baseline.is_empty() {
+            Box::new(self.hits.iter().copied())
+        } else {
+            let value_size = self.value_size;
+            Box::new(
+                self.baseline
+                    .iter()
+                    .flat_map(move |segment| BaselineHits::new(segment, value_size)),
+            )
+        }
+    }
+
+    /// Page over the candidates without materialising anything.
+    pub fn hits_page(&self, offset: usize, count: usize) -> Vec<PcHit> {
+        self.iter().skip(offset).take(count).collect()
+    }
+
+    /// Drop the dense baseline without turning it into hits.
+    pub fn drop_baseline(&mut self) {
+        self.baseline.clear();
+        self.baseline.shrink_to_fit();
+        self.baseline_candidates = 0;
+    }
+
+    /// Turn the dense baseline into a `Vec<PcHit>` and release the raw bytes.
+    ///
+    /// Used by the small-scan compatibility path and by callers that need the
+    /// full vector; [`refine`] and [`save`] never need it.
+    pub fn ensure_materialized(&mut self) {
+        if self.baseline.is_empty() {
+            return;
+        }
+        let hits: Vec<PcHit> = self.iter().collect();
+        self.hits = hits;
+        self.drop_baseline();
+    }
 }
 
 pub struct Progress<'a> {
@@ -233,19 +429,37 @@ pub fn compare_value(cur: u64, prev: u64, size: u32, compare: Compare, target: u
 const FILE_MAGIC: &[u8; 8] = b"NXUSPC01";
 
 /// Save / load the candidate list so the CLI can refine across invocations.
+///
+/// A dense scan is streamed straight out of the baseline: nothing is
+/// materialised, so saving a 134 M candidate scan does not build a hit vector.
 pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut out = Vec::with_capacity(24 + scan.hits.len() * 16);
-    out.extend_from_slice(FILE_MAGIC);
-    out.extend_from_slice(&scan.value_size.to_le_bytes());
-    out.extend_from_slice(&(scan.hits.len() as u64).to_le_bytes());
-    out.extend_from_slice(&(scan.truncated as u32).to_le_bytes());
-    for hit in &scan.hits {
-        out.extend_from_slice(&hit.address.to_le_bytes());
-        out.extend_from_slice(&hit.value.to_le_bytes());
+    use std::io::{BufWriter, Write};
+    let total = scan.len();
+    debug_assert_eq!(scan.iter().count(), total, "baseline_candidates must match the stored candidates");
+
+    let mut header = [0u8; 24];
+    header[0..8].copy_from_slice(FILE_MAGIC);
+    header[8..12].copy_from_slice(&scan.value_size.to_le_bytes());
+    header[12..20].copy_from_slice(&(total as u64).to_le_bytes());
+    header[20..24].copy_from_slice(&(scan.truncated as u32).to_le_bytes());
+
+    let file = std::fs::File::create(path)?;
+    let mut out = BufWriter::with_capacity(1 << 20, file);
+    out.write_all(&header)?;
+
+    // 16 bytes per record, batched so a dense scan does not cost one syscall
+    // (or even one BufWriter call) per candidate.
+    let mut batch: Vec<u8> = Vec::with_capacity(1 << 20);
+    for hit in scan.iter() {
+        batch.extend_from_slice(&hit.address.to_le_bytes());
+        batch.extend_from_slice(&hit.value.to_le_bytes());
+        if batch.len() >= (1 << 20) {
+            out.write_all(&batch)?;
+            batch.clear();
+        }
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&out)
+    out.write_all(&batch)?;
+    out.flush()
 }
 
 pub fn load(path: &str) -> std::io::Result<PcScan> {
@@ -271,31 +485,29 @@ pub fn load(path: &str) -> std::io::Result<PcScan> {
         hits.push(PcHit { address, value });
         at += 16;
     }
-    Ok(PcScan { value_size, hits, truncated, bytes_read: 0, reads: 0, failed_reads: 0 })
+    Ok(PcScan { value_size, hits, truncated, bytes_read: 0, reads: 0, failed_reads: 0, ..Default::default() })
 }
 
-/// First pass: read every region and remember each candidate value.
+/// First pass: read every region and keep the raw bytes as a dense baseline.
+///
+/// No `PcHit` is created here (except for small scans, see
+/// [`EAGER_MATERIALIZE_CANDIDATES`]), which is what removes the old
+/// `max_hits` truncation: the baseline costs `value_size`-free raw bytes plus
+/// 8 bytes per 16 KiB block instead of 16 bytes per candidate.
 pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, max_hits: usize,
                     cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<PcScan, String> {
     if value_size == 0 || value_size > 8 {
         return Err("value size must be 1, 2, 4 or 8".into());
     }
-    let step = value_size as u64;
+    // Kept for API/source compatibility.  The dense baseline is intentionally
+    // uncapped: the cap only ever existed to bound the old hit vector.
+    let _ = max_hits;
     let total: u64 = regions.iter().map(|r| r.size).sum();
     let mut done = 0u64;
-    // One allocation instead of 7.9M pushes growing it (41.7 -> 19.2 ms for 30 MB)
-    let planned: u64 = regions.iter().map(|r| r.size / step.max(1)).sum();
-    let mut scan = PcScan {
-        value_size,
-        hits: Vec::with_capacity(planned.min(max_hits as u64) as usize),
-        truncated: false,
-        bytes_read: 0,
-        reads: 0,
-        failed_reads: 0,
-    };
+    let mut scan = PcScan { value_size, ..Default::default() };
     let read_chunk = client.max_read().min(1 << 20).max(4096);
 
-    'outer: for region in regions {
+    for (region_index, region) in regions.iter().enumerate() {
         let mut pos = region.base;
         let end = region.base + region.size;
         while pos < end {
@@ -341,23 +553,23 @@ pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, ma
             scan.reads += 1;
             scan.bytes_read += data.len() as u64;
 
-            let aligned = (pos + step - 1) & !(step - 1);
-            let mut address = aligned;
-            let mut index = (aligned - pos) as usize;
-            while index + value_size as usize <= data.len() {
-                let value = load_value(&data[index..], value_size);
-                scan.hits.push(PcHit { address, value });
-                if scan.hits.len() >= max_hits {
-                    scan.truncated = true;
-                    break 'outer;
-                }
-                address += step;
-                index += step as usize;
-            }
-
             // Advance by what was actually returned: a short read would
             // otherwise skip the unread tail of this chunk.
             let got = data.len() as u64;
+
+            let candidates = candidate_count(pos, data.len(), value_size);
+            if candidates > 0 {
+                let block_hashes: Vec<u64> = data.chunks(BASELINE_BLOCK).map(fnv1a).collect();
+                scan.baseline_candidates += candidates;
+                scan.baseline.push(BaselineSegment {
+                    map_idx: region_index.min(u16::MAX as usize) as u16,
+                    base_offset: (pos - region.base).min(u32::MAX as u64) as u32,
+                    address: pos,
+                    data,
+                    block_hashes,
+                });
+            }
+
             if got == 0 {
                 break;                                  // nothing more readable here
             }
@@ -370,11 +582,179 @@ pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, ma
     Ok(scan)
 }
 
-/// Refine pass: read only the surviving addresses (coalesced) and drop the ones
-/// that no longer match.
+/// Whether an unchanged 16 KiB block can be skipped outright.
+///
+/// Only comparisons that an unchanged value can never satisfy qualify: with
+/// `Different` and a target of 0 the very opposite is true (`|cur - prev| == 0`
+/// matches every unchanged candidate), so that one is excluded.
+fn block_skip_applies(compare: Compare, target: u64) -> bool {
+    match compare {
+        Compare::Changed | Compare::Increased | Compare::Decreased => true,
+        Compare::Different => target != 0,
+        _ => false,
+    }
+}
+
+/// Append every remaining candidate of `segment` with its baseline value.
+fn keep_baseline_candidates(hits: &mut Vec<PcHit>, segment: &BaselineSegment, value_size: u32,
+                            mut index: usize, processed: &mut u64) {
+    let size = value_size as usize;
+    if size == 0 {
+        return;
+    }
+    while index + size <= segment.data.len() {
+        hits.push(PcHit {
+            address: segment.address + index as u64,
+            value: load_value(&segment.data[index..], value_size),
+        });
+        *processed += 1;
+        index += size;
+    }
+}
+
+/// The dense half of [`refine`]: re-read each baseline segment, skip unchanged
+/// 16 KiB blocks by hash and materialise only the surviving candidates.
+///
+/// `compared` reports how many candidate values were actually compared, which is
+/// what proves the block skip really skipped (tests assert on it).
+fn dense_refine_core(
+    scan: &mut PcScan,
+    compare: Compare,
+    target: u64,
+    target2: u64,
+    flags: u32,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+    compared: &mut u64,
+    mut read: impl FnMut(u64, u32) -> Result<Vec<u8>, ()>,
+) -> Result<(), String> {
+    let value_size = scan.value_size;
+    let size = value_size as usize;
+    let total = scan.baseline_candidates as u64;
+    let skip_blocks = block_skip_applies(compare, target);
+    let segments = std::mem::take(&mut scan.baseline);
+    let mut hits: Vec<PcHit> = Vec::new();
+    let mut processed = 0u64;
+    let mut failed = 0u64;
+    let mut cancelled = false;
+    let mut stopped = false;
+
+    for segment in &segments {
+        let len = segment.data.len();
+        if size == 0 || len < size {
+            continue;
+        }
+        let mut index = first_candidate_index(segment.address, size);
+        if stopped {
+            keep_baseline_candidates(&mut hits, segment, value_size, index, &mut processed);
+            continue;
+        }
+
+        let current = match read(segment.address, len as u32) {
+            Ok(data) => data,
+            Err(_) => {
+                // A transient read failure must not look like "no longer
+                // matches": keep the candidates with their baseline values.
+                failed += 1;
+                keep_baseline_candidates(&mut hits, segment, value_size, index, &mut processed);
+                progress(processed, total);
+                continue;
+            }
+        };
+        let current = &current[..current.len().min(len)];
+        if current.len() < len {
+            // Short reply: compare what came back, keep the unread tail.
+            failed += 1;
+        }
+
+        while index + size <= len {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                stopped = true;
+                break;
+            }
+
+            let block = index / BASELINE_BLOCK;
+            let block_start = block * BASELINE_BLOCK;
+            let block_end = (block_start + BASELINE_BLOCK).min(len);
+            let complete = block_end <= current.len();
+            let unchanged = complete
+                && segment
+                    .block_hashes
+                    .get(block)
+                    .map_or(false, |old| *old == fnv1a(&current[block_start..block_end]));
+
+            if skip_blocks && unchanged {
+                // O(1): every candidate starting in this block still holds its
+                // baseline value, so none of them can match a change compare.
+                let last_start = len - size;                     // inclusive
+                let take_end = block_end.min(last_start + 1);     // exclusive
+                let count = if index >= take_end { 0 } else { (take_end - 1 - index) / size + 1 };
+                if count > 0 {
+                    index += count * size;
+                    processed += count as u64;
+                    continue;
+                }
+                // Defensive: never spin without consuming a candidate.
+            }
+
+            if index + size > current.len() {
+                // Beyond the short reply: keep the baseline value for a retry.
+                hits.push(PcHit {
+                    address: segment.address + index as u64,
+                    value: load_value(&segment.data[index..], value_size),
+                });
+                index += size;
+                processed += 1;
+                continue;
+            }
+
+            let value = load_value(&current[index..], value_size);
+            *compared += 1;
+            if compare_value(value, load_value(&segment.data[index..], value_size), value_size,
+                             compare, target, target2, flags) {
+                hits.push(PcHit { address: segment.address + index as u64, value });
+            }
+            index += size;
+            processed += 1;
+        }
+
+        if stopped {
+            keep_baseline_candidates(&mut hits, segment, value_size, index, &mut processed);
+        }
+        progress(processed, total);
+    }
+
+    scan.hits = hits;
+    scan.failed_reads += failed;
+    scan.truncated = false;
+    // Release the baseline as soon as it has been turned into hits: the whole
+    // point is not to hold both representations at once.
+    scan.baseline.clear();
+    scan.baseline.shrink_to_fit();
+    scan.baseline_candidates = 0;
+
+    if cancelled {
+        return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+/// Refine pass.
+///
+/// A dense scan (right after [`scan_unknown`]) goes through
+/// [`dense_refine_core`], which is where the baseline is materialised.  Every
+/// later pass sees a normal `hits` vector and uses the sparse windowed reader
+/// below.
 pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: u64,
               target2: u64, flags: u32, cancel: &AtomicBool,
               progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+    if !scan.baseline.is_empty() {
+        let mut compared = 0u64;
+        return dense_refine_core(scan, compare, target, target2, flags, cancel, progress, &mut compared,
+                                 |address, size| client.read(address, size).map_err(|_| ()));
+    }
+
     let size = scan.value_size;
     let total = scan.hits.len() as u64;
     let mut keep = 0usize;
@@ -485,6 +865,7 @@ pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: 
 mod tests {
     use super::*;
     use crate::protocol::{Compare, SCAN_F_FLOAT, SCAN_F_SIGNED};
+    use std::sync::atomic::AtomicBool;
 
     fn s32_bits(v: i32) -> u64 {
         v as u32 as u64
@@ -613,6 +994,7 @@ mod tests {
             bytes_read: 0,
             reads: 0,
             failed_reads: 0,
+            ..Default::default()
         };
         let path = std::env::temp_dir().join("nxus_pcscan_round_trip.bin");
         let path = path.to_string_lossy().to_string();
@@ -625,5 +1007,232 @@ mod tests {
         assert!(loaded.truncated);
         assert_eq!(loaded.hits[0].address, 0x1000);
         assert_eq!(loaded.hits[1].value, 9);
+    }
+
+    // ---- dense baseline --------------------------------------------------
+
+    /// Build the state `scan_unknown` leaves behind for a linear memory image.
+    fn dense_scan_from_image(image: &[u8], base: u64, value_size: u32, chunk: usize) -> PcScan {
+        let mut scan = PcScan { value_size, ..Default::default() };
+        let mut at = 0usize;
+        while at < image.len() {
+            let end = (at + chunk).min(image.len());
+            let data = image[at..end].to_vec();
+            let block_hashes: Vec<u64> = data.chunks(BASELINE_BLOCK).map(fnv1a).collect();
+            let address = base + at as u64;
+            scan.baseline_candidates += candidate_count(address, data.len(), value_size);
+            scan.baseline.push(BaselineSegment {
+                map_idx: 0,
+                base_offset: at as u32,
+                address,
+                data,
+                block_hashes,
+            });
+            at = end;
+        }
+        scan
+    }
+
+    /// n consecutive little-endian u32 values 0, 1, 2, ...
+    fn u32_image(count: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count * 4);
+        for value in 0..count {
+            out.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn dense_baseline_skips_unchanged_16k_blocks_on_changed() {
+        let base = 0x3600_0000u64;
+        let mut image = u32_image(8192);                       // 32 KiB = two blocks
+        let mut scan = dense_scan_from_image(&image, base, 4, 32 * 1024);
+
+        // The first pass must not have built a hit vector.
+        assert!(scan.hits.is_empty(), "scan_unknown must not materialise PcHit");
+        assert!(scan.is_dense());
+        assert_eq!(scan.len(), 8192);
+        assert_eq!(scan.baseline.len(), 1);
+        assert_eq!(scan.baseline[0].block_hashes.len(), 2);
+
+        let changed_at = 16 * 1024 + 0x10;
+        image[changed_at..changed_at + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let cancel = AtomicBool::new(false);
+        let mut compared = 0u64;
+        let mut processed = 0u64;
+        {
+            let mut progress = |done: u64, _total: u64| {
+                processed = done;
+            };
+            let mut read = |address: u64, size: u32| -> Result<Vec<u8>, ()> {
+                let offset = (address - base) as usize;
+                Ok(image[offset..offset + size as usize].to_vec())
+            };
+            dense_refine_core(&mut scan, Compare::Changed, 0, 0, 0, &cancel,
+                              &mut progress, &mut compared, &mut read)
+                .expect("dense refine");
+        }
+
+        assert_eq!(scan.hits.len(), 1, "only the changed value survives");
+        assert_eq!(scan.hits[0].address, base + changed_at as u64);
+        assert_eq!(scan.hits[0].value, 0xDEAD_BEEF);
+        // 4096 candidates live in the touched block; the untouched 16 KiB block
+        // was skipped by hash, so only one block was ever compared.
+        assert_eq!(compared, 4096, "the unchanged 16 KiB block must be skipped O(1)");
+        assert_eq!(processed, 8192);
+        assert!(scan.baseline.is_empty(), "the baseline memory must be released");
+        assert_eq!(scan.baseline_candidates, 0);
+        assert_eq!(scan.len(), 1);
+    }
+
+    #[test]
+    fn dense_baseline_increased_materialises_lazily_and_pages_from_the_baseline() {
+        let base = 0x3600_0000u64;
+        let mut image = u32_image(8192);
+        let mut scan = dense_scan_from_image(&image, base, 4, 0x4000);   // two segments
+
+        assert_eq!(scan.baseline.len(), 2);
+        assert!(scan.hits.is_empty());
+        assert_eq!(scan.len(), 8192);
+
+        // Paging works straight out of the baseline, without materialising.
+        let page = scan.hits_page(4092, 8);
+        assert_eq!(page.len(), 8);
+        assert_eq!(page[0].address, base + 4092 * 4);
+        assert_eq!(page[0].value, 4092);
+        assert!(scan.hits.is_empty());
+
+        // Bump one value in the second segment.
+        let raised_at = 0x4000 + 0x20;
+        image[raised_at..raised_at + 4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+
+        let cancel = AtomicBool::new(false);
+        let mut compared = 0u64;
+        {
+            let mut read = |address: u64, size: u32| -> Result<Vec<u8>, ()> {
+                let offset = (address - base) as usize;
+                Ok(image[offset..offset + size as usize].to_vec())
+            };
+            dense_refine_core(&mut scan, Compare::Increased, 0, 0, 0, &cancel,
+                              &mut |_, _| {}, &mut compared, &mut read)
+                .expect("dense refine");
+        }
+
+        assert_eq!(scan.hits.len(), 1);
+        assert_eq!(scan.hits[0].address, base + raised_at as u64);
+        assert_eq!(scan.hits[0].value, 0x0001_0000);
+        assert_eq!(compared, 4096, "only the touched 16 KiB block is compared");
+        assert!(!scan.is_dense());
+        assert_eq!(scan.len(), 1);
+    }
+
+    #[test]
+    fn dense_baseline_different_with_zero_target_does_not_skip() {
+        // |cur - prev| == 0 matches every unchanged candidate, so the block skip
+        // must stay off or all of them would be lost.
+        let base = 0x3600_0000u64;
+        let image = u32_image(8192);
+        let mut scan = dense_scan_from_image(&image, base, 4, 32 * 1024);
+
+        let cancel = AtomicBool::new(false);
+        let mut compared = 0u64;
+        {
+            let mut read = |address: u64, size: u32| -> Result<Vec<u8>, ()> {
+                let offset = (address - base) as usize;
+                Ok(image[offset..offset + size as usize].to_vec())
+            };
+            dense_refine_core(&mut scan, Compare::Different, 0, 0, 0, &cancel,
+                              &mut |_, _| {}, &mut compared, &mut read)
+                .expect("dense refine");
+        }
+
+        assert_eq!(compared, 8192, "a zero Different target must compare every candidate");
+        assert_eq!(scan.hits.len(), 8192);
+    }
+
+    #[test]
+    fn dense_baseline_read_failure_keeps_candidates_for_a_retry() {
+        let base = 0x3600_0000u64;
+        let image = u32_image(8192);
+        let mut scan = dense_scan_from_image(&image, base, 4, 0x8000);
+
+        let cancel = AtomicBool::new(false);
+        let mut compared = 0u64;
+        {
+            let mut read = |_address: u64, _size: u32| -> Result<Vec<u8>, ()> { Err(()) };
+            dense_refine_core(&mut scan, Compare::Changed, 0, 0, 0, &cancel,
+                              &mut |_, _| {}, &mut compared, &mut read)
+                .expect("dense refine");
+        }
+
+        assert_eq!(compared, 0);
+        assert_eq!(scan.hits.len(), 8192, "a failed read must not drop candidates");
+        assert_eq!(scan.hits[0].value, 0);
+        assert_eq!(scan.failed_reads, 1);
+        assert!(!scan.is_dense());
+    }
+
+    #[test]
+    fn dense_baseline_save_streams_without_materialising() {
+        let base = 0x3600_0000u64;
+        let image = u32_image(2048);
+        let scan = dense_scan_from_image(&image, base, 4, 0x1000);
+        assert!(scan.hits.is_empty());
+        assert_eq!(scan.len(), 2048);
+
+        let path = std::env::temp_dir().join("nxus_pcscan_dense.bin");
+        let path = path.to_string_lossy().to_string();
+        save(&path, &scan).expect("save dense scan");
+        let loaded = load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.hits.len(), 2048);
+        assert!(loaded.baseline.is_empty());
+        assert_eq!(loaded.hits[0].address, base);
+        assert_eq!(loaded.hits[0].value, 0);
+        assert_eq!(loaded.hits[2047].address, base + 2047 * 4);
+        assert_eq!(loaded.hits[2047].value, 2047);
+    }
+
+    #[test]
+    fn ensure_materialized_expands_and_releases_the_baseline() {
+        let base = 0x3600_0000u64;
+        let image = u32_image(4096);
+        let mut scan = dense_scan_from_image(&image, base, 4, 0x4000);
+        assert_eq!(scan.len(), 4096);
+
+        scan.ensure_materialized();
+        assert!(!scan.is_dense());
+        assert_eq!(scan.baseline_candidates, 0);
+        assert_eq!(scan.hits.len(), 4096);
+        assert_eq!(scan.hits[4095].address, base + 4095 * 4);
+        assert_eq!(scan.hits[4095].value, 4095);
+    }
+
+    #[test]
+    fn block_skip_only_for_change_comparisons() {
+        assert!(block_skip_applies(Compare::Changed, 0));
+        assert!(block_skip_applies(Compare::Increased, 0));
+        assert!(block_skip_applies(Compare::Decreased, 0));
+        assert!(block_skip_applies(Compare::Different, 5));
+        assert!(!block_skip_applies(Compare::Different, 0));
+        assert!(!block_skip_applies(Compare::Unchanged, 0));
+        assert!(!block_skip_applies(Compare::Equal, 0));
+        assert!(!block_skip_applies(Compare::NotEqual, 0));
+    }
+
+    #[test]
+    fn candidate_count_matches_the_iterator() {
+        for value_size in [1u32, 2, 4, 8] {
+            for misalign in 0..value_size as u64 {
+                let base = 0x1000 + misalign;
+                let len = 64 + misalign as usize;
+                let image = vec![0u8; len];
+                let scan = dense_scan_from_image(&image, base, value_size, len);
+                assert_eq!(scan.baseline_candidates, scan.iter().count(),
+                           "value_size {} misalign {}", value_size, misalign);
+            }
+        }
     }
 }

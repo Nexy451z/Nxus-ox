@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
@@ -31,11 +32,17 @@ u32 __nx_fs_num_sessions = 1;
  *   network rx buffer     1MB
  *   scan chunk buffer     1MB   (configurable, halved automatically if refused)
  *   refine window         1MB
- *   hit list (SoA)        <=2.4MB  (150k hits * (8B address + 8B value))
+ *   hit list (SoA)        <=3.0MB  (dynamic cap from NXUS_SESSION_HIT_BUDGET_BYTES:
+ *                                  8B address + value_size per hit, so u8 keeps
+ *                                  ~341k hits, u64 ~192k)
+ *   baseline block map    <=0.6MB  (Unknown scan only: one entry per 16KB+ block,
+ *                                  plus the two block read buffers <=1MB)
  *   snapshot arrays       0.5MB  (allocated on first use, not at boot)
  *   per-command scratch   <=0.5MB
- *                          ~5.5MB total, so 8MB leaves headroom for code, thread
- * stacks and kernel bookkeeping (Atmosphère gives custom sysmodules ~14MB).
+ *                          ~7MB worst case, so 8MB still leaves headroom for code,
+ * thread stacks and kernel bookkeeping (Atmosphère gives custom sysmodules ~14MB).
+ * An allocation that does not fit degrades gracefully: the baseline falls back to
+ * the classic hit-list first pass / stops materialising, it never aborts the scan.
  */
 #define INNER_HEAP_SIZE (8 * 1024 * 1024)
 
@@ -68,6 +75,10 @@ void __appInit(void) {
     rc = fsInitialize();
     if (R_FAILED(rc)) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
     fsdevMountSdmc();
+    /* The Unknown scan streams its baseline dump to sdmc:/nxus/scan_base.bin, and
+       the log file lives in the same directory.  EEXIST is expected; any other
+       failure is not fatal because the session falls back to a RAM buffer. */
+    (void)mkdir(NXUS_SESSION_BASELINE_DIR, 0777);
 
     rc = nxusDmntInitialize();
     (void)rc;

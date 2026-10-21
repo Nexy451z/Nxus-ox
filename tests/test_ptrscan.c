@@ -120,6 +120,314 @@ static int findChain(const NxusPtrChain *chains, u32 count, u32 root_offset,
     return 0;
 }
 
+/* ---- dead-end memoisation / window cache -------------------------------- */
+
+/*
+ * A diamond graph: many static roots point at the *same* heap structure.
+ *
+ *   root[0..99]  (static) --> A --> C     both dead ends (no chain below)
+ *   root[100]    (static) --> B           B holds target-4  (a live chain)
+ *   root[101]    (static) --> B           the same B, shared
+ *
+ * Without memoisation A is dereferenced 100 times and B twice; with the
+ * dead-end set plus the direct-mapped window cache each structure must be read
+ * exactly once, while both live chains are still found.
+ */
+#define G_MODULE_BASE  0x00700000ull
+#define G_STATIC_BASE  0x00750000ull
+#define G_STATIC_SIZE  0x00001000ull
+#define G_A            0x30000000ull
+#define G_C            0x30010000ull
+#define G_B            0x31000000ull
+#define G_TBASE        0x32000000ull
+#define G_TARGET       (G_TBASE + 0x100ull)
+#define G_STRUCT_SIZE  0x00001000ull
+#define G_BLOCKS       10u
+
+typedef struct {
+    u64 base;
+    u32 size;
+    u8 *mem;
+} GBlock;
+
+typedef struct {
+    GBlock blocks[G_BLOCKS];
+    u32 count;
+    u64 reads;
+    u64 watch[4];
+    u64 seen[4];
+} GMem;
+
+static void gAdd(GMem *m, u64 base, u32 size) {
+    GBlock *b = &m->blocks[m->count++];
+    b->base = base;
+    b->size = size;
+    b->mem = (u8 *)calloc(1, size);
+}
+
+static void gPoke(GMem *m, u64 address, u32 value) {
+    for (u32 i = 0; i < m->count; i++) {
+        GBlock *b = &m->blocks[i];
+        if (address >= b->base && address + 4 <= b->base + b->size) {
+            memcpy(b->mem + (address - b->base), &value, 4);
+            return;
+        }
+    }
+    printf("  (test bug) gPoke outside all blocks: 0x%llX\n", (unsigned long long)address);
+}
+
+static void gWatch(GMem *m, u32 slot, u64 address) {
+    m->watch[slot] = address;
+    m->seen[slot] = 0;
+}
+
+static void gFree(GMem *m) {
+    for (u32 i = 0; i < m->count; i++) free(m->blocks[i].mem);
+    memset(m, 0, sizeof(*m));
+}
+
+static int gRead(void *ctx, u64 address, void *buffer, u32 size) {
+    GMem *m = (GMem *)ctx;
+    m->reads++;
+    for (u32 i = 0; i < m->count; i++) {
+        const GBlock *b = &m->blocks[i];
+        if (address >= b->base && address + size <= b->base + b->size) {
+            memcpy(buffer, b->mem + (address - b->base), size);
+            for (u32 w = 0; w < 4; w++)
+                if (m->watch[w] != 0 && address == m->watch[w]) m->seen[w]++;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void testDeadEndMemo(void) {
+    printf("[test] dead-end memoisation + window cache (100 duplicate roots)\n");
+    GMem m;
+    memset(&m, 0, sizeof(m));
+    gAdd(&m, G_STATIC_BASE, G_STATIC_SIZE);
+    gAdd(&m, G_A, G_STRUCT_SIZE);
+    gAdd(&m, G_C, G_STRUCT_SIZE);
+    gAdd(&m, G_B, G_STRUCT_SIZE);
+    gAdd(&m, G_TBASE, 0x00001000u);
+
+    for (u32 i = 0; i < 100; i++) gPoke(&m, G_STATIC_BASE + i * 4u, (u32)G_A);
+    gPoke(&m, G_STATIC_BASE + 0x200, (u32)G_B);
+    gPoke(&m, G_STATIC_BASE + 0x204, (u32)G_B);
+
+    gPoke(&m, G_A + 0x40, (u32)G_C);              /* A dead-ends one level down */
+    gPoke(&m, G_B + 0x00, (u32)(G_TARGET - 4));   /* B holds a live chain */
+
+    gWatch(&m, 0, G_A);
+    gWatch(&m, 1, G_B);
+    gWatch(&m, 2, G_C);
+
+    const NxusPtrRegion regions[] = {
+        { G_STATIC_BASE, G_STATIC_SIZE, NXUS_PTRREGION_STATIC, 0 },
+        { G_A, G_STRUCT_SIZE, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { G_C, G_STRUCT_SIZE, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { G_B, G_STRUCT_SIZE, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { G_TBASE, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+    };
+
+    NxusPtrScanOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = 3;
+    opts.max_offset = 0x1000;
+    opts.max_results = 64;
+    opts.value_width = 4;
+    opts.window_size = 0x400;
+    opts.max_reads = 10000;
+
+    NxusPtrChain chains[64];
+    NxusPtrScanStats st;
+    u32 count = 0;
+    u8 *scratch = (u8 *)malloc(64 * 1024);
+    int rc = nxusPtrScan(regions, 5, G_TARGET, G_MODULE_BASE, &opts,
+                         chains, 64, &count, gRead, &m, scratch, 64 * 1024, &st, NULL);
+
+    CHECK(rc == NXUS_SCAN_OK, "dead-end scan rc=%d", rc);
+    CHECK(count == 2, "expected exactly 2 chains, got %u", count);
+
+    const u32 in_module = (u32)(G_STATIC_BASE - G_MODULE_BASE);
+    {
+        const u32 steps[] = { 0x0 };
+        CHECK(findChain(chains, count, in_module + 0x200, steps, 1, 4),
+              "live chain via root+0x200 not found");
+        CHECK(findChain(chains, count, in_module + 0x204, steps, 1, 4),
+              "live chain via root+0x204 not found");
+    }
+
+    printf("       reads=%llu  A=%llu B=%llu C=%llu\n",
+           (unsigned long long)st.reads,
+           (unsigned long long)m.seen[0], (unsigned long long)m.seen[1],
+           (unsigned long long)m.seen[2]);
+
+    /* The whole point: 100 identical roots must not re-read A, and the shared
+       live node B must not be re-read by its second root.  The read budget also
+       proves the walk stays tiny: 1 static chunk + A + C + B = 4 reads. */
+    CHECK(st.reads == 4, "expected exactly 4 reads (1 chunk + A + C + B), got %llu",
+          (unsigned long long)st.reads);
+    CHECK(m.seen[0] == 1, "dead-end A was read %llu times (memoisation missed)",
+          (unsigned long long)m.seen[0]);
+    CHECK(m.seen[1] == 1, "shared live node B was read %llu times (window cache missed)",
+          (unsigned long long)m.seen[1]);
+    CHECK(m.seen[2] == 1, "dead-end C was read %llu times (subtree not memoised)",
+          (unsigned long long)m.seen[2]);
+
+    free(scratch);
+    gFree(&m);
+}
+
+/*
+ * Depth-class regression: the memo key masks the depth to two bits, so a proof
+ * made at depth 5 shares a key with depth 1.  Depth 5 has less depth budget, so
+ * it must never be reused to skip a depth-1 walk.  Here X is dead at depth 5
+ * (four hops are needed and only three remain) but alive at depth 1.
+ */
+static void testDeadDepthClass(void) {
+    printf("[test] dead-end memo must not leak proofs across depth classes\n");
+    GMem m;
+    memset(&m, 0, sizeof(m));
+
+    const u64 mod_base = 0x00800000ull;
+    const u64 static_base = 0x00850000ull;
+    const u64 h1 = 0x34000000ull, h2 = 0x34001000ull, h3 = 0x34002000ull;
+    const u64 h4 = 0x34003000ull, x = 0x34004000ull, y = 0x34005000ull;
+    const u64 z = 0x34006000ull, w = 0x34007000ull;
+    const u64 tbase = 0x35000000ull, target = tbase + 0x100ull;
+
+    gAdd(&m, static_base, 0x00001000u);
+    gAdd(&m, h1, 0x00001000u);
+    gAdd(&m, h2, 0x00001000u);
+    gAdd(&m, h3, 0x00001000u);
+    gAdd(&m, h4, 0x00001000u);
+    gAdd(&m, x, 0x00001000u);
+    gAdd(&m, y, 0x00001000u);
+    gAdd(&m, z, 0x00001000u);
+    gAdd(&m, w, 0x00001000u);
+    gAdd(&m, tbase, 0x00001000u);
+
+    /* root+0x300 reaches X at depth 5 (too late to walk the 4 hops to target) */
+    gPoke(&m, static_base + 0x300, (u32)h1);
+    gPoke(&m, h1, (u32)h2);
+    gPoke(&m, h2, (u32)h3);
+    gPoke(&m, h3, (u32)h4);
+    gPoke(&m, h4, (u32)x);
+    /* root+0x400 reaches X at depth 1, where the chain still fits */
+    gPoke(&m, static_base + 0x400, (u32)x);
+    gPoke(&m, x, (u32)y);
+    gPoke(&m, y, (u32)z);
+    gPoke(&m, z, (u32)w);
+    gPoke(&m, w, (u32)(target - 4));
+
+    const NxusPtrRegion regions[] = {
+        { static_base, 0x00001000u, NXUS_PTRREGION_STATIC, 0 },
+        { h1, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { h2, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { h3, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { h4, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { x, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { y, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { z, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { w, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { tbase, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+    };
+
+    NxusPtrScanOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = 8;
+    opts.max_offset = 0x1000;
+    opts.max_results = 64;
+    opts.value_width = 4;
+    opts.window_size = 0x400;
+    opts.max_reads = 10000;
+
+    NxusPtrChain chains[64];
+    NxusPtrScanStats st;
+    u32 count = 0;
+    u8 *scratch = (u8 *)malloc(64 * 1024);
+    int rc = nxusPtrScan(regions, 10, target, mod_base, &opts,
+                         chains, 64, &count, gRead, &m, scratch, 64 * 1024, &st, NULL);
+
+    CHECK(rc == NXUS_SCAN_OK, "depth-class scan rc=%d", rc);
+    CHECK(count == 1, "expected exactly 1 chain, got %u", count);
+    {
+        const u32 steps[] = { 0x0, 0x0, 0x0, 0x0 };
+        CHECK(findChain(chains, count, (u32)(static_base - mod_base) + 0x400,
+                        steps, 4, 4),
+              "depth-1 chain through X was lost to a depth-5 dead-end proof");
+    }
+
+    free(scratch);
+    gFree(&m);
+}
+
+/*
+ * Window isolation: the walk recurses *inside* the window loop, so each depth
+ * must own its window.  With one shared buffer the walk into the zeroed child
+ * C1 overwrites the parent's window and every pointer after offset 0 (here
+ * C2 at +0x40) is silently lost.
+ *
+ *   root+0 -> P -> [ +0x00 = C1 (zeroed), +0x40 = C2 ] -> C2+0x10 -> target-4
+ */
+static void testWindowIsolation(void) {
+    printf("[test] per-depth windows: a child walk must not erase the parent window\n");
+    GMem m;
+    memset(&m, 0, sizeof(m));
+
+    const u64 static_base = 0x00950000ull;
+    const u64 p = 0x33000000ull, c1 = 0x33100000ull, c2 = 0x33200000ull;
+    const u64 tbase = 0x33300000ull, target = tbase + 0x100ull;
+
+    gAdd(&m, static_base, 0x00001000u);
+    gAdd(&m, p, 0x00001000u);
+    gAdd(&m, c1, 0x00001000u);
+    gAdd(&m, c2, 0x00001000u);
+    gAdd(&m, tbase, 0x00001000u);
+
+    gPoke(&m, static_base + 0x80, (u32)p);
+    gPoke(&m, p + 0x00, (u32)c1);
+    gPoke(&m, p + 0x40, (u32)c2);
+    gPoke(&m, c2 + 0x10, (u32)(target - 4));
+
+    const NxusPtrRegion regions[] = {
+        { static_base, 0x00001000u, NXUS_PTRREGION_STATIC, 0 },
+        { p, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { c1, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { c2, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { tbase, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+    };
+
+    NxusPtrScanOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = 3;
+    opts.max_offset = 0x1000;
+    opts.max_results = 16;
+    opts.value_width = 4;
+    opts.window_size = 0x400;
+    opts.max_reads = 1000;
+
+    NxusPtrChain chains[16];
+    NxusPtrScanStats st;
+    u32 count = 0;
+    u8 *scratch = (u8 *)malloc(64 * 1024);
+    int rc = nxusPtrScan(regions, 5, target, 0x00900000ull, &opts,
+                         chains, 16, &count, gRead, &m, scratch, 64 * 1024, &st, NULL);
+
+    CHECK(rc == NXUS_SCAN_OK, "window isolation scan rc=%d", rc);
+    CHECK(count == 1, "expected exactly 1 chain, got %u", count);
+    {
+        const u32 steps[] = { 0x40, 0x10 };
+        CHECK(findChain(chains, count, (u32)(static_base - 0x00900000ull) + 0x80,
+                        steps, 2, 4),
+              "chain behind P+0x40 was lost (shared window buffer)");
+    }
+
+    free(scratch);
+    gFree(&m);
+}
+
 int main(void) {
     printf("=== Nxus pointer scan / cheat generator tests ===\n");
     Fake f;
@@ -236,6 +544,12 @@ int main(void) {
     CHECK(stats.reads <= 8, "read budget not honoured: %llu", (unsigned long long)stats.reads);
 
     free(scratch);
+
+    /* ---- dead-end memoisation / window cache ---- */
+    testDeadEndMemo();
+    testDeadDepthClass();
+    testWindowIsolation();
+
     teardown(&f);
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

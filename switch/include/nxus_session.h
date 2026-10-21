@@ -12,10 +12,29 @@
    128 KB, reading the same bytes. */
 #define NXUS_SESSION_DEFAULT_WINDOW  (1024u * 1024u)
 #define NXUS_SESSION_DEFAULT_GAP     (16u * 1024u)
-/* 150k hits cost up to ~2.4 MB (8 B address + 8 B value each), which fits the
-   8 MB inner heap together with the 1 MB rx buffer, the 1 MB scan chunk and the
-   lazily allocated snapshot arrays. */
+/* Floor for the hit cap (150k hits = ~2.4 MB with 8 B address + 8 B value each).
+   The real ceiling is derived per scan from NXUS_SESSION_HIT_BUDGET_BYTES below,
+   which raises it to ~192k-341k depending on the value width. */
 #define NXUS_SESSION_DEFAULT_MAXHITS 150000u
+
+/* Unknown scans cannot discard anything: the first pass stores a baseline of the
+   whole scoped range (SD card, RAM fallback) and every match must survive until
+   the second pass.  A flat 150k ceiling therefore truncates real candidates, so
+   the cap is derived from a byte budget instead:
+       max_hits = BUDGET / (8 B address + value_size B value)
+   3.0 MB yields ~256k hits for u32, ~307k for u16, ~341k for u8, ~192k for u64 -
+   always more than the old 150k default, and never more memory for wider types. */
+#define NXUS_SESSION_HIT_BUDGET_BYTES (3000u * 1024u)
+
+static inline u32 nxusSessionHitLimit(u32 value_size) {
+    if (value_size == 0) value_size = 1;
+    return (u32)(NXUS_SESSION_HIT_BUDGET_BYTES / (8u + value_size));
+}
+
+/* Baseline dump the Unknown scan keeps on the SD card (RAM fallback inside the
+   session when the card is unavailable).  main.c creates the directory at boot. */
+#define NXUS_SESSION_BASELINE_DIR  "sdmc:/nxus"
+#define NXUS_SESSION_BASELINE_PATH "sdmc:/nxus/scan_base.bin"
 
 void nxusSessionInit(u32 chunk_size, u32 max_hits);
 void nxusSessionExit(void);

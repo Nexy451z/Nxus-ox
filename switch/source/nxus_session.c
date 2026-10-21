@@ -4,6 +4,7 @@
 #include "nxus_log.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +19,11 @@ typedef struct {
     u32 gap_threshold;
 
     NxusHitList hits;
+    /* Unknown scans keep their first pass here instead of in the hit list: the
+       dense block fingerprints make a multi-GB "initial value" scan possible
+       without materialising every candidate.  active == 0 for every other mode,
+       where 'hits' is the only state. */
+    NxusBaseline baseline;
     NxusMappingEntry *map_entries;
     NxusMappingTable maps;
     NxusScanRegion *regions;
@@ -56,6 +62,125 @@ static Result snapshotMappings(void);
 static void buildRegions(const NxusScanRequest *req);
 
 static u64 nowMs(void) { return armTicksToNs(armGetSystemTick()) / 1000000ull; }
+
+/* ---- baseline store (SD card, RAM fallback) ---------------------------- */
+
+/*
+ * The dense baseline never holds the scanned bytes in RAM; it only keeps a
+ * per-block fingerprint and streams the non-zero blocks to this store.  Two
+ * backends share one interface so the engine does not care which is in use:
+ *
+ *   - SD card: "sdmc:/nxus/scan_base.bin", opened "wb+" with one static 64 KB
+ *     stdio buffer (no per-block malloc, writes coalesce into the card's
+ *     cluster size),
+ *   - RAM: a single malloc of the scoped byte count, used when the card cannot
+ *     be opened (no SD inserted, read-only card, ...) or when the scoped range is
+ *     small enough that writing a file would cost more than the memory
+ *     (<= 512 KB).
+ *
+ * Offsets are absolute positions in the store; the engine hands each block the
+ * offset it was assigned, so a plain fseek covers the sparse layout.
+ */
+#define NXUS_BASELINE_RAM_MAX   (512u * 1024u)
+#define NXUS_BASELINE_FILE_BUF  (64u * 1024u)
+/* Refine buffers: at least one whole block, and never below 64 KB so a future
+   smaller block size still gets a decent read size. */
+#define NXUS_BASELINE_BUF_MIN   (64u * 1024u)
+
+static FILE *g_BaseFile = NULL;
+static u8   *g_BaseRam = NULL;
+static u64   g_BaseRamSize = 0;
+static u8    g_BaseFileBuf[NXUS_BASELINE_FILE_BUF] __attribute__((aligned(0x10)));
+
+static int baselineStoreWrite(void *ctx, u64 offset, const void *buf, u32 len) {
+    (void)ctx;
+    if (len == 0) return 0;
+    if (g_BaseFile != NULL) {
+        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) return -1;
+        return fwrite(buf, 1, len, g_BaseFile) == len ? 0 : -1;
+    }
+    if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) return -1;
+    memcpy(g_BaseRam + offset, buf, len);
+    return 0;
+}
+
+static int baselineStoreRead(void *ctx, u64 offset, void *buf, u32 len) {
+    (void)ctx;
+    if (len == 0) return 0;
+    if (g_BaseFile != NULL) {
+        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) return -1;
+        return fread(buf, 1, len, g_BaseFile) == len ? 0 : -1;
+    }
+    if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) return -1;
+    memcpy(buf, g_BaseRam + offset, len);
+    return 0;
+}
+
+static const NxusBaselineIo g_BaselineIo = {
+    .write = baselineStoreWrite,
+    .read  = baselineStoreRead,
+};
+
+static u64 baselineRegionBytes(void) {
+    u64 total = 0;
+    for (u32 i = 0; i < g_Session.region_count; i++) {
+        if (g_Session.regions[i].size > 0xFFFFFFFFFFFFFFFFull - total) return 0xFFFFFFFFFFFFFFFFull;
+        total += g_Session.regions[i].size;
+    }
+    return total;
+}
+
+static void baselineStoreClose(void) {
+    if (g_BaseFile != NULL) {
+        fclose(g_BaseFile);       /* also flushes the setvbuf() buffer */
+        g_BaseFile = NULL;
+    }
+    free(g_BaseRam);
+    g_BaseRam = NULL;
+    g_BaseRamSize = 0;
+}
+
+/* Open a store able to hold every non-zero block of the current region list. */
+static bool baselineStoreOpen(void) {
+    baselineStoreClose();
+    remove(NXUS_SESSION_BASELINE_PATH);
+
+    const u64 region_bytes = baselineRegionBytes();
+    if (region_bytes == 0) return false;
+
+    if (region_bytes > NXUS_BASELINE_RAM_MAX) {
+        FILE *f = fopen(NXUS_SESSION_BASELINE_PATH, "wb+");
+        if (f != NULL) {
+            /* A full buffered stream keeps the write path off the heap and turns
+               the engine's per-block writes into card-sized bursts. */
+            setvbuf(f, (char *)g_BaseFileBuf, _IOFBF, sizeof(g_BaseFileBuf));
+            g_BaseFile = f;
+            NXUS_LOG("baseline: SD store open (%llu region bytes)", (unsigned long long)region_bytes);
+            return true;
+        }
+        NXUS_LOG("baseline: SD store unavailable, using RAM");
+    }
+
+    /* The whole scoped range is the worst case: only blocks that are not all-zero
+       are ever written, so this is an upper bound. */
+    g_BaseRam = (u8 *)malloc((size_t)region_bytes);
+    if (g_BaseRam == NULL) {
+        NXUS_LOG("baseline: %llu-byte RAM store allocation failed",
+                 (unsigned long long)region_bytes);
+        return false;
+    }
+    g_BaseRamSize = region_bytes;
+    NXUS_LOG("baseline: RAM store open (%llu bytes)", (unsigned long long)region_bytes);
+    return true;
+}
+
+/* Forget the baseline completely: heap block metadata, open handle and the SD
+   dump.  Safe to call when no baseline exists. */
+static void baselineDiscard(void) {
+    nxusBaselineFree(&g_Session.baseline);
+    baselineStoreClose();
+    remove(NXUS_SESSION_BASELINE_PATH);
+}
 
 /* ---- target memory access --------------------------------------------- */
 
@@ -98,6 +223,7 @@ void nxusSessionExit(void) {
         g_Session.thread_live = false;
     }
     nxusHitListFree(&g_Session.hits);
+    baselineDiscard();
     free(g_Session.map_entries);
     free(g_Session.regions);
     g_Session.map_entries = NULL;
@@ -108,7 +234,16 @@ u32  nxusSessionId(void)            { return g_Session.session_id; }
 u32  nxusSessionScanState(void)     { return g_Session.state; }
 u32  nxusSessionProgress(void)      { return g_Session.progress; }
 s32  nxusSessionLastResult(void)    { return g_Session.last_result; }
-u32  nxusSessionHitCount(void)      { return g_Session.hits.count; }
+/* While a baseline is live the hit list is intentionally empty (the first pass
+   only fingerprints), so report the candidate count the baseline covered: the
+   status then reads "N candidates" instead of "0 hits". */
+u32  nxusSessionHitCount(void)      {
+    if (g_Session.baseline.active) {
+        return (g_Session.baseline.candidate_count > 0xFFFFFFFFull)
+                   ? 0xFFFFFFFFu : (u32)g_Session.baseline.candidate_count;
+    }
+    return g_Session.hits.count;
+}
 u32  nxusSessionMappingCount(void)  { return g_Session.maps.count; }
 u64  nxusSessionProcessId(void)     { return g_Session.process_id; }
 
@@ -413,6 +548,9 @@ static void scanThread(void *arg) {
 
     u8 *chunk = NULL;
     u8 *window = NULL;
+    u8 *cur_buf = NULL;
+    u8 *prev_buf = NULL;
+    u64 candidates = 0;
     int rc = NXUS_SCAN_ERR_PARAM;
 
     if (first_pass) {
@@ -430,11 +568,67 @@ static void scanThread(void *arg) {
                      (unsigned)chunk_size);
             return;
         }
-        rc = nxusScanFirstEx(g_Session.regions, g_Session.region_count, &g_Session.job_req,
-                             &g_Session.job_pattern,
-                             &g_Session.hits, sessionRead, NULL,
-                             chunk, chunk_size, &stats,
-                             (int *)&g_Session.cancel);
+        if (g_Session.baseline.active) {
+            /* Unknown scan: fingerprint every block and stream the non-zero ones
+               to the baseline store.  No hits are pushed here - the candidate
+               count is what the status reports. */
+            rc = nxusScanFirstBaseline(&g_Session.baseline,
+                                       g_Session.regions, g_Session.region_count,
+                                       &g_Session.job_req,
+                                       sessionRead, NULL,
+                                       &g_BaselineIo, NULL,
+                                       chunk, chunk_size, &stats,
+                                       (int *)&g_Session.cancel);
+            candidates = g_Session.baseline.candidate_count;
+            if (rc != NXUS_SCAN_OK) {
+                /* A partial baseline cannot be refined safely: blocks that were
+                   never hashed would compare against garbage.  Drop it so
+                   ScanNext reports BadInput instead of silently scanning a
+                   subset of the range. */
+                baselineDiscard();
+            }
+        } else {
+            rc = nxusScanFirstEx(g_Session.regions, g_Session.region_count, &g_Session.job_req,
+                                 &g_Session.job_pattern,
+                                 &g_Session.hits, sessionRead, NULL,
+                                 chunk, chunk_size, &stats,
+                                 (int *)&g_Session.cancel);
+        }
+    } else if (g_Session.baseline.active) {
+        /* Second pass of an Unknown scan: only blocks whose fingerprint changed
+           are re-read, and only their matching candidates become hits.  The
+           buffers must hold one baseline block each. */
+        u32 buf_size = g_Session.baseline.block_size;
+        if (buf_size < NXUS_BASELINE_BUF_MIN) buf_size = NXUS_BASELINE_BUF_MIN;
+        cur_buf = (u8 *)malloc(buf_size);
+        prev_buf = (u8 *)malloc(buf_size);
+        if (cur_buf == NULL || prev_buf == NULL) {
+            baselineDiscard();
+            g_Session.state = NxusScanState_Error;
+            g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            NXUS_LOG("scan abort: %u-byte baseline buffers failed (out of memory)",
+                     (unsigned)buf_size);
+            free(chunk);
+            free(cur_buf);
+            free(prev_buf);
+            return;
+        }
+        rc = nxusScanNextFromBaseline(&g_Session.baseline,
+                                      &g_Session.hits,
+                                      &g_Session.job_req,
+                                      &g_Session.maps,
+                                      sessionRead, NULL,
+                                      &g_BaselineIo, NULL,
+                                      cur_buf, buf_size,
+                                      prev_buf, buf_size,
+                                      &stats, (int *)&g_Session.cancel);
+        candidates = g_Session.baseline.candidate_count;
+        /* The fingerprints are consumed (active is cleared on every exit path),
+           so release the SD dump and the block metadata right away instead of
+           holding ~1 MB through every later refine pass. */
+        baselineStoreClose();
+        remove(NXUS_SESSION_BASELINE_PATH);
+        nxusBaselineFree(&g_Session.baseline);
     } else {
         window = (u8 *)malloc(g_Session.window_size);
         if (window == NULL) {
@@ -471,13 +665,16 @@ static void scanThread(void *arg) {
     }
 
     g_Session.progress = stats.permille;
-    NXUS_LOG("scan done: state=%u hits=%u reads=%llu bytes=%llu dropped=%u",
+    NXUS_LOG("scan done: state=%u hits=%u candidates=%llu reads=%llu bytes=%llu dropped=%u",
              (unsigned)g_Session.state, (unsigned)g_Session.hits.count,
+             (unsigned long long)candidates,
              (unsigned long long)stats.reads, (unsigned long long)stats.bytes_read,
              (unsigned)stats.dropped);
 
     free(chunk);
     free(window);
+    free(cur_buf);
+    free(prev_buf);
 }
 
 static Result startJob(bool first_pass) {
@@ -494,7 +691,10 @@ static Result startJob(bool first_pass) {
     g_Session.progress = 0;
     atomic_store_explicit(&g_Session.cancel, 0, memory_order_relaxed);
 
-    alignas(0x1000) static u8 scanStack[0x8000];
+    /* The worker gained a deeper call path (Unknown first pass and the baseline
+       refine) and the old 32 KB stack had little margin; 64 KB keeps the engine's
+       per-block locals off the edge. */
+    alignas(0x1000) static u8 scanStack[0x10000];
     Result rc = threadCreate(&g_Session.thread, scanThread, NULL, scanStack, sizeof(scanStack), 0x2C, -2);
     if (R_FAILED(rc)) return rc;
 
@@ -552,6 +752,19 @@ static u32 listValueSize(const NxusScanRequest *req, u32 value_type) {
     return nxusHitListValueSize(value_type, req->value_size ? req->value_size : 4);
 }
 
+/* A dense baseline only fits a numeric "unknown initial value" scan.  Pattern
+   types (String/Bytes/Binary) and "All" have a match window wider than their
+   stride, so a value can straddle a block boundary and a block-grid candidate
+   enumeration would miss it - they keep the classic hit-list first pass. */
+static bool baselineApplies(const NxusScanRequest *req, u32 value_type, bool patterned) {
+    if (req->cmp_mode != NxusCmp_Unknown) return false;
+    if (patterned) return false;
+    if (value_type == NxusValueType_All) return false;
+    if (value_type == NxusValueType_String || value_type == NxusValueType_Bytes ||
+        value_type == NxusValueType_Binary) return false;
+    return true;
+}
+
 Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsilon_decimals,
                             const u8 *pattern, u32 pattern_len, const u8 *mask) {
     if (req == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
@@ -570,6 +783,13 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     setPattern(value_type, epsilon_decimals, pattern, pattern_len, mask);
     g_Session.job_pattern.flags = req->flags;
 
+    /* A new scan always starts from a clean baseline: the fingerprints describe
+       the previous request's width and byte range, so reusing them would compare
+       values from two different scans.  Doing it before the snapshot also covers
+       a scan that then fails (no target, empty scope): its stale dump must not
+       stay on the SD card. */
+    baselineDiscard();
+
     cacheProcessInfo();
     Result rc = snapshotMappings();
     if (R_FAILED(rc)) return rc;
@@ -577,15 +797,42 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     buildRegions(req);
     if (g_Session.region_count == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
+    const u32 hit_value_size = listValueSize(req, value_type);
+    if (baselineApplies(req, value_type, g_Session.job_pattern.pattern != NULL)) {
+        bool ready = nxusBaselineInit(&g_Session.baseline, g_Session.region_count + 1,
+                                      NXUS_BASELINE_MAX_BLOCKS,
+                                      hit_value_size, value_type) == NXUS_SCAN_OK;
+        if (ready) ready = baselineStoreOpen();
+        if (ready) {
+            NXUS_LOG("unknown scan: dense baseline armed (%u regions, %u-byte values)",
+                     (unsigned)g_Session.region_count, (unsigned)hit_value_size);
+        } else {
+            /* No store (card refused / out of memory) or no block arrays: keep the
+               classic all-hits first pass so the scan still works up to max_hits. */
+            baselineDiscard();
+            NXUS_LOG("unknown scan: baseline unavailable, using the classic first pass");
+        }
+    }
+
     nxusHitListFree(&g_Session.hits);
+    /* Dynamic ceiling: NXUS_SESSION_HIT_BUDGET_BYTES split into
+       8 B address + value_size B value, so a narrower type buys more hits
+       (u8 ~341k, u16 ~307k, u32 ~256k, u64 ~192k) for the same ~3 MB. */
+    u32 max_hits = nxusSessionHitLimit(hit_value_size);
+    if (max_hits < g_Session.max_hits) max_hits = g_Session.max_hits;
     u32 initial = 65536;
-    if (initial > g_Session.max_hits) initial = g_Session.max_hits;
-    rc = nxusHitListInit(&g_Session.hits, initial, g_Session.max_hits, listValueSize(req, value_type));
-    if (R_FAILED(rc)) return rc;
+    if (initial > max_hits) initial = max_hits;
+    rc = nxusHitListInit(&g_Session.hits, initial, max_hits, hit_value_size);
+    if (R_FAILED(rc)) {
+        baselineDiscard();
+        return rc;
+    }
 
     g_Session.session_id++;
     g_Session.state = NxusScanState_Idle;
-    return startJob(true);
+    Result jr = startJob(true);
+    if (R_FAILED(jr)) baselineDiscard();   /* no worker: the dump is dead weight */
+    return jr;
 }
 
 Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsilon_decimals,
@@ -594,7 +841,12 @@ Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsil
     if (g_Session.state == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
-    if (g_Session.hits.count == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    /* An Unknown scan's first pass deliberately pushes no hits: everything lives
+       in the baseline until the refine pass materialises the matches.  So an
+       empty hit list is only an error when there is no baseline to refine. */
+    if (g_Session.hits.count == 0 && !g_Session.baseline.active) {
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
     /* A refine must not widen the values it compares against the stored ones:
        that would read past every slot in the hit list. */
     if (nxusHitListValueSize(value_type, req->value_size ? req->value_size : 4) > g_Session.hits.value_size) {
@@ -635,6 +887,7 @@ void nxusSessionReset(void) {
         g_Session.thread_live = false;
     }
     nxusHitListFree(&g_Session.hits);
+    baselineDiscard();
     g_Session.state = NxusScanState_Idle;
     g_Session.session_id++;
     g_Session.progress = 0;

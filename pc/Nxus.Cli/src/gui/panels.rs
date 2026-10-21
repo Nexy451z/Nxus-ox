@@ -584,6 +584,7 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
                     bytes_read: 0,
                     reads: 0,
                     failed_reads: 0,
+                    ..Default::default()
                 };
                 let count = scan.hits.len();
                 match crate::pcscan::save(&path.to_string_lossy(), &scan) {

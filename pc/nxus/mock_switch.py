@@ -1006,9 +1006,6 @@ class MockSwitch:
                 for off in range(0, len(data) - len(needle) + 1):
                     if data[off:off + len(needle)] == needle:
                         self.hits.append((idx, base_off + off, needle))
-                        if len(self.hits) >= 300000:
-                            self.scan_state = P.SCAN_STATE['NxusScanState_Error']
-                            return self._status()
                 continue
 
             if value_type in (P.VT_BYTES, P.VT_BINARY) and pattern:
@@ -1027,9 +1024,6 @@ class MockSwitch:
                             break
                     if ok:
                         self.hits.append((idx, base_off + off, pattern))
-                        if len(self.hits) >= 300000:
-                            self.scan_state = P.SCAN_STATE['NxusScanState_Error']
-                            return self._status()
                 continue
 
             step = value_size
@@ -1037,10 +1031,6 @@ class MockSwitch:
                 cur = data[off:off + step]
                 if _compare(cur, None, target, value_size, cmp_mode, flags):
                     self.hits.append((idx, base_off + off, cur))
-                    if len(self.hits) >= 300000:
-                        self.scan_state = P.SCAN_STATE['NxusScanState_Error']
-                        self.last_result = 0x80000000 | 0x0002      # LibnxError_OutOfMemory
-                        return self._status()
 
         self.progress = 1000
         self.scan_state = P.SCAN_STATE['NxusScanState_Done']

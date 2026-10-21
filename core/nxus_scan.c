@@ -1160,3 +1160,541 @@ int nxusScanNext(NxusHitList *hits, const NxusScanRequest *req,
     return nxusScanNextEx(hits, req, NULL, maps, read, read_ctx, window, window_max,
                           gap_threshold, stats, cancel);
 }
+
+/* ------------------------------------------------------------------ */
+/* dense baseline                                                      */
+/* ------------------------------------------------------------------ */
+
+/* A 16 KB grid already gives an O(1) skip for 4 GB of address space in 256k
+   entries; the budget (block_cap) decides how much coarser it has to get. */
+#define NXUS_BASELINE_BLOCK_MAX (1u << 24)
+#define NXUS_BASELINE_READ_FLOOR 4096u
+
+/* FNV-1a over the block plus the OR of every byte, in one pass: the bytes are
+   folded in address order (so the result matches nxusHashBytes() exactly) while
+   a 64-bit load per eight bytes feeds or_acc.  or_acc == 0 means every byte is
+   zero, which is what lets the first pass skip the store entirely. */
+static void blockFingerprint(const u8 *buf, u32 len, u64 *out_hash, int *out_zero) {
+    u64 hash = 0xCBF29CE484222325ull;
+    u64 or_acc = 0;
+    u32 i = 0;
+
+    for (; i + 8u <= len; i += 8u) {
+        u64 word;
+        memcpy(&word, buf + i, sizeof(word));
+        or_acc |= word;
+        for (u32 k = 0; k < 8u; k++) {
+            hash ^= (u64)buf[i + k];
+            hash *= 0x100000001B3ull;
+        }
+    }
+    for (; i < len; i++) {
+        or_acc |= (u64)buf[i];
+        hash ^= (u64)buf[i];
+        hash *= 0x100000001B3ull;
+    }
+
+    if (out_hash != NULL) *out_hash = hash;
+    if (out_zero != NULL) *out_zero = (or_acc == 0) ? 1 : 0;
+}
+
+/* Candidates of one block: the first one sits at 'align_skip' (the offset that
+   makes the address an absolute multiple of the width) and every following one
+   'step' bytes later, as long as the whole value stays inside the block.  Both
+   passes derive the candidate positions from this one function, so the count the
+   first pass reports is exactly what the refine pass can produce. */
+static u32 blockCandidates(u32 align_skip, u32 step, u32 blk_len, u32 window) {
+    if (step == 0 || blk_len < window) return 0;
+    if (align_skip + window > blk_len) return 0;
+    return (blk_len - window - align_skip) / step + 1u;
+}
+
+/*
+ * Read [address, address+len) into dst.  dmnt may refuse a large request (the
+ * accepted size is not documented), so a refused read is retried with half the
+ * size - but never below the 4 KB floor - and the accepted pieces are
+ * concatenated.  Returns how many bytes could be read: a short result means the
+ * tail is genuinely unreadable and the caller must not judge it.
+ */
+static u32 readWithSplit(NxusReadFn read, void *read_ctx, u64 address, u8 *dst, u32 len,
+                         NxusScanStats *stats) {
+    u32 got = 0;
+
+    while (got < len) {
+        const u32 want = len - got;
+        if (read(read_ctx, address + got, dst + got, want) == 0) {
+            got += want;
+            continue;
+        }
+
+        u32 retry = want / 2u;
+        int ok = 0;
+        for (;;) {
+            if (retry < NXUS_BASELINE_READ_FLOOR) retry = NXUS_BASELINE_READ_FLOOR;
+            if (retry > want) break;              /* the floor does not even fit */
+            if (stats != NULL) stats->retries++;
+            if (read(read_ctx, address + got, dst + got, retry) == 0) { ok = 1; break; }
+            if (retry <= NXUS_BASELINE_READ_FLOOR) break;
+            retry /= 2u;
+        }
+        if (!ok) break;
+        got += retry;
+    }
+    return got;
+}
+
+/* The baseline only deals in fixed-width numeric values: with step < window a
+   value can straddle a block boundary and a block-grid enumeration would miss it,
+   so patterns / "All" keep using nxusScanFirstEx(). */
+static u32 baselineValueType(u32 value_type, u32 value_size, u32 flags) {
+    if (value_type == NxusValueType_All || value_type == NxusValueType_String ||
+        value_type == NxusValueType_Bytes || value_type == NxusValueType_Binary) {
+        return NxusValueType_All;                  /* rejected by the caller */
+    }
+    if (nxusValueTypeSize(value_type) == value_size) return value_type;
+
+    /* legacy callers pass value_type == 0 (U8) whatever the width; derive it */
+    if (flags & NXUS_SCAN_F_FLOAT) {
+        return (value_size == 8) ? NxusValueType_F64 : NxusValueType_F32;
+    }
+    switch (value_size) {
+        case 1: return NxusValueType_U8;
+        case 2: return NxusValueType_U16;
+        case 8: return NxusValueType_U64;
+        default: return NxusValueType_U32;
+    }
+}
+
+int nxusBaselineInit(NxusBaseline *bl, u32 region_cap, u32 block_cap, u32 value_size, u32 value_type) {
+    if (bl == NULL || region_cap == 0 || block_cap == 0 || value_size == 0 || value_size > 8) {
+        return NXUS_SCAN_ERR_PARAM;
+    }
+    memset(bl, 0, sizeof(*bl));
+    bl->regions = (NxusBaselineRegion *)calloc(region_cap, sizeof(NxusBaselineRegion));
+    bl->blocks  = (NxusBaselineBlock *)calloc(block_cap, sizeof(NxusBaselineBlock));
+    if (bl->regions == NULL || bl->blocks == NULL) {
+        nxusBaselineFree(bl);
+        return NXUS_SCAN_ERR_PARAM;
+    }
+    bl->region_cap = region_cap;
+    bl->block_cap  = block_cap;
+    bl->value_size = value_size;
+    bl->value_type = value_type;
+    return NXUS_SCAN_OK;
+}
+
+void nxusBaselineReset(NxusBaseline *bl) {
+    if (bl == NULL) return;
+    bl->region_count    = 0;
+    bl->block_count     = 0;
+    bl->stored_bytes    = 0;
+    bl->candidate_count = 0;
+    bl->block_size      = 0;
+    bl->active          = 0;
+}
+
+void nxusBaselineFree(NxusBaseline *bl) {
+    if (bl == NULL) return;
+    free(bl->regions);
+    free(bl->blocks);
+    memset(bl, 0, sizeof(*bl));
+}
+
+int nxusScanFirstBaseline(NxusBaseline *bl,
+                          const NxusScanRegion *regions, u32 region_count,
+                          const NxusScanRequest *req,
+                          NxusReadFn read, void *read_ctx,
+                          const NxusBaselineIo *io, void *io_ctx,
+                          u8 *chunk, u32 chunk_size,
+                          NxusScanStats *stats, int *cancel) {
+    if (bl == NULL || regions == NULL || req == NULL || read == NULL || io == NULL ||
+        bl->regions == NULL || bl->blocks == NULL) {
+        return NXUS_SCAN_ERR_PARAM;
+    }
+
+    const u32 window = bl->value_size;
+    if (window == 0 || window > 8) return NXUS_SCAN_ERR_PARAM;
+
+    const u32 value_type = baselineValueType(bl->value_type, window, req->flags);
+    if (value_type == NxusValueType_All) return NXUS_SCAN_ERR_PARAM;
+
+    bl->value_type      = value_type;
+    bl->region_count    = 0;
+    bl->block_count     = 0;
+    bl->stored_bytes    = 0;
+    bl->candidate_count = 0;
+    bl->active          = 0;
+
+    const u32 step = window;       /* numeric candidates sit on absolute multiples */
+
+    u64 total_bytes = 0;
+    for (u32 r = 0; r < region_count; r++) total_bytes += regions[r].size;
+
+    /* Smallest grid whose block count still fits the caller's budget. */
+    u32 block_size = NXUS_BASELINE_BLOCK_MIN;
+    while (block_size < NXUS_BASELINE_BLOCK_MAX &&
+           ((total_bytes + block_size - 1u) / block_size) + (u64)region_count > (u64)bl->block_cap) {
+        block_size <<= 1;
+    }
+    bl->block_size = block_size;
+
+    /* A block is hashed in one piece, so the caller's chunk has to hold one. */
+    u8 *blk_buf = chunk;
+    int own_buf = 0;
+    if (blk_buf == NULL || chunk_size < block_size) {
+        blk_buf = (u8 *)malloc(block_size);
+        if (blk_buf == NULL) return NXUS_SCAN_ERR_PARAM;
+        own_buf = 1;
+    }
+
+    if (stats != NULL) {
+        memset(stats, 0, sizeof(*stats));
+        stats->regions_total = region_count;
+    }
+
+    const u32 work_regions = (region_count > bl->region_cap) ? bl->region_cap : region_count;
+    u64 scanned = 0;
+    int rc = NXUS_SCAN_OK;
+
+    for (u32 r = 0; r < work_regions && rc == NXUS_SCAN_OK; r++) {
+        const NxusScanRegion *reg = &regions[r];
+        if (reg->size == 0) continue;
+
+        if (cancel != NULL && *cancel) { rc = NXUS_SCAN_ERR_CANCELLED; break; }
+
+        NxusBaselineRegion *br = &bl->regions[bl->region_count];
+        br->base        = reg->base;
+        br->addr_base   = reg->addr_base ? reg->addr_base : reg->base;
+        br->size        = reg->size;
+        br->mapping_idx = reg->mapping_idx;
+        br->block_first = bl->block_count;
+        br->block_count = 0;
+        /* First absolute multiple of the width at or after the region start. */
+        br->align_skip  = (u32)((step - (reg->base % step)) % step);
+        bl->region_count++;
+
+        u64 done = 0;
+        while (done < reg->size) {
+            if (cancel != NULL && *cancel) { rc = NXUS_SCAN_ERR_CANCELLED; break; }
+            if (bl->block_count >= bl->block_cap) {
+                /* out of metadata: the rest of the range stays unrepresented
+                   (the call is still usable, the count reports the loss) */
+                if (stats != NULL) stats->dropped++;
+                break;
+            }
+
+            const u64 remaining = reg->size - done;
+            const u32 blk_len = (remaining > (u64)block_size) ? block_size : (u32)remaining;
+            const u64 addr = reg->base + done;
+
+            NxusBaselineBlock *b = &bl->blocks[bl->block_count];
+            const u32 got = readWithSplit(read, read_ctx, addr, blk_buf, blk_len, stats);
+
+            if (got < blk_len) {
+                /* genuinely unreadable: keep the slot (the refine pass then knows
+                   this range has no baseline) and never abort the whole scan */
+                b->hash      = 0;
+                b->store_off = 0;
+                b->flags     = NXUS_BBLOCK_UNREADABLE;
+                bl->block_count++;
+                br->block_count++;
+                if (stats != NULL) stats->dropped++;
+                scanned += blk_len;
+                done += blk_len;
+                continue;
+            }
+
+            if (stats != NULL) {
+                stats->reads++;
+                stats->bytes_read += blk_len;
+            }
+
+            u64 hash = 0;
+            int zero = 0;
+            blockFingerprint(blk_buf, blk_len, &hash, &zero);
+
+            b->hash      = hash;
+            b->store_off = 0;
+            b->flags     = NXUS_BBLOCK_VALID;
+
+            if (zero) {
+                /* All-zero blocks are their own previous value: no store write,
+                   no SD space, and the refine pass still knows the baseline. */
+                b->flags |= NXUS_BBLOCK_ZERO;
+            } else if (io->write == NULL ||
+                       bl->stored_bytes + (u64)blk_len > 0xFFFFFFFFull) {
+                b->flags = NXUS_BBLOCK_UNREADABLE;
+                if (stats != NULL) stats->dropped++;
+            } else if (io->write(io_ctx, bl->stored_bytes, blk_buf, blk_len) != 0) {
+                b->flags = NXUS_BBLOCK_UNREADABLE;
+                if (stats != NULL) stats->dropped++;
+            } else {
+                b->store_off = (u32)bl->stored_bytes;
+                bl->stored_bytes += blk_len;
+            }
+
+            /* Only a block that can be read back contributes candidates: an
+               unreadable one can never produce a hit in the refine pass. */
+            if (b->flags & NXUS_BBLOCK_VALID) {
+                bl->candidate_count += blockCandidates(br->align_skip, step, blk_len, window);
+            }
+
+            bl->block_count++;
+            br->block_count++;
+            scanned += blk_len;
+            done += blk_len;
+        }
+
+        if (stats != NULL) {
+            stats->regions_done = r + 1;
+            stats->permille = total_bytes ? (u32)((scanned * 1000ull) / total_bytes) : 1000u;
+        }
+    }
+
+    if (own_buf) free(blk_buf);
+
+    if (stats != NULL) {
+        stats->dropped += region_count - work_regions;
+        stats->bytes_scanned = scanned;
+        stats->permille = total_bytes ? (u32)((scanned * 1000ull) / total_bytes) : 1000u;
+    }
+
+    if (rc != NXUS_SCAN_OK) {
+        bl->active = 0;
+        return rc;
+    }
+
+    bl->active = 1;
+    return NXUS_SCAN_OK;
+}
+
+int nxusScanNextFromBaseline(NxusBaseline *bl,
+                             NxusHitList *hits,
+                             const NxusScanRequest *req,
+                             const NxusMappingTable *maps,
+                             NxusReadFn read, void *read_ctx,
+                             const NxusBaselineIo *io, void *io_ctx,
+                             u8 *cur_buf, u32 cur_buf_size,
+                             u8 *prev_buf, u32 prev_buf_size,
+                             NxusScanStats *stats, int *cancel) {
+    if (bl == NULL || hits == NULL || req == NULL || maps == NULL || read == NULL ||
+        io == NULL || cur_buf == NULL || prev_buf == NULL) {
+        return NXUS_SCAN_ERR_PARAM;
+    }
+    if (!bl->active) return NXUS_SCAN_ERR_PARAM;   /* no baseline / already consumed */
+
+    const u32 block_size = bl->block_size;
+    const u32 window     = bl->value_size;
+    if (block_size == 0 || window == 0 || window > 8) return NXUS_SCAN_ERR_PARAM;
+    if (cur_buf_size < block_size || prev_buf_size < block_size) return NXUS_SCAN_ERR_PARAM;
+    if (hits->value_size < window || hits->value_size > 8) return NXUS_SCAN_ERR_PARAM;
+
+    u32 value_type = baselineValueType(bl->value_type, window, req->flags);
+    if (value_type == NxusValueType_All) return NXUS_SCAN_ERR_PARAM;
+
+    const u32 step = window;
+
+    /* Same epsilon derivation as the other passes (GUI/CLI send target2 == 0). */
+    NxusScanRequest effective = *req;
+    if (effective.cmp_mode == NxusCmp_FuzzyEqual && effective.target2 == 0) {
+        effective.target2 = fuzzyEpsilonBits(value_type, window, 0);
+    }
+    req = &effective;
+
+    u8 target[8];
+    memset(target, 0, sizeof(target));
+    nxusStoreLE(target, req->target, window);
+
+    const u32 cmp_mode = req->cmp_mode;
+    const int change_mode = (cmp_mode == NxusCmp_Changed || cmp_mode == NxusCmp_Increased ||
+                             cmp_mode == NxusCmp_Decreased || cmp_mode == NxusCmp_Different);
+    const int needs_prev = change_mode || (cmp_mode == NxusCmp_Unchanged);
+
+    /* Same single-width fast path as the classic refine pass. */
+    u32 fast_width = 0;
+    if (!(req->flags & (NXUS_SCAN_F_FLOAT | NXUS_SCAN_F_SIGNED)) &&
+        (window == 4 || window == 8) && hits->value_size == window &&
+        value_type != NxusValueType_F32 && value_type != NxusValueType_F64) {
+        switch (cmp_mode) {
+            case NxusCmp_Equal:
+            case NxusCmp_NotEqual:
+            case NxusCmp_Increased:
+            case NxusCmp_Decreased:
+            case NxusCmp_Changed:
+            case NxusCmp_Unchanged:
+                fast_width = window;
+                break;
+            default:
+                break;
+        }
+    }
+
+    u64 total_bytes = 0;
+    for (u32 r = 0; r < bl->region_count; r++) total_bytes += bl->regions[r].size;
+
+    if (stats != NULL) {
+        memset(stats, 0, sizeof(*stats));
+        stats->regions_total = bl->block_count;
+    }
+
+    const u32 initial_count = hits->count;
+    u64 scanned = 0;
+    u32 done_blocks = 0;
+    u32 dropped = 0;
+    int rc = NXUS_SCAN_OK;
+    int stop = 0;
+
+    for (u32 r = 0; r < bl->region_count && !stop && rc == NXUS_SCAN_OK; r++) {
+        const NxusBaselineRegion *br = &bl->regions[r];
+
+        /* A mapping that vanished (or was never valid) has no current bytes: its
+           blocks are dropped, exactly like a refine pass drops such hits. */
+        if (br->mapping_idx >= maps->count || !maps->entries[br->mapping_idx].valid) {
+            dropped += br->block_count;
+            done_blocks += br->block_count;
+            continue;
+        }
+
+        for (u32 bi = 0; bi < br->block_count; bi++) {
+            if (cancel != NULL && *cancel) { rc = NXUS_SCAN_ERR_CANCELLED; break; }
+
+            NxusBaselineBlock *b = &bl->blocks[br->block_first + bi];
+            const u64 block_addr = br->base + (u64)bi * block_size;
+            const u64 remain = br->size - (u64)bi * block_size;
+            const u32 blk_len = (remain > (u64)block_size) ? block_size : (u32)remain;
+
+            done_blocks++;
+            const u32 got = readWithSplit(read, read_ctx, block_addr, cur_buf, blk_len, stats);
+            if (got < blk_len) {
+                /* keep nothing from a block we could not read: a bogus compare
+                   would report changes that are not there */
+                dropped++;
+                if (stats != NULL) stats->dropped_reads++;
+                scanned += blk_len;
+                continue;
+            }
+            if (stats != NULL) {
+                stats->reads++;
+                stats->bytes_read += blk_len;
+            }
+
+            u64 cur_hash = 0;
+            int cur_zero = 0;
+            blockFingerprint(cur_buf, blk_len, &cur_hash, &cur_zero);
+
+            const int known = (b->flags & NXUS_BBLOCK_VALID) != 0;
+            int same_block = 0;
+            if (known) {
+                if (cur_zero && (b->flags & NXUS_BBLOCK_ZERO)) {
+                    same_block = 1;
+                } else if (cur_hash == b->hash) {
+                    same_block = 1;
+                }
+            }
+
+            /* O(1) block skip: for a change-only mode an unchanged block cannot
+               contain a hit, so neither the store nor a single value is touched. */
+            if (change_mode && known && same_block) {
+                scanned += blk_len;
+                continue;
+            }
+            if (change_mode && !known) {
+                /* nothing was captured for this block (it was unreadable, or the
+                   store ran out): a change cannot be proven, so nothing is kept */
+                dropped++;
+                if (stats != NULL) stats->dropped_reads++;
+                scanned += blk_len;
+                continue;
+            }
+
+            /* "Unchanged" on an unchanged block matches every candidate: a block
+               level decision instead of one compare per value. */
+            const int materialize_all =
+                (!change_mode && same_block && cmp_mode == NxusCmp_Unchanged);
+
+            /* Previous values are read lazily, and only for the blocks that need
+               them: a change-only pass touches the store once per changed block,
+               never per candidate. */
+            const u8 *prev = NULL;
+            if (!materialize_all) {
+                if (needs_prev) {
+                    if (known && (b->flags & NXUS_BBLOCK_ZERO)) {
+                        memset(prev_buf, 0, blk_len);
+                        prev = prev_buf;
+                    } else if (known && io->read != NULL &&
+                               io->read(io_ctx, b->store_off, prev_buf, blk_len) == 0) {
+                        if (stats != NULL) {
+                            stats->reads++;
+                            stats->bytes_read += blk_len;
+                        }
+                        prev = prev_buf;
+                    } else {
+                        dropped++;
+                        if (stats != NULL) stats->dropped_reads++;
+                        scanned += blk_len;
+                        continue;
+                    }
+                } else if (fast_width != 0) {
+                    /* Equal / NotEqual ignore the previous value, but the fast
+                       compares still load it: hand them a defined buffer. */
+                    memset(prev_buf, 0, blk_len);
+                    prev = prev_buf;
+                }
+            }
+
+            const u64 base_off = block_addr - br->addr_base;
+            u32 s = br->align_skip;
+            for (; s + window <= blk_len; s += step) {
+                const u8 *cur = cur_buf + s;
+                int match;
+
+                if (materialize_all) {
+                    match = 1;
+                } else if (fast_width == 4) {
+                    match = compareU32Fast(cur, prev + s, target, cmp_mode);
+                } else if (fast_width == 8) {
+                    match = compareU64Fast(cur, prev + s, target, cmp_mode);
+                } else {
+                    u32 flags = req->flags;
+                    if (value_type == NxusValueType_F32 || value_type == NxusValueType_F64) {
+                        flags |= NXUS_SCAN_F_FLOAT;
+                    } else {
+                        flags &= ~NXUS_SCAN_F_FLOAT;
+                    }
+                    match = nxusCompareBytes(cur, prev, target, window, cmp_mode,
+                                             req->target2, flags);
+                }
+                if (!match) continue;
+
+                /* A full hit list is a limit, not a failure: keep what fits and
+                   report success, so the caller never sees a dead scan. */
+                if (hits->count >= hits->max_capacity) { stop = 1; break; }
+
+                const u64 off = base_off + s;
+                if (off > 0xFFFFFFFFull) continue;   /* u32 offset limit */
+
+                u8 stored[8];
+                memset(stored, 0, sizeof(stored));
+                memcpy(stored, cur, window);
+                if (hitListPush(hits, br->mapping_idx, (u32)off, stored, value_type) != NXUS_SCAN_OK) {
+                    stop = 1;
+                    break;
+                }
+            }
+
+            scanned += blk_len;
+            if (stop) break;
+        }
+    }
+
+    if (stats != NULL) {
+        stats->regions_done = done_blocks;
+        stats->bytes_scanned = scanned;
+        stats->dropped += dropped;
+        stats->permille = total_bytes ? (u32)((scanned * 1000ull) / total_bytes) : 1000u;
+    }
+
+    bl->active = 0;
+    hits->prev_count = initial_count;
+    return rc;      /* NXUS_SCAN_OK also when the hit list filled up */
+}

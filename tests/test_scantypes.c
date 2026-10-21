@@ -885,6 +885,320 @@ static void testGeLeAndDifferent(void) {
     check(nxusHitListUndo(&g_hits) == NXUS_SCAN_ERR_PARAM, "second undo without refine is rejected");
 }
 
+/* ---- dense baseline -------------------------------------------------- */
+
+/* A memory "store" (an SD file on the console): the first pass writes every
+   non-zero block here once, and the refine pass reads a block back only when it
+   actually changed. */
+static u8  g_store[FAKE_SIZE];
+static u32 g_store_used;
+static u32 g_store_writes;
+static u32 g_store_reads;
+
+static int storeWrite(void *ctx, u64 offset, const void *buf, u32 len) {
+    (void)ctx;
+    if (offset + len > (u64)sizeof(g_store)) return -1;
+    memcpy(g_store + offset, buf, len);
+    g_store_writes++;
+    if (offset + len > (u64)g_store_used) g_store_used = (u32)(offset + len);
+    return 0;
+}
+
+static int storeRead(void *ctx, u64 offset, void *buf, u32 len) {
+    (void)ctx;
+    if (offset + len > (u64)g_store_used) return -1;
+    memcpy(buf, g_store + offset, len);
+    g_store_reads++;
+    return 0;
+}
+
+static const NxusBaselineIo g_store_io = { storeWrite, storeRead };
+
+/* The baseline allocates its own region / block tables; the data buffers below
+   must be at least one block (NXUS_BASELINE_BLOCK_MIN) wide. */
+static NxusBaseline  g_bl;
+static u8 g_blk_cur[NXUS_BASELINE_BLOCK_MIN];
+static u8 g_blk_prev[NXUS_BASELINE_BLOCK_MIN];
+static u8 g_blk_big[FAKE_SIZE];   /* for the coarse-grid case: one 64 KB block */
+
+static void baselineInit(u32 value_size, u32 value_type) {
+    nxusBaselineFree(&g_bl);
+    memset(g_store, 0, sizeof(g_store));
+    g_store_used   = 0;
+    g_store_writes = 0;
+    g_store_reads  = 0;
+    if (nxusBaselineInit(&g_bl, 4, 64, value_size, value_type) != NXUS_SCAN_OK) {
+        printf("baseline init failed\n");
+        failures++;
+    }
+}
+
+/* A hit list whose hard cap is far below the candidate count: the whole point of
+   the baseline is that this no longer truncates the scan. */
+static void baselineHits(u32 max_capacity) {
+    nxusHitListFree(&g_hits);
+    if (nxusHitListInit(&g_hits, 16, max_capacity, 4) != NXUS_SCAN_OK) {
+        printf("baseline hit list init failed\n");
+        failures++;
+    }
+}
+
+static int baselineFirst(const NxusScanRequest *req, NxusScanStats *stats) {
+    return nxusScanFirstBaseline(&g_bl, &g_region, 1, req, fakeRead, NULL, &g_store_io, NULL,
+                                 g_chunk, (u32)sizeof(g_chunk), stats, NULL);
+}
+
+static int baselineNext(const NxusScanRequest *req, NxusScanStats *stats) {
+    return nxusScanNextFromBaseline(&g_bl, &g_hits, req, &g_maps, fakeRead, NULL,
+                                    &g_store_io, NULL,
+                                    g_blk_cur, (u32)sizeof(g_blk_cur),
+                                    g_blk_prev, (u32)sizeof(g_blk_prev),
+                                    stats, NULL);
+}
+
+/* The core problem this feature exists for: an Unknown scan over 64 KB has
+   16,384 candidates - 160x the 100 hit slots the caller allows - and used to be
+   truncated.  The baseline records block fingerprints instead, so the candidate
+   count is complete and the refine pass materialises only what changed. */
+static void testDenseBaseline(void) {
+    printf("- dense baseline: 16,384 candidates with a 100 hit list\n");
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);      /* non-zero: each block must be stored */
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 4;
+
+    baselineInit(4, NxusValueType_U32);
+    baselineHits(100);
+
+    NxusScanStats stats;
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "unknown baseline capture completes");
+    check(g_hits.count == 0, "the first pass pushes no hits at all");
+    check(g_bl.candidate_count == FAKE_SIZE / 4, "all 16,384 candidates are counted");
+    check(g_bl.block_size == NXUS_BASELINE_BLOCK_MIN, "the block grid is 16 KB");
+    check(g_bl.block_count == 4, "64 KB is four blocks");
+    check(g_bl.stored_bytes == FAKE_SIZE, "every non-zero block is stored once");
+    check(g_store_writes == 4, "four store writes, not 16,384");
+    check(g_bl.active == 1, "the baseline stays active for the refine pass");
+
+    /* five values change; they sit in two of the four blocks, so the other two
+       blocks must be rejected by their hash alone */
+    const u64 changed[5] = { 0x4010, 0x4100, 0x7FF0, 0xC000, 0xCFFC };
+    for (u32 i = 0; i < 5; i++) putU64(changed[i], 0x22222222u, 4);
+
+    g_store_reads = 0;
+    req.cmp_mode = NxusCmp_Changed;
+    check(baselineNext(&req, &stats) == NXUS_SCAN_OK, "changed refine completes");
+    check(g_hits.count == 5, "exactly the five modified candidates are materialised");
+    check(g_store_reads == 2, "only the two changed blocks read the store (O(1) skip)");
+    check(g_bl.active == 0, "the baseline is consumed");
+
+    int hits_ok = (g_hits.count == 5);
+    for (u32 i = 0; i < g_hits.count; i++) {
+        if (g_hits.addresses[i].offset != (u32)changed[i]) hits_ok = 0;
+        if (nxusLoadLE(g_hits.values + (size_t)i * g_hits.value_size, 4) != 0x22222222u) hits_ok = 0;
+    }
+    check(hits_ok, "the hits carry the changed offsets and their fresh values");
+
+    /* same procedure with Increased */
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);
+    baselineInit(4, NxusValueType_U32);
+    baselineHits(100);
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "second baseline capture completes");
+    check(g_hits.count == 0, "still no hits after the capture");
+
+    for (u32 i = 0; i < 5; i++) putU64(changed[i], 0x11111112u, 4);   /* +1 each */
+
+    g_store_reads = 0;
+    req.cmp_mode = NxusCmp_Increased;
+    check(baselineNext(&req, &stats) == NXUS_SCAN_OK, "increased refine completes");
+    check(g_hits.count == 5, "increased materialises exactly the five raised values");
+    check(g_store_reads == 2, "increased also reads only the changed blocks");
+
+    int inc_ok = (g_hits.count == 5);
+    for (u32 i = 0; i < g_hits.count; i++) {
+        if (g_hits.addresses[i].offset != (u32)changed[i]) inc_ok = 0;
+    }
+    check(inc_ok, "the increased hits are at the five changed offsets");
+}
+
+/* A zeroed heap is the common case for an Unknown scan: the block is all zero,
+   so there is nothing to store - the flag alone is the previous value. */
+static void testBaselineZeroBlocks(void) {
+    printf("- dense baseline: zero blocks cost no store space\n");
+    setup();                                 /* g_memory is all zero */
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 4;
+
+    baselineInit(4, NxusValueType_U32);
+    baselineHits(100);
+
+    NxusScanStats stats;
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "all-zero baseline capture completes");
+    check(g_bl.stored_bytes == 0, "nothing is written for an all-zero range");
+    check(g_store_writes == 0, "zero store writes");
+    check(g_bl.candidate_count == FAKE_SIZE / 4, "candidates are still counted");
+    check(g_bl.block_count == 4, "blocks are still tracked");
+
+    putU64(0x8000, 0x1234, 4);               /* a value appears out of zero */
+
+    g_store_reads = 0;
+    req.cmp_mode = NxusCmp_Changed;
+    check(baselineNext(&req, &stats) == NXUS_SCAN_OK, "changed refine against zero blocks completes");
+    check(g_hits.count == 1, "only the value that left zero matches");
+    check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x8000, "the changed offset is found");
+    check(g_store_reads == 0, "the previous value came from the zero flag, not the store");
+
+    /* a target whose large reads are refused must still be hashed in full */
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);
+    baselineInit(4, NxusValueType_U32);
+    req.cmp_mode = NxusCmp_Unknown;
+    check(nxusScanFirstBaseline(&g_bl, &g_region, 1, &req, fakeReadLimited, NULL, &g_store_io,
+                                NULL, g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "capture survives a 4 KB read limit");
+    check(stats.retries > 0, "the refused block read was split into accepted pieces");
+    check(g_bl.block_size == NXUS_BASELINE_BLOCK_MIN, "block size is unchanged");
+    check(g_bl.candidate_count == FAKE_SIZE / 4, "all candidates found despite the read limit");
+}
+
+/* A small block budget makes the grid coarser instead of losing the range. */
+static void testBaselineBlockSizing(void) {
+    printf("- dense baseline: the block grid grows to fit the block budget\n");
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 4;
+
+    /* a two-block budget cannot hold 16 KB blocks for 64 KB */
+    nxusBaselineFree(&g_bl);
+    memset(g_store, 0, sizeof(g_store));
+    g_store_used = g_store_writes = g_store_reads = 0;
+    check(nxusBaselineInit(&g_bl, 2, 2, 4, NxusValueType_U32) == NXUS_SCAN_OK,
+          "baseline init with a two block budget");
+
+    NxusScanStats stats;
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "coarse-grid capture completes");
+    check(g_bl.block_size == FAKE_SIZE, "the grid grew to 64 KB to stay inside the budget");
+    check(g_bl.block_count == 1, "one block covers the range");
+    check(g_bl.candidate_count == FAKE_SIZE / 4, "the candidate count is unaffected");
+
+    putU64(0x1234, 0x22222222u, 4);
+
+    baselineHits(100);
+    req.cmp_mode = NxusCmp_Changed;
+    check(nxusScanNextFromBaseline(&g_bl, &g_hits, &req, &g_maps, fakeRead, NULL,
+                                   &g_store_io, NULL, g_chunk, (u32)sizeof(g_chunk),
+                                   g_blk_big, (u32)sizeof(g_blk_big), &stats, NULL) == NXUS_SCAN_OK,
+          "coarse-grid refine completes");
+    check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x1234,
+          "the changed value is found on the coarse grid");
+
+    /* a mapping that vanished must contribute nothing */
+    baselineInit(4, NxusValueType_U32);
+    req.cmp_mode = NxusCmp_Unknown;
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "capture before the mapping test");
+    baselineHits(100);
+    g_map_entry.valid = 0;
+    check(baselineNext(&req, &stats) == NXUS_SCAN_OK, "refine with a vanished mapping completes");
+    check(g_hits.count == 0, "a vanished mapping yields no hits");
+    g_map_entry.valid = 1;
+}
+
+/* A full hit list must stop the materialisation, not the scan. */
+static void testBaselineHitCap(void) {
+    printf("- dense baseline: a full hit list keeps the hits found so far\n");
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 4;
+
+    baselineInit(4, NxusValueType_U32);
+    NxusScanStats stats;
+    check(baselineFirst(&req, &stats) == NXUS_SCAN_OK, "capture for the cap test completes");
+
+    /* 200 changed candidates, 100 slots */
+    for (u32 i = 0; i < 200; i++) putU64(0x4000 + (u64)i * 4u, 0x33333333u, 4);
+
+    baselineHits(100);
+    req.cmp_mode = NxusCmp_Changed;
+    int rc = baselineNext(&req, &stats);
+    check(rc == NXUS_SCAN_OK, "a full hit list is not reported as an error");
+    check(g_hits.count == 100, "exactly max_capacity hits are returned");
+    check(g_hits.count == 100 && g_hits.addresses[0].offset == 0x4000,
+          "the hits start at the first changed candidate");
+    check(g_hits.count == 100 && g_hits.addresses[99].offset == 0x4000 + 99u * 4u,
+          "the hits are the ascending prefix of the changed candidates");
+    check(g_bl.active == 0, "the baseline is consumed even when it stops early");
+}
+
+/* The baseline replaces the classic "one hit per candidate" first pass, so it
+   must enumerate exactly the same addresses.  Checked on an unaligned region
+   base, where the absolute alignment (align_skip) decides the first candidate. */
+static NxusHitList g_ref_hits;
+
+static void testBaselineMatchesFirstPass(void) {
+    printf("- dense baseline: same candidates as the classic first pass\n");
+    setup();
+    for (u32 i = 0; i < FAKE_SIZE; i++) g_memory[i] = (u8)(i * 7u + 3u);
+
+    NxusScanRegion region;
+    memset(&region, 0, sizeof(region));
+    region.base = g_base + 3;             /* unaligned: align_skip must be applied */
+    region.addr_base = g_base;
+    region.size = 0x4000;
+    region.perm = NXUS_PERM_R | NXUS_PERM_W;
+    region.mapping_idx = 0;
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 2;
+
+    nxusHitListFree(&g_ref_hits);
+    check(nxusHitListInit(&g_ref_hits, 1024, 20000, 2) == NXUS_SCAN_OK,
+          "reference hit list init");
+
+    NxusScanStats stats;
+    check(nxusScanFirstEx(&region, 1, &req, NULL, &g_ref_hits, fakeRead, NULL,
+                          g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "classic unknown first pass completes");
+    const u32 ref_count = g_ref_hits.count;
+    check(ref_count > 8000, "the classic pass records every candidate");
+
+    nxusBaselineFree(&g_bl);
+    memset(g_store, 0, sizeof(g_store));
+    g_store_used = g_store_writes = g_store_reads = 0;
+    check(nxusBaselineInit(&g_bl, 4, 64, 2, NxusValueType_U16) == NXUS_SCAN_OK,
+          "baseline init for u16");
+    check(nxusScanFirstBaseline(&g_bl, &region, 1, &req, fakeRead, NULL, &g_store_io, NULL,
+                                g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "baseline capture completes");
+    check(g_bl.candidate_count == ref_count, "the baseline counts the same candidates");
+    check(g_bl.candidate_count == 8191, "unaligned base starts at the first even address");
+
+    nxusHitListFree(&g_hits);
+    check(nxusHitListInit(&g_hits, 1024, 20000, 2) == NXUS_SCAN_OK, "baseline hit list init");
+
+    check(nxusScanNextFromBaseline(&g_bl, &g_hits, &req, &g_maps, fakeRead, NULL,
+                                   &g_store_io, NULL, g_blk_cur, (u32)sizeof(g_blk_cur),
+                                   g_blk_prev, (u32)sizeof(g_blk_prev), &stats, NULL) == NXUS_SCAN_OK,
+          "baseline unknown refine completes");
+    check(g_hits.count == ref_count, "the baseline materialises the same number of candidates");
+
+    int same = (g_hits.count == ref_count);
+    for (u32 i = 0; i < g_hits.count && same; i++) {
+        if (g_hits.addresses[i].offset != g_ref_hits.addresses[i].offset) same = 0;
+        if (memcmp(g_hits.values + (size_t)i * g_hits.value_size,
+                   g_ref_hits.values + (size_t)i * g_ref_hits.value_size, 2) != 0) same = 0;
+    }
+    check(same, "candidate offsets and values match the classic pass exactly");
+
+    nxusHitListFree(&g_ref_hits);
+}
+
 int main(void) {
     printf("Nxus scan-type tests\n");
     testFloat();
@@ -907,6 +1221,11 @@ int main(void) {
     testUnknownInitial();
     testAlignmentAndSizes();
     testGeLeAndDifferent();
+    testDenseBaseline();
+    testBaselineZeroBlocks();
+    testBaselineBlockSizing();
+    testBaselineHitCap();
+    testBaselineMatchesFirstPass();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     if (failures == 0) printf("ALL SCAN-TYPE TESTS PASSED\n");

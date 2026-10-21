@@ -191,3 +191,125 @@ int nxusScanNext(NxusHitList *hits, const NxusScanRequest *req,
                  NxusReadFn read, void *read_ctx,
                  u8 *window, u32 window_max, u32 gap_threshold,
                  NxusScanStats *stats, int *cancel);
+
+/* ------------------------------------------------------------------ */
+/* dense baseline                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * An "unknown initial value" scan has to answer "which of the N candidates
+ * changed?", but materialising N hits is both O(memory) and capped by the hit
+ * list (150k hits is the practical wall).  The dense baseline replaces the hit
+ * list with a per-block FINGERPRINT of the first pass:
+ *
+ *   - the scanned range is cut into 16 KB (or larger) blocks,
+ *   - each block is described by a 64-bit FNV-1a hash plus an all-zero flag,
+ *   - all-zero blocks are never written to the store at all (a freshly zeroed
+ *     heap - the common case - costs nothing but one line of metadata),
+ *   - non-zero blocks are written to the caller's store exactly once,
+ *   - the first pass pushes ZERO hits; it only counts candidates.
+ *
+ * The refine pass then re-reads a block, hashes it, and for the change-only
+ * compare modes (Changed / Increased / Decreased / Different) an unchanged block
+ * is rejected in O(1) - no store read, no per-value compare.  Only blocks that
+ * really changed have their previous values read back (lazily, per block) and
+ * only their matching candidates are materialised into the hit list.
+ *
+ * The candidate geometry is fixed by value_size: numeric scans walk the
+ * absolute multiples of the width, exactly like nxusScanFirstEx(), so the
+ * candidate count and the addresses a hit would have are identical.
+ * Pattern / "All" scans keep using nxusScanFirstEx(): their window is wider
+ * than their stride, so a value can straddle a block boundary and a block-grid
+ * candidate enumeration would miss it.
+ */
+
+#define NXUS_BASELINE_BLOCK_MIN     16384u
+#define NXUS_BASELINE_MAX_BLOCKS    16384u   /* default block budget for nxusBaselineInit */
+
+#define NXUS_BBLOCK_VALID           0x01u
+#define NXUS_BBLOCK_ZERO            0x02u
+#define NXUS_BBLOCK_UNREADABLE      0x04u
+
+/* Where the previous values are kept (SD card, heap, ...).  The baseline never
+   keeps the data itself, so a 4 GB scan does not need 4 GB of RAM. */
+typedef struct {
+    int (*write)(void *ctx, u64 offset, const void *buf, u32 len);
+    int (*read)(void *ctx, u64 offset, void *buf, u32 len);
+} NxusBaselineIo;
+
+typedef struct {
+    u64 hash;       /* FNV-1a of the whole block, 0 when never hashed       */
+    u32 store_off;  /* offset in the store (only valid for non-zero blocks) */
+    u32 flags;      /* NXUS_BBLOCK_*                                       */
+} NxusBaselineBlock;
+
+typedef struct {
+    u64 base;       /* first byte read from the target                    */
+    u64 addr_base;  /* mapping base used for the hit offsets              */
+    u64 size;
+    u32 mapping_idx;
+    u32 block_first;/* first entry in NxusBaseline.blocks                 */
+    u32 block_count;
+    u32 align_skip; /* first candidate inside each block (0..value_size-1)*/
+} NxusBaselineRegion;
+
+typedef struct {
+    NxusBaselineRegion *regions;
+    u32 region_cap;
+    u32 region_count;
+    NxusBaselineBlock *blocks;
+    u32 block_cap;
+    u32 block_count;
+    u64 stored_bytes;      /* how much of the store is used          */
+    u64 candidate_count;   /* candidates covered by the first pass    */
+    u32 block_size;        /* chosen by nxusScanFirstBaseline         */
+    u32 value_size;
+    u32 value_type;
+    u32 active;            /* 1 until the baseline has been consumed */
+} NxusBaseline;
+
+/* Value type / size are fixed for the lifetime of the baseline: the caller
+   initialises them once and every pass compares the same width. */
+int  nxusBaselineInit(NxusBaseline *bl, u32 region_cap, u32 block_cap, u32 value_size, u32 value_type);
+void nxusBaselineReset(NxusBaseline *bl);
+void nxusBaselineFree(NxusBaseline *bl);
+
+/*
+ * First pass.  Reads every region through 'read' (a refused read is halved down
+ * to 4 KB and the block is assembled from the accepted pieces), stores the
+ * fingerprint of each block and pushes NO hits.  bl->candidate_count receives
+ * the number of aligned candidates the range holds, so the GUI can show
+ * "N candidates" instead of "N hits".
+ *
+ * 'chunk' is a scratch buffer of chunk_size bytes; when it is smaller than the
+ * chosen block size the function allocates one temporary block itself.
+ * A block that cannot be read is recorded as NXUS_BBLOCK_UNREADABLE (never
+ * fatal: the rest of the range still gets scanned).
+ */
+int  nxusScanFirstBaseline(NxusBaseline *bl,
+                           const NxusScanRegion *regions, u32 region_count,
+                           const NxusScanRequest *req,
+                           NxusReadFn read, void *read_ctx,
+                           const NxusBaselineIo *io, void *io_ctx,
+                           u8 *chunk, u32 chunk_size,
+                           NxusScanStats *stats, int *cancel);
+
+/*
+ * Refine pass against the baseline.  cur_buf / prev_buf must each hold at least
+ * bl->block_size bytes (cur_buf_size / prev_buf_size are checked).
+ *
+ * Only matches are pushed into 'hits', in ascending address order, so the
+ * resulting list is directly usable by nxusScanNextEx().  If the hit list fills
+ * up (hits->count >= hits->max_capacity) materialising stops, the hits found so
+ * far stay valid and NXUS_SCAN_OK is returned - a small hit list is a limit,
+ * never a failed scan.  bl->active is cleared on every exit path.
+ */
+int  nxusScanNextFromBaseline(NxusBaseline *bl,
+                              NxusHitList *hits,
+                              const NxusScanRequest *req,
+                              const NxusMappingTable *maps,
+                              NxusReadFn read, void *read_ctx,
+                              const NxusBaselineIo *io, void *io_ctx,
+                              u8 *cur_buf, u32 cur_buf_size,
+                              u8 *prev_buf, u32 prev_buf_size,
+                              NxusScanStats *stats, int *cancel);

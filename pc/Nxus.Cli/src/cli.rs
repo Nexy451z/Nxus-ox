@@ -683,8 +683,9 @@ fn execute(opts: &Opts) -> Result<()> {
                         crate::pcscan::refine(&client, &mut scan, compare, target, target2, flags,
                                               &cancel, &mut |_, _| {})
                             .map_err(|e| NxusError { message: e, result: None })?;
-                        println!("next scan: {} candidate(s)", scan.hits.len());
-                        for hit in scan.hits.iter().take(opts.num("limit").unwrap_or(16) as usize) {
+                        println!("next scan: {} candidate(s)", scan.len());
+                        let limit = opts.num("limit").unwrap_or(16) as usize;
+                        for hit in scan.hits_page(0, limit) {
                             println!("{:08X}  {}", hit.address, hit.value);
                         }
                         if let Some(path) = opts.flag("save") {
@@ -720,6 +721,7 @@ fn execute(opts: &Opts) -> Result<()> {
                             bytes_read: 0,
                             reads: 0,
                             failed_reads: 0,
+                            ..Default::default()
                         };
                         crate::pcscan::save(path, &scan)
                             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
@@ -757,9 +759,9 @@ fn execute(opts: &Opts) -> Result<()> {
                         }
                     }).map_err(|e| NxusError { message: e, result: None })?;
                     println!("unknown-value scan: {} candidate(s) from {} MB ({} reads){}",
-                             scan.hits.len(), scan.bytes_read / (1024 * 1024), scan.reads,
+                             scan.len(), scan.bytes_read / (1024 * 1024), scan.reads,
                              if scan.truncated { " [capped]" } else { "" });
-                    if scan.hits.is_empty() && scan.failed_reads > 0 {
+                    if scan.is_empty() && scan.failed_reads > 0 {
                         println!("warning: {} read(s) failed - is the address range inside a mapping?",
                                  scan.failed_reads);
                     }
@@ -789,7 +791,7 @@ fn execute(opts: &Opts) -> Result<()> {
                         let out_path = opts.flag("save").unwrap_or(path);
                         crate::pcscan::save(out_path, &scan)
                             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
-                        println!("undo scan: {} candidate(s) restored", scan.hits.len());
+                        println!("undo scan: {} candidate(s) restored", scan.len());
                         return Ok(());
                     }
                     let st = client.scan_undo()?;

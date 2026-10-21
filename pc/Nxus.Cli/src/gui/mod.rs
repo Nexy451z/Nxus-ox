@@ -280,10 +280,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             };
                             let scan = crate::pcscan::scan_unknown(c, &regions, value_size, max_hits,
                                                                     &cancel, &mut progress)?;
-                            let hits: Vec<(u64, u64)> = scan.hits.iter().map(|h| (h.address, h.value)).collect();
+                            let total_candidates = scan.len();
+                            let hits: Vec<(u64, u64)> = scan.hits_page(0, 65536).into_iter().map(|h| (h.address, h.value)).collect();
                             let mut message = format!("unknown-value scan: {} candidate(s) from {} MB ({} reads)",
-                                                  hits.len(), scan.bytes_read / (1024 * 1024), scan.reads);
-                            if hits.is_empty() && scan.failed_reads > 0 {
+                                                  total_candidates, scan.bytes_read / (1024 * 1024), scan.reads);
+                            if total_candidates == 0 && scan.failed_reads > 0 {
                                 message.push_str(&format!(" - {} read(s) failed, check the scope/range",
                                                           scan.failed_reads));
                             }
@@ -306,8 +307,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             };
                             crate::pcscan::refine(c, &mut scan, compare_by_index(compare), target, target2,
                                                   flags, &cancel, &mut progress)?;
-                            let hits: Vec<(u64, u64)> = scan.hits.iter().map(|h| (h.address, h.value)).collect();
-                            let message = format!("next scan: {} candidate(s)", hits.len());
+                            let total_candidates = scan.len();
+                            let hits: Vec<(u64, u64)> = scan.hits_page(0, 65536).into_iter().map(|h| (h.address, h.value)).collect();
+                            let message = format!("next scan: {} candidate(s)", total_candidates);
                             let value_size = scan.value_size;
                             let truncated = scan.truncated;
                             pc_scan = Some(scan);
@@ -328,10 +330,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         }
                         Cmd::ScanUndo => {
                             if let Some(scan) = prev_pc_scan.take() {
-                                let hits: Vec<(u64, u64)> = scan.hits.iter().map(|h| (h.address, h.value)).collect();
+                                let total_candidates = scan.len();
+                                let hits: Vec<(u64, u64)> = scan.hits_page(0, 65536).into_iter().map(|h| (h.address, h.value)).collect();
                                 let value_size = scan.value_size;
                                 let truncated = scan.truncated;
-                                let message = format!("undo scan: {} candidate(s) restored", hits.len());
+                                let message = format!("undo scan: {} candidate(s) restored", total_candidates);
                                 pc_scan = Some(scan);
                                 let _ = tx.send(Ev::PcHits { hits, value_size, message, truncated });
                             } else {

@@ -237,13 +237,23 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     opts.max_offset = req.max_offset ? req.max_offset : 0x1000;
     opts.max_results = req.max_results ? req.max_results : NXUS_PTRSCAN_MAX_RESULTS;
     if (opts.max_results > NXUS_PTRSCAN_MAX_RESULTS) opts.max_results = NXUS_PTRSCAN_MAX_RESULTS;
-    opts.value_width = (req.value_width == 8) ? 8 : 4;
+    /* Pointer width.  An explicit 4/8 request always wins; when the client lets
+       us decide (0), infer it from the module base: a 32-bit title (MHXX and
+       friends) maps its main module below 4 GB and must be walked with 4-byte
+       loads, because an 8-byte load would fold the neighbouring field into the
+       pointer and find no chains at all.  Anything above 4 GB (or unknown) is a
+       64-bit title and needs the wide loads. */
+    if (req.value_width == 4 || req.value_width == 8) {
+        opts.value_width = req.value_width;
+    } else {
+        opts.value_width = (module_base != 0 && module_base < 0x100000000ull) ? 4u : 8u;
+    }
     opts.window_size = 0x400;
     opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
 
-    NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u regions=%u",
+    NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u width=%u regions=%u",
              (unsigned long long)req.target_address, (unsigned long long)module_base,
-             (unsigned)opts.max_depth, (unsigned)region_count);
+             (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count);
 
     u32 count = 0;
     int src = nxusPtrScan(regions, region_count, req.target_address, module_base, &opts,
