@@ -1,0 +1,1047 @@
+#include "nxus_server.h"
+#include "nxus_debug.h"
+#include "nxus_dmntcht.h"
+#include "nxus_hid.h"
+
+#include <malloc.h>
+#include "nxus_log.h"
+#include "nxus_net.h"
+#include "nxus_ptrscan.h"
+#include "nxus_session.h"
+#include "nxus_snapshot_srv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static NxusConfig g_Config;
+/* Set while the connection thread is inside a handler (see nxusServerTick). */
+static volatile bool g_CommandActive;
+/* When the current command started, so a handler that never returns (blocked dmnt
+   call, stalled send) cannot suppress the watchdog and reaper for the whole boot. */
+static volatile u64  g_CommandStartedMs;
+#define NXUS_COMMAND_GRACE_MS 30000u
+
+/* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
+#define NXUS_PTRSCAN_MAX_RESULTS 64
+static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
+static u32              g_ChainCount;
+static NxusPtrScanStats g_PtrStats;
+static u64              g_PtrTarget;
+static u64              g_PtrModuleBase;
+
+/* Fired from the HID thread: freeze the target without touching the PC. */
+static void onHotkeyFired(void *user) {
+    (void)user;
+    if (nxusDebugIsAttached()) {
+        NXUS_LOG("hotkey: ignored while debug mode owns the process");
+        return;
+    }
+    Result rc = nxusDmntPause();
+    NXUS_RESULT("hotkey pause", rc);
+    if (R_SUCCEEDED(rc)) {
+        nxusSessionSetPaused(true);
+        nxusNetSendEvent(NxusEvent_HotkeyPaused, NULL, 0);
+    }
+}
+
+void nxusServerInit(void) {
+    memset(&g_Config, 0, sizeof(g_Config));
+    g_Config.hotkey_enabled = 0;
+    g_Config.chunk_size = NXUS_SESSION_DEFAULT_CHUNK;
+    g_Config.watchdog_timeout_ms = 15000;
+    g_Config.heartbeat_interval_ms = 5000;
+    g_Config.log_level = 1;
+
+    nxusHidInit();
+    nxusHidSetCallback(onHotkeyFired, NULL);
+}
+
+/* ---- helpers ----------------------------------------------------------- */
+
+static void reply(int fd, u16 type, u32 seq, const void *payload, u32 length) {
+    Result rc = nxusNetSendFd(fd, type, 0, seq, payload, length);
+    if (R_FAILED(rc)) NXUS_RESULT("send reply", rc);
+}
+
+static void replyError(int fd, u16 type, u32 seq, Result rc) {
+    s32 value = (s32)rc;
+    nxusNetSendFd(fd, type, NXUS_FLAG_ERROR, seq, &value, sizeof(value));
+}
+
+/* How long the console waits for a command before it assumes the PC is gone. */
+#define NXUS_DEBUG_IDLE_TIMEOUT_MS 20000u
+
+static void fillStatus(NxusStatus *st) {
+    memset(st, 0, sizeof(*st));
+    st->proto_version = NXUS_PROTO_VERSION;
+    st->mode = NXUS_MODE_DMNT;
+    st->scan_state = nxusSessionScanState();
+    st->process_id = nxusSessionProcessId();
+    st->program_id = nxusSessionProgramId();
+    st->main_base = nxusSessionMainBase();
+    st->main_size = nxusSessionMainSize();
+    st->hit_count = nxusSessionHitCount();
+    st->progress_permille = nxusSessionProgress();
+    st->last_result = nxusSessionLastResult();
+    st->uptime_ms = (u32)(armTicksToNs(armGetSystemTick()) / 1000000ull);
+    /* The client must not ask for more than one net buffer can carry; saying so
+       keeps the PC-side scanner from silently failing on oversized reads. */
+    /* One reply carries header + payload, so the largest usable read is the buffer
+       minus the header. Advertising the real limit keeps PC-side scans from doing
+       four times the necessary round trips. */
+    st->max_read = NXUS_NET_BUF_SIZE - (u32)sizeof(NxusPacketHeader);
+    {
+        struct mallinfo mi = mallinfo();
+        st->heap_used = (u32)mi.uordblks;
+        st->heap_total = (u32)mi.arena;
+    }
+
+    u32 flags = 0;
+    if (nxusDebugIsAttached()) {
+        /* dmnt is closed (has_process would fail), but we do hold the process. */
+        flags |= NXUS_ST_HAS_PROCESS | NXUS_ST_DEBUG_MODE | NXUS_ST_DEBUG_ATTACHED;
+    } else {
+        bool has_process = false;
+        if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process) {
+            flags |= NXUS_ST_HAS_PROCESS;
+        }
+    }
+    if (nxusSessionIsPaused()) flags |= NXUS_ST_PAUSED;
+    if (nxusSessionScanState() == NxusScanState_Running) flags |= NXUS_ST_SCANNING;
+    st->status_flags = flags;
+}
+
+/* ---- module detection -------------------------------------------------- */
+
+static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
+    const NxusMappingTable *maps = nxusSessionMappings();
+    if (maps == NULL || maps->count == 0) return 0;
+
+    u32 found = 0;
+    u8 page[0x200];
+    for (u32 i = 0; i < maps->count && found < max_modules; i++) {
+        const NxusMappingEntry *m = &maps->entries[i];
+        if (!(m->reserved & NXUS_PERM_R) || m->size < sizeof(page)) continue;
+        if (nxusSessionReadMemory(m->base, page, sizeof(page)) != 0) continue;
+
+        for (u32 off = 0; off + 0x20 <= sizeof(page); off += 4) {
+            if (memcmp(page + off, "MOD0", 4) != 0) continue;
+            memset(&out[found], 0, sizeof(out[found]));
+            out[found].base = m->base;
+            out[found].size = m->size;
+            /* The NSO header sits at the mapping base and carries the build id at
+               +0x40. */
+            memcpy(out[found].build_id, page + 0x40, 0x20);
+
+            /* MOD0 carries no module name (its 0x1C field is RelroStart on
+               19.0.0+), so title NSOs get a positional name.  Do not read a name
+               offset here: the NSO header's ModuleNameOffset is a different
+               struct, and a hostile/garbage offset would escape this 0x200 buffer. */
+            snprintf(out[found].name, sizeof(out[found].name), "mod%u", (unsigned)found);
+            found++;
+            break;
+        }
+    }
+    return found;
+}
+
+/* ---- pointer scan ------------------------------------------------------ */
+
+static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_base) {
+    const NxusMappingTable *maps = nxusSessionMappings();
+    const u64 module_base = nxusSessionMainBase();
+    const u64 module_end = module_base + nxusSessionMainSize();
+    *out_module_base = module_base;
+
+    u32 n = 0;
+    for (u32 i = 0; i < maps->count && n < max_regions; i++) {
+        const NxusMappingEntry *m = &maps->entries[i];
+        if (!(m->reserved & NXUS_PERM_R) || m->size == 0) continue;
+
+        out[n].base = m->base;
+        out[n].size = m->size;
+        /* Chains may only root inside the module's own static data (.data/.bss):
+           anything else moves between sessions. */
+        int is_static = (m->reserved & NXUS_PERM_W) &&
+                        module_base != 0 && module_end > module_base &&
+                        m->base >= module_base && m->base + m->size <= module_end;
+        out[n].kind = is_static ? NXUS_PTRREGION_STATIC : NXUS_PTRREGION_TRAVERSABLE;
+        out[n].reserved = m->reserved;
+        n++;
+    }
+    return n;
+}
+
+static void sendChainList(int fd, u32 seq, u16 type) {
+    u32 payload = (u32)(sizeof(NxusPtrChainListHeader) + g_ChainCount * sizeof(NxusPtrChainWire));
+    u8 *buffer = (u8 *)malloc(payload ? payload : 1);
+    if (buffer == NULL) {
+        replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+        return;
+    }
+    NxusPtrChainListHeader header;
+    memset(&header, 0, sizeof(header));
+    header.count = g_ChainCount;
+    header.total = g_ChainCount;
+    header.truncated = g_PtrStats.truncated;
+    memcpy(buffer, &header, sizeof(header));
+
+    u32 offset = (u32)sizeof(header);
+    for (u32 i = 0; i < g_ChainCount; i++) {
+        NxusPtrChainWire wire;
+        memset(&wire, 0, sizeof(wire));
+        wire.root_offset = g_Chains[i].root_offset;
+        wire.final_offset = g_Chains[i].final_offset;
+        wire.step_count = g_Chains[i].step_count;
+        for (u32 s = 0; s < g_Chains[i].step_count && s < NXUS_PTRSCAN_MAX_DEPTH; s++)
+            wire.steps[s] = g_Chains[i].steps[s];
+        memcpy(buffer + offset, &wire, sizeof(wire));
+        offset += (u32)sizeof(wire);
+    }
+    reply(fd, type, seq, buffer, offset);
+    free(buffer);
+}
+
+static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
+    if (length < sizeof(NxusPtrScanRequest)) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
+    NxusPtrScanRequest req;
+    memcpy(&req, payload, sizeof(req));
+
+    Result rc = nxusSessionRefreshMappings();
+    if (R_FAILED(rc)) { replyError(fd, type, seq, rc); return; }
+
+    const NxusMappingTable *maps = nxusSessionMappings();
+    if (maps->count == 0) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS)); return; }
+
+    u32 region_cap = maps->count + 1;
+    NxusPtrRegion *regions = (NxusPtrRegion *)calloc(region_cap, sizeof(NxusPtrRegion));
+    u8 *scratch = (u8 *)malloc(256 * 1024);
+    if (regions == NULL || scratch == NULL) {
+        free(regions); free(scratch);
+        replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+        return;
+    }
+
+    u64 module_base = 0;
+    u32 region_count = buildPtrRegions(regions, region_cap, &module_base);
+    if (req.module_base != 0) module_base = req.module_base;
+
+    NxusPtrScanOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = req.max_depth ? req.max_depth : 3;
+    if (opts.max_depth > NXUS_PTRSCAN_MAX_DEPTH) opts.max_depth = NXUS_PTRSCAN_MAX_DEPTH;
+    opts.max_offset = req.max_offset ? req.max_offset : 0x1000;
+    opts.max_results = req.max_results ? req.max_results : NXUS_PTRSCAN_MAX_RESULTS;
+    if (opts.max_results > NXUS_PTRSCAN_MAX_RESULTS) opts.max_results = NXUS_PTRSCAN_MAX_RESULTS;
+    opts.value_width = (req.value_width == 8) ? 8 : 4;
+    opts.window_size = 0x400;
+    opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
+
+    NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u regions=%u",
+             (unsigned long long)req.target_address, (unsigned long long)module_base,
+             (unsigned)opts.max_depth, (unsigned)region_count);
+
+    u32 count = 0;
+    int src = nxusPtrScan(regions, region_count, req.target_address, module_base, &opts,
+                          g_Chains, NXUS_PTRSCAN_MAX_RESULTS, &count,
+                          nxusSessionReadCallback, NULL, scratch, 256 * 1024, &g_PtrStats, NULL);
+
+    g_ChainCount = (src == NXUS_SCAN_OK) ? count : 0;
+    g_PtrTarget = req.target_address;
+    g_PtrModuleBase = module_base;
+
+    NXUS_LOG("ptrscan: chains=%u roots=%llu reads=%llu",
+             (unsigned)g_ChainCount, (unsigned long long)g_PtrStats.roots_examined,
+             (unsigned long long)g_PtrStats.reads);
+
+    free(regions);
+    free(scratch);
+
+    if (src != NXUS_SCAN_OK && src != NXUS_SCAN_ERR_CANCELLED) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
+    sendChainList(fd, seq, type);
+}
+
+static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
+    if (length < sizeof(NxusCheatExportRequest)) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
+    NxusCheatExportRequest req;
+    memcpy(&req, payload, sizeof(req));
+    if (req.index >= g_ChainCount) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
+
+    char *text = (char *)malloc(1024);
+    if (text == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); return; }
+
+    int written = nxusCheatGenerate(&g_Chains[req.index], (req.flags & NXUS_CHEAT_F_32BIT) ? 1 : 0,
+                                    req.value, req.value_width ? req.value_width : 4,
+                                    "Nxus", text, 1024);
+    if (written <= 0) replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_UNSUPPORTED));
+    else reply(fd, type, seq, text, (u32)written);
+    free(text);
+}
+
+/* ---- scan results ------------------------------------------------------ */
+
+static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
+    const NxusHitList *hits = nxusSessionHits();
+    const NxusMappingTable *maps = nxusSessionMappings();
+
+    u32 count = req->count;
+    if (count > NXUS_MAX_HITS_PER_BATCH) count = NXUS_MAX_HITS_PER_BATCH;
+    if (req->offset >= hits->count) count = 0;
+    else if (req->offset + count > hits->count) count = hits->count - req->offset;
+
+    u32 map_count = maps->count;
+    u32 payload_size = (u32)sizeof(NxusHitBatchHeader) + map_count * (u32)sizeof(u64) + count * (u32)sizeof(NxusHit);
+    if (payload_size > NXUS_NET_BUF_SIZE) {
+        replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
+        return;
+    }
+
+    u8 *buffer = (u8 *)malloc(payload_size);
+    if (buffer == NULL) {
+        replyError(fd, NxusCmd_ScanGetHits, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+        return;
+    }
+
+    NxusHitBatchHeader header;
+    memset(&header, 0, sizeof(header));
+    header.session_id = nxusSessionId();
+    header.count = count;
+    header.total = hits->count;
+    header.value_size = hits->value_size;
+    header.mapping_count = map_count;
+    memcpy(buffer, &header, sizeof(header));
+
+    u32 offset = (u32)sizeof(header);
+    for (u32 i = 0; i < map_count; i++) {
+        memcpy(buffer + offset, &maps->entries[i].base, sizeof(u64));
+        offset += (u32)sizeof(u64);
+    }
+
+    for (u32 i = 0; i < count; i++) {
+        u32 index = req->offset + i;
+        NxusHit hit;
+        memset(&hit, 0, sizeof(hit));
+        hit.offset = hits->addresses[index].offset;
+        hit.mapping_idx = hits->addresses[index].mapping_idx;
+        hit.value_type = hits->addresses[index].reserved;
+        memcpy(&hit.value, hits->values + (size_t)index * hits->value_size, hits->value_size);
+        memcpy(buffer + offset, &hit, sizeof(hit));
+        offset += (u32)sizeof(hit);
+    }
+
+    reply(fd, NxusCmd_ScanGetHits, seq, buffer, payload_size);
+    free(buffer);
+}
+
+/* ---- main dispatch ----------------------------------------------------- */
+
+void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload, u32 length, void *user) {
+    (void)user;
+    const u16 type = header->type;
+    const u32 seq = header->seq;
+    Result rc = 0;
+
+    /* Any traffic counts as "the PC is still here": without this the pause
+       watchdog would resume the target during a long scan or a hex-edit session,
+       which only sends polls. */
+    nxusSessionHeartbeat();
+
+    /* Pointer scans and snapshots run synchronously here, so while they work the
+       connection thread cannot read the client's heartbeats either.  Tell the
+       watchdog to stay quiet instead of resuming the target mid-operation. */
+    g_CommandActive = true;
+    g_CommandStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
+
+    switch (type) {
+        case NxusCmd_Nop:
+            reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_Heartbeat:
+            nxusSessionHeartbeat();
+            reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_Pause:
+            /* Pause/Resume are dmnt cheat-VM operations.  While we hold a debug
+               session dmnt is closed, so say so instead of reporting a dmnt error
+               the user cannot act on. */
+            if (nxusDebugIsAttached()) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            rc = nxusDmntPause();
+            if (R_SUCCEEDED(rc)) nxusSessionSetPaused(true);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_Resume:
+            if (nxusDebugIsAttached()) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            rc = nxusDmntResume();
+            nxusSessionSetPaused(false);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_ForceOpen:
+            rc = nxusDmntForceOpen();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_ForceClose:
+            rc = nxusDmntForceClose();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_GetStatus: {
+            NxusStatus st;
+            fillStatus(&st);
+            reply(fd, type, seq, &st, sizeof(st));
+            break;
+        }
+
+        case NxusCmd_GetMetadata: {
+            NxusProcessMetadata md;
+            memset(&md, 0, sizeof(md));
+            if (nxusDebugIsAttached()) {
+                /* dmnt is closed: serve the values cached when we attached (the
+                   client is told to scan before attaching so main/heap are filled). */
+                md.process_id = nxusSessionProcessId();
+                md.program_id = nxusSessionProgramId();
+                md.main_nso_base = nxusSessionMainBase();
+                md.main_nso_size = nxusSessionMainSize();
+                reply(fd, type, seq, &md, sizeof(md));
+                break;
+            }
+            rc = nxusDmntGetMetadata(&md);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &md, sizeof(md));
+            break;
+        }
+
+        case NxusCmd_GetMappingCount: {
+            u64 count = 0;
+            if (nxusDebugIsAttached()) {
+                /* dmnt is closed: answer from the snapshot the session built with
+                   svcQueryDebugProcessMemory instead of failing. */
+                const NxusMappingTable *table = nxusSessionMappings();
+                count = table ? table->count : 0;
+                reply(fd, type, seq, &count, sizeof(count));
+                break;
+            }
+            rc = nxusDmntGetMappingCount(&count);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &count, sizeof(count));
+            break;
+        }
+
+        case NxusCmd_GetMappings: {
+            if (length < sizeof(NxusMappingsRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusMappingsRequest req;
+            memcpy(&req, payload, sizeof(req));
+            u32 max_count = req.max_count;
+            if (max_count == 0 || max_count > 1024) max_count = 1024;
+
+            NxusMemoryInfo *buffer = (NxusMemoryInfo *)malloc((size_t)max_count * sizeof(NxusMemoryInfo));
+            if (buffer == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); break; }
+
+            size_t got = 0;
+            if (nxusDebugIsAttached()) {
+                const NxusMappingTable *table = nxusSessionMappings();
+                if (table != NULL) {
+                    for (u32 i = (u32)req.offset; i < table->count && got < max_count; i++) {
+                        const NxusMappingEntry *m = &table->entries[i];
+                        memset(&buffer[got], 0, sizeof(NxusMemoryInfo));
+                        buffer[got].base_addr = m->base;
+                        buffer[got].size = m->size;
+                        /* the snapshot keeps the MemType: without it the PC-side
+                           heap/TLS filters would see every region as "data" */
+                        buffer[got].memory_type = m->type ? m->type : 4;
+                        buffer[got].perm = m->reserved;
+                        got++;
+                    }
+                }
+                reply(fd, type, seq, buffer, (u32)(got * sizeof(NxusMemoryInfo)));
+                free(buffer);
+                break;
+            }
+            rc = nxusDmntGetMappings(buffer, max_count, (size_t)req.offset, &got);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, buffer, (u32)(got * sizeof(NxusMemoryInfo)));
+            free(buffer);
+            break;
+        }
+
+        case NxusCmd_Query: {
+            if (length < sizeof(u64)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            u64 address = 0;
+            memcpy(&address, payload, sizeof(address));
+            NxusMemoryInfo info;
+            memset(&info, 0, sizeof(info));
+            rc = nxusDebugIsAttached() ? nxusDebugQueryMemory(address, &info)
+                                       : nxusDmntQuery(address, &info);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &info, sizeof(info));
+            break;
+        }
+
+        case NxusCmd_Read: {
+            if (length < sizeof(NxusReadRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusReadRequest req;
+            memcpy(&req, payload, sizeof(req));
+            u32 size = req.size;
+            if (size == 0 || size > NXUS_NET_BUF_SIZE - (u32)sizeof(NxusPacketHeader)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE)); break; }
+
+            u8 *buffer = (u8 *)malloc(size);
+            if (buffer == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); break; }
+            /* dmnt's accepted read size is undocumented: on failure retry with
+               half (down to 4 KB) instead of failing the whole request. */
+            u32 want = size;
+            /* sessionRead picks the right source: dmnt:cht, or the debug handle
+               while we hold a debug session (dmnt is closed then, so a direct
+               dmnt call would fail every read - hex view, write read-back, scans). */
+            int read_rc = nxusSessionReadMemory(req.address, buffer, want);
+            while (read_rc != 0 && want > 4096u) {
+                want /= 2;
+                read_rc = nxusSessionReadMemory(req.address, buffer, want);
+            }
+            rc = (read_rc == 0) ? 0 : NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+            if (R_SUCCEEDED(rc)) size = want;
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, buffer, size);
+            free(buffer);
+            break;
+        }
+
+        case NxusCmd_Write: {
+            if (length < sizeof(NxusWriteHeader)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusWriteHeader wh;
+            memcpy(&wh, payload, sizeof(wh));
+            if (wh.size == 0 || length < sizeof(NxusWriteHeader) + wh.size) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            /* While attached to the process dmnt:cht is closed, so the write
+               has to go through the debug handle - otherwise hex editing (and
+               the value patching the user just attached to do) silently fails. */
+            if (nxusDebugIsAttached()) {
+                rc = nxusDebugWriteMemory(wh.address, payload + sizeof(NxusWriteHeader), wh.size);
+            } else {
+                rc = nxusDmntWrite(wh.address, payload + sizeof(NxusWriteHeader), wh.size);
+            }
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+        }
+
+        case NxusCmd_GetModules: {
+            NxusModuleInfo *modules = (NxusModuleInfo *)calloc(NXUS_MAX_MODULES, sizeof(NxusModuleInfo));
+            if (modules == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); break; }
+            u32 found = collectModules(modules, NXUS_MAX_MODULES);
+            reply(fd, type, seq, modules, found * (u32)sizeof(NxusModuleInfo));
+            free(modules);
+            break;
+        }
+
+        case NxusCmd_GetProcesses: {
+            u64 pids[64];
+            s32 count = 0;
+            rc = svcGetProcessList(&count, pids, 64);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, pids, (u32)((count > 0 ? count : 0) * (s32)sizeof(u64)));
+            break;
+        }
+
+        case NxusCmd_ScanBegin:
+        case NxusCmd_ScanNext: {
+            if (length < sizeof(NxusScanRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusScanRequest req;
+            memcpy(&req, payload, sizeof(req));
+            (void)req;
+            /* Optional tail, in this order:
+                 [NxusRangeListHeader + entries]  (only with NXUS_SCAN_F_RANGES)
+                 [NxusScanExt + pattern bytes + wildcard mask] */
+            u32 value_type = NxusValueType_U32;
+            u32 epsilon = 0;
+            const u8 *pattern = NULL;
+            const u8 *mask = NULL;
+            u32 pattern_len = 0;
+            u32 tail = (u32)sizeof(NxusScanRequest);
+
+            if (req.flags & NXUS_SCAN_F_RANGES) {
+                NxusRangeEntry list[NXUS_MAX_SCAN_RANGES];
+                u32 next = 0;
+                int count = nxusParseRangeList(payload, length, &next, list, NXUS_MAX_SCAN_RANGES);
+                if (count < 0) {
+                    /* malformed, or more entries than the protocol allows: reject rather
+                       than clamp, which would read the ext/pattern from the wrong offset */
+                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                    break;
+                }
+                nxusSessionSetScanRanges(list, (u32)count);
+                tail = next;
+            } else if (req.scope == NxusScope_Ranges) {
+                /* list mode without a list: reject instead of scanning nothing */
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            } else {
+                nxusSessionSetScanRanges(NULL, 0);
+            }
+
+            if (length >= tail + sizeof(NxusScanExt)) {
+                NxusScanExt ext;
+                memcpy(&ext, payload + tail, sizeof(ext));
+                value_type = ext.value_type;
+                epsilon = ext.epsilon_decimals;
+                pattern_len = ext.pattern_len;
+                u32 room = length - tail - (u32)sizeof(NxusScanExt);
+                if (pattern_len > room) pattern_len = room;
+                if (pattern_len > NXUS_SCAN_MAX_PATTERN) pattern_len = NXUS_SCAN_MAX_PATTERN;
+                if (pattern_len > 0) {
+                    pattern = payload + tail + sizeof(NxusScanExt);
+                    if ((req.flags & NXUS_SCAN_F_WILDCARD) && room >= pattern_len * 2) {
+                        mask = pattern + pattern_len;
+                    }
+                }
+            }
+            rc = (type == NxusCmd_ScanBegin)
+                    ? nxusSessionScanBegin(&req, value_type, epsilon, pattern, pattern_len, mask)
+                    : nxusSessionScanNext(&req, value_type, epsilon, pattern, pattern_len, mask);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else {
+                NxusStatus st;
+                fillStatus(&st);
+                reply(fd, type, seq, &st, sizeof(st));
+            }
+            break;
+        }
+
+        case NxusCmd_ScanStatus: {
+            NxusStatus st;
+            fillStatus(&st);
+            reply(fd, type, seq, &st, sizeof(st));
+            break;
+        }
+
+        case NxusCmd_ScanCancel:
+            rc = nxusSessionScanCancel();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_ScanReset:
+            nxusSessionReset();
+            reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_ScanUndo: {
+            rc = nxusSessionScanUndo();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else {
+                NxusStatus st;
+                fillStatus(&st);
+                reply(fd, type, seq, &st, sizeof(st));
+            }
+            break;
+        }
+
+        case NxusCmd_ScanGetHits: {
+            /* The worker reallocs the hit arrays while it runs; reading them from
+               the connection thread would be a use-after-free. */
+            if (nxusSessionScanState() == NxusScanState_Running) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
+            if (length < sizeof(NxusGetHitsRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusGetHitsRequest req;
+            memcpy(&req, payload, sizeof(req));
+            sendHits(fd, seq, &req);
+            break;
+        }
+
+        case NxusCmd_SnapshotCapture: {
+            /* Snapshot preparation rebuilds the mapping/region arrays the scan
+               worker is reading, so a running scan must be refused first. */
+            if (nxusSessionScanState() == NxusScanState_Running) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
+            if (length < sizeof(NxusSnapshotRequest)) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            NxusSnapshotRequest req;
+            memcpy(&req, payload, sizeof(req));
+            NxusSnapshotSummary summary;
+            memset(&summary, 0, sizeof(summary));
+            rc = nxusSnapshotTake(req.slot, req.scope, req.range_begin, req.range_end,
+                                  req.block_size, &summary);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &summary, sizeof(summary));
+            break;
+        }
+
+        case NxusCmd_SnapshotDiff: {
+            u32 from_slot = 0, to_slot = 1;
+            if (length >= sizeof(NxusSnapshotDiffRequest)) {
+                NxusSnapshotDiffRequest req;
+                memcpy(&req, payload, sizeof(req));
+                from_slot = req.from_slot;
+                to_slot = req.to_slot;
+            }
+            NxusSnapshotSummary summary;
+            memset(&summary, 0, sizeof(summary));
+            rc = nxusSnapshotCompare(from_slot, to_slot, &summary);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &summary, sizeof(summary));
+            break;
+        }
+
+        case NxusCmd_SnapshotChanged: {
+            u32 offset = 0, count = 1024;
+            if (length >= sizeof(NxusGetHitsRequest)) {
+                NxusGetHitsRequest req;
+                memcpy(&req, payload, sizeof(req));
+                offset = req.offset;
+                if (req.count > 0 && req.count < count) count = req.count;
+            }
+            NxusChangedBlockWire *blocks =
+                (NxusChangedBlockWire *)calloc(count, sizeof(NxusChangedBlockWire));
+            if (blocks == NULL) {
+                replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+                break;
+            }
+            u32 n = nxusSnapshotGetChanged(blocks, count, offset);
+            reply(fd, type, seq, blocks, n * (u32)sizeof(NxusChangedBlockWire));
+            free(blocks);
+            break;
+        }
+
+        case NxusCmd_PtrScanBegin:
+            /* Same reason as SnapshotCapture: the pointer scan walks the mapping
+               snapshot the worker rebuilds under it. */
+            if (nxusSessionScanState() == NxusScanState_Running) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
+            handlePtrScanBegin(fd, type, seq, payload, length);
+            break;
+
+        case NxusCmd_PtrScanGet:
+            sendChainList(fd, seq, type);
+            break;
+
+        case NxusCmd_CheatExport:
+            handleCheatExport(fd, type, seq, payload, length);
+            break;
+
+        case NxusCmd_FrozenList: {
+            if (nxusDebugIsAttached()) {
+                /* dmnt (and with it the freeze list) is closed: an empty list is the
+                   honest answer - the client labels it "no frozen addresses". */
+                reply(fd, type, seq, NULL, 0);
+                break;
+            }
+            u32 max_count = 64;
+            if (length >= sizeof(NxusMappingsRequest)) {
+                NxusMappingsRequest req;
+                memcpy(&req, payload, sizeof(req));
+                if (req.max_count > 0 && req.max_count <= 512) max_count = req.max_count;
+            }
+            NxusFrozenAddressEntry *entries = (NxusFrozenAddressEntry *)calloc(max_count, sizeof(NxusFrozenAddressEntry));
+            NxusFrozenEntry *wire = (NxusFrozenEntry *)calloc(max_count, sizeof(NxusFrozenEntry));
+            if (entries == NULL || wire == NULL) {
+                free(entries); free(wire);
+                replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+                break;
+            }
+            size_t got = 0;
+            rc = nxusDmntGetFrozenEntries(entries, max_count, 0, &got);
+            if (R_FAILED(rc)) {
+                replyError(fd, type, seq, rc);
+            } else {
+                for (size_t i = 0; i < got; i++) {
+                    wire[i].address = entries[i].address;
+                    wire[i].value = entries[i].value;
+                    wire[i].width = entries[i].width;
+                }
+                reply(fd, type, seq, wire, (u32)(got * sizeof(NxusFrozenEntry)));
+            }
+            free(entries); free(wire);
+            break;
+        }
+
+        case NxusCmd_FrozenEnable: {
+            if (length < sizeof(NxusFrozenRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            NxusFrozenRequest req;
+            memcpy(&req, payload, sizeof(req));
+            u64 value = 0;
+            if (nxusDebugIsAttached()) {
+                /* Freezing is a dmnt cheat-VM feature and dmnt is closed while we
+                   hold the debug handle, so answer with a clear result instead of
+                   a dmnt error the client cannot interpret. */
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
+            rc = nxusDmntEnableFrozen(req.address, req.width, &value);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &value, sizeof(value));
+            break;
+        }
+
+        case NxusCmd_FrozenDisable: {
+            if (length < sizeof(u64)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            u64 address = 0;
+            memcpy(&address, payload, sizeof(address));
+            if (nxusDebugIsAttached()) {
+                /* Nothing can be frozen while attached (FrozenEnable answers BUSY),
+                   so there is nothing to remove: acknowledge instead of surfacing a
+                   dmnt error the client cannot act on. */
+                reply(fd, type, seq, NULL, 0);
+                break;
+            }
+            rc = nxusDmntDisableFrozen(address);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+        }
+
+        case NxusCmd_Config: {
+            if (length >= sizeof(NxusConfig)) {
+                memcpy(&g_Config, payload, sizeof(g_Config));
+                nxusSessionSetWatchdogTimeout(g_Config.watchdog_timeout_ms);
+                nxusSessionSetChunkSize(g_Config.chunk_size);
+                nxusHidConfigure(g_Config.hotkey_mask, g_Config.hotkey_hold_ms, g_Config.hotkey_enabled);
+                if (g_Config.hotkey_enabled && g_Config.hotkey_mask != 0) nxusHidStart();
+            }
+            /* optional tail: NxusDebugConfig (watchpoint encoding style) */
+            if (length >= sizeof(NxusConfig) + sizeof(NxusDebugConfig)) {
+                NxusDebugConfig dbg;
+                memcpy(&dbg, payload + sizeof(NxusConfig), sizeof(dbg));
+                nxusDebugConfigure(&dbg);
+                NXUS_LOG("debug config: watch style=%u auto_continue=%u",
+                         (unsigned)dbg.style, (unsigned)dbg.auto_continue);
+            }
+            reply(fd, type, seq, &g_Config, sizeof(g_Config));
+            break;
+        }
+
+        case NxusCmd_LogGet: {
+            static char log[8192];
+            size_t n = nxusLogTail(log, sizeof(log));
+            reply(fd, type, seq, log, (u32)n);
+            break;
+        }
+
+        /* ---- debug mode (own kernel debug session) ---- */
+
+        case NxusCmd_DebugAttach: {
+            u64 pid = 0;
+            if (length >= sizeof(u64)) {
+                memcpy(&pid, payload, sizeof(pid));
+            }
+            if (pid == 0) {
+                pid = nxusSessionProcessId();
+            }
+            if (pid == 0) {
+                NxusProcessMetadata md;
+                memset(&md, 0, sizeof(md));
+                if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) pid = md.process_id;
+            }
+            rc = nxusDebugAttach(pid);
+            if (R_FAILED(rc)) {
+                replyError(fd, type, seq, rc);
+            } else {
+                /* The metadata cached from dmnt describes the PREVIOUS process.  We
+                   cannot ask dmnt for the new one (it is closed while attached), so
+                   reset the identity: an unknown main base makes --scope main fail
+                   visibly instead of quietly scanning another process's address. */
+                /* Only a DIFFERENT process invalidates the cached identity: attaching
+                   to the current game keeps main_base, which the day-1 flow (scan
+                   first, attach afterwards) relies on. */
+                if (pid != nxusSessionProcessId()) {
+                    nxusSessionSetProcessIdentity(pid, 0, 0);
+                }
+                NXUS_LOG("attached to pid=%llu: process info reset (main base unknown "
+                         "until the next dmnt session)", (unsigned long long)pid);
+                NxusDebugStatus st;
+                nxusDebugGetStatus(&st);
+                reply(fd, type, seq, &st, sizeof(st));
+            }
+            break;
+        }
+
+        case NxusCmd_DebugDetach:
+            rc = nxusDebugDetach();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_DebugStatus: {
+            NxusDebugStatus st;
+            nxusDebugGetStatus(&st);
+            reply(fd, type, seq, &st, sizeof(st));
+            break;
+        }
+
+        case NxusCmd_BreakSet: {
+            if (length < sizeof(NxusBreakRequest)) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            NxusBreakRequest request;
+            memcpy(&request, payload, sizeof(request));
+            rc = nxusDebugSetBreak(&request);
+            if (R_FAILED(rc)) {
+                replyError(fd, type, seq, rc);
+            } else {
+                NxusBreakEntry entries[NXUS_DEBUG_SERVER_MAX_BREAKS];
+                u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_MAX_BREAKS);
+                reply(fd, type, seq, entries, n * (u32)sizeof(NxusBreakEntry));
+            }
+            break;
+        }
+
+        case NxusCmd_BreakClear: {
+            if (length < sizeof(u32)) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            u32 slot = 0;
+            memcpy(&slot, payload, sizeof(slot));
+            rc = nxusDebugClearBreak(slot);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+        }
+
+        case NxusCmd_BreakList: {
+            NxusBreakEntry entries[NXUS_DEBUG_SERVER_MAX_BREAKS];
+            u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_MAX_BREAKS);
+            reply(fd, type, seq, entries, n * (u32)sizeof(NxusBreakEntry));
+            break;
+        }
+
+        case NxusCmd_DebugContinue:
+            rc = nxusDebugContinueAll();
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+
+        case NxusCmd_ThreadList: {
+            NxusThreadEntry threads[NXUS_DEBUG_SERVER_MAX_THREADS];
+            u32 n = nxusDebugGetThreads(threads, NXUS_DEBUG_SERVER_MAX_THREADS);
+            reply(fd, type, seq, threads, n * (u32)sizeof(NxusThreadEntry));
+            break;
+        }
+
+        case NxusCmd_RegsGet: {
+            if (length < sizeof(u64)) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            u64 thread_id = 0;
+            memcpy(&thread_id, payload, sizeof(thread_id));
+            NxusThreadContext ctx;
+            memset(&ctx, 0, sizeof(ctx));
+            rc = nxusDebugGetRegs(thread_id, &ctx);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else reply(fd, type, seq, &ctx, sizeof(ctx));
+            break;
+        }
+
+        case NxusCmd_RegsSet: {
+            if (length < sizeof(NxusThreadContext)) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
+            NxusThreadContext ctx;
+            memcpy(&ctx, payload, sizeof(ctx));
+            rc = nxusDebugSetRegs(ctx.thread_id, &ctx);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+        }
+
+        case NxusCmd_HitGet: {
+            u32 count = NXUS_DEBUG_SERVER_MAX_HITS;
+            if (length >= sizeof(NxusGetHitsRequest)) {
+                NxusGetHitsRequest req;
+                memcpy(&req, payload, sizeof(req));
+                if (req.count > 0 && req.count < count) count = req.count;
+            }
+            NxusBreakHit *hits = (NxusBreakHit *)calloc(count, sizeof(NxusBreakHit));
+            if (hits == NULL) {
+                replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+                break;
+            }
+            u32 n = nxusDebugGetHits(hits, count);
+            reply(fd, type, seq, hits, n * (u32)sizeof(NxusBreakHit));
+            free(hits);
+            break;
+        }
+
+        case NxusCmd_HitClear:
+            nxusDebugClearHits();
+            reply(fd, type, seq, NULL, 0);
+            break;
+
+        default:
+            NXUS_LOG("unknown command 0x%04X", (unsigned)type);
+            replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_UNSUPPORTED));
+            break;
+    }
+
+    g_CommandActive = false;
+    /* A handler longer than the watchdog timeout leaves the timer expired, so the
+       next tick would resume a paused target the moment the command returns.
+       Treat the completion as client activity. */
+    nxusSessionHeartbeat();
+}
+
+/* If the PC vanishes while a debug session is open, hand the process back:
+   dmnt stays closed (the game's own cheats are dead) until someone reopens it,
+   so a stale attach must not survive an idle client. */
+static void reapStaleDebugSession(void) {
+    if (!nxusDebugIsAttached()) return;
+    if (!nxusSessionIdleExpired(NXUS_DEBUG_IDLE_TIMEOUT_MS)) return;
+    NXUS_LOG("no client activity for %u ms - detaching the debug session",
+             (unsigned)NXUS_DEBUG_IDLE_TIMEOUT_MS);
+    nxusDebugDetach();
+}
+
+void nxusServerTick(void) {
+    /* Checked first: a long handler (snapshot, pointer scan) blocks the
+       connection thread, so both the pause watchdog and the stale-session
+       reaper would otherwise fire in the middle of it -- the reaper even closes
+       the debug handle the handler is reading through. */
+    if (g_CommandActive) {
+        /* Protect a long legitimate handler, but never for ever: if it is stuck
+           the target would stay paused with no watchdog and no reaper. */
+        const u64 started = g_CommandStartedMs;
+        const u64 now = armTicksToNs(armGetSystemTick()) / 1000000ull;
+        if (started != 0 && now - started < NXUS_COMMAND_GRACE_MS) return;
+        NXUS_LOG("a command has been running for %llu ms - watchdog re-enabled",
+                 (unsigned long long)(now - started));
+        g_CommandActive = false;
+    }
+    reapStaleDebugSession();
+    if (nxusSessionWatchdogExpired(nxusSessionWatchdogTimeout())) {
+        if (nxusDebugIsAttached()) {
+            /* dmnt is closed while we hold a debug session: resuming here would fail
+               and still tell the client "auto-resumed" while the target stays held. */
+            NXUS_LOG("watchdog: skipped while a debug session is attached");
+            return;
+        }
+        Result rc = nxusDmntResume();
+        if (R_SUCCEEDED(rc)) {
+            nxusSessionSetPaused(false);
+            NXUS_LOG("watchdog: auto-resume rc=0x%08X", (unsigned)rc);
+            nxusNetSendEvent(NxusEvent_AutoResume, NULL, 0);
+        } else {
+            NXUS_LOG("watchdog: auto-resume FAILED rc=0x%08X", (unsigned)rc);
+        }
+    }
+}

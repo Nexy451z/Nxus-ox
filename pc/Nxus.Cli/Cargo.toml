@@ -1,0 +1,24 @@
+[package]
+name = "nxus"
+version = "0.1.0-alpha"
+edition = "2021"
+description = "Nxus - Nintendo Switch memory analysis (PC side)"
+
+[[bin]]
+name = "nxus"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui_extras = "0.37"
+serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+# Debug builds of the GUI are painfully slow; use the release profile for deps
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,42 @@
+# ── Release / build outputs (never committed) ──────────────────────────────
+# Rust build cache (pc/Nxus.Cli/target, ~1.7 GB)
+target/
+# Packaged release zips and staged binaries
+release_packages/
+# Staged SD-card layout and PC binary
+dist/
+# Internal docs / notes
+docs/
+switch/npdm_*.bin
+tests/trivial.c
+
+# ── devkitA64 / libnx build trees ─────────────────────────────────────────
+switch/build/
+probe/build/
+*.o
+*.d
+*.elf
+*.nso
+*.nsp
+*.npdm
+*.lst
+*.map
+switch/build.log
+probe/build.log
+
+# ── Host test artifacts ───────────────────────────────────────────────────
+tests/*.exe
+tests/*.log
+*.tmp
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ── Editors / OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*~
