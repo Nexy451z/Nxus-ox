@@ -41,7 +41,9 @@ memory
   read <address> <size>           hex dump
   write <address> <spec>          spec: hex bytes, u32:V, u64:V, i32:V
   dump <file.dmp> [--scope S]     save jnoexs-compatible NDMP RAM dump (default: writable)
-  dump info <file.dmp>            inspect an NDMP dump offline
+  dump info <file>                inspect an NDMP or EdiZon-SE (EDZN/eFZN) dump offline
+  dump export-edizon <in.dmp> <out.dmp> --target <address>
+                                  convert an NDMP dump into a PointerSearcher-SE EDZN dump
   freeze <address> --width N      server-side freeze (no PC polling)
   unfreeze <address>
 
@@ -75,8 +77,10 @@ snapshots (dump-free diffing)
   snapshot changed [--limit N] [--csv FILE]
 
 analysis
-  ptrscan <address> [--depth 3] [--max-offset 0x1000] [--module BASE] [--width 4]
+  ptrscan <address|auto> [--depth 3] [--max-offset 0x1000] [--module BASE] [--width 4]
                     [--pc] [--dump FILE] [--save-dump FILE] [--cheat-value N]
+                    auto (or no address) with --dump FILE uses the target saved in
+                    an EdiZon-SE (EDZN/eFZN) dump
   cheat <index> --value N [--width 4] [--64bit] [--out FILE]
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
                   [--count N] [--seconds N] [--keep]
@@ -233,9 +237,25 @@ pub fn run(args: &[String]) -> i32 {
 fn execute(opts: &Opts) -> Result<()> {
     let command = opts.positional.first().map(|s| s.as_str()).unwrap_or("");
 
-    // Offline commands that operate purely on an NDMP dump file on disk:
+    // Offline commands that operate purely on a dump file on disk:
     if command == "dump" && opts.positional.get(1).map(|s| s.as_str()) == Some("info") {
-        let path = opts.positional.get(2).ok_or_else(|| usage("dump info <file.dmp>"))?;
+        let path = opts.positional.get(2).ok_or_else(|| usage("dump info <file>"))?;
+        if crate::edizon::is_edizon_file(path) {
+            let dump = crate::edizon::EdizonDump::load(path)
+                .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+            println!("format       : EdiZon-SE / PointerSearcher-SE (EDZN/eFZN)");
+            println!("magic        : {:08X} ({})", dump.magic,
+                     if dump.compressed { "LZ8 compressed" } else { "uncompressed" });
+            println!("main         : {:08X} .. {:08X} ({} bytes)",
+                     dump.main_base, dump.main_end,
+                     dump.main_end.saturating_sub(dump.main_base));
+            println!("heap         : {:08X} .. {:08X} ({} bytes)",
+                     dump.heap_base, dump.heap_end,
+                     dump.heap_end.saturating_sub(dump.heap_base));
+            println!("target       : {:08X}", dump.target);
+            println!("pairs        : {}", dump.pairs.len());
+            return Ok(());
+        }
         let dump = crate::dump::MemoryDump::load(path)
             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
         let (main_base, main_size) = dump.infer_main_module();
@@ -250,8 +270,60 @@ fn execute(opts: &Opts) -> Result<()> {
         }
         return Ok(());
     }
+    if command == "dump" && opts.positional.get(1).map(|s| s.as_str()) == Some("export-edizon") {
+        let usage_text = "dump export-edizon <in.dmp> <out.dmp> --target <address>";
+        let in_path = opts.positional.get(2).ok_or_else(|| usage(usage_text))?;
+        let out_path = opts.positional.get(3).ok_or_else(|| usage(usage_text))?;
+        let target = opts.num("target").ok_or_else(|| usage(usage_text))?;
+        let dump = crate::dump::MemoryDump::load(in_path)
+            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+        let pairs = crate::edizon::export_ndmp_to_edizon(&dump, target, None, None, out_path)
+            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+        println!("wrote EdiZon-SE pointer dump to {} ({} pairs, target {:08X})",
+                 out_path, pairs, target);
+        return Ok(());
+    }
     if command == "ptrscan" {
         if let Some(dump_path) = opts.flag("dump") {
+            let depth = opts.num("depth").unwrap_or(3) as u32;
+            let max_offset = opts.num("max-offset").unwrap_or(0x1000) as u32;
+            let max_results = opts.num("max").unwrap_or(64) as usize;
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+
+            if crate::edizon::is_edizon_file(dump_path) {
+                let dump = crate::edizon::EdizonDump::load(dump_path)
+                    .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+                let module_base = opts.num("module").unwrap_or(dump.main_base);
+                let raw_addr = opts.positional.get(1).map(|s| s.as_str()).unwrap_or("auto");
+                let target = if raw_addr.eq_ignore_ascii_case("auto") {
+                    dump.target
+                } else if let Some(rest) = raw_addr.strip_prefix("main+") {
+                    module_base + parse_number(rest)?
+                } else {
+                    parse_number(raw_addr).or_else(|_| {
+                        let bare = raw_addr.trim().replace('_', "");
+                        u64::from_str_radix(&bare, 16)
+                            .map_err(|_| NxusError { message: format!("not an address: {}", raw_addr), result: None })
+                    })?
+                };
+                let width = opts.num("width").unwrap_or(8) as u32;
+                let res = crate::edizon::ptrscan_edizon(
+                    &dump,
+                    &crate::dump::PtrScanOptions {
+                        target,
+                        module_base,
+                        module_size: dump.main_end.saturating_sub(dump.main_base),
+                        max_depth: depth,
+                        max_offset,
+                        width,
+                        max_results,
+                    },
+                    &cancel,
+                );
+                print_ptrscan_chains(&res.chains, res.truncated, "EdiZon dump", opts)?;
+                return Ok(());
+            }
+
             let dump = crate::dump::MemoryDump::load(dump_path)
                 .map_err(|e| NxusError { message: e.to_string(), result: None })?;
             let (inferred_base, inferred_size) = dump.infer_main_module();
@@ -266,11 +338,7 @@ fn execute(opts: &Opts) -> Result<()> {
                         .map_err(|_| NxusError { message: format!("not an address: {}", raw_addr), result: None })
                 })?
             };
-            let depth = opts.num("depth").unwrap_or(3) as u32;
-            let max_offset = opts.num("max-offset").unwrap_or(0x1000) as u32;
             let width = opts.num("width").unwrap_or(4) as u32;
-            let max_results = opts.num("max").unwrap_or(64) as usize;
-            let cancel = std::sync::atomic::AtomicBool::new(false);
             let res = crate::dump::ptrscan_dump(
                 &dump,
                 &crate::dump::PtrScanOptions {

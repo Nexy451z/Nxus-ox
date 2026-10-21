@@ -58,8 +58,11 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 - **Context View (`--around` & GUI `Disasm` Tab)**: Displays instructions before and after any target address or hitting `PC` with `=>` markers, `<main+0x...>` module offsets, and full register state (`PC`, `LR`, `SP`, `CPSR`, `R0..R12` / `X0..X28`).
 - **Live RX Code Patching**: Write directly to executable `.text` (`RX`) pages via `svcWriteDebugProcessMemory` (which performs full-system instruction cache invalidation across all cores). Includes 1-click **[NOP]** patching in the GUI (`00 00 A0 E1` for ARM32, `00 BF` / `AF F3 00 80` for Thumb, `1F 20 03 D5` for AArch64).
 
-### 4. Pointer Scanner, RAM Dump (`NDMP`), & Snapshot Diff
+### 4. Pointer Scanner, Cross-Tool Dump Compatibility (`Jnoexs` & `EdiZon-SE`), & Snapshot Diff
 - **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
+- **Full Jnoexs (`NDMP`) & EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN`) Dump Interoperability**:
+  - **Jnoexs (`NDMP` `.dmp`)**: 100% byte-for-byte compatible with Jnoexs (`MemoryDump.java`) and Takumi4685's PointerSearcher.
+  - **EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN` / `FDZN` / `fFZN` `.dmp*`)**: Directly loads and decompresses (LZ8) EdiZon-SE pointer dumps (`nxus dump info <file>`, `nxus ptrscan auto --dump <file>`, or via the GUI **Scan dump...** button), and can export/convert any `NDMP` dump into a PointerSearcher-SE compatible `EDZN` dump (`nxus dump export-edizon <in.dmp> <out.dmp1> --target <ADDR>`).
 - **Block Snapshot Diff (`core/nxus_snapshot.c`)**: Hashes memory in 16 KiB blocks (`Capture A` → `Capture B` → `Diff`) to locate changed structures without dumping gigabytes over the network.
 
 ---
@@ -185,7 +188,7 @@ bash tools/build_pc.sh
 # 1. Host C Core Tests (1,010 checks: scanner, fast paths, chunk boundaries, ptrscan, snapshot, hotkey)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (27 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, pcscan)
+# 2. Rust Unit Tests (34 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
 # 3. Python + Rust CLI End-to-End Tests against MockSwitch (75 tests)

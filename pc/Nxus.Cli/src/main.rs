@@ -13,6 +13,7 @@
 mod cli;
 mod client;
 mod dump;
+mod edizon;
 mod gui;
 mod pcscan;
 mod png;

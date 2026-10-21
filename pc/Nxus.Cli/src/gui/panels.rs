@@ -409,7 +409,8 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                     }, "saving NDMP dump");
                 }
             }
-            if ui.button("Scan NDMP...").on_hover_text("Run pointer scan offline on a saved .dmp file").clicked() {
+            if ui.button("Scan dump...").on_hover_text(
+                "Run pointer scan offline on a saved dump: Nxus NDMP or EdiZon-SE / PointerSearcher-SE EDZN/eFZN").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     app.send(Cmd::PtrScanPc {
                         target: app.hex.cursor,
@@ -417,7 +418,7 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                         depth: app.prefs.ptr_depth,
                         max_offset: app.prefs.ptr_max_offset,
                         dump_path: Some(path.to_string_lossy().to_string()),
-                    }, "scanning NDMP dump");
+                    }, "scanning dump");
                 }
             }
         });

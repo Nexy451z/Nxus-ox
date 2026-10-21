@@ -165,25 +165,51 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                 }
                 Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: Some(path) } => {
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
-                    let dump = crate::dump::MemoryDump::load(&path).map_err(|e| e.to_string())?;
-                    let (inf_base, inf_size) = dump.infer_main_module();
-                    let res = crate::dump::ptrscan_dump(
-                        &dump,
-                        &crate::dump::PtrScanOptions {
-                            target,
-                            module_base: if module_base != 0 { module_base } else { inf_base },
-                            module_size: inf_size,
-                            max_depth: depth,
-                            max_offset,
-                            width: 4,
-                            max_results: 64,
-                        },
-                        &cancel,
-                    );
-                    let note = if res.truncated { " - TRUNCATED" } else { "" };
-                    let _ = tx.send(Ev::Message(format!("NDMP pointer scan: {} chain(s) from {}{}",
-                                                        res.chains.len(), path, note)));
-                    let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                    if crate::edizon::is_edizon_file(&path) {
+                        let dump = crate::edizon::EdizonDump::load(&path).map_err(|e| e.to_string())?;
+                        // Offline: the GUI may have no live module base, and the
+                        // cursor may be 0 - fall back to what the dump recorded.
+                        let target = if target != 0 { target } else { dump.target };
+                        let module_base = if module_base != 0 { module_base } else { dump.main_base };
+                        let res = crate::edizon::ptrscan_edizon(
+                            &dump,
+                            &crate::dump::PtrScanOptions {
+                                target,
+                                module_base,
+                                module_size: dump.main_end.saturating_sub(dump.main_base),
+                                max_depth: depth,
+                                max_offset,
+                                width: 8,
+                                max_results: 64,
+                            },
+                            &cancel,
+                        );
+                        let note = if res.truncated { " - TRUNCATED" } else { "" };
+                        let _ = tx.send(Ev::Message(format!(
+                            "EdiZon pointer scan: {} chain(s) from {} ({} pointer(s)){}",
+                            res.chains.len(), path, res.pointers_indexed, note)));
+                        let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                    } else {
+                        let dump = crate::dump::MemoryDump::load(&path).map_err(|e| e.to_string())?;
+                        let (inf_base, inf_size) = dump.infer_main_module();
+                        let res = crate::dump::ptrscan_dump(
+                            &dump,
+                            &crate::dump::PtrScanOptions {
+                                target,
+                                module_base: if module_base != 0 { module_base } else { inf_base },
+                                module_size: inf_size,
+                                max_depth: depth,
+                                max_offset,
+                                width: 4,
+                                max_results: 64,
+                            },
+                            &cancel,
+                        );
+                        let note = if res.truncated { " - TRUNCATED" } else { "" };
+                        let _ = tx.send(Ev::Message(format!("NDMP pointer scan: {} chain(s) from {}{}",
+                                                            res.chains.len(), path, note)));
+                        let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                    }
                 }
                 other => {
                     let c = client.as_ref().ok_or("not connected")?;

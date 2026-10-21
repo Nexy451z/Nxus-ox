@@ -987,4 +987,58 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
+
+    /// Byte-for-byte golden file produced by the REAL jnoexs `MemoryDump.java`
+    /// writer (via `.tmp_ndmp_compat/java/src/JnoexsDriver.java`, `write_min`):
+    /// tid 0x0100C3800049C000, one 16-byte region at 0x1000 (type 2, perm 3),
+    /// data 00..0F.  0x32 header + 0x10 data + 0x18 index + 0x18 info = 114 bytes.
+    const JNOEXS_MIN_DMP_114: [u8; 114] = [
+        0x4e, 0x44, 0x4d, 0x50, 0x01, 0x00, 0xc3, 0x80, 0x00, 0x49, 0xc0, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+    ];
+
+    #[test]
+    fn ndmp_bytes_match_jnoexs_memorydump_java() {
+        let dump = MemoryDump {
+            tid: 0x0100_C380_0049_C000,
+            infos: vec![info(0x1000, 0x10, 2, 3)],
+            indices: vec![DumpIndex { addr: 0x1000, file_pos: NDMP_DATA_OFFSET, size: 0x10 }],
+            data_base: NDMP_DATA_OFFSET,
+            data: (0u8..16).collect(),
+        };
+
+        let path = std::env::temp_dir()
+            .join(format!("nxus_jnoexs_golden_{}.dmp", std::process::id()));
+        let path = path.to_string_lossy().to_string();
+        dump.save(&path).expect("save golden NDMP");
+        let bytes = std::fs::read(&path).expect("read golden NDMP");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(bytes.len(), 114, "jnoexs minimal dump must stay 114 bytes");
+        assert_eq!(
+            bytes.as_slice(),
+            JNOEXS_MIN_DMP_114.as_slice(),
+            "NDMP writer drifted from MemoryDump.java"
+        );
+
+        // ... and the loader must accept the same real-jnoexs layout.
+        let path = std::env::temp_dir()
+            .join(format!("nxus_jnoexs_golden_read_{}.dmp", std::process::id()));
+        let path = path.to_string_lossy().to_string();
+        std::fs::write(&path, &JNOEXS_MIN_DMP_114).expect("write golden NDMP");
+        let loaded = MemoryDump::load(&path).expect("load real jnoexs byte layout");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.tid, 0x0100_C380_0049_C000);
+        assert_eq!(loaded.infos.len(), 1);
+        assert_eq!(loaded.indices.len(), 1);
+        assert_eq!(loaded.read(0x1000, 16), Some(&(0u8..16).collect::<Vec<_>>()[..]));
+    }
 }
