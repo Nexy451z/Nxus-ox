@@ -115,13 +115,44 @@ fn console_scan_stats(c: &NxusClient) -> String {
         .unwrap_or_default()
 }
 
+/// Idle keep-alive period.  The console's watchdog resumes a paused target when
+/// it hears nothing for its own timeout, so even an idle PC has to keep talking.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
+/// Deadline for one keep-alive.  Deliberately short: a Switch that went to sleep
+/// (or a Wi-Fi link that dropped) must be noticed in seconds instead of after the
+/// 30 s a normal request would wait for its reply.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How often a disconnected-but-wanted session is retried in the background.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One silent reconnect attempt: connect, prove the session works with a status
+/// request, and hand both back.  On failure the half-open socket is dropped (the
+/// `Drop` impl sends the FIN), so no stale session is left on the console.
+fn try_reconnect(host: &str, port: u16) -> Option<(NxusClient, Status)> {
+    let c = NxusClient::connect(host, port).ok()?;
+    match c.status() {
+        Ok(st) => Some((c, st)),
+        Err(_) => None,
+    }
+}
+
 fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let mut client: Option<NxusClient> = None;
     let mut pc_scan: Option<crate::pcscan::PcScan> = None;
     let mut prev_pc_scan: Option<crate::pcscan::PcScan> = None;
 
+    // Where to go back to, and whether a session is still wanted.  A manual
+    // Disconnect clears `want_connected`, so the worker never reconnects behind
+    // the user's back; pressing Connect again re-arms it.
+    let mut last_host: Option<String> = None;
+    let mut last_port: u16 = P::DEFAULT_PORT;
+    let mut want_connected = false;
+    // What the UI currently believes.  Only real transitions are reported, so a
+    // console that stays away does not fill the log with "disconnected" lines.
+    let mut ui_connected = false;
 
     let mut last_heartbeat = Instant::now();
+    let mut last_reconnect = Instant::now();
 
     loop {
         let cmd = match rx.recv_timeout(Duration::from_millis(25)) {
@@ -132,11 +163,57 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
 
         // The console resumes a paused target if it hears nothing for the
         // watchdog timeout, so an idle PC (user staring at the hex editor) must
-        // keep saying it is alive.
-        if client.is_some() && last_heartbeat.elapsed() >= Duration::from_secs(4) {
-            last_heartbeat = Instant::now();
-            if let Some(c) = client.as_ref() {
-                let _ = c.heartbeat();
+        // keep saying it is alive.  A failed keep-alive means the link is gone
+        // (Switch asleep, Wi-Fi dropped, cable pulled): drop the socket, try once
+        // to rebuild the session, and tell the UI what happened.
+        let heartbeat_failed = match client.as_ref() {
+            Some(c) if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL => {
+                last_heartbeat = Instant::now();
+                c.heartbeat_timeout(HEARTBEAT_TIMEOUT).is_err()
+            }
+            _ => false,
+        };
+        if heartbeat_failed {
+            client = None;                       // Drop sends the FIN right away
+            last_reconnect = Instant::now();
+            let reconnected = last_host.as_deref()
+                .and_then(|host| try_reconnect(host, last_port)
+                    .map(|(c, st)| (host.to_string(), c, st)));
+            match reconnected {
+                Some((host, new_client, status)) => {
+                    // Same console, same session from the UI's point of view: a
+                    // status push keeps CONNECTED and the panels live.
+                    client = Some(new_client);
+                    ui_connected = true;
+                    let _ = tx.send(Ev::Status(status));
+                    let _ = tx.send(Ev::Message(format!("link lost - reconnected to {}:{}", host, last_port)));
+                }
+                None => {
+                    if ui_connected {
+                        ui_connected = false;
+                        let _ = tx.send(Ev::Disconnected);
+                        let _ = tx.send(Ev::Message(
+                            "connection lost - retrying in the background".into()));
+                    }
+                }
+            }
+        }
+
+        // Nothing connected but the session is still wanted: keep retrying so a
+        // Switch waking up (or Wi-Fi coming back) turns into CONNECTED by itself.
+        if client.is_none() && want_connected && last_host.is_some()
+            && last_reconnect.elapsed() >= RECONNECT_INTERVAL {
+            last_reconnect = Instant::now();
+            if let Some(host) = last_host.as_deref() {
+                if let Some((new_client, status)) = try_reconnect(host, last_port) {
+                    let metadata = new_client.metadata().ok();
+                    let host = host.to_string();
+                    let _ = tx.send(Ev::Connected { status, metadata });
+                    let _ = tx.send(Ev::Message(format!("auto-reconnected to {}:{}", host, last_port)));
+                    client = Some(new_client);
+                    ui_connected = true;
+                    last_heartbeat = Instant::now();
+                }
             }
         }
 
@@ -151,15 +228,43 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
         let outcome: Result<(), String> = (|| {
             match cmd {
                 Cmd::Connect { host, port } => {
-                    let c = NxusClient::connect(&host, port).map_err(|e| e.to_string())?;
-                    let status = c.status().map_err(|e| e.to_string())?;
-                    let metadata = c.metadata().ok();
-                    client = Some(c);
-                    let _ = tx.send(Ev::Connected { status, metadata });
-                    let _ = tx.send(Ev::Message(format!("connected to {}:{}", host, port)));
+                    // Close the old session BEFORE opening the new one: two live
+                    // connections to the same console fight over the read thread
+                    // and leave a half-dead socket holding a pending request map.
+                    client = None;
+                    last_host = Some(host.clone());
+                    last_port = port;
+                    want_connected = true;             // re-arm background recovery
+                    let attempt = NxusClient::connect(&host, port).and_then(|c| {
+                        let status = c.status()?;
+                        let metadata = c.metadata().ok();
+                        Ok((c, status, metadata))
+                    });
+                    last_reconnect = Instant::now();   // the retry loop waits a full interval
+                    match attempt {
+                        Ok((c, status, metadata)) => {
+                            client = Some(c);
+                            ui_connected = true;
+                            last_heartbeat = Instant::now();   // no keep-alive on the fresh socket yet
+                            let _ = tx.send(Ev::Connected { status, metadata });
+                            let _ = tx.send(Ev::Message(format!("connected to {}:{}", host, port)));
+                        }
+                        Err(e) => {
+                            // The old session is already gone, so the UI must stop
+                            // claiming CONNECTED: the background retry loop below
+                            // is silent until it actually finds a console.
+                            ui_connected = false;
+                            let _ = tx.send(Ev::Disconnected);
+                            return Err(e.to_string());
+                        }
+                    }
                 }
                 Cmd::Disconnect => {
+                    // The user wants it gone: stop the automatic recovery, or the
+                    // worker would reconnect a moment later and undo the click.
+                    want_connected = false;
                     client = None;
+                    ui_connected = false;
                     let _ = tx.send(Ev::Disconnected);
                     let _ = tx.send(Ev::Message("disconnected".into()));
                 }

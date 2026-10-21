@@ -203,24 +203,52 @@ static void recordHit(const DebugEventInfo *event) {
     memset(&hit, 0, sizeof(hit));
 
     const u32 bp_type = event->info.exception.specific.break_point.type;
-    hit.address = (u64)event->info.exception.specific.break_point.address;
+    /* On hardware the kernel frequently reports 0 in break_point.address for a
+       watchpoint exception (observed: "last watch addr=00000000 pc=21122038"), so
+       the raw field is useless for matching.  Fall back to the exception address
+       first and to the armed slot's address afterwards. */
+    u64 raw_addr = (u64)event->info.exception.specific.break_point.address;
+    if (raw_addr == 0) raw_addr = (u64)event->info.exception.address;
+
+    hit.address = raw_addr;
     hit.kind = (bp_type == BreakPointType_HardwareData) ? NxusBp_Write : NxusBp_Execute;
     hit.thread_id_low = (u32)event->thread_id;
     hit.slot = 0xFFFFFFFFu;
 
     /* The exception reports the value the breakpoint was programmed with, which is
        the aligned address, not necessarily the address the user asked for.  Match
-       either form and report the user's address so the PC can identify the hit. */
-    for (u32 i = 0; i < g_BreakCount; i++) {
-        if (!g_Breaks[i].enabled) continue;
-        const bool exact = (g_Breaks[i].address == hit.address);
-        const bool same_word = (g_Breaks[i].kind == NxusBp_Execute)
-                                   ? ((g_Breaks[i].address & ~3ull) == (hit.address & ~3ull))
-                                   : ((g_Breaks[i].address & ~7ull) == (hit.address & ~7ull));
-        if (exact || same_word) {
+       either form and report the user's address so the PC can identify the hit.
+       Skipped when the kernel gave us nothing: comparing 0 would match any
+       breakpoint armed in the lowest 8-byte word. */
+    if (raw_addr != 0) {
+        for (u32 i = 0; i < g_BreakCount; i++) {
+            if (!g_Breaks[i].enabled) continue;
+            const bool exact = (g_Breaks[i].address == hit.address);
+            const bool same_word = (g_Breaks[i].kind == NxusBp_Execute)
+                                       ? ((g_Breaks[i].address & ~3ull) == (hit.address & ~3ull))
+                                       : ((g_Breaks[i].address & ~7ull) == (hit.address & ~7ull));
+            if (exact || same_word) {
+                hit.slot = g_Breaks[i].slot;
+                hit.kind = g_Breaks[i].kind;
+                if (hit.kind != NxusBp_Execute) hit.address = g_Breaks[i].address;
+                break;
+            }
+        }
+    }
+
+    /* No usable address from the kernel: attribute the hit to the armed slot whose
+       type matches the exception (a data watchpoint exception can only come from a
+       watch slot, an instruction breakpoint only from an execution slot).  Without
+       this the PC sees slot=0xFFFFFFFF/addr=0 and cannot map the hit at all. */
+    if (hit.slot == 0xFFFFFFFFu) {
+        const bool want_exec = (bp_type != BreakPointType_HardwareData);
+        for (u32 i = 0; i < g_BreakCount; i++) {
+            if (!g_Breaks[i].enabled) continue;
+            const bool is_exec = (g_Breaks[i].kind == NxusBp_Execute);
+            if (is_exec != want_exec) continue;
             hit.slot = g_Breaks[i].slot;
             hit.kind = g_Breaks[i].kind;
-            if (hit.kind != NxusBp_Execute) hit.address = g_Breaks[i].address;
+            if (hit.address == 0) hit.address = g_Breaks[i].address;
             break;
         }
     }

@@ -162,9 +162,25 @@ int main(int argc, char *argv[]) {
 
     NXUS_LOG("ready - connect with the PC client on port %u", (unsigned)NXUS_DEFAULT_PORT);
 
+    /* Sleep/wake detection.  armGetSystemTick() keeps counting while the console
+       is suspended, so one "100 ms" sleep that took 3 s or more can only mean the
+       Switch was asleep.  Every socket the sysmodule holds is stale by then (the
+       PC client has timed out too), so drop the old connection and rebuild the
+       listener - the PC reconnects to a live :7332 instead of hitting
+       "connection refused" or a half-open session. */
+    u64 last_tick = armGetSystemTick();
     while (true) {
         nxusServerTick();
         svcSleepThread(100000000ull);   /* 100ms watchdog tick */
+
+        const u64 now_tick = armGetSystemTick();
+        const u64 gap_ns = armTicksToNs(now_tick - last_tick);
+        if (gap_ns > 3000000000ull) {
+            NXUS_LOG("sleep/wake detected (%llu ms in one 100 ms tick) - resetting network",
+                     (unsigned long long)(gap_ns / 1000000ull));
+            nxusNetRequestReset("sleep-wake");
+        }
+        last_tick = now_tick;
     }
 
     return 0;

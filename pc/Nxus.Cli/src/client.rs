@@ -148,7 +148,9 @@ pub struct NxusClient {
     pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
     events: Mutex<Receiver<Event>>,
     seq: Mutex<u32>,
-    running: Arc<Mutex<bool>>,
+    /// Shared with the reader thread; an `AtomicBool` (not a `Mutex<bool>`) so `Drop`
+    /// can flag it without ever blocking behind a busy lock.
+    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Text for an I/O error that is safe to show in the GUI.
@@ -191,12 +193,18 @@ impl NxusClient {
         stream
             .set_read_timeout(Some(Duration::from_millis(200)))
             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+        // Without a write deadline a dead link makes `write_all` block for
+        // minutes: the TCP stack keeps retrying and the request never fails, so
+        // the GUI would look frozen instead of noticing the console went away.
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
         let reader_stream = stream
             .try_clone()
             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
 
         let pending: Arc<Mutex<HashMap<u32, Sender<Response>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let running = Arc::new(Mutex::new(true));
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
         {
@@ -237,12 +245,19 @@ impl NxusClient {
         put_u32(&mut header, payload.len() as u32);
         put_u32(&mut header, seq);
 
-        {
+        // The write happens with no reply registered yet, so a failed send has to
+        // unregister the request itself: the reader thread never will, and the
+        // map would grow by one dead entry per failed request on a dying link.
+        let sent = {
             let mut stream = self.stream.lock().unwrap();
             stream
                 .write_all(&header)
                 .and_then(|_| stream.write_all(payload))
-                .map_err(|e| NxusError { message: format!("send failed: {}", e), result: None })?;
+                .and_then(|_| stream.flush())
+        };
+        if let Err(e) = sent {
+            self.pending.lock().unwrap().remove(&seq);
+            return Err(NxusError { message: format!("send failed: {}", e), result: None });
         }
 
         match rx.recv_timeout(timeout) {
@@ -298,6 +313,15 @@ impl NxusClient {
 
     pub fn heartbeat(&self) -> Result<()> {
         self.request(cmd::HEARTBEAT, &[]).map(|_| ())
+    }
+
+    /// Heartbeat with a caller-chosen deadline.
+    ///
+    /// The GUI's idle keep-alive uses this: the default 30 s of `request` would
+    /// keep a sleeping console looking connected for half a minute, while a
+    /// console that is awake answers in milliseconds.
+    pub fn heartbeat_timeout(&self, timeout: Duration) -> Result<()> {
+        self.request_timeout(cmd::HEARTBEAT, &[], timeout).map(|_| ())
     }
 
     pub fn force_open(&self) -> Result<()> {
@@ -750,8 +774,13 @@ impl NxusClient {
 
 impl Drop for NxusClient {
     fn drop(&mut self) {
-        if let Ok(mut running) = self.running.lock() {
-            *running = false;
+        self.running.store(false, Ordering::SeqCst);
+        // A graceful shutdown sends the FIN immediately, so the console drops the
+        // session and the reader thread's blocking read wakes up in milliseconds
+        // instead of after the next read timeout.  This is what lets the GUI open
+        // a fresh connection right after dropping the old one.
+        if let Ok(s) = self.stream.lock() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
 }
@@ -784,10 +813,10 @@ fn parse_chains(body: &[u8]) -> (Vec<PtrChain>, bool) {
 }
 
 fn reader_loop(mut stream: TcpStream, pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
-               events: Sender<Event>, running: Arc<Mutex<bool>>) {
+               events: Sender<Event>, running: Arc<std::sync::atomic::AtomicBool>) {
     let mut header = [0u8; HEADER_SIZE];
     loop {
-        if !*running.lock().unwrap() {
+        if !running.load(Ordering::SeqCst) {
             break;
         }
         if !read_exact(&mut stream, &mut header) {

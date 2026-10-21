@@ -4,6 +4,12 @@
  * One client at a time (dmnt:cht only allows two debug sessions, so Nxus takes
  * exactly one).  Sends are serialised through a mutex because the response
  * thread, the watchdog and (later) the HID thread all write to the same socket.
+ *
+ * Reconnects are preemptive: a client waiting for the next command watches the
+ * listen socket as well, so a new connection kicks the half-open one out instead
+ * of queueing behind it.  After a sleep/wake cycle (or a dropped link) the bsd
+ * session itself is rebuilt on the fly, so the port never stays dead and a
+ * reconnect succeeds immediately.
  */
 #pragma once
 
@@ -38,3 +44,9 @@ Result nxusNetSendEvent(u16 type, const void *payload, u32 length);
 
 /* Send a response, splitting large payloads is the caller's problem for now. */
 Result nxusNetRespond(u32 seq, const void *payload, u32 length);
+
+/* Ask the server thread to drop the current client and rebuild the listener from
+ * scratch (sleep/wake, Wi-Fi rejoin, any other stale-bsd situation).  The flag is
+ * picked up by the protocol thread within one poll slice (~200 ms), so the call
+ * is safe from any thread and never blocks.  `reason` only shows up in the log. */
+void   nxusNetRequestReset(const char *reason);
