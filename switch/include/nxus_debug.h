@@ -38,6 +38,24 @@ Result nxusDebugGetRegs(u64 thread_id, NxusThreadContext *out);
 Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in);
 Result nxusDebugContinueAll(void);
 
+/* GDB-style stop management.  With auto_continue == 0 (the default) a breakpoint
+   or watchpoint hit stops the target and leaves it stopped until the PC asks for
+   DebugContinue or DebugStep.  While stopped the kernel keeps every thread of the
+   process debug-suspended, so registers and memory stay readable. */
+bool   nxusDebugIsStopped(void);
+u64    nxusDebugStoppedThread(void);
+/* Stores the mode and reports whether it is in effect.  Returns false only when
+   auto-continue was enabled but a held target could not be released. */
+bool   nxusDebugSetAutoContinue(u32 enabled);
+
+/* Run a single instruction and stay stopped.  thread_id == 0 means "the thread the
+   last stop was published for".  Falls back to "resume briefly, disarm/re-arm"
+   when the kernel has no hardware single-step support. */
+Result nxusDebugStep(u64 thread_id);
+/* Stop the target without a breakpoint (svcBreakDebugProcess): the debug-session
+   equivalent of Pause.  The stop is published like a hit. */
+Result nxusDebugBreak(void);
+
 void   nxusDebugConfigure(const NxusDebugConfig *config);
 void   nxusDebugGetConfig(NxusDebugConfig *out);
 

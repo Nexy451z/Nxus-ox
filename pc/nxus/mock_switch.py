@@ -176,6 +176,11 @@ class MockSwitch:
         self.changed: list = []
         self.changed_truncated = 0
         self.hotkey = dict(mask=0, hold_ms=0, enabled=0)
+        # NxusDebugConfig.auto_continue (0 = GDB-style hold, the sysmodule default;
+        # 1 = resume after a hit) and the thread the console is holding
+        # (NxusDebugStatus.stopped_thread_low).
+        self.auto_continue = 0
+        self.stopped_thread = 0
         self.value_type = P.VT_U32
         self.pattern = b''
         # mirrors NXUS_NET_BUF_SIZE - header in shared/nxus_net.h
@@ -406,6 +411,10 @@ class MockSwitch:
             flags |= P.ST['NXUS_ST_PAUSED']
         if self.scan_state == P.SCAN_STATE['NxusScanState_Running']:
             flags |= P.ST['NXUS_ST_SCANNING']
+        if self.attached:
+            flags |= P.ST['NXUS_ST_DEBUG_MODE'] | P.ST['NXUS_ST_DEBUG_ATTACHED']
+        if self.stopped_thread:
+            flags |= P.ST['NXUS_ST_DEBUG_STOPPED']
         flags |= P.ST['NXUS_ST_HAS_PROCESS']
         return P.STATUS.pack(P.PROTO_VERSION, P.MODE['NXUS_MODE_DMNT'], flags, self.scan_state,
                              0x1234, 0x0100C3800049C000, MAIN_BASE, MAIN_SIZE,
@@ -493,11 +502,13 @@ class MockSwitch:
             req_pid = int.from_bytes(payload[:8], 'little') if len(payload) >= 8 else 0
             self.attached = True
             self.attached_pid = req_pid if req_pid != 0 else 0x82
+            self.stopped_thread = 0
             self.last_result = 0
             return self._debug_status()
         if cmd == P.CMD['DebugDetach']:
             self.attached = False
             self.breaks = []
+            self.stopped_thread = 0
             return b''
         if cmd == P.CMD['DebugStatus']:
             return self._debug_status()
@@ -531,6 +542,19 @@ class MockSwitch:
         if cmd == P.CMD['BreakList']:
             return self._break_list()
         if cmd == P.CMD['DebugContinue']:
+            self.stopped_thread = 0
+            return b''
+        if cmd == P.CMD['DebugStep']:
+            # nxusDebugStep(): single-step the held thread and keep holding it, so
+            # the PC can inspect the instruction that just retired.
+            thread_id = int.from_bytes(payload[:8], 'little') if len(payload) >= 8 else 0
+            if thread_id == 0:
+                thread_id = self.stopped_thread or (self.threads[0] if self.threads else 0)
+            ctx = self.regs.get(thread_id)
+            if ctx is not None:
+                thumb = ctx.get('arch32') and (ctx.get('cpsr', 0) & 0x20)
+                ctx['pc'] = (ctx['pc'] + (2 if thumb else 4)) & 0xFFFFFFFFFFFFFFFF
+            self.stopped_thread = thread_id
             return b''
         if cmd == P.CMD['ThreadList']:
             return b''.join(P.THREAD_ENTRY.pack(t, 1, 0x2C, 0, 0) for t in self.threads)
@@ -642,8 +666,9 @@ class MockSwitch:
             if cfg[4]:
                 self.watchdog_ms = cfg[4]
             if len(payload) >= P.CONFIG.size + P.DEBUG_CONFIG.size:
-                style, _auto, _a, _b = P.DEBUG_CONFIG.unpack_from(payload, P.CONFIG.size)
+                style, auto, _a, _b = P.DEBUG_CONFIG.unpack_from(payload, P.CONFIG.size)
                 self.watch_style = style
+                self.auto_continue = auto
             return P.CONFIG.pack(*cfg)
         if cmd == P.CMD['LogGet']:
             return '\n'.join(self.log).encode()
@@ -724,7 +749,8 @@ class MockSwitch:
     def _debug_status(self) -> bytes:
         return P.DEBUG_STATUS.pack(1 if self.attached else 0, self.watch_style,
                                    len(self.breaks), len(self.hits), len(self.threads),
-                                   self.last_result, 1, 0)
+                                   self.last_result, self.auto_continue,
+                                   self.stopped_thread & 0xFFFFFFFF)
 
     def _break_list(self) -> bytes:
         return b''.join(P.BREAK_ENTRY.pack(b['slot'], b['kind'], b['size'], b['enabled'],
@@ -801,6 +827,15 @@ class MockSwitch:
                    r=r_vals, tick=12345)
         self.hits.append(hit)
         self.send_event(P.EVT['BreakHit'], self._pack_hit(hit))
+        if self.auto_continue == 0:
+            # auto_continue=0: the console holds the thread at the trapping
+            # instruction and reports the stop separately (NxusEvent_DebugStopped).
+            # Sync the thread context first so a regs read agrees with the event.
+            if ctx is not None:
+                ctx['pc'] = pc
+            self.stopped_thread = thread_id
+            self.send_event(P.EVT['DebugStopped'],
+                            P.DEBUG_STOP.pack(thread_id, pc, hit_address, kind, slot))
         return hit
 
     def simulate_watch_hit(self, address: int, pc: int, value: int, kind: int = 1,

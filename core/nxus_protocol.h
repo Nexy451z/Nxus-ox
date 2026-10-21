@@ -96,6 +96,11 @@ typedef enum {
     NxusCmd_RegsSet          = 0x0059,
     NxusCmd_HitGet           = 0x005A,
     NxusCmd_HitClear         = 0x005B,
+    /* GDB-style single step.  0x0057..0x005B are ThreadList/RegsGet/RegsSet/
+       HitGet/HitClear and NxusCmd_Config starts at 0x0060, so 0x005C is the next
+       free id after DebugContinue.  Payload: optional u64 thread_id (absent or 0 =
+       the thread the last stop was recorded on). */
+    NxusCmd_DebugStep        = 0x005C,
 
     NxusCmd_Config           = 0x0060,
     NxusCmd_LogGet           = 0x0061,
@@ -113,6 +118,8 @@ typedef enum {
     NxusEvent_ProcessEvent   = 0x8005,
     NxusEvent_Log            = 0x8006,
     NxusEvent_DebugEvent     = 0x8007,
+    /* A GDB-style stop was published: payload is NxusDebugStop. */
+    NxusEvent_DebugStopped   = 0x8008,
 } NxusEvent;
 
 /* ---- status flags ---- */
@@ -121,6 +128,7 @@ typedef enum {
 #define NXUS_ST_HAS_PROCESS    0x0004u
 #define NXUS_ST_DEBUG_MODE     0x0008u
 #define NXUS_ST_DEBUG_ATTACHED 0x0010u
+#define NXUS_ST_DEBUG_STOPPED  0x0020u  /* target held at a break/watch stop */
 
 /* ---- run modes ---- */
 #define NXUS_MODE_DMNT        0u   /* thin dmnt:cht client (cheat VM coexists) */
@@ -488,6 +496,19 @@ typedef struct NXUS_PACKED {
 } NxusBreakHit;
 NXUS_STATIC_ASSERT(sizeof(NxusBreakHit) == 112, "NxusBreakHit must be 112 bytes");
 
+/* Payload of NxusEvent_DebugStopped: the stop the switch just published.  With
+   auto_continue == 0 a hit holds the target (GDB-style) until the PC sends
+   DebugContinue or DebugStep, and this event tells it which thread trapped and
+   from where.  kind/slot are 0xFFFFFFFF for a manual break (Pause). */
+typedef struct NXUS_PACKED {
+    u64 thread_id;    /* thread that took the exception (0 = no single owner) */
+    u64 pc;           /* PC at the trap */
+    u64 address;      /* trapped data address (watchpoints), 0 for exec/manual */
+    u32 kind;         /* NxusBreakKind, or 0xFFFFFFFF for a manual break */
+    u32 slot;         /* hardware slot, 0xFFFFFFFF when unknown */
+} NxusDebugStop;
+NXUS_STATIC_ASSERT(sizeof(NxusDebugStop) == 32, "NxusDebugStop must be 32 bytes");
+
 typedef struct NXUS_PACKED {
     u64 thread_id;
     u32 state;
@@ -519,13 +540,17 @@ typedef struct NXUS_PACKED {
     u32 thread_count;
     s32 last_result;
     u32 auto_continue;
-    u32 reserved;
+    /* Low 32 bits of the thread the current stop belongs to (0 = not stopped).
+       The full id is in the NxusEvent_DebugStopped payload.  The field used to be
+       `reserved`; the size and offsets are unchanged. */
+    u32 stopped_thread_low;
 } NxusDebugStatus;
 NXUS_STATIC_ASSERT(sizeof(NxusDebugStatus) == 32, "NxusDebugStatus must be 32 bytes");
 
 typedef struct NXUS_PACKED {
     u32 style;            /* NxusWatchStyle */
-    u32 auto_continue;
+    u32 auto_continue;    /* 0 = GDB-style: a hit stops the target (default),
+                             1 = resume automatically after each hit */
     u32 reserved[2];
 } NxusDebugConfig;
 NXUS_STATIC_ASSERT(sizeof(NxusDebugConfig) == 16, "NxusDebugConfig must be 16 bytes");

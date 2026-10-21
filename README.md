@@ -56,6 +56,11 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   - **Linked Hardware Watchpoints** (`Write`, `Read`, `Access`) in slots `0x10..0x13` with automatic 8-byte `DBGWVR_EL1` alignment (`address & ~7ULL`) and byte-lane `BAS` selection.
   - **AArch32 Register Mapping**: Automatically maps `R13 (SP)`, `R14 (LR)`, and `R11 (FP)` from `cpu_gprs[11/13/14]` when debugging 32-bit titles.
   - **Non-Stop Stepping**: Automatically performs *disarm → `svcContinueDebugEvent` → 1 ms instruction retirement sleep → re-arm* on hit so the target game does not freeze in an infinite re-trap loop.
+- **GDB-Style Stop on Hit (default)**: A watchpoint/breakpoint hit now *holds* the target stopped instead of silently resuming it — like `(gdb) continue` / `(gdb) stepi`.
+  - The console publishes `NxusEvent_DebugStopped` (thread id, PC, address, slot), sets `NXUS_ST_DEBUG_STOPPED`, and waits for an explicit resume.
+  - **CLI**: `nxus continue` (step over the trapping instruction, re-arm, resume), `nxus step [thread_id]` (single instruction), and `nxus watch <addr> --stop` / `nxus break <addr> --stop` which prints `STOPPED thread=… pc=… (main+0x…)`, the surrounding disassembly and all registers. `nxus config --auto-continue 0|1` switches back to the old auto-resume policy at runtime.
+  - **GUI**: a `■ STOPPED` badge plus a banner with **[Continue] [Step]**; on every stop the GUI automatically fetches the stopped thread's registers and disassembles the code around its PC (`=>` highlight).
+  - **Pause/resume while debug-attached**: `nxus pause` maps to `svcBreakDebugProcess` and `nxus resume` to `ContinueDebugEvent`, so a scan can run against a frozen title; the GUI's *"pause target while scanning"* option does this automatically.
 
 ### 3. GDB-Style Disassembler & Live Code Patcher (CLI + GUI)
 - **Built-in Multi-Architecture Decoder (`protocol.rs`)**: Decodes **AArch64**, **AArch32 (ARM32)**, and **Thumb (T16 / T32)** instructions with zero external DLL dependencies.

@@ -101,6 +101,8 @@ static void fillStatus(NxusStatus *st) {
     if (nxusDebugIsAttached()) {
         /* dmnt is closed (has_process would fail), but we do hold the process. */
         flags |= NXUS_ST_HAS_PROCESS | NXUS_ST_DEBUG_MODE | NXUS_ST_DEBUG_ATTACHED;
+        /* GDB-style stop: the target is being held at a break/watch stop. */
+        if (nxusDebugIsStopped()) flags |= NXUS_ST_DEBUG_STOPPED;
     } else {
         bool has_process = false;
         if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process) {
@@ -386,17 +388,28 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             break;
 
         case NxusCmd_Pause:
-            /* Pause/Resume are dmnt cheat-VM operations.  While we hold a debug
-               session dmnt is closed, so say so instead of reporting a dmnt error
-               the user cannot act on. */
-            if (nxusDebugIsAttached()) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            /* While a debug session owns the process dmnt is closed, so Pause is
+               mapped onto the debug session itself: svcBreakDebugProcess suspends
+               every thread and publishes a stop.  This is what lets the user stop
+               the game BEFORE a scan instead of receiving BAD_STATE. */
+            if (nxusDebugIsAttached()) {
+                rc = nxusDebugBreak();
+                if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+                break;
+            }
             rc = nxusDmntPause();
             if (R_SUCCEEDED(rc)) nxusSessionSetPaused(true);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_Resume:
-            if (nxusDebugIsAttached()) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            /* Same mapping: resume the held debug session (drain, acknowledge,
+               re-arm) instead of a dmnt call that cannot work while we own it. */
+            if (nxusDebugIsAttached()) {
+                rc = nxusDebugContinueAll();
+                if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+                break;
+            }
             rc = nxusDmntResume();
             nxusSessionSetPaused(false);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
@@ -984,6 +997,17 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             rc = nxusDebugContinueAll();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
+
+        case NxusCmd_DebugStep: {
+            /* Optional u64 thread_id; without it the thread the stop was published
+               for is stepped (the PC usually just repeats "step"). */
+            u64 thread_id = 0;
+            if (length >= sizeof(u64)) memcpy(&thread_id, payload, sizeof(thread_id));
+            if (thread_id == 0) thread_id = nxusDebugStoppedThread();
+            rc = nxusDebugStep(thread_id);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            break;
+        }
 
         case NxusCmd_ThreadList: {
             NxusThreadEntry threads[NXUS_DEBUG_SERVER_MAX_THREADS];

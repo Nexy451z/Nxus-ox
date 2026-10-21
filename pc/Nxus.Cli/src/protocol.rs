@@ -62,6 +62,7 @@ pub mod cmd {
     pub const REGS_SET: u16 = 0x0059;
     pub const HIT_GET: u16 = 0x005A;
     pub const HIT_CLEAR: u16 = 0x005B;
+    pub const DEBUG_STEP: u16 = 0x005C;
 
     pub const CONFIG: u16 = 0x0060;
     pub const LOG_GET: u16 = 0x0061;
@@ -75,7 +76,18 @@ pub mod event {
     pub const PROCESS_EVENT: u16 = 0x8005;
     pub const LOG: u16 = 0x8006;
     pub const DEBUG_EVENT: u16 = 0x8007;
+    /// The target stopped on a breakpoint and is held (auto_continue == 0).
+    pub const DEBUG_STOPPED: u16 = 0x8008;
 }
+
+// ---- status flags (NXUS_ST_*) ----
+pub const ST_PAUSED: u32 = 0x0001;
+pub const ST_SCANNING: u32 = 0x0002;
+pub const ST_HAS_PROCESS: u32 = 0x0004;
+pub const ST_DEBUG_MODE: u32 = 0x0008;
+pub const ST_DEBUG_ATTACHED: u32 = 0x0010;
+/// A debug breakpoint hit is holding the target (see NxusEvent_DebugStopped).
+pub const ST_DEBUG_STOPPED: u32 = 0x0020;
 
 // ---- enums ----
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -361,19 +373,25 @@ impl Status {
         }
     }
     pub fn paused(&self) -> bool {
-        self.status_flags & 0x0001 != 0
+        self.status_flags & ST_PAUSED != 0
     }
     pub fn scanning(&self) -> bool {
-        self.status_flags & 0x0002 != 0
+        self.status_flags & ST_SCANNING != 0
     }
     pub fn has_process(&self) -> bool {
-        self.status_flags & 0x0004 != 0
+        self.status_flags & ST_HAS_PROCESS != 0
     }
     pub fn debug_mode(&self) -> bool {
-        self.status_flags & 0x0008 != 0
+        self.status_flags & ST_DEBUG_MODE != 0
     }
     pub fn debug_attached(&self) -> bool {
-        self.status_flags & 0x0010 != 0
+        self.status_flags & ST_DEBUG_ATTACHED != 0
+    }
+    /// A breakpoint hit is holding the target (the thread itself is reported by
+    /// NxusDebugStatus.stopped_thread_low, which `Client::debug_stopped_thread`
+    /// reads).
+    pub fn debug_stopped(&self) -> bool {
+        self.status_flags & ST_DEBUG_STOPPED != 0
     }
 }
 
@@ -500,17 +518,68 @@ pub struct DebugStatus {
     pub break_count: u32,
     pub hit_count: u32,
     pub thread_count: u32,
+    pub last_result: i32,
+    pub auto_continue: u32,
+    /// Low 32 bits of the thread held at a breakpoint (0 = nothing held).  The
+    /// C header calls this `stopped_thread_low`; the thread id is a u64, so the
+    /// wire status only carries the half that fits.
+    pub stopped_thread_low: u32,
 }
 
 impl DebugStatus {
     pub const SIZE: usize = 32;
     pub fn parse(data: &[u8]) -> DebugStatus {
-        DebugStatus {
+        let mut status = DebugStatus {
             attached: rd_u32(data, 0) != 0,
             watch_style: rd_u32(data, 4),
             break_count: rd_u32(data, 8),
             hit_count: rd_u32(data, 12),
             thread_count: rd_u32(data, 16),
+            ..Default::default()
+        };
+        if data.len() >= 24 {
+            status.last_result = rd_u32(data, 20) as i32;
+        }
+        if data.len() >= 28 {
+            status.auto_continue = rd_u32(data, 24);
+        }
+        if data.len() >= Self::SIZE {
+            status.stopped_thread_low = rd_u32(data, 28);
+        }
+        status
+    }
+
+    /// Thread currently held at a breakpoint, or None when the target runs.
+    pub fn stopped_thread(&self) -> Option<u64> {
+        match self.stopped_thread_low {
+            0 => None,
+            low => Some(low as u64),
+        }
+    }
+}
+
+/// NxusEvent_DebugStopped payload (C: `NxusDebugStop`, 32 bytes): the console
+/// holds the target after a breakpoint hit, and this says which thread stopped
+/// and where.
+#[derive(Debug, Clone, Default)]
+pub struct DebugStop {
+    pub thread_id: u64,
+    pub pc: u64,
+    /// Trapped data address (watchpoints); 0 for an execute breakpoint.
+    pub address: u64,
+    pub kind: u32,
+    pub slot: u32,
+}
+
+impl DebugStop {
+    pub const SIZE: usize = 32;
+    pub fn parse(data: &[u8]) -> DebugStop {
+        DebugStop {
+            thread_id: rd_u64(data, 0),
+            pc: rd_u64(data, 8),
+            address: rd_u64(data, 16),
+            kind: rd_u32(data, 24),
+            slot: rd_u32(data, 28),
         }
     }
 }
@@ -2155,6 +2224,45 @@ mod tests {
                    Some(cmd::DEBUG_ATTACH as u32));
         assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_ScanBegin"),
                    Some(cmd::SCAN_BEGIN as u32));
+    }
+
+    #[test]
+    fn debug_step_stop_and_flags_match_the_c_header() {
+        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_DebugStep"),
+                   Some(cmd::DEBUG_STEP as u32));
+        assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_DebugStopped"),
+                   Some(event::DEBUG_STOPPED as u32));
+        assert_eq!(header_define(HEADER, "NXUS_ST_DEBUG_STOPPED"), Some(ST_DEBUG_STOPPED));
+        assert_eq!(header_size(HEADER, "NxusDebugStop"), Some(DebugStop::SIZE as u32));
+        assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
+    }
+
+    #[test]
+    fn debug_status_decodes_the_stopped_thread_at_offset_28() {
+        let mut data = vec![0u8; DebugStatus::SIZE];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());          // attached
+        data[24..28].copy_from_slice(&0u32.to_le_bytes());        // auto_continue
+        data[28..32].copy_from_slice(&0x1001u32.to_le_bytes());   // stopped_thread_low
+        let status = DebugStatus::parse(&data);
+        assert!(status.attached);
+        assert_eq!(status.auto_continue, 0);
+        assert_eq!(status.stopped_thread(), Some(0x1001));
+        // a running target reports 0 there, and a short reply must not panic
+        assert_eq!(DebugStatus::parse(&vec![0u8; DebugStatus::SIZE]).stopped_thread(), None);
+        assert_eq!(DebugStatus::parse(&[0u8; 20]).stopped_thread(), None);
+    }
+
+    #[test]
+    fn debug_stop_payload_decodes_at_the_header_offsets() {
+        let mut data = vec![0u8; DebugStop::SIZE];
+        data[0..8].copy_from_slice(&0x1001u64.to_le_bytes());
+        data[8..16].copy_from_slice(&0x00712345u64.to_le_bytes());
+        data[16..24].copy_from_slice(&0x42CA1DC4u64.to_le_bytes());
+        data[24..28].copy_from_slice(&1u32.to_le_bytes());
+        data[28..32].copy_from_slice(&0x10u32.to_le_bytes());
+        let stop = DebugStop::parse(&data);
+        assert_eq!((stop.thread_id, stop.pc, stop.address, stop.kind, stop.slot),
+                   (0x1001, 0x00712345, 0x42CA1DC4, 1, 0x10));
     }
 
     #[test]

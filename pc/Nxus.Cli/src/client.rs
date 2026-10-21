@@ -694,6 +694,29 @@ impl NxusClient {
         Ok(DebugStatus::parse(&body))
     }
 
+    /// Resume a target the console is holding at a breakpoint.
+    pub fn debug_continue(&self) -> Result<()> {
+        self.request_timeout(cmd::DEBUG_CONTINUE, &[], Duration::from_secs(60)).map(|_| ())
+    }
+
+    /// Single-step the stopped thread (0 = whichever thread the console holds).
+    pub fn debug_step(&self, thread_id: u64) -> Result<()> {
+        let mut payload = Vec::new();
+        put_u64(&mut payload, thread_id);
+        self.request_timeout(cmd::DEBUG_STEP, &payload, Duration::from_secs(60)).map(|_| ())
+    }
+
+    /// Thread the console is holding at a breakpoint (None = the target runs).
+    pub fn debug_stopped_thread(&self) -> Result<Option<u64>> {
+        Ok(self.debug_status()?.stopped_thread())
+    }
+
+    /// Set the watchpoint encoding and the auto-continue policy
+    /// (`auto_continue == 0` makes a hit hold the target until `debug_continue`).
+    pub fn set_debug_config(&self, style: u32, auto_continue: u32) -> Result<()> {
+        self.set_config(0, 0, 0, 0, 15000, 5000, 1, Some((style, auto_continue))).map(|_| ())
+    }
+
     pub fn break_set(&self, address: u64, kind: u32, size: u32, slot: u32, ctrl: u64) -> Result<Vec<BreakEntry>> {
         let mut payload = Vec::new();
         put_u32(&mut payload, slot);

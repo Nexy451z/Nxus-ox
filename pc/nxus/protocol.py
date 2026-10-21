@@ -81,8 +81,12 @@ PTR_CHAIN_LIST_HEADER = struct.Struct('<IIII')
 PTR_CHAIN = struct.Struct('<IIII8I')
 CHEAT_EXPORT_REQUEST = struct.Struct('<IIIIQ')
 THREAD_CONTEXT = struct.Struct('<QQQQQ I 13I I 29Q')
+# attached, watch_style, break_count, hit_count, thread_count, last_result,
+# auto_continue, stopped_thread_low (C: stopped_thread_low, 0 = nothing held)
 DEBUG_STATUS = struct.Struct('<IIIIIiII')
 DEBUG_CONFIG = struct.Struct('<IIII')
+# NxusEvent_DebugStopped payload: thread_id, pc, address, kind, slot (32 bytes)
+DEBUG_STOP = struct.Struct('<QQQII')
 
 WATCH_STYLE_PLAIN = 0
 WATCH_STYLE_LINK5 = 1
@@ -126,6 +130,7 @@ STRUCTS = {
     'NxusThreadContext': THREAD_CONTEXT,
     'NxusDebugStatus': DEBUG_STATUS,
     'NxusDebugConfig': DEBUG_CONFIG,
+    'NxusDebugStop': DEBUG_STOP,
 }
 
 CMD = {
@@ -174,6 +179,7 @@ CMD = {
     'RegsSet': 0x0059,
     'HitGet': 0x005A,
     'HitClear': 0x005B,
+    'DebugStep': 0x005C,
     'Config': 0x0060,
     'LogGet': 0x0061,
     'ProbeRun': 0x0070,
@@ -188,6 +194,7 @@ EVT = {
     'ProcessEvent': 0x8005,
     'Log': 0x8006,
     'DebugEvent': 0x8007,
+    'DebugStopped': 0x8008,
 }
 
 ST = {
@@ -196,6 +203,7 @@ ST = {
     'NXUS_ST_HAS_PROCESS': 0x0004,
     'NXUS_ST_DEBUG_MODE': 0x0008,
     'NXUS_ST_DEBUG_ATTACHED': 0x0010,
+    'NXUS_ST_DEBUG_STOPPED': 0x0020,
 }
 
 MODE = {'NXUS_MODE_DMNT': 0, 'NXUS_MODE_DEBUG': 1}

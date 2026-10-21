@@ -22,11 +22,17 @@ session
   log                             dump the sysmodule log ring
   pause | resume                  freeze / unfreeze the target
   config [--hotkey COMBO] [--hold MS] [--watchdog MS] [--chunk N]
-                                  set the controller hotkey (COMBO: plus, L+PLUS, off)
+         [--watch-style N] [--auto-continue 0|1]
+                                  set the controller hotkey (COMBO: plus, L+PLUS, off) and
+                                  the debug policy (auto-continue 0 = a breakpoint hit
+                                  holds the target)
   events [--seconds N] [--count N] listen for Switch-initiated events
   pids | processes                list running process IDs on the console
   attach [--pid PID]              attach kernel debugger (default: current game)
   detach                          leave debug mode (if attached)
+  continue                        resume a target the console is holding (after --stop)
+  step [thread_id]                single-step the held thread, then show its registers
+                                  and the code at the new pc
   forceopen                       re-open dmnt's cheat process (recovery: only needed
                                   if it is stuck closed - normally detach restores it)
   threads                         list threads of the attached process
@@ -83,11 +89,14 @@ analysis
                     an EdiZon-SE (EDZN/eFZN) dump
   cheat <index> --value N [--width 4] [--64bit] [--out FILE]
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
-                  [--count N] [--seconds N] [--keep]
+                  [--count N] [--seconds N] [--keep] [--stop]
                   on every hit: pc / lr / sp / r0-r3, then a disassembly window
                   around the pc (the hit instruction is marked with '=>') and the
-                  whole 32-bit register set
-  break <address> [--size 4] [--seconds S] [--keep]
+                  whole 32-bit register set.
+                  --stop holds the target on the hit (auto-continue 0): prints
+                  STOPPED thread=... pc=... (main+0x...) with the code around the
+                  pc and every register; 'nxus continue' resumes, 'nxus step' steps
+  break <address> [--size 4] [--seconds S] [--keep] [--stop]
                   execute breakpoint (same as watch --kind exec), same hit context
 
 addresses accept 0xHEX, decimal, bare hex, or expressions (e.g. main+0x80000+0x1000, (heap+0x1DC0)+4)
@@ -370,6 +379,16 @@ fn execute(opts: &Opts) -> Result<()> {
             println!("main         : {:08X} + {:X}", st.main_base, st.main_size);
             println!("process      : {}", if st.has_process() { "attached" } else { "none" });
             println!("paused       : {}", st.paused());
+            // A --stop breakpoint hit leaves the target held: say so, and name the
+            // thread (the status flags only carry the fact, NxusDebugStatus the id).
+            if st.debug_stopped() {
+                match client.debug_status().ok().and_then(|dbg| dbg.stopped_thread()) {
+                    Some(tid) => println!("debug        : stopped (thread=0x{:X})", tid),
+                    None => println!("debug        : stopped"),
+                }
+            } else if st.debug_attached() {
+                println!("debug        : attached");
+            }
             println!("scan         : {} ({} hits, {} permille)", scan_state_name(st.scan_state),
                      st.hit_count, st.progress_permille);
             println!("uptime       : {} ms", st.uptime_ms);
@@ -444,6 +463,39 @@ fn execute(opts: &Opts) -> Result<()> {
         "detach" => {
             client.debug_detach()?;
             println!("detached (dmnt restored)");
+        }
+
+        // Resume a target that `watch/break --stop` left held at a breakpoint.
+        "continue" => {
+            client.debug_continue()?;
+            println!("resumed");
+        }
+
+        // One instruction at a time.  The console holds the thread afterwards, so
+        // show the same context a --stop hit shows: where we are and what changed.
+        "step" => {
+            let requested = match opts.positional.get(1) {
+                Some(raw) => parse_number(raw)?,
+                None => 0,
+            };
+            client.debug_step(requested)?;
+            println!("stepped");
+            let thread_id = if requested != 0 {
+                Some(requested)
+            } else {
+                client.debug_stopped_thread().unwrap_or(None)
+            }
+            .or_else(|| client.thread_list().ok().and_then(|t| t.first().map(|t| t.thread_id)));
+            if let Some(tid) = thread_id {
+                let main_base = client.status().map(|st| st.main_base).unwrap_or(0);
+                match client.regs_get(tid) {
+                    Ok(ctx) => {
+                        println!("thread 0x{:X}:", ctx.thread_id);
+                        print_stopped_context(&client, &ctx, main_base);
+                    }
+                    Err(e) => eprintln!("warning: cannot read the registers of thread 0x{:X}: {}", tid, e),
+                }
+            }
         }
 
         // dmnt can be left closed (e.g. the console rebooted with a stale debugger, or a
@@ -640,6 +692,12 @@ fn execute(opts: &Opts) -> Result<()> {
                         }
                         event::HOTKEY_PAUSED => println!("[{:6.2}s] hotkey: target paused", at),
                         event::AUTO_RESUME => println!("[{:6.2}s] watchdog: target auto-resumed", at),
+                        event::DEBUG_STOPPED if ev.payload.len() >= DebugStop::SIZE => {
+                            let stop = DebugStop::parse(&ev.payload);
+                            println!("[{:6.2}s] stopped: thread=0x{:X} pc={:08X} ({} to {:08X})",
+                                     at, stop.thread_id, stop.pc,
+                                     break_kind_name(stop.kind), stop.address);
+                        }
                         event::SCAN_PROGRESS => println!("[{:6.2}s] scan progress", at),
                         event::PROCESS_EVENT => println!("[{:6.2}s] process event", at),
                         other => println!("[{:6.2}s] event 0x{:04X} ({} bytes)", at, other, ev.payload.len()),
@@ -941,7 +999,7 @@ fn execute(opts: &Opts) -> Result<()> {
         // The GDB spelling for an execute breakpoint: watch <addr> --kind exec.
         "break" => {
             let address = parse_address(&client, opts.positional.get(1)
-                .ok_or_else(|| usage("break <address> [--size 4] [--seconds S] [--keep]"))?)?;
+                .ok_or_else(|| usage("break <address> [--size 4] [--seconds S] [--keep] [--stop]"))?)?;
             run_watch(&client, opts, address, break_kind::EXECUTE)?;
         }
 
@@ -969,6 +1027,9 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
     let want = opts.num("count").unwrap_or(1) as usize;
     let seconds = opts.num("seconds").unwrap_or(60);
     let keep = opts.has("keep");
+    // --stop is opt-in: without it a hit resumes the target (the historical
+    // behaviour); with it the console holds the thread until `nxus continue`.
+    let stop = opts.has("stop");
 
     // main_base must be read BEFORE attaching: dmnt is closed while we hold
     // the debug handle, so this call would fail (or return 0) afterwards.
@@ -979,6 +1040,15 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
 
     let status = client.debug_attach()?;
     println!("debug mode: attached={} watch_style={}", status.attached, status.watch_style);
+    // The console's policy is explicit here, not assumed: --stop holds the target
+    // on a hit, and without it a hit must resume the title exactly as before (the
+    // switch defaults to the GDB-style hold, so "no flag" has to say so).
+    if stop {
+        client.set_debug_config(status.watch_style, 0)?;
+        println!("stop mode    : on (target held on a hit; nxus continue resumes)");
+    } else {
+        client.set_debug_config(status.watch_style, 1)?;
+    }
 
     client.hit_clear()?;
     let breaks = client.break_set(address, kind, size, slot, 0)?;
@@ -999,6 +1069,19 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
             let _ = client.heartbeat();
         }
         if let Some(event) = client.poll_event(Duration::from_millis(200)) {
+            if stop {
+                if event.kind == event::DEBUG_STOPPED && event.payload.len() >= DebugStop::SIZE {
+                    let halt = DebugStop::parse(&event.payload);
+                    print_stopped_line(client, &halt, metadata.main_base);
+                    seen += 1;
+                    // A held target cannot hit again, so release it for the next
+                    // stop the caller asked for; the last one stays held.
+                    if seen < want {
+                        let _ = client.debug_continue();
+                    }
+                }
+                continue;
+            }
             if event.kind == event::BREAK_HIT && event.payload.len() >= BreakHit::SIZE {
                 let hit = BreakHit::parse(&event.payload);
                 let offset = hit.pc.wrapping_sub(metadata.main_base);
@@ -1021,12 +1104,59 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
     if !keep {
         client.break_clear(slot)?;
         client.hit_clear()?;
+        if stop {
+            // Leave the console on the default policy: a later non-stop watch must
+            // not freeze the title because this run configured a hold.
+            let _ = client.set_debug_config(status.watch_style, 1);
+        }
         client.debug_detach()?;
         println!("detached (dmnt restored)");
     } else {
         println!("leaving the watchpoint armed (use: nxus detach)");
     }
     Ok(())
+}
+
+/// The `--stop` counterpart of a hit: one STOPPED line, then the same context a
+/// GDB stop prints - the code around the pc and every stopped register.
+fn print_stopped_line(client: &NxusClient, halt: &DebugStop, main_base: u64) {
+    if main_base != 0 {
+        let offset = halt.pc.wrapping_sub(main_base);
+        println!("STOPPED thread=0x{:X} pc={:08X} (main+{:#x})", halt.thread_id, halt.pc, offset);
+    } else {
+        println!("STOPPED thread=0x{:X} pc={:08X}", halt.thread_id, halt.pc);
+    }
+    match client.regs_get(halt.thread_id) {
+        // The event's pc is the trapping instruction; a register read may already
+        // look one instruction further, so the window stays centred on the event.
+        Ok(ctx) => print_stop_body(client, halt.pc, ctx.cpsr, &ctx, main_base),
+        Err(e) => {
+            eprintln!("   (cannot read the registers of thread 0x{:X}: {})", halt.thread_id, e);
+            let mode = resolve_mode(client, halt.pc, 0);
+            println!("   ---------------- code around pc ({}) ----------------", mode.label());
+            print_code_window(client, halt.pc, 8, 12, 32, mode, main_base);
+        }
+    }
+}
+
+/// Registers and code window for a thread the console is holding.
+fn print_stopped_context(client: &NxusClient, ctx: &ThreadContext, main_base: u64) {
+    print_stop_body(client, ctx.pc, ctx.cpsr, ctx, main_base);
+}
+
+fn print_stop_body(client: &NxusClient, pc: u64, cpsr: u32, ctx: &ThreadContext, main_base: u64) {
+    let mode = resolve_mode(client, pc, cpsr);
+    println!("   ---------------- code around pc ({}) ----------------", mode.label());
+    print_code_window(client, pc, 8, 12, 32, mode, main_base);
+    // "every register" (r0-r12 / sp / lr / pc / cpsr) is what a stopped debugger
+    // shows; the 32-bit view is the one a hit reports, and the alias a 32-bit
+    // title uses.  Same row shape as print_hit_context, but complete.
+    println!("   r0-r3  = {:08X} {:08X} {:08X} {:08X}", ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3]);
+    println!("   r4-r12 = {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+             ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7], ctx.r[8],
+             ctx.r[9], ctx.r[10], ctx.r[11], ctx.r[12]);
+    println!("   sp     = {:08X}   lr = {:08X}   pc = {:08X}", ctx.sp, ctx.lr, ctx.pc);
+    println!("   cpsr   = {:08X}", ctx.cpsr);
 }
 
 /// GDB-style context for a hit: a few instructions around the pc plus the

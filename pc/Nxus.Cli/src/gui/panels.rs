@@ -4,7 +4,7 @@ use eframe::egui;
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use super::{App, Cmd, Tab, SCOPE_NAMES, WATCH_KINDS};
+use super::{App, Cmd, Tab, DISASM_PAGE, SCOPE_NAMES, WATCH_KINDS};
 use crate::protocol::VALUE_TYPE_NAMES;
 
 const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
@@ -95,13 +95,21 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // GDB style: "connected" is still true while the target is held, so
+                // the STOPPED badge sits next to it instead of replacing it.
+                let stopped = app.st.is_stopped();
                 let (text, color) = if !app.st.connected {
                     ("OFFLINE".to_string(), DIM)
+                } else if stopped {
+                    ("CONNECTED".to_string(), GREEN)
                 } else if app.st.status.as_ref().map(|s| s.paused()).unwrap_or(false) {
                     ("PAUSED".to_string(), YELLOW)
                 } else {
                     ("CONNECTED".to_string(), GREEN)
                 };
+                if stopped && app.st.connected {
+                    ui.label(RichText::new("■ STOPPED").strong().color(RED));
+                }
                 ui.label(RichText::new(text).strong().color(color));
             });
         });
@@ -177,6 +185,7 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                 for line in &app.st.log {
                     let color = if line.contains("error") { RED }
+                                else if line.contains("STOPPED") { RED }
                                 else if line.contains("watch hit") || line.contains("hotkey") { YELLOW }
                                 else { DIM };
                     ui.label(RichText::new(line).monospace().size(12.0).color(color));
@@ -288,6 +297,11 @@ fn scan_section(app: &mut App, ui: &mut egui::Ui) {
                         .desired_width(110.0).hint_text("end"));
                 });
             }
+
+            ui.checkbox(&mut app.prefs.scan_pause, "pause target while scanning")
+                .on_hover_text("freeze the game for the duration of the scan so no value \
+                                changes under the reads; resumed automatically when the scan \
+                                ends (needs debug attach - plain dmnt scans keep running)");
 
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(RichText::new("First Scan").strong())).on_hover_text("F5").clicked() {
@@ -496,6 +510,16 @@ fn watch_section(app: &mut App, ui: &mut egui::Ui) {
                 app.st.watch_armed = None;
             }
         });
+        if ui.checkbox(&mut app.prefs.watch_stop_on_hit, "stop on hit (GDB style)")
+            .on_hover_text("hold the target at the hit and open the disassembly at the PC \
+                            (auto_continue=0, sent BEFORE arming); off = record the hit and \
+                            resume the game immediately")
+            .changed()
+        {
+            // an armed breakpoint must follow a policy change right away, not
+            // only from the next arm
+            app.apply_stop_on_hit();
+        }
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new(RichText::new("Arm on cursor").strong())).clicked() {
                 app.arm_watchpoint();
@@ -536,8 +560,78 @@ fn watch_section(app: &mut App, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- central
 
+/// GDB-style stop banner: a hit is a stop, so the first thing on screen is which
+/// thread is parked, where the PC is, what was hit, and the two actions that make
+/// sense (Continue / Step).  It sits above the tab bar so it is visible whichever
+/// tab the hit interrupted.
+fn stop_banner(app: &mut App, ui: &mut egui::Ui) {
+    // Only a stop with details is a "hit": a manual break (the Pause button, the
+    // scan pause) is shown by the STOPPED badge in the top bar instead, because
+    // there is no hitting instruction to jump to.
+    let Some(stop) = app.st.debug_stop.clone() else {
+        return;
+    };
+    let main_base = app.st.main_base();
+    let mut do_continue = false;
+    let mut do_step = false;
+    let mut goto_pc = false;
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(0x3A, 0x17, 0x1B))
+        .stroke(egui::Stroke::new(1.0, RED))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("■ STOPPED").heading().strong().color(RED));
+                ui.label(RichText::new(format!("thread {}", stop.thread_id))
+                    .strong().color(YELLOW));
+                let pc = RichText::new(format!("PC={:08X} (main+{:#x})", stop.pc,
+                                               stop.pc.wrapping_sub(main_base)))
+                    .monospace().color(GREEN);
+                if ui.add(egui::Label::new(pc).sense(egui::Sense::click()))
+                    .on_hover_text("open the PC in the hex editor")
+                    .clicked()
+                {
+                    goto_pc = true;
+                }
+                ui.label(RichText::new(format!("— hit {} on {:08X} (slot {:#x})",
+                                               crate::protocol::break_kind::name(stop.kind),
+                                               stop.address, stop.slot))
+                    .color(DIM));
+                ui.separator();
+                if ui.add(egui::Button::new(RichText::new("Continue").strong()))
+                    .on_hover_text("resume the held threads (F10)")
+                    .clicked()
+                {
+                    do_continue = true;
+                }
+                if ui.button("Step")
+                    .on_hover_text("single step and refresh the listing at the new PC")
+                    .clicked()
+                {
+                    do_step = true;
+                }
+            });
+        });
+    ui.add_space(4.0);
+
+    if do_continue {
+        app.debug_continue();
+    }
+    if do_step {
+        app.debug_step();
+    }
+    if goto_pc {
+        let pc = stop.pc;
+        app.goto(pc);
+        app.tab = Tab::Hex;
+    }
+}
+
 pub fn central(app: &mut App, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
+        stop_banner(app, ui);
         ui.horizontal(|ui| {
             for (tab, name) in [(Tab::Results, "Results"), (Tab::Hex, "Hex editor"),
                                 (Tab::Disasm, "Disasm"), (Tab::Snapshot, "Snapshot"),
@@ -729,11 +823,11 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     if let Some(address) = watch {
-        // kind 0 is EXECUTE: this button promises "trap writes here"
-        app.send(Cmd::BreakSet { address,
-                                 kind: crate::protocol::break_kind::WRITE,
-                                 size: app.prefs.watch_size },
-                  "arming watchpoint");
+        // kind 0 is EXECUTE: this button promises "trap writes here".  The arm
+        // helper pushes "stop on hit" first, like the WATCHPOINT section does.
+        let size = app.prefs.watch_size;
+        app.arm_breakpoint(address, crate::protocol::break_kind::WRITE, size,
+                           "arming watchpoint");
     }
     if let Some((address, width)) = freeze {
         app.send(Cmd::Freeze { address, width }, "freezing");
@@ -822,6 +916,51 @@ fn snapshot_tab(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn watch_tab(app: &mut App, ui: &mut egui::Ui) {
+    // ---- debug session: what the watchpoint does when it fires ------------------
+    let mut do_continue = false;
+    let mut do_step = false;
+    let mut stop_on_hit_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Debug session").strong());
+        stop_on_hit_changed = ui
+            .checkbox(&mut app.prefs.watch_stop_on_hit, "stop on hit (GDB style)")
+            .on_hover_text("auto_continue=0: the target is held at the hit and the disassembly \
+                            opens at the PC; off = only the hit is recorded")
+            .changed();
+        if let Some(stop) = app.st.debug_stop.clone() {
+            ui.label(RichText::new(format!("■ STOPPED thread {} at main+{:#x}", stop.thread_id,
+                                           stop.pc.wrapping_sub(app.st.main_base())))
+                .monospace().color(RED));
+            if ui.add(egui::Button::new(RichText::new("Continue").strong()))
+                .on_hover_text("resume the held threads (F10)").clicked()
+            {
+                do_continue = true;
+            }
+            if ui.button("Step").clicked() {
+                do_step = true;
+            }
+        } else if app.st.is_stopped() {
+            ui.label(RichText::new("■ STOPPED").color(RED));
+            if ui.button("Continue").clicked() {
+                do_continue = true;
+            }
+        } else if app.st.status.as_ref().map(|s| s.debug_attached()).unwrap_or(false) {
+            ui.label(RichText::new("running (attached)").color(GREEN));
+        } else {
+            ui.label(RichText::new("not attached").color(DIM));
+        }
+    });
+    if stop_on_hit_changed {
+        app.apply_stop_on_hit();
+    }
+    if do_continue {
+        app.debug_continue();
+    }
+    if do_step {
+        app.debug_step();
+    }
+
+    ui.separator();
     ui.label(RichText::new("Watchlist (Address Book)").strong());
     ui.horizontal(|ui| {
         ui.label("label");
@@ -1020,9 +1159,8 @@ fn watch_tab(app: &mut App, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- disassembler
 
-/// Bytes fetched per disassembler page: 32 AArch64/ARM instructions or up to 64
-/// Thumb-16 ones.
-const DISASM_PAGE: u32 = 128;
+// DISASM_PAGE (one page = 32 AArch64/ARM instructions) lives in `super`: the
+// stop handler fetches the same page without going through this tab.
 /// Tint used for the "=>" row (the PC being debugged).
 const DISASM_HL: Color32 = Color32::from_rgb(0x22, 0x3D, 0x27);
 
@@ -1075,7 +1213,9 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
     let mut do_read: Option<u64> = None;
     let mut fetch_pc = false;
     let mut resume = false;
+    let mut step = false;
     let mut clear_exec_bp = false;
+    let stopped = app.st.is_stopped();
 
     ui.horizontal(|ui| {
         ui.label("addr");
@@ -1118,10 +1258,20 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
             do_read = Some(base.wrapping_add(32));
         }
         if ui.add(egui::Button::new(RichText::new("Continue").strong()))
-            .on_hover_text("resume the target")
+            .on_hover_text(if stopped {
+                "continue past the breakpoint (DebugContinue)"
+            } else {
+                "resume the target"
+            })
             .clicked()
         {
             resume = true;
+        }
+        if ui.button("Step")
+            .on_hover_text("single step and refresh the listing at the new PC")
+            .clicked()
+        {
+            step = true;
         }
         if ui.button("Clear exec BP")
             .on_hover_text("clear the execute breakpoint slot (0)")
@@ -1153,17 +1303,44 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
         app.send(Cmd::ReadDisasm { address, size: DISASM_PAGE }, "disassembling");
     }
     if fetch_pc {
-        app.send(Cmd::FetchCurrentPcAndDisasm { size: DISASM_PAGE },
-                 "reading registers and code at PC");
+        // At a stop, "the first thread" is usually the wrong one: the console
+        // parked a specific thread and that is the one whose PC matters.
+        match app.st.debug_stop.clone() {
+            Some(stop) => {
+                app.send(Cmd::FetchThreadPcAndDisasm {
+                    thread_id: stop.thread_id,
+                    pc: stop.pc,
+                    size: DISASM_PAGE,
+                }, "reading the stopped thread");
+            }
+            None => {
+                app.send(Cmd::FetchCurrentPcAndDisasm { size: DISASM_PAGE },
+                         "reading registers and code at PC");
+            }
+        }
     }
     if resume {
-        app.send(Cmd::Resume, "resuming");
+        // dmnt's Resume does nothing for a thread the kernel parked on a
+        // breakpoint: at a stop the debug continue is the one that works.
+        if stopped {
+            app.debug_continue();
+        } else {
+            app.send(Cmd::Resume, "resuming");
+        }
+    }
+    if step {
+        app.debug_step();
     }
     if clear_exec_bp {
         // execute breakpoints are armed in slot 0 (watchpoints use 0x10)
         app.send(Cmd::BreakClear { slot: 0 }, "clearing execute breakpoint");
     }
 
+    if app.st.is_stopped() {
+        ui.label(RichText::new(
+            "■ held: the target will not run until Continue / Step (or Resume in the top bar)")
+            .color(RED));
+    }
     if app.st.disasm_bytes.is_empty() {
         ui.label(RichText::new(
             "Enter an address (or main+offset) and press Disassemble. \
@@ -1251,11 +1428,9 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
         });
 
     if let Some((address, size)) = set_bp {
-        app.send(Cmd::BreakSet {
-            address,
-            kind: crate::protocol::break_kind::EXECUTE,
-            size: size as u32,
-        }, "arming exec breakpoint");
+        // same path as the WATCHPOINT section: push "stop on hit" first
+        app.arm_breakpoint(address, crate::protocol::break_kind::EXECUTE, size as u32,
+                           "arming exec breakpoint");
     }
     if let Some((address, size)) = nop {
         let patch = nop_bytes(arch, size);

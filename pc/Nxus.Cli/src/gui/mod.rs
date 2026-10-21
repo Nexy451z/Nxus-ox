@@ -69,6 +69,22 @@ pub enum Cmd {
     Config { mask: u64, hold: u32, enabled: u32, watchdog: u32, style: u32 },
     Pause,
     Resume,
+    /// Push the console's debug block before arming: `auto_continue = 0` means
+    /// "hold the target at the hit" (GDB style), `1` means "record the hit and
+    /// resume".  The server rewrites its whole config from one CONFIG request,
+    /// so the hotkey/watchdog half travels along instead of being zeroed.
+    DebugConfigure { auto_continue: u32, mask: u64, hold: u32, enabled: u32,
+                     watchdog: u32, style: u32 },
+    /// Resume the threads the console parked at a breakpoint
+    /// (NxusCmd_DebugContinue -> svcContinueDebugEvent).
+    DebugContinue,
+    /// Single-step a held thread.  `thread_id == 0` steps the thread the console
+    /// stopped; the step keeps the stop published, only the PC moves.
+    DebugStep { thread_id: u64 },
+    /// Fetch the context of the thread a stop event named, plus the code around
+    /// its PC.  `FetchCurrentPcAndDisasm` picks "the first thread", which is the
+    /// wrong one as soon as a breakpoint parked a worker thread.
+    FetchThreadPcAndDisasm { thread_id: u64, pc: u64, size: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +111,10 @@ pub enum Ev {
     Chains(Vec<PtrChain>, bool),          // chains, truncated-by-console
     Cheat(String),
     BreakHits(Vec<BreakHit>),
+    /// The target is parked at a breakpoint/watchpoint (NxusEvent_DebugStopped).
+    /// The UI turns this into the stop banner, a register fetch and the
+    /// disassembly around the PC.
+    DebugStopped { thread_id: u64, pc: u64, address: u64, kind: u32, slot: u32 },
     Snapshot { summary: P::SnapshotSummary, changed: Vec<ChangedBlock> },
     Async { kind: u16, payload: Vec<u8> },
     Progress { done: u64, total: u64, label: String },
@@ -124,6 +144,55 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often a disconnected-but-wanted session is retried in the background.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bytes fetched when the disassembler opens itself on a stop: 32 AArch64
+/// instructions, or the same byte count of ARM/Thumb ones.
+pub const DISASM_PAGE: u32 = 128;
+
+/// kind/slot the console reports for a stop it created itself (`svcBreakDebugProcess`,
+/// i.e. the Pause button), as opposed to a hardware breakpoint hit.  Those are a
+/// "the target is held" state, not a watchpoint hit, so they get no stop banner.
+const NO_BREAK_SLOT: u32 = 0xFFFF_FFFF;
+
+/// True when a DebugStopped describes a stop the console made for itself
+/// (`svcBreakDebugProcess`: the Pause button, the scan pause) rather than a
+/// hardware breakpoint hit.  Decided on `kind` only: a real hit whose hardware
+/// slot could not be paired up also reports 0xFFFFFFFF in `slot`.
+pub fn is_manual_stop(kind: u32) -> bool {
+    kind == NO_BREAK_SLOT
+}
+
+/// NxusDebugConfig.auto_continue for the "stop on hit" preference: 0 holds the
+/// target at the hit (GDB style), 1 records the hit and resumes the game.
+pub fn auto_continue_for(stop_on_hit: bool) -> u32 {
+    if stop_on_hit { 0 } else { 1 }
+}
+
+/// Forward whatever the console pushed while the worker was blocked.  A scan can
+/// run for minutes and the event loop only polls between commands, so without
+/// this a DebugStopped would be delivered AFTER the scan result and re-open the
+/// banner for a stop that the follow-up Resume already undid.
+fn drain_events(c: &NxusClient, tx: &Sender<Ev>) {
+    while let Some(ev) = c.poll_event(Duration::from_millis(0)) {
+        if ev.kind == event::DEBUG_STOPPED && ev.payload.len() >= P::DebugStop::SIZE {
+            let stop = P::DebugStop::parse(&ev.payload);
+            let _ = tx.send(Ev::DebugStopped {
+                thread_id: stop.thread_id, pc: stop.pc, address: stop.address,
+                kind: stop.kind, slot: stop.slot,
+            });
+            continue;
+        }
+        let _ = tx.send(Ev::Async { kind: ev.kind, payload: ev.payload });
+    }
+}
+
+/// Re-read the status after a pause/resume/step so the UI stops guessing: the
+/// stopped bit (and the held-thread field) are the console's own answer.
+fn push_status(c: &NxusClient, tx: &Sender<Ev>) {
+    if let Ok(status) = c.status() {
+        let _ = tx.send(Ev::Status(status));
+    }
+}
 
 /// One silent reconnect attempt: connect, prove the session works with a status
 /// request, and hand both back.  On failure the half-open socket is dropped (the
@@ -218,9 +287,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
         }
 
         if let Some(c) = client.as_ref() {
-            while let Some(ev) = c.poll_event(Duration::from_millis(0)) {
-                let _ = tx.send(Ev::Async { kind: ev.kind, payload: ev.payload });
-            }
+            drain_events(c, &tx);
         }
 
         let Some(cmd) = cmd else { continue };
@@ -346,6 +413,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let st = c.scan_wait_cancellable(Duration::from_secs(900), &cancel)
                                 .map_err(|e| e.to_string())?;
                             let hits = c.scan_all_hits(8192).map_err(|e| e.to_string())?;
+                            // anything the console pushed during the scan (e.g. the
+                            // stop that "pause while scanning" asked for) must reach
+                            // the UI BEFORE the result, or it would arrive after the
+                            // matching Resume and re-open a stale banner
+                            drain_events(c, &tx);
                             let _ = tx.send(Ev::Hits {
                                 message: format!("first scan {} (result=0x{:08X}): {} hit(s){}",
                                                  scan_state::name(st.scan_state),
@@ -360,6 +432,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let st = c.scan_wait_cancellable(Duration::from_secs(900), &cancel)
                                 .map_err(|e| e.to_string())?;
                             let hits = c.scan_all_hits(8192).map_err(|e| e.to_string())?;
+                            drain_events(c, &tx);
                             let _ = tx.send(Ev::Hits {
                                 message: format!("next scan {} (result=0x{:08X}): {} hit(s){}",
                                                  scan_state::name(st.scan_state),
@@ -396,6 +469,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let truncated = scan.truncated;
                             prev_pc_scan = None;
                             pc_scan = Some(scan);
+                            drain_events(c, &tx);      // see ScanBegin
                             let _ = tx.send(Ev::PcHits { hits, value_size, message, truncated });
                         }
                         Cmd::PcScanRefine { compare, target, target2, flags } => {
@@ -418,6 +492,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let value_size = scan.value_size;
                             let truncated = scan.truncated;
                             pc_scan = Some(scan);
+                            drain_events(c, &tx);      // see ScanBegin
                             let _ = tx.send(Ev::PcHits { hits, value_size, message, truncated });
                         }
                         Cmd::PcScanCancel => {
@@ -622,10 +697,62 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         Cmd::Pause => {
                             c.pause().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message("paused".into()));
+                            // While attached this maps to svcBreakDebugProcess, which
+                            // publishes a stop: the status is where that shows up.
+                            push_status(c, &tx);
                         }
                         Cmd::Resume => {
                             c.resume().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message("resumed".into()));
+                            push_status(c, &tx);
+                        }
+                        Cmd::DebugConfigure { auto_continue, mask, hold, enabled, watchdog, style } => {
+                            // One request carries both blocks (that is how the server
+                            // parses it), so the hotkey/watchdog settings are re-sent
+                            // unchanged instead of being silently reset.
+                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, 1,
+                                         Some((style, auto_continue)))
+                                .map_err(|e| e.to_string())?;
+                            let _ = tx.send(Ev::Message(format!(
+                                "debug: {} (auto_continue={})",
+                                if auto_continue == 0 { "stop on hit" } else { "auto-resume on hit" },
+                                auto_continue)));
+                        }
+                        Cmd::DebugContinue => {
+                            c.debug_continue().map_err(|e| e.to_string())?;
+                            let _ = tx.send(Ev::Message("debug continue: target running".into()));
+                            push_status(c, &tx);       // clears the stopped bit
+                        }
+                        Cmd::DebugStep { thread_id } => {
+                            // 0 = "the thread the console stopped" (it remembers it).
+                            c.debug_step(thread_id).map_err(|e| e.to_string())?;
+                            let _ = tx.send(Ev::Message("debug step".into()));
+                            // A step keeps the stop published (only the PC moves), so
+                            // the status is re-read and the caller refreshes the
+                            // context afterwards.
+                            push_status(c, &tx);
+                        }
+                        Cmd::FetchThreadPcAndDisasm { thread_id, pc, size } => {
+                            // The thread the console parked is the interesting one; dmnt
+                            // only reports contexts for stopped threads, so a failure
+                            // here must still show the code at the event's PC.
+                            let (ctx, address, data) = match c.regs_get(thread_id) {
+                                Ok(ctx) => {
+                                    let pc = if ctx.pc != 0 { ctx.pc } else { pc };
+                                    let address = pc.saturating_sub(32);
+                                    let data = c.read(address, size).map_err(|e| e.to_string())?;
+                                    (ctx, address, data)
+                                }
+                                Err(e) => {
+                                    let address = pc.saturating_sub(32);
+                                    let data = c.read(address, size).map_err(|e| e.to_string())?;
+                                    let _ = tx.send(Ev::Message(format!(
+                                        "registers of thread {} unavailable: {}", thread_id, e)));
+                                    let ctx = P::ThreadContext { thread_id, pc, ..Default::default() };
+                                    (ctx, address, data)
+                                }
+                            };
+                            let _ = tx.send(Ev::RegsAndDisasm { ctx, address, data });
                         }
                         Cmd::Connect { .. } | Cmd::Disconnect | Cmd::PtrScanPc { dump_path: Some(_), .. } => {}
                     }
@@ -697,6 +824,12 @@ pub struct WatchEntry {
     pub edit_text: String,
 }
 
+/// serde default for the preference flags that must stay ON when an old
+/// `nxus-prefs` blob (written before the field existed) is loaded.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Prefs {
     pub host: String,
@@ -721,6 +854,14 @@ pub struct Prefs {
     pub watch_style: u32,
     pub watch_kind: usize,
     pub watch_size: u32,
+    /// GDB style: hold the target at a watchpoint hit instead of resuming it.
+    /// Sent as NxusDebugConfig.auto_continue = 0 right before an arm.
+    #[serde(default = "default_true")]
+    pub watch_stop_on_hit: bool,
+    /// Freeze the target for the duration of a scan, so no value changes under
+    /// the scan (only meaningful while Nxus owns the debug session).
+    #[serde(default = "default_true")]
+    pub scan_pause: bool,
     pub ptr_depth: u32,
     pub ptr_max_offset: u32,
     #[serde(default)]
@@ -755,6 +896,9 @@ impl Default for Prefs {
             watch_style: 1,
             watch_kind: 0,
             watch_size: 4,
+            // GDB behaviour by default: a hit is a stop, not a log line.
+            watch_stop_on_hit: true,
+            scan_pause: true,
             ptr_depth: 3,
             ptr_max_offset: 0x1000,
             ptr_pc_mode: false,
@@ -834,6 +978,12 @@ pub struct State {
     pub disasm_bytes: Vec<u8>,
     /// Registers fetched by "At Current PC (Regs)"; shown above the listing.
     pub last_regs: Option<P::ThreadContext>,
+    /// Set while the console holds the target at a breakpoint and the stop
+    /// details are known (P::DebugStop).  `None` with the status bit set means
+    /// "held, but this stop is not a breakpoint hit" (e.g. the Pause button).
+    pub debug_stop: Option<P::DebugStop>,
+    /// The scan section paused the target and still owes it a Resume.
+    pub scan_paused_target: bool,
 }
 
 impl State {
@@ -876,11 +1026,20 @@ impl State {
             disasm_highlight_pc: None,
             disasm_bytes: Vec::new(),
             last_regs: None,
+            debug_stop: None,
+            scan_paused_target: false,
         }
     }
 
     pub fn main_base(&self) -> u64 {
         self.status.as_ref().map(|s| s.main_base).unwrap_or(0)
+    }
+
+    /// The target is held: either a breakpoint stop with details (banner) or just
+    /// the console's status bit (a manual break/scan pause, badge only).
+    pub fn is_stopped(&self) -> bool {
+        self.debug_stop.is_some()
+            || self.status.as_ref().map(|s| s.debug_stopped()).unwrap_or(false)
     }
 
     pub fn heap_base(&self) -> u64 {
@@ -1017,6 +1176,39 @@ mod font_tests {
         }
         // Latin text must keep working too
         assert!(fonts.has_glyphs(&ui_font, "Nxus ready - connect"));
+        // The stop marker must render as well.  ⏸ (U+23F8) is NOT in any bundled
+        // face - it came out as a tofu box - so the UI draws ■ (U+25A0) instead.
+        for marker in ["■ STOPPED", "▌▌", "●"] {
+            assert!(
+                fonts.has_glyphs(&ui_font, marker),
+                "stop marker {marker} would render as a box"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_stop_tests {
+    use super::*;
+
+    /// The wire sentinel decides whether the UI opens a stop banner at all, and it
+    /// is `kind` that carries it: a genuine hit whose hardware slot could not be
+    /// paired up also reports 0xFFFFFFFF in `slot`, so `slot` must not be used.
+    #[test]
+    fn manual_break_is_told_apart_from_a_hit() {
+        assert!(is_manual_stop(0xFFFF_FFFF));
+        assert!(!is_manual_stop(break_kind::WRITE));
+        assert!(!is_manual_stop(break_kind::READ));
+        assert!(!is_manual_stop(break_kind::EXECUTE));
+        assert!(!is_manual_stop(break_kind::ACCESS));
+    }
+
+    /// "stop on hit" must reach the console as auto_continue = 0 (hold), because
+    /// 1 silently resumes the game and the banner would describe a running target.
+    #[test]
+    fn stop_on_hit_sends_auto_continue_zero() {
+        assert_eq!(auto_continue_for(true), 0);
+        assert_eq!(auto_continue_for(false), 1);
     }
 }
 
@@ -1096,6 +1288,9 @@ impl App {
         self.scan_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.cmd_tx.send(Cmd::ScanCancel);
         let _ = self.cmd_tx.send(Cmd::PcScanCancel);
+        // The worker processes this after the cancel, so the game is not left
+        // frozen by the "pause while scanning" checkbox.
+        self.end_scan_pause();
         self.st.last_message = label.to_string();
     }
 
@@ -1130,6 +1325,9 @@ impl App {
                 self.st.busy = false;
                 self.st.status = Some(status);
                 self.st.metadata = metadata;
+                // a fresh session holds nothing: never inherit the previous stop
+                self.st.debug_stop = None;
+                self.st.scan_paused_target = false;
                 self.st.log("connected");
                 let _ = self.cmd_tx.send(Cmd::FetchModules);
                 // the region list is needed as soon as a scan range has to be chosen
@@ -1157,9 +1355,17 @@ impl App {
                 self.st.connected = false;
                 self.st.busy = false;
                 self.st.status = None;
+                self.st.debug_stop = None;         // no console, no stop
+                self.st.scan_paused_target = false;
                 self.console_log.clear();      // belongs to the console we just lost
             }
             Ev::Status(status) => {
+                // No stopped bit means the console let the target run again (the
+                // Continue button, its own watchdog, or a fresh attach), so a
+                // banner left over from the stale stop must go away.
+                if !status.debug_stopped() {
+                    self.st.debug_stop = None;
+                }
                 self.st.status = Some(status);
                 self.st.busy = false;
             }
@@ -1197,6 +1403,7 @@ impl App {
                         self.goto(address);
                     }
                 }
+                self.end_scan_pause();           // the scan is over: let the game run
             }
             Ev::Read { address, data } => {
                 self.hex.set_data(address, data);
@@ -1217,6 +1424,13 @@ impl App {
                 // Thumb code has T set in CPSR; AArch64/ARM leave that bit clear.
                 if ctx.cpsr & 0x20 != 0 {
                     self.st.disasm_arch = 2;
+                }
+                // A Step moves the PC: the banner has to follow the listing, or it
+                // keeps naming the address the target left behind.
+                if let Some(stop) = self.st.debug_stop.as_mut() {
+                    if stop.thread_id == ctx.thread_id || stop.thread_id == 0 {
+                        stop.pc = ctx.pc;
+                    }
                 }
                 self.st.last_regs = Some(ctx);
                 self.st.busy = false;
@@ -1260,6 +1474,39 @@ impl App {
                 self.st.break_hits = hits;
                 self.st.busy = false;
             }
+            Ev::DebugStopped { thread_id, pc, address, kind, slot } => {
+                if let Some(status) = self.st.status.as_mut() {
+                    status.status_flags |= P::ST_DEBUG_STOPPED;
+                }
+                let offset = pc.wrapping_sub(self.st.main_base());
+                if is_manual_stop(kind) {
+                    // A stop the console made for itself (`svcBreakDebugProcess`,
+                    // i.e. the Pause button / the scan pause): the target is held,
+                    // but nothing was "hit", so no banner, no tab jump - just the
+                    // STOPPED badge and a log line.
+                    self.st.debug_stop = None;
+                    self.st.log(format!(
+                        "STOPPED: target held by a manual break (pc=main+{:#x}); resume to run again",
+                        offset));
+                    return;
+                }
+                self.st.busy = true;             // the register/code fetch is next
+                self.st.debug_stop = Some(P::DebugStop { thread_id, pc, address, kind, slot });
+                self.st.log(format!(
+                    "STOPPED: thread {} at pc=main+{:#x} ({:08X}) - {} hit on {:08X} (slot {:#x})",
+                    thread_id, offset, pc, break_kind::name(kind), address, slot));
+                // Open the disassembly at the hitting instruction right away; the
+                // bytes and the registers arrive from the worker a moment later.
+                self.st.disasm_highlight_pc = Some(pc);
+                self.st.disasm_base = pc.saturating_sub(32);
+                self.st.disasm_addr_input = format!("main+{:#x}", offset);
+                self.st.disasm_bytes.clear();    // stale code from the old base
+                self.st.last_regs = None;        // the previous thread's regs, not this one's
+                self.tab = Tab::Disasm;          // show the hit, not the tab we were on
+                let _ = self.cmd_tx.send(Cmd::FetchThreadPcAndDisasm {
+                    thread_id, pc, size: DISASM_PAGE,
+                });
+            }
             Ev::Snapshot { summary, changed } => {
                 self.st.snapshot.summary = Some(summary);
                 self.st.snapshot.changed = changed;
@@ -1289,7 +1536,9 @@ impl App {
                     self.st.log("watchdog: target auto-resumed");
                     if let Some(st) = self.st.status.as_mut() {
                         st.status_flags &= !0x0004;
+                        st.status_flags &= !P::ST_DEBUG_STOPPED;
                     }
+                    self.st.debug_stop = None;   // it is running again, banner goes
                 }
                 event::SCAN_PROGRESS => {}
                 other => self.st.log(format!("event 0x{:04X} ({} bytes)", other, payload.len())),
@@ -1322,6 +1571,7 @@ impl App {
                         self.goto(address);
                     }
                 }
+                self.end_scan_pause();           // the scan is over: let the game run
             }
             Ev::Message(message) => {
                 self.st.busy = false;
@@ -1332,6 +1582,8 @@ impl App {
                 // a failed arm (e.g. not attached) must not leave the panel
                 // claiming a watchpoint is armed
                 self.st.watch_armed = None;
+                // a scan that failed must not leave the game frozen either
+                self.end_scan_pause();
                 self.st.log(format!("error: {}", message));
             }
         }
@@ -1396,13 +1648,24 @@ impl App {
         hit.regs[3] = 3940;
         self.st.break_hits = vec![hit];
         self.st.watch_armed = Some(0x42CA1DC4);
+        // --screenshot demo: the GDB-style stop that the stop banner shows.
+        self.st.debug_stop = Some(P::DebugStop {
+            thread_id: 0x1001,
+            pc: 0x00712340,
+            address: 0x42CA1DC4,
+            kind: break_kind::WRITE,
+            slot: 0x10,
+        });
+        if let Some(status) = self.st.status.as_mut() {
+            status.status_flags |= P::ST_DEBUG_STOPPED;
+        }
         self.st.log = vec![
             "[    0.0s] Nxus demo data (no console attached)".into(),
             "[    0.3s] connected to 127.0.0.1:7332".into(),
             "[    0.6s] 1 module(s)".into(),
             "[    1.2s] scan done: 41 hit(s)".into(),
-            "[    2.0s] watchpoint armed at 42CA1DC4 (slot 16)".into(),
-            "[    2.6s] watch hit: write to 42CA1DC4  pc=main+0x12345".into(),
+            "[    2.0s] watchpoint armed at 42CA1DC4 (slot 16) - stop on hit".into(),
+            "[    2.6s] STOPPED: thread 4097 at pc=main+0x12340 (00712340) - write hit on 42CA1DC4 (slot 0x10)".into(),
         ];
     }
 }
@@ -1460,10 +1723,10 @@ impl eframe::App for App {
 
 impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        let (f5, f6, f7, f8, f9) = ctx.input(|i| (
+        let (f5, f6, f7, f8, f9, f10) = ctx.input(|i| (
             i.key_pressed(egui::Key::F5), i.key_pressed(egui::Key::F6),
             i.key_pressed(egui::Key::F7), i.key_pressed(egui::Key::F8),
-            i.key_pressed(egui::Key::F9),
+            i.key_pressed(egui::Key::F9), i.key_pressed(egui::Key::F10),
         ));
         if f5 {
             self.start_scan(false);
@@ -1485,6 +1748,10 @@ impl App {
         if f9 {
             self.arm_watchpoint();
         }
+        if f10 && self.st.is_stopped() {
+            // the "let it run again" key, next to the two buttons in the banner
+            self.debug_continue();
+        }
     }
 
     pub fn start_scan(&mut self, refine: bool) {
@@ -1504,6 +1771,7 @@ impl App {
                 &self.st.scan_range_begin, &self.st.scan_range_end,
                 self.st.main_base(), self.st.heap_base(),
             );
+            self.begin_scan_pause();
             self.send(Cmd::PcScanUnknown {
                 value_size: value_type.size(),
                 scope: self.prefs.scope as u32,
@@ -1524,6 +1792,7 @@ impl App {
                 .map(|(_, t)| t.is_float()).unwrap_or(false) {
                 flags |= crate::protocol::SCAN_F_FLOAT;
             }
+            self.begin_scan_pause();
             self.send(Cmd::PcScanRefine {
                 compare: compare as u32, target, target2, flags,
             }, "next scan (PC side)");
@@ -1538,6 +1807,7 @@ impl App {
                 spec.range_begin = begin;
                 spec.range_end = end;
                 let label = if refine { "next scan" } else { "first scan" };
+                self.begin_scan_pause();
                 if refine {
                     self.send(Cmd::ScanNext { spec }, label);
                 } else {
@@ -1548,12 +1818,122 @@ impl App {
         }
     }
 
+    /// "Pause target while scanning": freeze the game for the duration of a scan
+    /// so nothing moves under the reads.  Only while Nxus owns the debug session
+    /// (the console maps Pause to svcBreakDebugProcess there); otherwise the scan
+    /// runs against a live game exactly as before.
+    fn begin_scan_pause(&mut self) {
+        if !self.prefs.scan_pause || self.st.scan_paused_target || !self.st.connected {
+            return;
+        }
+        if self.st.is_stopped() {
+            return;                 // already held at a breakpoint: nothing to do
+        }
+        let attached = self.st.status.as_ref()
+            .map(|s| s.debug_attached() || s.debug_mode())
+            .unwrap_or(false);
+        if !attached {
+            return;
+        }
+        self.st.scan_paused_target = true;
+        self.send(Cmd::Pause, "pausing target for the scan");
+    }
+
+    /// Undo `begin_scan_pause`, from every path a scan can end on (result, error,
+    /// cancel) - leaving the game frozen would look like a crash.  The pause IS a
+    /// manual break while Nxus owns the debug session, so the held state has to be
+    /// released here too (Resume maps to DebugContinue on the console).
+    fn end_scan_pause(&mut self) {
+        if !self.st.scan_paused_target {
+            return;
+        }
+        self.st.scan_paused_target = false;
+        if !self.st.connected {
+            return;
+        }
+        self.clear_stop();
+        self.send(Cmd::Resume, "resuming target");
+    }
+
+    /// Build the CONFIG request that carries the debug block.  It has to be sent
+    /// BEFORE the breakpoint is set, otherwise the first hit resumes behind the
+    /// user's back.  The whole config travels because the server rewrites all of
+    /// it, and the hotkey/watchdog half must not be zeroed as a side effect.
+    fn debug_config_cmd(&self, auto_continue: u32) -> Cmd {
+        let enabled = self.prefs.hotkey_enabled as u32;
+        Cmd::DebugConfigure {
+            auto_continue,
+            mask: if enabled == 0 { 0 } else { self.prefs.hotkey_mask },
+            hold: self.prefs.hotkey_hold,
+            enabled,
+            watchdog: self.prefs.watchdog_ms,
+            style: self.prefs.watch_style,
+        }
+    }
+
+    /// Arm a breakpoint the way the WATCHPOINT section does: push "stop on hit"
+    /// first, then the break itself.  Used by the results table and the
+    /// disassembler so those shortcuts behave identically.
+    pub fn arm_breakpoint(&mut self, address: u64, kind: u32, size: u32, label: &str) {
+        let auto_continue = auto_continue_for(self.prefs.watch_stop_on_hit);
+        let configure = self.debug_config_cmd(auto_continue);
+        self.send(configure, "configuring debug session");
+        self.send(Cmd::BreakSet { address, kind, size }, label);
+    }
+
+    /// Push the current "stop on hit" choice on its own (the checkbox moved): an
+    /// already armed breakpoint then keeps the new policy instead of only the
+    /// next arm picking it up.
+    pub fn apply_stop_on_hit(&mut self) {
+        if !self.st.connected {
+            return;                 // nothing to talk to; the next arm sends it
+        }
+        let auto_continue = auto_continue_for(self.prefs.watch_stop_on_hit);
+        let configure = self.debug_config_cmd(auto_continue);
+        self.send(configure, "configuring debug session");
+    }
+
     pub fn arm_watchpoint(&mut self) {
         let address = self.hex.cursor;
         let (_, kind) = WATCH_KINDS[self.prefs.watch_kind.min(WATCH_KINDS.len() - 1)];
         let size = self.prefs.watch_size;
         // the label is set when the console confirms (Ev::WatchArmed), not here
-        self.send(Cmd::BreakSet { address, kind, size }, "arming watchpoint");
+        self.arm_breakpoint(address, kind, size, "arming watchpoint");
+    }
+
+    /// Continue past a debug stop (banner button, F10).  The console has no
+    /// "resumed" event, so the banner clears here and the status reply the worker
+    /// fetches afterwards confirms it (and corrects the banner if it failed).
+    pub fn debug_continue(&mut self) {
+        self.clear_stop();
+        self.send(Cmd::DebugContinue, "continuing");
+    }
+
+    /// Single step the held thread.  A step does NOT release the target (the
+    /// console keeps the stop published), so the banner stays and the context is
+    /// re-read afterwards - only the PC moves.
+    pub fn debug_step(&mut self) {
+        let stop = self.st.debug_stop.clone();
+        let thread_id = stop.as_ref().map(|s| s.thread_id).unwrap_or(0);
+        let pc = stop.as_ref().map(|s| s.pc).unwrap_or(0);
+        self.send(Cmd::DebugStep { thread_id }, "stepping");
+        if thread_id != 0 {
+            // the worker steps first and reads the fresh context right after, so
+            // the listing follows the PC without a second click
+            self.st.busy = true;
+            let _ = self.cmd_tx.send(Cmd::FetchThreadPcAndDisasm {
+                thread_id, pc, size: DISASM_PAGE,
+            });
+        }
+    }
+
+    /// The console has no "resumed" event: clear the stop locally when the user
+    /// asks to run again, and let the next status reply correct a stale banner.
+    fn clear_stop(&mut self) {
+        self.st.debug_stop = None;
+        if let Some(status) = self.st.status.as_mut() {
+            status.status_flags &= !P::ST_DEBUG_STOPPED;
+        }
     }
 }
 

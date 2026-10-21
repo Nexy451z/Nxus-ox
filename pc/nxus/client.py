@@ -365,11 +365,13 @@ class NxusClient:
 
     @staticmethod
     def _debug_status_from(body: bytes) -> dict:
-        attached, style, breaks, hits, threads, last_result, auto_continue, _res = \
-            P.DEBUG_STATUS.unpack(body)
+        (attached, style, breaks, hits, threads, last_result, auto_continue,
+         stopped_thread_low) = P.DEBUG_STATUS.unpack(body)
         return dict(attached=bool(attached), watch_style=style, break_count=breaks,
                     hit_count=hits, thread_count=threads, last_result=last_result,
-                    auto_continue=auto_continue)
+                    auto_continue=auto_continue,
+                    stopped_thread=stopped_thread_low or None,
+                    stopped_thread_low=stopped_thread_low)
 
     def break_set(self, address: int, kind: int, size: int = 4, slot: int = 0,
                   ctrl: int = 0) -> list[dict]:
@@ -395,6 +397,15 @@ class NxusClient:
 
     def debug_continue(self):
         self.request(P.CMD['DebugContinue'])
+
+    def debug_step(self, thread_id: int = 0):
+        """Single-step the held thread (0 = whichever thread the console holds)."""
+        self.request(P.CMD['DebugStep'],
+                     (thread_id & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little'), timeout=20.0)
+
+    def debug_stopped_thread(self):
+        """Thread the console is holding at a breakpoint (None = running)."""
+        return self.debug_status()['stopped_thread']
 
     def thread_list(self) -> list[dict]:
         _, _, body = self.request(P.CMD['ThreadList'])
