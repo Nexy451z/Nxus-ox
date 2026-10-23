@@ -158,17 +158,6 @@ nxus write <CODE_ADDR> "00 00 A0 E1"
 nxus detach
 ```
 
----
-
-## Companion project: Smithy
-
-The **MHXX CTRPF-style on-device mod menu** lives in its own repository:
-**[Nexy451z/Smithy](https://github.com/Nexy451z/Smithy)** — 15 one-word AArch32
-code patches, 6 pointer-chain values, a touch + D-pad numeric keypad, and a
-`dmnt:cht`-only cheat engine (no debug session stolen from Nxus).
-
----
-
 ## Repository Structure
 
 ```text
