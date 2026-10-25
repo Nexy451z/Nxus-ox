@@ -1173,6 +1173,124 @@ class FrozenRelease(unittest.TestCase):
             self.server.attached = False
 
 
+class PayloadRecordingSwitch(MockSwitch):
+    """MockSwitch that keeps the raw request payload of every command.
+
+    A client-side default is only really "automatic" when the bytes on the wire
+    say so: the console has to receive 0, not the 4 a helper substituted for it
+    before sending.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.payloads = {}                 # cmd -> [raw request payload]
+
+    def _handle(self, cmd, payload):
+        self.payloads.setdefault(cmd, []).append(payload)
+        return super()._handle(cmd, payload)
+
+    def last_payload(self, cmd):
+        return self.payloads[cmd][-1]
+
+
+class ClientAutoDefaults(unittest.TestCase):
+    """The console's "0 = you infer it" must be what an omitted argument sends.
+
+    The console owns the pointer-width decision (the process's own architecture
+    first, then the mappings the walk traverses).  A PC-side default of 4 made
+    that dead code and walked every 64-bit title with 4-byte pointers, which
+    silently finds no chain; the cheat export was pinned to the 32-bit 540F form
+    the same way.  These tests pin the WIRE value, not just the Python default.
+    """
+
+    # The chain the mock plants: .data+0x1000 -> heap+0x120 -> record+4.
+    CHAIN = dict(root_offset=(DATA_BASE - MAIN_BASE) + 0x1000, final_offset=4, steps=[0x20])
+
+    def setUp(self):
+        self.server = PayloadRecordingSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    # ---- pointer scan ----
+
+    def test_ptr_scan_begin_defaults_to_auto_width(self):
+        self.client.ptr_scan_begin(MONEY_ADDRESS, module_base=MAIN_BASE)
+        payload = self.server.last_payload(P.CMD['PtrScanBegin'])
+        (_target, _module, _depth, _offset, _max,
+         value_width) = P.PTRSCAN_REQUEST.unpack(payload)
+        self.assertEqual(value_width, 0,
+                         'an omitted value_width must reach the console as 0 (auto)')
+
+    def test_ptr_scan_begin_still_sends_an_explicit_width(self):
+        self.client.ptr_scan_begin(MONEY_ADDRESS, module_base=MAIN_BASE, value_width=8)
+        payload = self.server.last_payload(P.CMD['PtrScanBegin'])
+        (_target, _module, _depth, _offset, _max,
+         value_width) = P.PTRSCAN_REQUEST.unpack(payload)
+        self.assertEqual(value_width, 8, 'an explicit width must not be rewritten to 0')
+
+    # ---- cheat export ----
+
+    def export_payload(self, **kwargs):
+        self.server.chains = [dict(self.CHAIN)]
+        self.client.cheat_export(0, 9999999, **kwargs)
+        return P.CHEAT_EXPORT_REQUEST.unpack(
+            self.server.last_payload(P.CMD['CheatExport']))
+
+    def test_cheat_export_defaults_to_auto(self):
+        index, value_width, flags, _res, value = self.export_payload()
+        self.assertEqual(index, 0)
+        self.assertEqual(value, 9999999)
+        self.assertEqual(value_width, 0,
+                         'auto must let the console use the width it walked with')
+        self.assertEqual(flags, 0,
+                         'auto must not pin the 32-bit 540F form on the wire')
+
+    def test_cheat_export_follows_a_pinned_width(self):
+        _index, value_width, flags, _res, _value = self.export_payload(is_32bit=True)
+        self.assertEqual((value_width, flags), (4, P.CHEAT_F_32BIT))
+
+        # 64-bit: 580F loads go with an 8-byte (680F) value write, not a 4-byte one
+        _index, value_width, flags, _res, _value = self.export_payload(is_32bit=False)
+        self.assertEqual((value_width, flags), (8, 0))
+
+    def test_an_explicit_value_width_is_kept(self):
+        _index, value_width, flags, _res, _value = self.export_payload(
+            value_width=4, is_32bit=False)
+        self.assertEqual((value_width, flags), (4, 0),
+                         'a caller that names the width keeps it, flag included')
+
+    # ---- the walked width in the chain list header ----
+
+    def chain_body(self, header_pointer_width=None):
+        """One chain, with the 16-byte header or the 20-byte one that appends the
+        walked pointer width (NxusPtrChainListHeader.pointer_width)."""
+        steps = [0x20] + [0] * 7
+        body = struct.pack('<IIII', 1, 1, 0, 0)
+        if header_pointer_width is not None:
+            body += struct.pack('<I', header_pointer_width)
+        return body + P.PTR_CHAIN.pack(self.CHAIN['root_offset'],
+                                       self.CHAIN['final_offset'], 1, 0, *steps)
+
+    def test_chain_list_without_the_appended_width_still_parses(self):
+        chains = self.client._parse_chains(self.chain_body())
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(chains[0]['root_offset'], self.CHAIN['root_offset'])
+        self.assertEqual(self.client.last_ptr_scan_width, 0)
+
+    def test_chain_list_with_the_appended_width_stays_aligned(self):
+        """The new word is APPENDED: a reader that keeps parsing at offset 16
+        would decode four bytes of it as the first record's root offset."""
+        chains = self.client._parse_chains(self.chain_body(header_pointer_width=8))
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(chains[0], dict(root_offset=self.CHAIN['root_offset'],
+                                         final_offset=self.CHAIN['final_offset'],
+                                         step_count=1, steps=[0x20]))
+        self.assertEqual(self.client.last_ptr_scan_width, 8)
+
+
 def batch_total(batch):
     return batch['total']
 

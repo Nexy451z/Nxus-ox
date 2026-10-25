@@ -33,6 +33,10 @@
 #include "nxus_dmntcht.h"
 #include "nxus_hid.h"
 #include "nxus_protocol.h"
+/* nxusPtrScanArchFromAddressSpace(): the console-side rule for "is this an
+   AArch32 or AArch64 process?", reused here so the probe reports the same bitness
+   the pointer scan will walk with (core/nxus_ptrscan.c, linked into the probe). */
+#include "nxus_ptrscan.h"
 
 u32 __nx_applet_type = AppletType_None;
 u32 __nx_fs_num_sessions = 1;
@@ -543,11 +547,24 @@ static void probeDmnt(void) {
             (unsigned long long)md.alias_size);
         out("  aslr     : 0x%llX + 0x%llX", (unsigned long long)md.aslr_base,
             (unsigned long long)md.aslr_size);
-        out("  build id : %02X%02X%02X%02X %02X%02X%02X%02X (%s)",
+        out("  build id : %02X%02X%02X%02X %02X%02X%02X%02X",
             md.main_nso_build_id[0], md.main_nso_build_id[1], md.main_nso_build_id[2],
             md.main_nso_build_id[3], md.main_nso_build_id[4], md.main_nso_build_id[5],
-            md.main_nso_build_id[6], md.main_nso_build_id[7],
-            (md.main_nso_size > 0x100000000ull) ? "64-bit title" : "32-bit title");
+            md.main_nso_build_id[6], md.main_nso_build_id[7]);
+        /* The title's bitness comes from its ADDRESS SPACE, not from the NSO size:
+           an NSO is always well below 4 GiB, so the old
+           main_nso_size > 4 GiB test printed "32-bit title" for every title,
+           AArch64 included.  Both values are shown: the derived arch (the same
+           rule the pointer scan uses, from aslr_base/aslr_size) and the NSO size
+           it was NOT derived from, so a surprising pair is visible in the report
+           instead of being hidden behind a wrong label. */
+        const NxusPtrScanArch arch =
+            nxusPtrScanArchFromAddressSpace(md.aslr_base, md.aslr_size);
+        const char *arch_name = (arch == NXUS_PTRSCAN_ARCH_AARCH64) ? "AArch64"
+                              : (arch == NXUS_PTRSCAN_ARCH_AARCH32) ? "AArch32"
+                              : "unknown";
+        out("  arch     : %s (addr space), NSO size 0x%llX",
+            arch_name, (unsigned long long)md.main_nso_size);
     }
 
     u64 count = 0;

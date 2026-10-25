@@ -451,14 +451,18 @@ NXUS_STATIC_ASSERT(sizeof(NxusChangedBlockWire) == 16, "NxusChangedBlockWire mus
 #define NXUS_PTRSCAN_MAX_DEPTH 8
 
 /* NxusPtrScanRequest.value_width: 4 or 8 forces the load width; 0 asks the console
-   to infer it from the mappings the walk will traverse (a mapping whose end lies
-   above 4 GiB means 8-byte pointers, all below 4 GiB means 4; module_base is only
-   the fallback hint when no mapping was collected, and 0 there means "unknown").
-   The inference exists because a 64-bit title's main module can land below 4 GiB
-   (AArch64 ASLR) while its heap is randomised independently: deciding from the
-   module base alone used to pick 4-byte loads and then silently find no chain.
-   Neither the PtrScan chain reply nor NxusPtrChainListHeader carries the chosen
-   width, so a client that wants cheat codes sends the same value to CheatExport. */
+   to infer it from the process's own architecture and the mappings the walk will
+   traverse (a mapping whose end lies above 4 GiB means 8-byte pointers, all below
+   4 GiB means 4; module_base is only the fallback hint when no mapping was
+   collected, and 0 there means "unknown").  The inference exists because a 64-bit
+   title's main module can land below 4 GiB (AArch64 ASLR) while its heap is
+   randomised independently: deciding from the module base alone used to pick
+   4-byte loads and then silently find no chain.
+   The width the walk actually used is reported back in
+   NxusPtrChainListHeader.pointer_width (0 = the server predates that field).
+   CheatExport therefore no longer has to be told the width: when the server knows
+   the walked width it uses that, and the request's value_width is only the
+   fallback for a list published without one. */
 typedef struct NXUS_PACKED {
     u64 target_address;
     u64 module_base;
@@ -474,8 +478,19 @@ typedef struct NXUS_PACKED {
     u32 total;
     u32 truncated;
     u32 reserved;
+    /* Appended to the 16-byte header (never inserted): the pointer width the walk
+       actually loaded with - 4 or 8.  0 = 不明/旧サーバ: the server build that
+       produced this list predates the field (or the list is empty), so the reader
+       must fall back to the width it asked for.
+       The chain records start after the WHOLE header, i.e. at offset 20 on a
+       server that sends this field; a client that only knows the old 16-byte
+       header must not keep parsing records at offset 16 when the payload is
+       longer than 16 + count*sizeof(NxusPtrChainWire).  Because the field is
+       appended, the first 16 bytes (count/total/truncated/reserved) keep their
+       offsets, so a legacy reader still decodes those correctly. */
+    u32 pointer_width;
 } NxusPtrChainListHeader;
-NXUS_STATIC_ASSERT(sizeof(NxusPtrChainListHeader) == 16, "NxusPtrChainListHeader must be 16 bytes");
+NXUS_STATIC_ASSERT(sizeof(NxusPtrChainListHeader) == 20, "NxusPtrChainListHeader must be 20 bytes");
 
 typedef struct NXUS_PACKED {
     u32 root_offset;      /* relative to the module base (M=0 in cheat codes) */
@@ -486,6 +501,11 @@ typedef struct NXUS_PACKED {
 } NxusPtrChainWire;
 NXUS_STATIC_ASSERT(sizeof(NxusPtrChainWire) == 48, "NxusPtrChainWire must be 48 bytes");
 
+/* CheatExport.  value_width/flags describe the width the CLIENT believes the
+   title uses (its own inference ran on a mapping table that may be stale).  The
+   server prefers the width it actually walked with (NxusPtrChainListHeader.
+   pointer_width) when that is known, and falls back to this request otherwise;
+   value_width == 0 means "let the console decide", exactly as it did before. */
 typedef struct NXUS_PACKED {
     u32 index;
     u32 value_width;

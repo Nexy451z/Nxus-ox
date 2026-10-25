@@ -80,7 +80,10 @@ CHANGE_VANISHED = 1
 CHANGE_APPEARED = 2
 SNAPSHOT_DEFAULT_BLOCK_SIZE = 16384
 PTRSCAN_REQUEST = struct.Struct('<QQIIII')
-PTR_CHAIN_LIST_HEADER = struct.Struct('<IIII')
+# count, total, truncated, reserved, pointer_width (the last one is a later
+# addition: a 16-byte prefix from an old console still parses, the width reads 0)
+PTR_CHAIN_LIST_HEADER = struct.Struct('<IIIII')
+PTR_CHAIN_LIST_HEADER_LEGACY = struct.Struct('<IIII')
 PTR_CHAIN = struct.Struct('<IIII8I')
 CHEAT_EXPORT_REQUEST = struct.Struct('<IIIIQ')
 THREAD_CONTEXT = struct.Struct('<QQQQQ I 13I I 29Q')

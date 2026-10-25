@@ -33,6 +33,9 @@ class NxusClient:
         self.port = port
         self.timeout = timeout
         self.max_read = 0                   # filled in from the status reply
+        # Pointer width the last chain list reported it walked with (0 = the reply
+        # predates NxusPtrChainListHeader.pointer_width).
+        self.last_ptr_scan_width = 0
         self._sock: socket.socket | None = None
         self._rx_thread: threading.Thread | None = None
         self._running = False
@@ -274,7 +277,20 @@ class NxusClient:
 
     def ptr_scan_begin(self, target_address: int, module_base: int = 0, max_depth: int = 3,
                        max_offset: int = 0x1000, max_results: int = 64,
-                       value_width: int = 4, timeout: float = 150.0) -> list[dict]:
+                       value_width: int = 0, timeout: float = 150.0) -> list[dict]:
+        """Walk the pointer chain graph that reaches `target_address`.
+
+        `value_width` is 0 by default: the console infers the pointer width from
+        the process's own architecture and from the mappings the walk traverses
+        (a mapping whose end lies above 4 GiB means 8-byte pointers).  A hard-coded
+        4 used to disable that inference, so every 64-bit title was walked with
+        4-byte pointers and silently found no chain.  Pass 4 or 8 to pin it.
+
+        The width the console actually walked with comes back in
+        `NxusPtrChainListHeader.pointer_width` and is kept on this client as
+        `last_ptr_scan_width` (0 when the reply predates that field), so a caller
+        can pass it back to cheat_export() instead of guessing.
+        """
         payload = P.PTRSCAN_REQUEST.pack(target_address, module_base, max_depth, max_offset,
                                          max_results, value_width)
         # 150 s: the console aborts its own walk after 90 s (NXUS_PTRSCAN_TIME_BUDGET_MS
@@ -312,15 +328,47 @@ class NxusClient:
         _, _, body = self.request(P.CMD['PtrScanGet'])
         return self._parse_chains(body)
 
-    def cheat_export(self, index: int, value: int, value_width: int = 4, is_32bit: bool = True) -> str:
-        flags = P.CHEAT_F_32BIT if is_32bit else 0
+    def cheat_export(self, index: int, value: int, value_width: int | None = None,
+                     is_32bit: bool | None = None) -> str:
+        """Render chain #index as an Atmosphère cheat block.
+
+        `is_32bit=None` (the default) does NOT pin the load form: the request
+        leaves `NXUS_CHEAT_F_32BIT` clear and asks for `value_width` 0, i.e. it
+        lets the console use the width the pointer scan actually walked with
+        (`NxusPtrChainListHeader.pointer_width`) instead of a PC-side guess that
+        can go stale.  Pass True for the 540F (32-bit) form or False for 580F.
+
+        `value_width=None` follows `is_32bit` (4 bytes for 32-bit, 8 for 64-bit -
+        the console's 6T0F form takes the byte width).  One flag setup therefore
+        never pairs 580F loads with a 4-byte value store, and an explicit 1/2/4/8
+        still overrides it.
+        """
+        if value_width is None:
+            value_width = 0 if is_32bit is None else (4 if is_32bit else 8)
+        flags = 0 if is_32bit is None else (P.CHEAT_F_32BIT if is_32bit else 0)
         payload = P.CHEAT_EXPORT_REQUEST.pack(index, value_width, flags, 0, value)
         _, _, body = self.request(P.CMD['CheatExport'], payload)
         return body.decode('utf-8')
 
     def _parse_chains(self, body: bytes) -> list[dict]:
-        count, total, truncated, _res = P.PTR_CHAIN_LIST_HEADER.unpack_from(body, 0)
-        pos = P.PTR_CHAIN_LIST_HEADER.size
+        # The first four header words keep their offsets; Round 17 appends the
+        # pointer width the walk actually used (16 -> 20 bytes).  Reading just the
+        # prefix works with both mirrors, and the payload length says which layout
+        # this reply used - a 16-byte reader must not take the appended word for
+        # the first chain record.
+        count, total, truncated, _res = P.PTR_CHAIN_LIST_HEADER_LEGACY.unpack_from(body, 0)
+        records = count * P.PTR_CHAIN.size
+        self.last_ptr_scan_width = 0
+        # 16-byte header from an older console, 20-byte with pointer_width appended.
+        # The frame length decides: guessing wrong shifts every record by four bytes
+        # and yields plausible-looking garbage instead of an error.
+        if len(body) == 20 + records:
+            pos = 20
+            self.last_ptr_scan_width = int.from_bytes(body[16:20], 'little')
+        else:
+            pos = 16
+            if len(body) != 16 + records:
+                raise NxusError(f"chain list length {len(body)} matches neither header")
         out = []
         for _ in range(count):
             root, final, step_count, _r, *steps = P.PTR_CHAIN.unpack_from(body, pos)

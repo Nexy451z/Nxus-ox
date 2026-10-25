@@ -1244,10 +1244,19 @@ fn disasm_arch_for(app: &App) -> crate::protocol::DisasmArch {
                 }
                 return if ctx.is_aarch32() { DisasmArch::Arm32 } else { DisasmArch::AArch64 };
             }
+            // No context yet: the same rule `nxus disasm` follows - the title's
+            // pointer width (crate::client::pointer_width_for) decides, and a
+            // 4-byte-pointer title is AArch32.  `is_aarch32_title()` is exactly
+            // that fallback (it only consults the width while no context exists).
+            if app.st.is_aarch32_title() {
+                return DisasmArch::Arm32;
+            }
+            // No 32-bit evidence from the title: an ARM-AL word in the fetched
+            // page is still solid evidence of AArch32 code, so keep that last hint.
             let arm32_hits = app.st.disasm_bytes.chunks_exact(4)
                 .filter(|c| (u32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 28) == 0xE)
                 .count();
-            if arm32_hits > 0 || app.st.is_aarch32_title() {
+            if arm32_hits > 0 {
                 DisasmArch::Arm32
             } else {
                 DisasmArch::AArch64

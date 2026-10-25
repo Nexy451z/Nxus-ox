@@ -1387,7 +1387,7 @@ class MockSwitch:
 
     def _chain_list(self) -> bytes:
         truncated = 1 if getattr(self, 'ptr_truncated', False) else 0
-        header = P.PTR_CHAIN_LIST_HEADER.pack(len(self.chains), len(self.chains), truncated, 0)
+        header = P.PTR_CHAIN_LIST_HEADER.pack(len(self.chains), len(self.chains), truncated, 0, getattr(self, 'ptr_scan_width', 0))
         body = header
         for c in self.chains:
             steps = list(c['steps']) + [0] * (P.NXUS_PTRSCAN_MAX_DEPTH - len(c['steps']))

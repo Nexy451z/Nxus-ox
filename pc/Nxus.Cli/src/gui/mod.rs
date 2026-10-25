@@ -1116,11 +1116,46 @@ pub struct SnapshotState {
 /// keystroke freezes the UI for seconds (see build_visible_hits).
 pub const FILTER_LIMIT: usize = 2_000_000;
 
+/// Which process the cached UI state belongs to.
+///
+/// Both halves matter: restarting the SAME title gives it a new PID (and a fresh
+/// ASLR layout), so a cached hit address or pointer chain is stale even though the
+/// program id did not change.  `None` in [`State::target`] means "the console
+/// reports no process".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TargetId {
+    pub process_id: u64,
+    pub program_id: u64,
+}
+
+impl TargetId {
+    fn new(process_id: u64, program_id: u64) -> Option<TargetId> {
+        if process_id == 0 && program_id == 0 {
+            None                 // no process: "unknown", not a target called zero
+        } else {
+            Some(TargetId { process_id, program_id })
+        }
+    }
+
+    pub fn from_status(status: &Status) -> Option<TargetId> {
+        TargetId::new(status.process_id, status.program_id)
+    }
+
+    pub fn from_metadata(metadata: &Metadata) -> Option<TargetId> {
+        TargetId::new(metadata.process_id, metadata.program_id)
+    }
+}
+
 pub struct State {
     pub connected: bool,
     pub busy: bool,
     pub status: Option<Status>,
     pub metadata: Option<Metadata>,
+    /// The process every cached address below belongs to.  `None` = the console
+    /// reports no process.  A change here means the previous title's hits,
+    /// chains, registers and frozen list name addresses of a dead process, so
+    /// [`State::note_target`] drops them.
+    pub target: Option<TargetId>,
     pub modules: Vec<ModuleInfo>,
     /// Target memory map (scopes/region picker).  Kept as raw MemoryInfo so the list can
     /// show base/size/perms/type exactly like the CLI does.
@@ -1190,6 +1225,7 @@ impl State {
             busy: false,
             status: None,
             metadata: None,
+            target: None,
             modules: Vec::new(),
             mappings: Vec::new(),
             regions_writable_only: true,     // the interesting regions are writable ones
@@ -1232,6 +1268,62 @@ impl State {
 
     pub fn main_base(&self) -> u64 {
         self.status.as_ref().map(|s| s.main_base).unwrap_or(0)
+    }
+
+    /// Remember which target the cached state belongs to; drop that state when a
+    /// different one appears.
+    ///
+    /// Returns true when a previously known target was replaced (or disappeared)
+    /// and [`State::clear_target_state`] ran, so the caller can refetch the
+    /// tables of the new target.  The FIRST identification - "unknown -> known"
+    /// after a connect - clears nothing: there is nothing cached yet, and the
+    /// connect handler builds that state itself.
+    pub fn note_target(&mut self, target: Option<TargetId>) -> bool {
+        if self.target == target {
+            return false;
+        }
+        let switched = self.target.is_some();
+        self.target = target;
+        if switched {
+            self.clear_target_state();
+        }
+        switched
+    }
+
+    /// Drop everything that described the PREVIOUS target's memory.
+    ///
+    /// A game switch used to leave the old registers, hits, pointer chains and
+    /// frozen list on screen: the GUI then formatted those addresses with the NEW
+    /// main base, which made them look valid while they named a process that no
+    /// longer exists.  Anything target-dependent goes; user preferences (filter,
+    /// sort order, value type, scan text) stay.
+    pub fn clear_target_state(&mut self) {
+        self.last_regs = None;
+        self.debug_stop = None;
+        self.hits.clear();
+        self.hits_truncated = false;
+        self.scan_hits = 0;
+        self.selected = None;
+        // The cached filtered row list is keyed on the generation, but drop it
+        // outright: the rows themselves would keep the old hits alive.
+        self.hits_generation = self.hits_generation.wrapping_add(1);
+        self.visible_cache = None;
+        self.break_hits.clear();
+        self.chains.clear();
+        self.chains_truncated = false;
+        self.cheat_text.clear();
+        self.snapshot = SnapshotState { summary: None, changed: Vec::new(), slot: 0 };
+        self.watch_armed = None;
+        self.frozen.clear();
+        self.modules.clear();
+        self.mappings.clear();
+        self.scan_ranges.clear();
+        self.scan_progress = 0.0;
+        self.scan_paused_target = false;
+        self.disasm_bytes.clear();
+        self.disasm_highlight_pc = None;
+        self.disasm_base = 0;
+        self.disasm_addr_input = "main+0x0".into();
     }
 
     /// Pointer width the console will infer for this title (0 is sent on the
@@ -1583,6 +1675,142 @@ mod incomplete_result_tests {
     }
 }
 
+#[cfg(test)]
+mod target_switch_tests {
+    use super::*;
+
+    const OLD_TITLE: u64 = 0x0100C3800049C000;
+    const NEW_TITLE: u64 = 0x010015B000000000;
+
+    fn target(process_id: u64, program_id: u64) -> TargetId {
+        TargetId { process_id, program_id }
+    }
+
+    /// A state filled the way a live session fills it: everything cached belongs
+    /// to the one target named by the status reply.
+    fn populated(process_id: u64, program_id: u64) -> State {
+        let mut st = State::new();
+        let status = Status { process_id, program_id, main_base: 0x0070_0000,
+                              ..Default::default() };
+        st.target = TargetId::from_status(&status);
+        st.status = Some(status);
+        st.hits = vec![Hit { address: 0x42CA1DC4, mapping_idx: 2,
+                             value_type: ValueType::U32 as u16, value: 6440 }];
+        st.hits_truncated = true;
+        st.scan_hits = 1;
+        st.selected = Some(0);
+        st.break_hits = vec![BreakHit::default()];
+        st.chains = vec![PtrChain { root_offset: 0x81000, final_offset: 4, steps: vec![0x20] }];
+        st.chains_truncated = true;
+        st.cheat_text = "[Nxus]\n540F0000 00081000\n".into();
+        st.frozen = vec![0x42CA1DC4];
+        st.watch_armed = Some(0x42CA1DC4);
+        st.modules = vec![ModuleInfo { base: 0x0070_0000, size: 0x0186_B03E,
+                                       build_id: "00".into() }];
+        st.mappings = vec![P::MemoryInfo { base: 0x42CA_0000, size: 0x3000,
+                                           perm: 0, ..Default::default() }];
+        st.scan_ranges = vec![(0x42CA_0000, 0x42CB_0000)];
+        st.scan_progress = 0.5;
+        st.last_regs = Some(P::ThreadContext { thread_id: 0x1001, pc: 0x0071_2340,
+                                               ..Default::default() });
+        st.debug_stop = Some(P::DebugStop { thread_id: 0x1001, pc: 0x0071_2340,
+                                            address: 0x42CA1DC4,
+                                            kind: break_kind::WRITE, slot: 0x10 });
+        st.snapshot.summary = Some(P::SnapshotSummary::default());
+        st.snapshot.changed = vec![ChangedBlock { address: 0x42CA1DC4, size: 4, flags: 0 }];
+        st.snapshot.slot = 1;
+        st.disasm_base = 0x0071_2300;
+        st.disasm_bytes = vec![0x1F, 0x20, 0x03, 0xD5];
+        st.disasm_highlight_pc = Some(0x0071_2340);
+        st.disasm_addr_input = "main+0x12340".into();
+        st
+    }
+
+    fn assert_target_state_dropped(st: &State) {
+        assert!(st.last_regs.is_none(), "the old registers survived the switch");
+        assert!(st.debug_stop.is_none(), "the old stop banner survived");
+        assert!(st.hits.is_empty(), "the old hits survived");
+        assert!(!st.hits_truncated);
+        assert_eq!(st.scan_hits, 0);
+        assert!(st.selected.is_none());
+        assert!(st.break_hits.is_empty());
+        assert!(st.chains.is_empty());
+        assert!(!st.chains_truncated);
+        assert!(st.cheat_text.is_empty());
+        assert!(st.snapshot.summary.is_none());
+        assert!(st.snapshot.changed.is_empty());
+        assert!(st.watch_armed.is_none());
+        assert!(st.frozen.is_empty(), "the old frozen list survived");
+        assert!(st.modules.is_empty(), "the old module table survived");
+        assert!(st.mappings.is_empty(), "the old mapping table survived");
+        assert!(st.scan_ranges.is_empty());
+        assert_eq!(st.scan_progress, 0.0);
+        assert!(st.disasm_bytes.is_empty());
+        assert!(st.disasm_highlight_pc.is_none());
+        assert!(st.visible_cache.is_none());
+    }
+
+    #[test]
+    fn a_different_game_drops_the_previous_title() {
+        let mut st = populated(0x1111, OLD_TITLE);
+        let generation = st.hits_generation;
+        assert!(st.note_target(Some(target(0x2222, NEW_TITLE))),
+                "a new PID/program id is a target switch");
+        assert_target_state_dropped(&st);
+        assert_eq!(st.target, Some(target(0x2222, NEW_TITLE)));
+        assert_ne!(st.hits_generation, generation,
+                   "the cached filtered row list outlived the switch");
+    }
+
+    #[test]
+    fn a_restarted_game_is_a_new_target_even_with_the_same_program_id() {
+        let mut st = populated(0x1111, OLD_TITLE);
+        assert!(st.note_target(Some(target(0x9999, OLD_TITLE))),
+                "a new PID means new addresses even for the same title");
+        assert_target_state_dropped(&st);
+    }
+
+    #[test]
+    fn the_same_target_keeps_the_state() {
+        let mut st = populated(0x1111, OLD_TITLE);
+        assert!(!st.note_target(Some(target(0x1111, OLD_TITLE))),
+                "a plain status refresh is not a switch");
+        assert_eq!(st.hits.len(), 1, "a refresh must not wipe the hit list");
+        assert!(st.last_regs.is_some());
+        assert_eq!(st.frozen, vec![0x42CA1DC4]);
+        assert_eq!(st.chains.len(), 1);
+    }
+
+    #[test]
+    fn the_target_going_away_drops_the_state_too() {
+        let mut st = populated(0x1111, OLD_TITLE);
+        assert!(st.note_target(None), "the console reporting no process is a change");
+        assert_target_state_dropped(&st);
+        assert_eq!(st.target, None);
+        // The next game is a first identification: nothing cached, nothing to do.
+        assert!(!st.note_target(Some(target(0x2222, NEW_TITLE))));
+    }
+
+    #[test]
+    fn the_first_identification_clears_nothing() {
+        let mut st = State::new();
+        assert!(!st.note_target(Some(target(0x1111, OLD_TITLE))),
+                "connect is not a switch: there is nothing cached to drop");
+        assert_eq!(st.target, Some(target(0x1111, OLD_TITLE)));
+    }
+
+    #[test]
+    fn a_zeroed_identity_is_unknown_not_a_target_called_zero() {
+        assert_eq!(TargetId::from_status(&Status::default()), None);
+        assert_eq!(TargetId::from_metadata(&Metadata::default()), None);
+        assert_eq!(TargetId::from_status(&Status { process_id: 0x10, ..Default::default() }),
+                   Some(target(0x10, 0)));
+        assert_eq!(TargetId::from_metadata(&Metadata { program_id: OLD_TITLE,
+                                                       ..Default::default() }),
+                   Some(target(0, OLD_TITLE)));
+    }
+}
+
 /// Japanese text (Windows error strings, module paths, cheat names) has no glyphs in
 /// egui's default Latin fonts and used to render as a row of boxes.  M PLUS 1p is a
 /// readable OFL font that covers JIS level 1+2 for ~1.7 MB.
@@ -1690,7 +1918,8 @@ impl App {
         }
     }
 
-    /// Keep `st.frozen` in step with the console's own table.
+    /// Keep `st.frozen` in step with the console's own table, and keep the
+    /// target identity fresh.
     ///
     /// The GUI used to know only the addresses IT froze, so a freeze made by
     /// another dmnt user - or the console's own release of the addresses of a
@@ -1698,6 +1927,12 @@ impl App {
     /// described something that no longer existed.  `FROZEN_LIST` is the truth,
     /// and it is polled instead of being read on demand so the markers correct
     /// themselves without the user pressing anything.
+    ///
+    /// The same tick re-reads the status: the console names the process there,
+    /// and without a periodic read the GUI would keep showing the previous
+    /// title's registers until the user happened to press something (the title
+    /// is only visible in the status reply).  [`State::note_target`] decides
+    /// whether that reply means a game switch.
     fn poll_frozen(&mut self) {
         if self.demo || !self.st.connected || self.st.busy {
             return;                       // nothing to ask, or the worker is busy
@@ -1715,6 +1950,11 @@ impl App {
         // Sent directly, not through `send()`: this is a background refresh and
         // must not flip the UI into "busy" every two seconds.
         let _ = self.cmd_tx.send(Cmd::RefreshFrozen);
+        // The status reply is where the console names the process it is looking
+        // at, so the same tick re-reads it: switching games then drops the old
+        // title's cached hits/registers within two seconds instead of after the
+        // next button press.  One extra tiny request per tick.
+        let _ = self.cmd_tx.send(Cmd::Refresh);
     }
 
     fn apply(&mut self, ev: Ev) {
@@ -1722,11 +1962,20 @@ impl App {
             Ev::Connected { status, metadata } => {
                 self.st.connected = true;
                 self.st.busy = false;
+                // A reconnect can land in a different game: the old title's
+                // registers/hits/chains must not survive it.  Same target (or the
+                // first connect) keeps the state, so a two-second link drop does
+                // not throw away a scan the user is reading.
+                let switched = self.st.note_target(TargetId::from_status(&status));
                 self.st.status = Some(status);
                 self.st.metadata = metadata;
                 // a fresh session holds nothing: never inherit the previous stop
                 self.st.debug_stop = None;
                 self.st.scan_paused_target = false;
+                if switched {
+                    // Modules/mappings are refetched below anyway.
+                    self.drop_target_state();
+                }
                 self.st.log("connected");
                 let _ = self.cmd_tx.send(Cmd::FetchModules);
                 // the region list is needed as soon as a scan range has to be chosen
@@ -1759,6 +2008,11 @@ impl App {
                 self.console_log.clear();      // belongs to the console we just lost
             }
             Ev::Status(status) => {
+                // The status reply is the only place the console names the process
+                // it is looking at.  A different PID/program id means the user
+                // switched games (or restarted one): the cached registers, hits,
+                // pointer chains and frozen list all describe the old process.
+                let switched = self.st.note_target(TargetId::from_status(&status));
                 // No stopped bit means the console let the target run again (the
                 // Continue button, its own watchdog, or a fresh attach), so a
                 // banner left over from the stale stop must go away.
@@ -1767,13 +2021,25 @@ impl App {
                 }
                 self.st.status = Some(status);
                 self.st.busy = false;
+                if switched {
+                    self.target_changed();
+                }
             }
             Ev::Metadata(metadata) => {
                 if let Some(st) = self.st.status.as_mut() {
                     st.main_base = metadata.main_base;
                     st.main_size = metadata.main_size;
                 }
+                // Metadata is the same identity from the dmnt side; it cannot say
+                // "no process", so a zeroed reply (all fields zero) is ignored
+                // instead of being read as "the target disappeared".
+                let switched = TargetId::from_metadata(&metadata)
+                    .map(|target| self.st.note_target(Some(target)))
+                    .unwrap_or(false);
                 self.st.metadata = Some(metadata);
+                if switched {
+                    self.target_changed();
+                }
             }
             Ev::Modules(modules) => {
                 self.st.log(format!("{} module(s)", modules.len()));
@@ -2092,6 +2358,7 @@ impl App {
         status.main_size = 0x0186B03E;
         status.hit_count = 41;
         status.status_flags = 0x0004;
+        self.st.target = TargetId::from_status(&status);   // the demo hits belong here
         self.st.status = Some(status);
         self.st.connected = true;
         self.st.value_size = 4;
@@ -2435,6 +2702,26 @@ impl App {
                 thread_id, pc, size: DISASM_PAGE,
             });
         }
+    }
+
+    /// Drop the previous target's cached memory views, including the ones that
+    /// live outside [`State`] (the hex pane's bytes and the PC-side candidate
+    /// list both belong to the process that is gone).
+    fn drop_target_state(&mut self) {
+        self.st.clear_target_state();
+        self.pc_scan_active = false;
+        self.hex.data.clear();
+        self.hex.undo.clear();
+        self.hex.anchor = None;
+        self.st.log(
+            "target changed - dropped the previous title's hits, chains, registers and frozen list");
+    }
+
+    /// [`App::drop_target_state`] plus the tables the new target owns.
+    fn target_changed(&mut self) {
+        self.drop_target_state();
+        let _ = self.cmd_tx.send(Cmd::FetchModules);
+        let _ = self.cmd_tx.send(Cmd::FetchMappings);
     }
 
     /// Drop the register bar and the code listing: both belong to the thread the

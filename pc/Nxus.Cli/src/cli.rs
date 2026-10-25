@@ -54,11 +54,14 @@ session
                                   if it is stuck closed - normally detach restores it)
   threads                         list threads of the attached process
   regs [thread_id] [--set K=V]    show or modify 64-bit/32-bit CPU registers (x0..x28, r0..r12, pc, lr, sp, fp)
-  disasm <address|pc> [count] [--arm32|--thumb] [--around]
+  disasm <address|pc> [count] [--arm32|--arm64|--thumb] [--around]
                                   disassemble instructions at an address, or at the
                                   current pc (pc: first thread's pc, mode detected from
-                                  CPSR).  --around marks that instruction with '=>' and
-                                  appends its main+offset (GDB style)
+                                  CPSR).  Without --arm32/--arm64 the mode follows the
+                                  title: its AArch32 thread flag first, then the
+                                  pointer width (unknown -> AArch64).  --around marks
+                                  that instruction with '=>' and appends its
+                                  main+offset (GDB style)
 
 memory
   read <address> <size>           hex dump
@@ -669,6 +672,8 @@ fn execute(opts: &Opts) -> Result<()> {
                 Some(DisasmMode::Thumb)
             } else if opts.has("arm32") || opts.has("32bit") || opts.has("arm") {
                 Some(DisasmMode::Arm32)
+            } else if opts.has("arm64") || opts.has("64bit") || opts.has("aarch64") {
+                Some(DisasmMode::Arm64)
             } else {
                 None
             };
@@ -685,7 +690,16 @@ fn execute(opts: &Opts) -> Result<()> {
                 println!("pc = {:016X}  (thread 0x{:X}, {})", ctx.pc, ctx.thread_id, mode.label());
                 (ctx.pc, mode)
             } else {
-                (parse_address(&client, raw)?, explicit.unwrap_or(DisasmMode::Arm64))
+                let address = parse_address(&client, raw)?;
+                // A bare address has no thread of its own, but the title still says
+                // which execution state it runs in: the running context's AArch32
+                // flag first, then the title's pointer width - never a silent
+                // AArch64 assumption.
+                let mode = explicit.unwrap_or_else(|| {
+                    let ctx = first_thread_context(&client);
+                    auto_disasm_mode(&client, initial_status.as_ref(), ctx.as_ref())
+                });
+                (address, mode)
             };
             let main_base = if around {
                 client.metadata().map(|m| m.main_base).unwrap_or(0)
@@ -1611,6 +1625,72 @@ impl DisasmMode {
             DisasmMode::Thumb => "AArch32/Thumb",
         }
     }
+
+    /// The state a fetched context proves: `NXUS_THREADCTX_FLAG_AARCH32` is set
+    /// by the console itself, so it beats every heuristic (and the CPSR, whose
+    /// M[4] is masked away for AArch32 threads).
+    fn from_aarch32(aarch32: bool) -> Self {
+        if aarch32 { DisasmMode::Arm32 } else { DisasmMode::Arm64 }
+    }
+
+    /// The state a title's pointer width implies.
+    ///
+    /// [`crate::client::pointer_width_for`] answers 4 only when every byte the
+    /// title can address fits in a 4-byte pointer, which is exactly the AArch32
+    /// address space; 8 is the wide (AArch64) answer and is also what an unknown
+    /// title defaults to.
+    fn from_pointer_width(width: u32) -> Self {
+        if width == 4 { DisasmMode::Arm32 } else { DisasmMode::Arm64 }
+    }
+}
+
+/// Default execution state for `disasm` when no flag pins it.
+///
+/// The order is the one the GUI's disasm tab uses:
+///
+/// * a fetched context is exact - its AArch32 flag decides (`from_aarch32`);
+/// * otherwise the title's pointer width is the evidence
+///   ([`crate::client::pointer_width_for`], fed the same main base and mapping
+///   table the pointer scan and the GUI explain), so a 4-byte title is AArch32;
+/// * with no status reply at all there is nothing to go on: keep the historic
+///   AArch64 default, but say so, so a listing that looks wrong has a visible
+///   reason.
+///
+/// Thumb is deliberately never inferred here: it only holds for the pc being run
+/// (`mode_from_context`), and `--thumb` stays the way to pin an address listing.
+fn auto_disasm_mode(
+    client: &NxusClient,
+    status: Option<&Status>,
+    ctx: Option<&ThreadContext>,
+) -> DisasmMode {
+    if let Some(ctx) = ctx {
+        return DisasmMode::from_aarch32(ctx.is_aarch32());
+    }
+    match status {
+        Some(status) => {
+            let estimate = estimate_width(client, status.main_base);
+            if !estimate.from_mappings && status.main_base == 0 {
+                eprintln!("note: arch unknown, assuming AArch64");
+            }
+            DisasmMode::from_pointer_width(estimate.width)
+        }
+        None => {
+            eprintln!("note: arch unknown, assuming AArch64");
+            DisasmMode::Arm64
+        }
+    }
+}
+
+/// The first running thread's context, when the console can supply one.
+///
+/// `disasm <address>` has no thread of its own, but the running title's context
+/// still reports whether the process is AArch32 (`NXUS_THREADCTX_FLAG_AARCH32`).
+/// Any failure means "no context", never an error: the caller then falls back to
+/// the title's pointer width.
+fn first_thread_context(client: &NxusClient) -> Option<ThreadContext> {
+    let threads = client.thread_list().ok()?;
+    let tid = threads.first()?.thread_id;
+    client.regs_get(tid).ok()
 }
 
 /// Detect the execution state of a context from its pc / CPSR pair.
@@ -2716,6 +2796,20 @@ mod tests {
         assert_eq!(mode_from_context(0x1_0000_0000, 0x6000_0000), DisasmMode::Arm64);
         // An unmasked AArch32 context is still recognised on its own.
         assert_eq!(mode_from_context(0x1B00_4000, 0x6000_0010), DisasmMode::Arm32);
+    }
+
+    /// `disasm <address>` used to decode as AArch64 unless `--arm32` was given.
+    /// The title decides now: the console's AArch32 flag is exact, and without a
+    /// context a 4-byte-pointer title is AArch32 - only "no evidence" keeps the
+    /// old AArch64 default (announced by `auto_disasm_mode`).
+    #[test]
+    fn disasm_mode_follows_the_title_when_no_flag_is_given() {
+        assert_eq!(DisasmMode::from_aarch32(true), DisasmMode::Arm32);
+        assert_eq!(DisasmMode::from_aarch32(false), DisasmMode::Arm64);
+        // A 4-byte-pointer title such as MHXX (main base 0x07804000) is AArch32;
+        // a wide or unknown title stays AArch64.
+        assert_eq!(DisasmMode::from_pointer_width(4), DisasmMode::Arm32);
+        assert_eq!(DisasmMode::from_pointer_width(8), DisasmMode::Arm64);
     }
 
     /// MHXX-style AArch32/ARM code: every word carries an AL condition nibble,

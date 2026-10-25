@@ -223,6 +223,13 @@ static void flushFrozenReleased(void) {
 #define NXUS_PTRSCAN_MAX_RESULTS 64
 static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
 static u32              g_ChainCount;
+/* Pointer width the published list was actually walked with (4 or 8), 0 when
+   nobody walked one / the list was discarded.  Published with the list (see
+   ptrScanPublish) so PtrScanGet can report it in NxusPtrChainListHeader.
+   pointer_width and CheatExport can build its codes from the real width instead
+   of trusting the client's claim.  Deliberately NOT read from g_PtrJob after the
+   walk: the job is only the in-flight request, this is the published result. */
+static u32              g_ChainWidth;
 static NxusPtrScanStats g_PtrStats;
 
 /* Which target g_Chains was found for.
@@ -1006,10 +1013,11 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
  *   - core/nxus_ptrscan.c keeps its ~38 KB engine state in a static (documented
  *     non-reentrant), so exactly ONE worker may run at a time: g_PtrJobState is
  *     that gate and a second PtrScanBegin is refused with BUSY.
- *   - g_Chains / g_PtrStats / g_ChainCount / g_ChainOwner / g_ChainsStale are
- *     written by the worker and read by PtrScanGet.  The worker publishes them
- *     BEFORE its release store that marks the job Done/Failed, and every reader
- *     acquire-loads the state first, so no reader ever sees a half-written list.
+ *   - g_Chains / g_PtrStats / g_ChainCount / g_ChainWidth / g_ChainOwner /
+ *     g_ChainsStale are written by the worker and read by PtrScanGet.  The worker
+ *     publishes them BEFORE its release store that marks the job Done/Failed, and
+ *     every reader acquire-loads the state first, so no reader ever sees a
+ *     half-written list.
  *   - CheatExport indexes g_Chains and is refused while the worker runs.  Both it
  *     and PtrScanGet first check that the list still belongs to the current target
  *     (ptrChainOwnerCheck) - the chains may be one title old.
@@ -1036,6 +1044,12 @@ typedef struct {
     u32                 scratch_size;
     u32                 region_count;
     NxusPtrScanOptions  opts;
+    /* The width the walk really loads with: opts.value_width has already been
+       resolved (explicit 4/8, or nxusPtrScanAutoWidthFor()'s answer) and the
+       engine cannot change it any more, but this field is what the published
+       result reports, so it is set where the decision is made and never
+       re-derived at reply time. */
+    u32                 walk_width;
     u64                 module_base;
     PtrScanBudget       budget;
     /* Target identity captured at Begin (published with the chains, see
@@ -1124,6 +1138,11 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
     if (g_PtrJob.budget.budget_hit || src == NXUS_SCAN_ERR_CANCELLED) g_PtrStats.truncated = 1;
     const bool ok = (src == NXUS_SCAN_OK || src == NXUS_SCAN_ERR_CANCELLED);
     g_ChainCount = ok ? count : 0;
+    /* Published with the list, for the same reason as g_ChainOwner: the job's
+       width describes the walk that just ended, and a later Begin overwrites the
+       job before a client may still be polling for THIS result.  A failed walk
+       publishes no list, so its width must not stay behind either (0 = unknown). */
+    g_ChainWidth = ok ? g_PtrJob.walk_width : 0;
     /* Stamp the list with the target it was walked in (captured at Begin).  Done
        here, before the release store that publishes Done/Failed, like every other
        field a reader consumes.  A new publication also clears the stale marker of
@@ -1208,6 +1227,10 @@ static void sendChainList(int fd, u32 seq, u16 type) {
     header.count = g_ChainCount;
     header.total = g_ChainCount;
     header.truncated = g_PtrStats.truncated;
+    /* The width the walk actually used (0 = unknown).  Appended field: the first
+       16 bytes keep their offsets for a reader that predates it, and the chain
+       records follow the full 20-byte header. */
+    header.pointer_width = g_ChainWidth;
     memcpy(buffer, &header, sizeof(header));
 
     u32 offset = (u32)sizeof(header);
@@ -1294,6 +1317,7 @@ static Result ptrChainOwnerCheck(void) {
     /* Invalidate instead of leaving the bytes around: a later reader must not be
        able to serve them, and the next Begin replaces them anyway. */
     g_ChainCount = 0;
+    g_ChainWidth = 0;   /* the width belonged to the list that is now gone */
     g_ChainOwner.valid = false;
     g_ChainsStale = true;
     return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
@@ -1428,6 +1452,12 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
                  (unsigned long long)module_base,
                  (unsigned long long)max_mapping_end, (unsigned)process_arch);
     }
+    /* The resolved width the walk will load with - explicit request or the
+       auto-inference above, never 0 here.  Captured once so the reply and
+       CheatExport report the width that was actually walked, not the client's
+       claim (they can differ: the client's inference sees its own, possibly
+       stale mapping table). */
+    const u32 walk_width = opts.value_width;
     opts.window_size = 0x400;
     opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
 
@@ -1444,6 +1474,7 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     g_PtrJob.scratch_size = 256 * 1024;
     g_PtrJob.region_count = region_count;
     g_PtrJob.opts = opts;
+    g_PtrJob.walk_width = walk_width;
     g_PtrJob.module_base = module_base;
     g_PtrJob.budget = budget;
 
@@ -1552,8 +1583,43 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
     char *text = (char *)malloc(1024);
     if (text == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); return; }
 
-    int written = nxusCheatGenerate(&g_Chains[req.index], (req.flags & NXUS_CHEAT_F_32BIT) ? 1 : 0,
-                                    req.value, req.value_width ? req.value_width : 4,
+    /* Which width the generated code must use.
+     *
+     * The list was walked with g_ChainWidth, and those chains only make sense
+     * with the loads that found them: a 4-byte walk of a 64-bit title (or the
+     * reverse) generates a code that walks a different graph.  The request's
+     * value_width is the client's own guess, made from a mapping table it may
+     * have read minutes ago (or from a dump of another title).  So when the
+     * walked width is known it wins, and a disagreement is logged.  When it is
+     * unknown (0: a list published by an older server, or none at all) the
+     * request is used exactly as it always was - that keeps old clients working.
+     *
+     * The load form (is_32bit) follows the same width.  Mixing a 4-byte store
+     * with 8-byte loads would pull the neighbouring field into the register, so
+     * it cannot be inherited from the client flag once the width is known.
+     * Exception: a 1/2-byte value_width is a store-size choice, not a claim
+     * about the pointer width, so it is left alone while the loads follow the
+     * walked width. */
+    u32 value_width;
+    int is_32bit;
+    if (g_ChainWidth == 4 || g_ChainWidth == 8) {
+        is_32bit = (g_ChainWidth == 4) ? 1 : 0;
+        if (req.value_width == 1 || req.value_width == 2) {
+            value_width = req.value_width;
+        } else {
+            if (req.value_width != 0 && req.value_width != g_ChainWidth) {
+                NXUS_LOG("cheat: using the walked width %u (client asked %u)",
+                         (unsigned)g_ChainWidth, (unsigned)req.value_width);
+            }
+            value_width = g_ChainWidth;
+        }
+    } else {
+        value_width = req.value_width ? req.value_width : 4;
+        is_32bit = (req.flags & NXUS_CHEAT_F_32BIT) ? 1 : 0;
+    }
+
+    int written = nxusCheatGenerate(&g_Chains[req.index], is_32bit,
+                                    req.value, value_width,
                                     "Nxus", text, 1024);
     if (written <= 0) replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_UNSUPPORTED));
     else reply(fd, type, seq, text, (u32)written);

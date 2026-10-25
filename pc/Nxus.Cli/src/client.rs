@@ -1489,16 +1489,34 @@ impl Drop for NxusClient {
 
 /// Returns the chains and whether the console hit its own cap (the header's
 /// truncated flag: count == 64 is NOT the same thing).
+/// Pointer width the console actually walked (0 when the console predates the
+/// field).  parse_chains() records it here so callers can render/verify it without
+/// changing the (chains, truncated) tuple they already use.
+static LAST_CHAIN_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn last_chain_pointer_width() -> u32 {
+    LAST_CHAIN_WIDTH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn parse_chains(body: &[u8]) -> (Vec<PtrChain>, bool) {
     if body.len() < 16 {
         return (Vec::new(), false);
     }
     let truncated = rd_u32(body, 8) != 0;
+
     // A corrupt count must not become a multi-gigabyte allocation: only as many
     // chains as the body can actually hold are ever decoded.
-    let count = (rd_u32(body, 0) as usize).min((body.len() - 16) / 48);
+    // A 20-byte header appends the walked pointer width; 16 bytes is an older
+    // console.  The length decides, because guessing wrong shifts every record by
+    // four bytes and yields plausible garbage instead of an error.
+    let count_guess = rd_u32(body, 0) as usize;
+    let wide = body.len() == 20 + count_guess * 48;
+    let header = if wide { 20usize } else { 16usize };
+    let parsed_width = if wide { rd_u32(body, 16) } else { 0 };
+    let count = count_guess.min(body.len().saturating_sub(header) / 48);
+    LAST_CHAIN_WIDTH.store(parsed_width, std::sync::atomic::Ordering::Relaxed);
     let mut chains = Vec::with_capacity(count);
-    let mut pos = 16;
+    let mut pos = header;
     for _ in 0..count {
         if pos + 48 > body.len() {
             break;
