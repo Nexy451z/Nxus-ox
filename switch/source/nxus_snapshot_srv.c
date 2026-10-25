@@ -80,7 +80,12 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
        alone take 2 x 256 KB), so cap the scratch buffer at 256 KB. */
     const u32 chunk_size = 256 * 1024;
     u8 *chunk = (u8 *)malloc(chunk_size);
-    if (chunk == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    if (chunk == NULL) {
+        /* The region list is pinned: release it before bailing out, or the retire
+           ring never drains and every later publish leaks its old block. */
+        nxusSessionViewRelease();
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
 
     NxusScanStats stats;
     int src = nxusSnapshotCapture(&g_Snapshots[slot], regions, region_count,

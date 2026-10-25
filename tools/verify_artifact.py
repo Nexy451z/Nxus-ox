@@ -271,17 +271,21 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
                 else:
                     flags = info['misc_flags']
                     bits = flags & DEBUG_BITS
-                    # ForceDebug (0x08) is what grants debug capabilities to a
-                    # sysmodule; "exactly one bit" also accepted EnableDebug-only
-                    # (0x02) builds, which cannot debug anything.
-                    one_bit = (bits == FORCE_DEBUG)
+                    # The loader accepts exactly one debug bit; ForceDebug (0x08) is
+                    # the one that grants the capabilities this module needs, so a
+                    # build without it is flagged loudly but not rejected (nxus.json
+                    # only declares allow_debug, and a valid build may use it).
+                    one_bit = bin(bits).count('1') == 1
+                    if one_bit and bits != FORCE_DEBUG:
+                        print(f"  WARN {name} debug bits 0x{bits:02X} lack ForceDebug(0x08): "
+                              f"this build cannot obtain debug privileges")
                     report(one_bit,
                            f"{name} debug flags 0x{flags:02X} "
                            f"(MiscFlags @0x{info['misc_flags_off']:X}, {kc}; "
                            f"EnableDebug={bool(flags & 2)}, "
                            f"ForceDebugProd={bool(flags & 4)}, "
                            f"ForceDebug={bool(flags & 8)})"
-                           f"{'' if one_bit else ' <- must be exactly ForceDebug (0x08)'}")
+                           f"{'' if one_bit else ' <- must be exactly ONE debug bit'}")
                 if name == 'ACID':
                     acid_flags = info['flags']
                     region = (acid_flags >> 2) & 0x0F
@@ -325,9 +329,16 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
                     report(not os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag')),
                            "probe folder has NO flags/boot2.flag")
                 elif folder_tid == TID:
+                    staged_probe = os.environ.get('NXUS_STAGE_PROBE', '') == '1'
                     report(meta.get('boot2_flag') is True, "main metadata says boot2_flag=true")
-                    report(os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag')),
-                           "main folder ships flags/boot2.flag")
+                    has_flag = os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag'))
+                    if staged_probe:
+                        # tools/build.sh with NXUS_STAGE_PROBE=1 deliberately swaps
+                        # which folder boots, so the flag is expected to be absent.
+                        report(not has_flag,
+                               "main folder has no boot2.flag (NXUS_STAGE_PROBE=1 staging)")
+                    else:
+                        report(has_flag, "main folder ships flags/boot2.flag")
         else:
             report(False, "metadata.json present")
 

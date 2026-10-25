@@ -29,6 +29,7 @@ static u32    g_LogPending = 0;
 static u64    g_LogLastFlush = 0;
 #define NXUS_LOG_FLUSH_BYTES    4096u
 #define NXUS_LOG_FLUSH_INTERVAL 500000000ull   /* 500 ms in ns */
+#define NXUS_LOG_RETRY_NS       10000000000ull /* 10 s between open retries */
 
 void nxusLogInit(int write_to_sd) {
     mutexInit(&g_LogMutex);
@@ -76,9 +77,22 @@ static void logRotateLocked(void) {
     (void)logOpenLocked("ab");
 }
 
+static u64 g_LogRetryAt = 0;
+
 static void logWriteLocked(const char *line, size_t len) {
     if (!g_LogToSd) return;
-    if (g_LogFile == NULL && !logOpenLocked("ab")) return;
+    if (g_LogFile == NULL) {
+        /* A missing/unwritable sdmc:/nxus turned every single log line into an
+           fopen()+fclose() (measured ~57 us per call).  Back off for 10 s after a
+           failed open so logging stays cheap on a read-only or full SD card. */
+        const u64 now = armGetSystemTick();
+        if (g_LogRetryAt != 0 && now < g_LogRetryAt) return;
+        if (!logOpenLocked("ab")) {
+            g_LogRetryAt = now + armNsToTicks(NXUS_LOG_RETRY_NS);
+            return;
+        }
+        g_LogRetryAt = 0;
+    }
     if (g_LogBytes >= NXUS_LOG_MAX_BYTES) {
         logRotateLocked();
         if (g_LogFile == NULL) return;

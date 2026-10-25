@@ -214,12 +214,17 @@ static u64 estimateHeapPeak(void) {
             hit_bytes = (u64)NXUS_SESSION_HIT_BUDGET_BYTES;
     }
 
-    return persistent + held +
-           hit_bytes +
-           (u64)NXUS_SESSION_DEFAULT_CHUNK +
-           (u64)NXUS_SESSION_DEFAULT_WINDOW +
-           (u64)NXUS_HEAP_SNAPSHOT_CHUNK_BYTES +
-           ptr_peak;
+    /* Only ONE of the scan buffers is live per pass, and a scan cannot be running
+       here (PtrScanBegin sits behind the scan BUSY gate), so the two are not
+       additive.  The snapshot capture scratch is likewise transient and runs on
+       this very thread, so it cannot coexist with the pointer scan either.
+       Counting all of them (the first version did) rejected legitimate work with
+       ~2.3 MiB of memory that can never be resident. */
+    const u64 scan_work = ((u64)NXUS_SESSION_DEFAULT_CHUNK > (u64)NXUS_SESSION_DEFAULT_WINDOW)
+                              ? (u64)NXUS_SESSION_DEFAULT_CHUNK
+                              : (u64)NXUS_SESSION_DEFAULT_WINDOW;
+
+    return persistent + held + hit_bytes + scan_work + ptr_peak;
 }
 
 /* Fired from the HID thread: freeze the target without touching the PC.
@@ -754,13 +759,17 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     const NxusMappingTable *maps = nxusSessionMappings();
     /* nxusSessionMappings() publishes NULL when there is no table (never
        snapshotted, or already released), so the count needs the NULL guard. */
-    if (maps == NULL || maps->count == 0) {
+    if (maps == NULL) {
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS),
                          NXUS_REASON_NO_MAPPINGS);
         return;
     }
-
+    /* The pin is only needed to read the count: drop it as soon as the region
+       array is sized, or the retire ring can never drain and every later publish
+       leaks its old block (about 40 runs to OOM on a 1000-mapping title). */
     u32 region_cap = maps->count + 1;
+    nxusSessionViewRelease();
+
     NxusPtrRegion *regions = (NxusPtrRegion *)calloc(region_cap, sizeof(NxusPtrRegion));
     u8 *scratch = (u8 *)malloc(256 * 1024);
     if (regions == NULL || scratch == NULL) {
