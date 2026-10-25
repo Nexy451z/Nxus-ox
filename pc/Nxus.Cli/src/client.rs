@@ -40,11 +40,35 @@ impl std::error::Error for NxusError {}
 
 pub type Result<T> = std::result::Result<T, NxusError>;
 
-/// The title's pointer width in bytes (4 or 8) - the ONE width rule on the PC.
+/// End of the 32-bit address space: the highest address a 4-byte pointer can
+/// describe.
+///
+/// A mapping that ends exactly here still holds only 32-bit-addressable bytes, so
+/// it does not by itself prove 8-byte pointers (the console compares the same way
+/// in `nxusPtrScanAutoWidthFor()`).
+pub const WIDTH_LIMIT: u64 = 0x1_0000_0000;
+
+// Why [`pointer_width_with_reason`] answered what it answered.  The wording
+// mirrors `NXUS_PTRSCAN_WIDTH_REASON_*` (core/nxus_ptrscan.h) so a console log
+// line and a PC display agree about the same title, and the UI can render
+// "width: auto (assumed 64-bit from ...)" without inventing its own explanation.
+//
+// One constant per branch, not one per step: "the process address space" can
+// decide either way, and an operator reading 4 vs 8 needs to know which.
+pub const WIDTH_REASON_PROCESS_64: &str = "the process address space is 64-bit";
+pub const WIDTH_REASON_PROCESS_32: &str = "the process address space fits in 32 bits";
+pub const WIDTH_REASON_MAPPINGS_64: &str = "the highest mapping end is above 4 GiB";
+pub const WIDTH_REASON_MAPPINGS_32: &str = "every mapping ends within 4 GiB";
+pub const WIDTH_REASON_MAIN_BASE_64: &str = "the main module base is at or above 4 GiB";
+pub const WIDTH_REASON_MAIN_BASE_32: &str = "the main module base is below 4 GiB";
+pub const WIDTH_REASON_DEFAULT: &str = "nothing is known, AArch64 is the default";
+
+/// The title's pointer width in bytes (4 or 8) *and the evidence for it* - the
+/// ONE width rule on the PC.
 ///
 /// Nothing here is ever sent to the console: a pointer scan request carries
 /// `value_width = 0` ("automatic") and the console decides.  This mirrors the
-/// console's `nxusPtrScanAutoWidth()` (core/nxus_ptrscan.c) so the PC can
+/// console's `nxusPtrScanAutoWidthFor()` (core/nxus_ptrscan.c) so the PC can
 /// *explain* that decision and pick the matching parts: the address format in
 /// the GUI, the pointer width a PC-side dump walk uses, and the 540F/580F pointer
 /// load plus the 640F/680F value write of a cheat export.
@@ -54,23 +78,40 @@ pub type Result<T> = std::result::Result<T, NxusError>;
 /// the CLI decided from the mapping table), so a display, a PC-side scan and an
 /// exported cheat could disagree about the very same title.
 ///
-/// The rule, in the console's order:
+/// The rule, in the console's order - the order is what makes the two agree:
 ///
-/// * `mappings` is the target's memory map.  An entry whose end lies above 4 GiB
-///   proves a 64-bit address space; when every entry ends at or below 4 GiB,
-///   4-byte pointers cover the whole map.  An end exactly at 4 GiB still holds
-///   only 32-bit-addressable bytes, so it does not prove 8 (the console compares
-///   the same way).  Entries the console could not walk (size 0, not readable)
-///   are ignored exactly like `buildPtrRegions()` ignores them.
-/// * Without a usable mapping table the main module base is the only evidence:
-///   `0` means "unknown" and defaults to 8 (AArch64 is the common case, and a
-///   wide load on a 32-bit title only costs a failed scan while a narrow load on
-///   a 64-bit title silently loses every chain), a base at or above 4 GiB is
-///   already outside the 32-bit address space, everything else is 4.
-pub fn pointer_width_for(metadata: &Metadata, mappings: Option<&[Mapping]>) -> u32 {
-    /// Highest address a 4-byte pointer can describe.
-    const WIDTH_LIMIT: u64 = 0x1_0000_0000;
+/// 1. **The process's own address space** (`Metadata::address_space_arch()`,
+///    from dmnt's `aslr_base`/`aslr_size`).  This outranks every observation of
+///    where the memory happens to sit this run: AArch64 ASLR routinely places a
+///    64-bit title's main module at 0x00700000 and its heap around 0x36000000,
+///    i.e. *every mapping ends below 4 GiB*, and the old mapping-only rule then
+///    walked that title with 4-byte loads - the server said 8, the PC said 4, and
+///    the GUI happily generated 540F/640F code for a 64-bit game.  A 32-bit
+///    process can never hold a pointer above 4 GiB, so AArch32 is equally
+///    authoritative - but only when the metadata really says so: "no answer"
+///    (0 size: an old console or dmnt closed) must not be read as AArch32.
+/// 2. **The mappings.**  `mappings` is the target's memory map.  An entry whose
+///    end lies above 4 GiB proves a 64-bit address space; when every entry ends
+///    at or below 4 GiB, 4-byte pointers cover the whole map.  Entries the console
+///    could not walk (size 0, not readable) are ignored exactly like
+///    `buildPtrRegions()` ignores them.
+/// 3. **The main module base.**  Without a usable mapping table this is the only
+///    evidence left: `0` means "unknown" and falls through to 8, a base at or
+///    above 4 GiB is already outside the 32-bit address space, everything else 4.
+/// 4. **8**: nothing known at all.  AArch64 is the common case, and a wide load
+///    on a 32-bit title only costs a failed scan while a narrow load on a 64-bit
+///    title silently loses every chain.
+pub fn pointer_width_with_reason(metadata: &Metadata,
+                                 mappings: Option<&[Mapping]>) -> (u32, &'static str) {
+    // 1. The process itself.  `Unknown` (old firmware, dmnt closed, inconsistent
+    //    region) falls through instead of guessing.
+    match metadata.address_space_arch() {
+        AddressSpaceArch::Aarch64 => return (8, WIDTH_REASON_PROCESS_64),
+        AddressSpaceArch::Aarch32 => return (4, WIDTH_REASON_PROCESS_32),
+        AddressSpaceArch::Unknown => {}
+    }
 
+    // 2. The mappings the walk is about to traverse.
     let mut have_mapping = false;
     let mut wide = false;
     for mapping in mappings.unwrap_or(&[]) {
@@ -86,9 +127,28 @@ pub fn pointer_width_for(metadata: &Metadata, mappings: Option<&[Mapping]>) -> u
         }
     }
     if have_mapping {
-        return if wide { 8 } else { 4 };
+        return if wide {
+            (8, WIDTH_REASON_MAPPINGS_64)
+        } else {
+            (4, WIDTH_REASON_MAPPINGS_32)
+        };
     }
-    if metadata.main_base == 0 || metadata.main_base >= WIDTH_LIMIT { 8 } else { 4 }
+
+    // 3. The main module base, then 4. the wide default.
+    match metadata.main_base {
+        0 => (8, WIDTH_REASON_DEFAULT),
+        base if base >= WIDTH_LIMIT => (8, WIDTH_REASON_MAIN_BASE_64),
+        _ => (4, WIDTH_REASON_MAIN_BASE_32),
+    }
+}
+
+/// The width alone, for callers that only need the number.
+///
+/// Kept as the narrow signature the CLI, the dump walker and the EdiZon export
+/// already call; [`pointer_width_with_reason`] is the same decision plus the
+/// evidence, and the GUI shows that evidence.
+pub fn pointer_width_for(metadata: &Metadata, mappings: Option<&[Mapping]>) -> u32 {
+    pointer_width_with_reason(metadata, mappings).0
 }
 
 /// `sizeof(NxusDebugConfig)` on the wire.  A CONFIG payload of exactly this
@@ -1598,8 +1658,11 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
-                released_addresses, select_stopped_thread, Mapping, Metadata, NxusError,
-                PERM_R, RESULT_BUSY};
+                pointer_width_with_reason, released_addresses, select_stopped_thread,
+                Mapping, Metadata, NxusError, PERM_R, RESULT_BUSY,
+                WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
+                WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64, WIDTH_REASON_PROCESS_32,
+                WIDTH_REASON_PROCESS_64};
     use crate::protocol::{put_u32, DebugStatus};
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
@@ -1652,6 +1715,165 @@ mod tests {
         assert_eq!(pointer_width_for(&metadata(0x0070_0000), Some(&unusable)), 4,
                    "unreadable / empty mappings fall back to the main base");
         assert_eq!(pointer_width_for(&metadata(0), Some(&unusable)), 8);
+    }
+
+    /// The High-severity bug this rule fixes: a 64-bit title whose main module
+    /// and heap both ASLR'd below 4 GiB.  Every mapping ends below 4 GiB, so the
+    /// mapping-only rule said 4 while the console - which also looks at the
+    /// process's own address space - said 8; the GUI then generated 540F/640F
+    /// code for a 64-bit game.
+    #[test]
+    fn the_process_address_space_outranks_the_mappings() {
+        let low = 0x0070_0000u64;
+        let low_maps = [mapping(low, 0x80000, PERM_R), mapping(0x3600_0000, 0x10_0000, PERM_R)];
+        // dmnt's AArch64 pair: 0x8000000 + 0x7FF8000000 (512 GiB).
+        let wide = Metadata {
+            main_base: low,
+            aslr_base: 0x0800_0000,
+            aslr_size: 0x7FF8_0000_00,
+            ..Default::default()
+        };
+        assert_eq!(pointer_width_with_reason(&wide, Some(&low_maps)),
+                   (8, WIDTH_REASON_PROCESS_64),
+                   "a low mapping table must not drag a 64-bit process down to 4");
+
+        // dmnt's AArch32 pair: 0x200000 + 0xFFE00000 (ends exactly at 4 GiB).
+        let narrow = Metadata {
+            main_base: low,
+            aslr_base: 0x0020_0000,
+            aslr_size: 0xFFE0_0000,
+            ..Default::default()
+        };
+        assert_eq!(pointer_width_with_reason(&narrow, Some(&low_maps)),
+                   (4, WIDTH_REASON_PROCESS_32));
+        // AArch32 stays authoritative even next to a mapping the PC cannot place
+        // (a 32-bit title can never hold a pointer above 4 GiB).
+        assert_eq!(pointer_width_with_reason(&narrow, Some(&[mapping(0x7F_0000_0000, 0x1000,
+                                                                      PERM_R)])),
+                   (4, WIDTH_REASON_PROCESS_32));
+        // No metadata answer (old console / dmnt closed): the mappings decide.
+        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&low_maps)),
+                   (4, WIDTH_REASON_MAPPINGS_32));
+        // ... and a high mapping still proves the wide space on its own.
+        assert_eq!(pointer_width_with_reason(&metadata(low),
+                                             Some(&[mapping(0x7F_0000_0000, 0x1000, PERM_R)])),
+                   (8, WIDTH_REASON_MAPPINGS_64));
+    }
+
+    /// Every branch names its evidence, and the words line up with the value:
+    /// the UI prints "{width}-bit from {reason}", so a mismatched pair would be
+    /// worse than no explanation at all.
+    #[test]
+    fn every_width_names_its_evidence() {
+        let low = 0x0070_0000u64;
+        let cases: [(Metadata, Option<&[Mapping]>, u32, &str); 5] = [
+            (Metadata { aslr_base: 0x0800_0000, aslr_size: 0x7FF8_0000_00,
+                        ..Default::default() },
+             None, 8, WIDTH_REASON_PROCESS_64),
+            (Metadata { aslr_base: 0x0020_0000, aslr_size: 0xFFE0_0000,
+                        ..Default::default() },
+             None, 4, WIDTH_REASON_PROCESS_32),
+            (metadata(low), None, 4, WIDTH_REASON_MAIN_BASE_32),
+            (metadata(0x1_0000_0000), None, 8, WIDTH_REASON_MAIN_BASE_64),
+            (metadata(0), None, 8, WIDTH_REASON_DEFAULT),
+        ];
+        for (md, maps, width, reason) in cases {
+            let (got_width, got_reason) = pointer_width_with_reason(&md, maps);
+            assert_eq!((got_width, got_reason), (width, reason));
+            assert_eq!(pointer_width_for(&md, maps), width,
+                       "the narrow wrapper must not disagree with the decision");
+        }
+        // The two mapping branches too, with a table each.
+        let wide_maps = [mapping(0x7F_0000_0000, 0x1000, PERM_R)];
+        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&wide_maps)).1,
+                   WIDTH_REASON_MAPPINGS_64);
+        let narrow_maps = [mapping(low, 0x80000, PERM_R)];
+        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&narrow_maps)).1,
+                   WIDTH_REASON_MAPPINGS_32);
+        // No reason is empty or shared with a different width.
+        let all = [WIDTH_REASON_PROCESS_64, WIDTH_REASON_PROCESS_32, WIDTH_REASON_MAPPINGS_64,
+                   WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAIN_BASE_64,
+                   WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_DEFAULT];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two branches share a reason");
+            }
+        }
+    }
+
+    /// Trans-language parity with the console's own rule.
+    ///
+    /// The expectations below were produced by BUILDING AND RUNNING
+    /// `core/nxus_ptrscan.c` on the host - a throwaway harness that calls
+    /// `nxusPtrScanArchFromAddressSpace()` and `nxusPtrScanAutoWidthFor()` with
+    /// exactly these inputs - not by reading the C by hand.  A future edit on
+    /// either side that changes a decision therefore fails here.
+    ///
+    /// The inputs model what the console really passes: `ptrScanProcessArch()`'s
+    /// two dmnt aslr pairs (0x8000000 + 0x7FF8000000 for AArch64, 0x200000 +
+    /// 0xFFE00000 for AArch32) and `buildPtrRegions()`'s region list (readable,
+    /// non-empty mappings only).
+    ///
+    /// One deliberate difference, and only for an input the console cannot
+    /// produce: `buildPtrRegions()` filters `!(reserved & NXUS_PERM_R)` out, so
+    /// the C rule never sees an unreadable mapping, while the PC's tables (the
+    /// GUI's mapping list, dump files) contain them and this rule ignores them.
+    /// That can only turn "a high but unreadable region" into "no mapping
+    /// evidence", which then falls through to the main base - the C would have
+    /// counted its end.  See `without_mappings_an_unknown_base_is_64bit`.
+    #[test]
+    fn matches_the_console_pointer_width_rule() {
+        const A64: (u64, u64) = (0x0800_0000, 0x7FF8_0000_00);   // 512 GiB
+        const A32: (u64, u64) = (0x0020_0000, 0xFFE0_0000);      // ends exactly at 4 GiB
+        let low = [mapping(0x0070_0000, 0x80000, PERM_R),
+                   mapping(0x3600_0000, 0x10_0000, PERM_R)];
+        let high = [mapping(0x7F_0000_0000, 0x1000, PERM_R)];
+        let at_4gib = [mapping(0xFFFF_F000, 0x1000, PERM_R)];
+        let wrapping = [mapping(u64::MAX - 0xFFF, 0x2000, PERM_R)];
+        let empty_size = [mapping(0x7F_0000_0000, 0, PERM_R)];
+
+        let with_aslr = |pair: (u64, u64), main_base: u64| Metadata {
+            main_base, aslr_base: pair.0, aslr_size: pair.1, ..Default::default()
+        };
+
+        // (C harness output) -> (our width, our reason)
+        let cases: [(Metadata, Option<&[Mapping]>, u32, &str); 13] = [
+            // A64 pair + low maps: arch=2 width=8 "process is 64-bit" (max_end 0x36100000)
+            (with_aslr(A64, 0x0070_0000), Some(&low), 8, WIDTH_REASON_PROCESS_64),
+            // A64 pair + no regions: arch=2 width=8
+            (with_aslr(A64, 0x0070_0000), None, 8, WIDTH_REASON_PROCESS_64),
+            // A32 pair + low maps: arch=1 width=4 "process is AArch32"
+            (with_aslr(A32, 0x0780_4000), Some(&low), 4, WIDTH_REASON_PROCESS_32),
+            // A32 pair + high map: arch=1 width=4 (the process outranks the mapping)
+            (with_aslr(A32, 0x0070_0000), Some(&high), 4, WIDTH_REASON_PROCESS_32),
+            // straddling pair + low maps: arch=0 width=4 "mapping ends"
+            (with_aslr((0x8000_0000, 0x9000_0000), 0x0070_0000), Some(&low),
+             4, WIDTH_REASON_MAPPINGS_32),
+            // overflowing pair: arch=0 width=4
+            (with_aslr((0xFFFF_FFFF_FFFF_0000, 0x1000), 0), Some(&low),
+             4, WIDTH_REASON_MAPPINGS_32),
+            // no answer + low maps: arch=0 width=4
+            (metadata(0x0070_0000), Some(&low), 4, WIDTH_REASON_MAPPINGS_32),
+            // no answer + high map: width=8
+            (metadata(0x0070_0000), Some(&high), 8, WIDTH_REASON_MAPPINGS_64),
+            // no answer + an end exactly at 4 GiB: width=4 (max_end 0x100000000)
+            (metadata(0x0070_0000), Some(&at_4gib), 4, WIDTH_REASON_MAPPINGS_32),
+            // no answer + wrapping region: width=8 (max_end 0xFFFFFFFFFFFFFFFF)
+            (metadata(0x0070_0000), Some(&wrapping), 8, WIDTH_REASON_MAPPINGS_64),
+            // no answer + only zero-size regions: width=4 (they are skipped)
+            (metadata(0x0070_0000), Some(&empty_size), 4, WIDTH_REASON_MAIN_BASE_32),
+            // no answer + no regions, base 0: width=8 (the AArch64 default)
+            (metadata(0), None, 8, WIDTH_REASON_DEFAULT),
+            // no answer + no regions, base 4 GiB: width=8
+            (metadata(0x1_0000_0000), None, 8, WIDTH_REASON_MAIN_BASE_64),
+        ];
+        for (metadata, mappings, width, reason) in cases {
+            assert_eq!(pointer_width_with_reason(&metadata, mappings), (width, reason),
+                       "diverged from core/nxus_ptrscan.c for aslr={:#x}+{:#x} main={:#x}: \
+                        the console's host-run rule answers {}",
+                       metadata.aslr_base, metadata.aslr_size, metadata.main_base, width);
+        }
     }
 
     #[test]

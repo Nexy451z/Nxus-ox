@@ -549,11 +549,60 @@ static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
     replyErrorReason(fd, type, seq, (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY), reason);
 }
 
+/* Drop the stored scan results when they belong to an earlier target.
+ *
+ * hits and the mapping snapshot are keyed to the process that produced them (see
+ * the ownership block in nxus_session.h).  Switching titles - ForceOpen to another
+ * game, a relaunch with a new pid, a DebugAttach to a different process - left them
+ * in place, so sendHits happily answered with the previous title's addresses under
+ * the new title's pid: every address and mapping_idx still resolves through the
+ * table the PC holds, so the batch looks completely valid.  The chain list already
+ * refuses this (ptrChainOwnerCheck); this is the same gate for the scan results.
+ *
+ * Runs on the connection thread (status path) and in the 1 Hz identity tick:
+ * nxusSessionInvalidateHits() is safe from both (it never frees the arrays a handler
+ * may be walking).  The log line is emitted once per mismatch: a client that keeps
+ * polling after the refusal must not flood the log ring. */
+static void discardResultsOfEarlierTarget(void) {
+    static atomic_int logged;
+    if (nxusSessionHitsMatchTarget()) {
+        atomic_store_explicit(&logged, 0, memory_order_relaxed);   /* re-arm */
+        return;
+    }
+    if (atomic_exchange_explicit(&logged, 1, memory_order_relaxed) == 0) {
+        NXUS_LOG("hits: the hit list belongs to an earlier target - discarding");
+    }
+    nxusSessionInvalidateHits();
+}
+
+/* Same rule for the mapping snapshot: the PC resolves every address it received
+ * from a hit batch through these bases, so serving the previous title's table is as
+ * wrong as serving its hits.  Only the debug-session path reads the session's
+ * snapshot (without a debug session the pages come straight from dmnt and are
+ * current by construction).  A failed refresh keeps the cached table, which is what
+ * this path did before the ownership check existed. */
+static void refreshMappingsAfterTargetChange(void) {
+    if (nxusSessionHitsMatchTarget()) return;
+    discardResultsOfEarlierTarget();
+    /* Never rebuild the table under a running pass: the worker walks it (and the
+       region list) without a pin, and this page can be answered from the cache. */
+    if (nxusSessionScanState() == NxusScanState_Running) return;
+    Result rc = nxusSessionRefreshMappings();
+    if (R_FAILED(rc)) {
+        NXUS_RESULT("mappings: refresh after the target changed", rc);
+    }
+}
+
 /* How long the console waits for a command before it assumes the PC is gone. */
 #define NXUS_DEBUG_IDLE_TIMEOUT_MS 20000u
 
 static void fillStatus(NxusStatus *st) {
     memset(st, 0, sizeof(*st));
+    /* Results are keyed to the target that produced them.  The 1 Hz tick keeps the
+       cached identity current, so the first status poll after a title switch sees
+       the mismatch here and drops the previous title's list - instead of reporting
+       its hit count as if it described the process the client now sees. */
+    discardResultsOfEarlierTarget();
     st->proto_version = NXUS_PROTO_VERSION;
     /* Which read path the console is serving, not a build-time constant: while
        Nxus owns the kernel debug handle dmnt:cht is closed and nxusSessionReadMemory()
@@ -1629,6 +1678,18 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
 /* ---- scan results ------------------------------------------------------ */
 
 static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
+    /* The list is tied to the target that produced it: after a title switch every
+       address and mapping_idx in it belongs to a different process, and the batch
+       would still look valid to the PC (it resolves against the base array it was
+       given).  Refuse and discard BEFORE the pin is taken, so this path cannot leak
+       one; the client has to rescan.  No dedicated NXUS_REASON_* exists for "the
+       target changed", and a reason word here would read as an argument problem, so
+       the refusal stays a bare NXUS_ERR_BAD_STATE (the log names the cause). */
+    if (!nxusSessionHitsMatchTarget()) {
+        discardResultsOfEarlierTarget();
+        replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
     /* One token pin covers both views for the whole reply: the hit list arrays and
        the mapping table are walked while it is held.  Every early return below
        unpins exactly this token, so no path can leak the pin - and a stray release
@@ -1865,8 +1926,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             u64 count = 0;
             if (nxusDebugIsAttached()) {
                 /* dmnt is closed: answer from the snapshot the session built with
-                   svcQueryDebugProcessMemory instead of failing.  The token pin is
+                   svcQueryDebugProcessMemory instead of failing.  A snapshot taken
+                   for an earlier target is re-taken first, so the PC never pages
+                   through the previous title's mapping table.  The token pin is
                    dropped on both paths (the table may legitimately be NULL). */
+                refreshMappingsAfterTargetChange();
                 NxusViewPin pin;
                 if (!nxusSessionViewPinCurrent(&pin)) {
                     NXUS_LOG("mapping count: view pin table exhausted (%u held) - refusing",
@@ -1904,7 +1968,10 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (nxusDebugIsAttached()) {
                 /* Token pin: the table is walked while it is held, and the pin is
                    dropped on every path out of this branch (a NULL table is a
-                   legitimate "no snapshot", not an error, but the pin still goes). */
+                   legitimate "no snapshot", not an error, but the pin still goes).
+                   Re-take the snapshot when it belongs to an earlier target: this is
+                   the table the PC resolves hit addresses against. */
+                refreshMappingsAfterTargetChange();
                 NxusViewPin pin;
                 if (!nxusSessionViewPinCurrent(&pin)) {
                     NXUS_LOG("mappings: view pin table exhausted (%u held) - refusing the page",
@@ -2933,6 +3000,12 @@ static void refreshTargetIdentityThrottled(void) {
     bool has_process = false;
     if (R_FAILED(nxusDmntHasCheatProcess(&has_process)) || !has_process) return;
     (void)nxusSessionRefreshIdentity();
+    /* The refresh may have moved the session to a different title (the PC can quit
+       game A, start game B, and never ask for a status in between).  The stored hits
+       and the mapping snapshot then describe the process we left, so drop them here
+       too - once per second is enough, and with a debug session attached dmnt is
+       closed, which is why this sits after the refresh instead of at the top. */
+    discardResultsOfEarlierTarget();
 }
 
 /* The debugee exited while we were attached.  The event thread has already

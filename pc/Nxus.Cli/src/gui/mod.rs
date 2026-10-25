@@ -31,6 +31,14 @@ pub enum Cmd {
     /// dmnt user, or the console's own release of a vanished client).
     RefreshFrozen,
     FetchModules,
+    /// Re-read the dmnt metadata (`GET_METADATA`).
+    ///
+    /// It carries the process's ASLR region - the evidence that tells a low-placed
+    /// 64-bit title apart from a 32-bit one - and it names the process it
+    /// describes, so a target change has to refetch it instead of keeping the
+    /// previous game's address space (which would answer the width question for
+    /// the wrong process).
+    FetchMetadata,
     /// The target's memory map: shown as a list so a scan range can be picked from
     /// the real regions (what "nxus mappings" prints on the CLI).
     FetchMappings,
@@ -65,11 +73,17 @@ pub enum Cmd {
     PtrScan { target: u64, module_base: u64, depth: u32, max_offset: u32, width: u32 },
     PtrScanPc { target: u64, module_base: u64, depth: u32, max_offset: u32, dump_path: Option<String> },
     SaveDump { path: String, scope: u32, begin: u64, end: u64 },
-    /// Generate the cheat block for a chain the console already published.
-    /// `width` is the title's pointer width taken from the single shared rule
-    /// ([`crate::client::pointer_width_for`]); the value write uses the same
-    /// width, so a 64-bit title gets 580F loads and an 8-byte (680F) value
-    /// instead of the old 4-byte one on top of 580F loads.
+    /// Generate the cheat block for a chain the console published.
+    ///
+    /// This ALWAYS asks the console (`CHEAT_EXPORT`) and shows its answer: the
+    /// console owns the chain list and refuses one that belongs to an earlier
+    /// target with `NXUS_ERR_BAD_STATE`, so a stale list can no longer turn into
+    /// code for the game that is running now.  The GUI used to format the block
+    /// itself from `State::chains`, which bypassed exactly that check.
+    /// `width` is the title's pointer width from the single shared rule
+    /// ([`crate::client::pointer_width_with_reason`]); a current console prefers
+    /// the width it actually walked with, so this is only the fallback for an
+    /// older one.
     Cheat { index: u32, value: u64, width: u32 },
     Attach,
     Detach,
@@ -139,7 +153,12 @@ pub enum Ev {
     /// were released than fit in one frame (at most 32 addresses ride along).
     FrozenReleased { count: u32, addresses: Vec<u64> },
     WatchlistValues(Vec<(u64, u64)>),
-    Chains(Vec<PtrChain>, bool),          // chains, truncated-by-console
+    /// A console-side pointer scan result.  `owner` is the target the walk ran
+    /// against plus the width the console walked with (see [`ChainOwner`]); it is
+    /// `None` for a list whose ownership the PC cannot prove (an offline dump),
+    /// and such a list is never used for a local preview.
+    Chains { chains: Vec<PtrChain>, truncated: bool, owner: Option<ChainOwner> },
+    /// The console's own cheat export (`CHEAT_EXPORT` answer), already formatted.
     Cheat(String),
     BreakHits(Vec<BreakHit>),
     /// The target is parked at a breakpoint/watchpoint (NxusEvent_DebugStopped).
@@ -462,7 +481,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         let _ = tx.send(Ev::Message(format!(
                             "EdiZon pointer scan: {} chain(s) from {} ({} pointer(s)){}",
                             res.chains.len(), path, res.pointers_indexed, note)));
-                        let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                        // An offline file names no live target, so the list gets no
+                        // owner stamp: the GUI then offers no local preview for it
+                        // (the file may be another title's dump entirely).  The
+                        // console's export is still available and checks the owner.
+                        let _ = tx.send(Ev::Chains { chains: res.chains, truncated: res.truncated,
+                                                     owner: None });
                     } else {
                         let dump = crate::dump::MemoryDump::load(&path).map_err(|e| e.to_string())?;
                         let (inf_base, inf_size) = dump.infer_main_module();
@@ -491,7 +515,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         let note = if res.truncated { " - TRUNCATED" } else { "" };
                         let _ = tx.send(Ev::Message(format!("NDMP pointer scan: {} chain(s) from {}{}",
                                                             res.chains.len(), path, note)));
-                        let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                        // A saved dump is not tied to the running target (see the
+                        // EdiZon branch above): no owner stamp, no local preview.
+                        let _ = tx.send(Ev::Chains { chains: res.chains, truncated: res.truncated,
+                                                     owner: None });
                     }
                 }
                 other => {
@@ -523,6 +550,19 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         Cmd::FetchModules => {
                             let modules = c.modules().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Modules(modules));
+                        }
+                        Cmd::FetchMetadata => {
+                            // A failure is not fatal: dmnt can be closed while the
+                            // console holds its own debug session, and the width
+                            // rule then falls back to the mapping table / main base
+                            // through State::trusted_metadata().
+                            match c.metadata() {
+                                Ok(metadata) => { let _ = tx.send(Ev::Metadata(metadata)); }
+                                Err(e) => {
+                                    let _ = tx.send(Ev::Message(format!(
+                                        "process metadata unavailable: {}", e)));
+                                }
+                            }
                         }
                         Cmd::FetchMappings => {
                             let maps = c.mappings(0, 256).map_err(|e| e.to_string())?;
@@ -727,14 +767,38 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             // 0 = auto: the console derives the pointer width from
                             // the title, so a 64-bit title is walked with 8-byte
                             // pointers instead of the old hard-coded 4.
+                            //
+                            // The owner stamp is read BEFORE the request for the
+                            // same reason the console captures it at Begin: it has
+                            // to describe the target the walk runs against, not
+                            // whichever game happens to run when the walk ends.  A
+                            // title switch during the walk then leaves the list
+                            // untrusted here (no local preview) even before the
+                            // console refuses to export it.
+                            let before = ChainOwner::current_target(c);
                             let (chains, truncated) = c.ptrscan_begin(target, module_base, depth, max_offset, 64, width)
                                 .map_err(|e| e.to_string())?;
+                            // The width the console walked with, from the reply's
+                            // NxusPtrChainListHeader.pointer_width (0 = an older
+                            // console, which leaves the local preview disabled).
+                            let walked = crate::client::last_chain_pointer_width();
+                            let owner = before.map(|target| ChainOwner::new(target, walked));
                             let note = if truncated { " - TRUNCATED by the console" } else { "" };
-                            let _ = tx.send(Ev::Message(format!("pointer scan: {} chain(s){}", chains.len(), note)));
-                            let _ = tx.send(Ev::Chains(chains, truncated));
+                            let width_note = match walked {
+                                4 | 8 => format!(" (walked with {}-byte pointers)", walked),
+                                _ => String::new(),
+                            };
+                            let _ = tx.send(Ev::Message(format!("pointer scan: {} chain(s){}{}",
+                                                                chains.len(), note, width_note)));
+                            let _ = tx.send(Ev::Chains { chains, truncated, owner });
                         }
                         Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: None } => {
                             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                            // The dump is captured from the live target, so the
+                            // chains describe it: stamp them with the identity the
+                            // capture started against (an offline dump below gets
+                            // no stamp, because it may be another title entirely).
+                            let before = ChainOwner::current_target(c);
                             let mut last = 0u64;
                             let mut progress = |done: u64, total: u64| {
                                 if done - last > 512 * 1024 || done == total {
@@ -768,7 +832,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let note = if res.truncated { " - TRUNCATED" } else { "" };
                             let _ = tx.send(Ev::Message(format!("PC pointer scan: {} chain(s) ({} ptrs indexed){}",
                                                                 res.chains.len(), res.pointers_indexed, note)));
-                            let _ = tx.send(Ev::Chains(res.chains, res.truncated));
+                            let owner = before.map(|target| ChainOwner::new(target, width));
+                            let _ = tx.send(Ev::Chains { chains: res.chains, truncated: res.truncated,
+                                                         owner });
                         }
                         Cmd::SaveDump { path, scope, begin, end } => {
                             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -791,14 +857,27 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             // the title's pointer width, exactly like the CLI's
                             // `cheat`, and the value write follows it too: an
                             // 8-byte title needs 680F (the console's 6T0F form
-                            // with T = the byte width), not 640F.  The width comes
-                            // from the UI, which is the side that knows the
-                            // mapping table (the Cmd carries it so the worker
-                            // cannot re-guess with a different rule).
+                            // with T = the byte width), not 640F.
+                            //
+                            // The text is ALWAYS the console's answer.  It owns the
+                            // chain list and checks the owner before exporting, so a
+                            // list that survived a title switch is refused with
+                            // BAD_STATE instead of being coded into the game that
+                            // runs now - which is exactly what the GUI's local
+                            // formatter used to do.  A current console prefers the
+                            // width it walked with and only logs a disagreement.
                             let width = if width == 4 { 4 } else { 8 };
-                            let text = c.cheat_export(index, value, width, width == 4)
-                                .map_err(|e| e.to_string())?;
-                            let _ = tx.send(Ev::Cheat(text));
+                            match c.cheat_export(index, value, width, width == 4) {
+                                Ok(text) => { let _ = tx.send(Ev::Cheat(text)); }
+                                Err(e) => {
+                                    // Drop whatever block was on screen first: it
+                                    // described the previous list/target, and copying
+                                    // it into the running game is the failure this
+                                    // whole path exists to prevent.
+                                    let _ = tx.send(Ev::Cheat(String::new()));
+                                    return Err(format!("the console refused the export: {}", e));
+                                }
+                            }
                         }
                         Cmd::Attach => {
                             let st = c.debug_attach().map_err(|e| e.to_string())?;
@@ -1146,6 +1225,41 @@ impl TargetId {
     }
 }
 
+/// Which target a pointer-chain list was walked in, and with which width.
+///
+/// The console stamps its own list the same way (`NxusChainOwner`, captured at
+/// PtrScanBegin) and refuses to export a list that belongs to an earlier target.
+/// The wire reply carries no owner, so the PC takes the stamp from the status
+/// reply *before* the walk - the identity the request was made against - for the
+/// same reason: a title switch during a 90 s walk must leave the list untrusted,
+/// not mis-stamped with whoever runs when it ends.
+///
+/// A local preview formatted from such a list is only offered while this stamp
+/// still names the current target (see [`State::chain_owner_now`]); the
+/// authoritative export always comes from the console.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainOwner {
+    pub target: TargetId,
+    /// Pointer width the walk actually used (4 or 8).  0 = unknown: a console
+    /// that predates `NxusPtrChainListHeader.pointer_width`.
+    pub width: u32,
+}
+
+impl ChainOwner {
+    /// A stamp naming `target`, with the walked width normalised (anything other
+    /// than 4/8 becomes 0 = "unknown", which disables the local preview).
+    pub fn new(target: TargetId, width: u32) -> ChainOwner {
+        ChainOwner { target, width: if width == 4 || width == 8 { width } else { 0 } }
+    }
+
+    /// Identity of the target the console is looking at right now, if it names
+    /// one at all.  A failed status read is "unknown", never "some target".
+    fn current_target(client: &crate::client::NxusClient) -> Option<TargetId> {
+        let status = client.status().ok()?;
+        TargetId::from_status(&status)
+    }
+}
+
 pub struct State {
     pub connected: bool,
     pub busy: bool,
@@ -1186,7 +1300,19 @@ pub struct State {
     pub chains: Vec<PtrChain>,
     /// Set by the console's own truncated flag (not by counting chains).
     pub chains_truncated: bool,
+    /// Which target `chains` was walked in, and with which pointer width.  `None`
+    /// = no list, or a list whose ownership the PC cannot prove (an offline dump
+    /// scan) - and then no local preview is shown at all.
+    pub chains_owner: Option<ChainOwner>,
+    /// Index into `chains` the "Generate code" button exports (set by clicking a
+    /// chain, so the exported block describes the row the user picked).
+    pub cheat_chain: usize,
+    /// The cheat block: either the console's own export, or - while
+    /// `cheat_preview` is set - a block formatted locally as a PREVIEW from a
+    /// chain list that is provably this target's.  The two are never conflated in
+    /// the UI, and only the console's answer is authoritative.
     pub cheat_text: String,
+    pub cheat_preview: bool,
     pub snapshot: SnapshotState,
     pub watch_armed: Option<u64>,
     pub frozen: Vec<u64>,
@@ -1242,7 +1368,10 @@ impl State {
             break_hits: Vec::new(),
             chains: Vec::new(),
             chains_truncated: false,
+            chains_owner: None,
+            cheat_chain: 0,
             cheat_text: String::new(),
+            cheat_preview: false,
             snapshot: SnapshotState { summary: None, changed: Vec::new(), slot: 0 },
             watch_armed: None,
             frozen: Vec::new(),
@@ -1311,7 +1440,10 @@ impl State {
         self.break_hits.clear();
         self.chains.clear();
         self.chains_truncated = false;
+        self.chains_owner = None;
+        self.cheat_chain = 0;
         self.cheat_text.clear();
+        self.cheat_preview = false;
         self.snapshot = SnapshotState { summary: None, changed: Vec::new(), slot: 0 };
         self.watch_armed = None;
         self.frozen.clear();
@@ -1326,20 +1458,75 @@ impl State {
         self.disasm_addr_input = "main+0x0".into();
     }
 
-    /// Pointer width the console will infer for this title (0 is sent on the
-    /// wire, so this only drives the display, the address format and the
-    /// 540F/580F + 640F/680F cheat form).
+    /// The dmnt metadata, but only while it still describes [`State::target`].
     ///
-    /// The GUI has no width selector: it hands both pieces of evidence the console
-    /// uses to [`crate::client::pointer_width_for`] - the mapping table fetched on
-    /// connect and the main module base (metadata first, the status reply as the
-    /// fallback) - so there is no second, local rule that could drift.
-    pub fn pointer_width(&self) -> u32 {
-        let mut metadata = self.metadata.clone().unwrap_or_default();
+    /// The GUI fetches it on connect and after every target change ([`Cmd::FetchMetadata`]),
+    /// but a reply can also be missing (dmnt closed while the console holds its own
+    /// debug session) or lag behind a game switch.  Its `main_base`/`aslr_base`/
+    /// `aslr_size` would then describe the PREVIOUS title, and trusting that would
+    /// reintroduce exactly the wrong-width case this rule exists to fix - the
+    /// status reply and the mapping table are the fresh evidence then.
+    fn trusted_metadata(&self) -> Option<&Metadata> {
+        let metadata = self.metadata.as_ref()?;
+        let described = TargetId::from_metadata(metadata)?;   // a zeroed reply is none
+        let current = self.target?;
+        if described.process_id != current.process_id {
+            return None;                    // another process
+        }
+        // A program id of 0 on either side means "unknown", not a mismatch: dmnt
+        // can answer without it while the status reply still names the title.
+        if described.program_id != 0 && current.program_id != 0
+            && described.program_id != current.program_id {
+            return None;                    // same pid, different title
+        }
+        Some(metadata)
+    }
+
+    /// Pointer width the console will infer for this title, with the evidence it
+    /// rests on (0 is sent on the wire, so this only drives the display, the
+    /// address format and the 540F/580F + 640F/680F cheat form).
+    ///
+    /// The GUI has no width selector: it hands the console's own inputs to
+    /// [`crate::client::pointer_width_with_reason`] - the process address space
+    /// from the dmnt metadata (`aslr_base`/`aslr_size`, the evidence that tells a
+    /// low-placed 64-bit title apart from a 32-bit one), the mapping table fetched
+    /// on connect, and the main module base (metadata first, the status reply as
+    /// the fallback) - so there is no second, local rule that could drift.  The
+    /// reason string is what the pointer panel prints, so the number is never
+    /// shown without saying where it came from.
+    pub fn pointer_width_with_reason(&self) -> (u32, &'static str) {
+        // Only metadata that names the CURRENT target may speak for it.
+        let mut metadata = self.trusted_metadata().cloned().unwrap_or_default();
         if metadata.main_base == 0 {
             metadata.main_base = self.main_base();
         }
-        crate::client::pointer_width_for(&metadata, Some(&self.mappings))
+        crate::client::pointer_width_with_reason(&metadata, Some(&self.mappings))
+    }
+
+    /// The width alone (address formatting, the disassembler's arch fallback).
+    pub fn pointer_width(&self) -> u32 {
+        self.pointer_width_with_reason().0
+    }
+
+    /// The chain list's owner stamp - but only while it still names the CURRENT
+    /// target and reports the width it was walked with.
+    ///
+    /// This is the gate for the GUI's local cheat PREVIEW.  Formatting a block
+    /// from another title's chain list is worse than useless: a chain is a
+    /// module-relative root plus offsets, so it looks valid for whatever runs now.
+    /// The console applies the same rule server-side (`ptrChainOwnerCheck()`,
+    /// which answers BAD_STATE), and an unstamped list - an offline dump, or a
+    /// console that predates the width field - is treated as "not ours" instead of
+    /// being trusted by default.
+    pub fn chain_owner_now(&self) -> Option<ChainOwner> {
+        let owner = self.chains_owner?;
+        if Some(owner.target) != self.target {
+            return None;               // the list belongs to an earlier target
+        }
+        if owner.width != 4 && owner.width != 8 {
+            return None;               // the walk's width is unknown
+        }
+        Some(owner)
     }
 
     /// Is this a 32-bit (AArch32) title?
@@ -1581,9 +1768,91 @@ mod pointer_width_tests {
     #[test]
     fn metadata_is_the_main_base_source() {
         let mut st = State::new();
-        st.status = Some(Status { main_base: 0x0070_0000, ..Default::default() });
-        st.metadata = Some(Metadata { main_base: 0x1_0000_0000, ..Default::default() });
+        let status = Status { process_id: 0x10, program_id: 0xABC, main_base: 0x0070_0000,
+                              ..Default::default() };
+        st.target = TargetId::from_status(&status);
+        st.status = Some(status);
+        st.metadata = Some(Metadata { process_id: 0x10, program_id: 0xABC,
+                                      main_base: 0x1_0000_0000, ..Default::default() });
         assert_eq!(st.pointer_width(), 8);
+    }
+
+    /// Metadata that names another process is the PREVIOUS title's reply: its main
+    /// base and its ASLR region must not answer the width question for this one.
+    #[test]
+    fn metadata_of_an_earlier_title_is_ignored() {
+        let mut st = State::new();
+        let status = Status { process_id: 0x20, program_id: 0xDEF, main_base: 0x0070_0000,
+                              ..Default::default() };
+        st.target = TargetId::from_status(&status);
+        st.status = Some(status);
+        st.metadata = Some(Metadata {
+            process_id: 0x10, program_id: 0xABC,
+            main_base: 0x0070_0000,
+            // the OLD title was 32-bit: keeping this would call the new one 32-bit
+            aslr_base: 0x0020_0000, aslr_size: 0xFFE0_0000,
+            ..Default::default()
+        });
+        assert_eq!(st.pointer_width_with_reason(),
+                   (4, crate::client::WIDTH_REASON_MAIN_BASE_32),
+                   "the stale aslr pair must not be used");
+        // The mapping table is not stale (it is refetched on every switch), so it
+        // decides as soon as it arrives.
+        st.mappings = vec![MemoryInfo { base: 0x7F_0000_0000, size: 0x1000, perm: PERM_R,
+                                        ..Default::default() }];
+        assert_eq!(st.pointer_width_with_reason(),
+                   (8, crate::client::WIDTH_REASON_MAPPINGS_64));
+        // A metadata reply that names the CURRENT target is used again - including
+        // its address space (same pid, program id unknown on the metadata side).
+        st.metadata = Some(Metadata {
+            process_id: 0x20,
+            aslr_base: 0x0800_0000, aslr_size: 0x7FF8_0000_00,
+            ..Default::default()
+        });
+        assert_eq!(st.pointer_width_with_reason(),
+                   (8, crate::client::WIDTH_REASON_PROCESS_64));
+    }
+
+    /// The High-severity case this rule was fixed for: a 64-bit title whose main
+    /// module and heap both ASLR'd below 4 GiB.  The GUI used to see only the
+    /// mapping table (all below 4 GiB) and call it 32-bit while the console walked
+    /// it with 8-byte pointers - and then generate 540F/640F code for it.
+    #[test]
+    fn a_low_placed_64bit_title_is_64bit() {
+        let mut st = State::new();
+        let status = Status { process_id: 0x1234, program_id: 0x0100_C380_0049_C000,
+                              main_base: 0x0070_0000, ..Default::default() };
+        st.target = TargetId::from_status(&status);
+        st.status = Some(status);
+        st.metadata = Some(Metadata {
+            process_id: 0x1234, program_id: 0x0100_C380_0049_C000,
+            main_base: 0x0070_0000,
+            // dmnt's AArch64 pair: 0x8000000 + 0x7FF8000000 (512 GiB).
+            aslr_base: 0x0800_0000,
+            aslr_size: 0x7FF8_0000_00,
+            ..Default::default()
+        });
+        st.mappings = vec![
+            MemoryInfo { base: 0x0070_0000, size: 0x80000, perm: PERM_R, ..Default::default() },
+            MemoryInfo { base: 0x3600_0000, size: 0x10_0000, perm: PERM_R, ..Default::default() },
+        ];
+        assert_eq!(st.pointer_width(), 8, "the process address space outranks the mappings");
+        assert_eq!(st.pointer_width_with_reason(),
+                   (8, crate::client::WIDTH_REASON_PROCESS_64),
+                   "the panel has to say WHY it is 8");
+
+        // The measured MHXX (AArch32) pair: 0x200000 + 0xFFE00000.
+        st.metadata = Some(Metadata {
+            process_id: 0x1234, program_id: 0x0100_C380_0049_C000,
+            main_base: 0x0780_4000,
+            aslr_base: 0x0020_0000,
+            aslr_size: 0xFFE0_0000,
+            ..Default::default()
+        });
+        st.status = Some(Status { process_id: 0x1234, program_id: 0x0100_C380_0049_C000,
+                                  main_base: 0x0780_4000, ..Default::default() });
+        assert_eq!(st.pointer_width_with_reason(),
+                   (4, crate::client::WIDTH_REASON_PROCESS_32));
     }
 
     #[test]
@@ -1702,7 +1971,10 @@ mod target_switch_tests {
         st.break_hits = vec![BreakHit::default()];
         st.chains = vec![PtrChain { root_offset: 0x81000, final_offset: 4, steps: vec![0x20] }];
         st.chains_truncated = true;
+        st.chains_owner = Some(ChainOwner::new(st.target.expect("a target"), 8));
+        st.cheat_chain = 0;
         st.cheat_text = "[Nxus]\n540F0000 00081000\n".into();
+        st.cheat_preview = true;
         st.frozen = vec![0x42CA1DC4];
         st.watch_armed = Some(0x42CA1DC4);
         st.modules = vec![ModuleInfo { base: 0x0070_0000, size: 0x0186_B03E,
@@ -1736,7 +2008,11 @@ mod target_switch_tests {
         assert!(st.break_hits.is_empty());
         assert!(st.chains.is_empty());
         assert!(!st.chains_truncated);
+        // The chain list's owner stamp belongs to the old target too: without it
+        // the GUI could offer a preview of the previous title's chains.
+        assert!(st.chains_owner.is_none(), "the old chain list's owner stamp survived");
         assert!(st.cheat_text.is_empty());
+        assert!(!st.cheat_preview, "a preview of the old list survived");
         assert!(st.snapshot.summary.is_none());
         assert!(st.snapshot.changed.is_empty());
         assert!(st.watch_armed.is_none());
@@ -1789,6 +2065,39 @@ mod target_switch_tests {
         assert_eq!(st.target, None);
         // The next game is a first identification: nothing cached, nothing to do.
         assert!(!st.note_target(Some(target(0x2222, NEW_TITLE))));
+    }
+
+    /// A local cheat preview is only allowed while the chain list is provably the
+    /// current target's AND its walked width is known: a chain is a module-relative
+    /// root plus offsets, so another title's list would format into something that
+    /// looks valid for whatever runs now.  The console applies the same rule
+    /// server-side (`ptrChainOwnerCheck()`), which is why "Generate code" asks it.
+    #[test]
+    fn a_chain_preview_needs_the_current_target_and_a_known_width() {
+        let mut st = State::new();
+        st.target = Some(target(0x1111, OLD_TITLE));
+        st.chains_owner = Some(ChainOwner::new(target(0x1111, OLD_TITLE), 8));
+        assert_eq!(st.chain_owner_now(), st.chains_owner);
+
+        // A list walked in an earlier target: no preview.
+        st.chains_owner = Some(ChainOwner::new(target(0x2222, NEW_TITLE), 8));
+        assert!(st.chain_owner_now().is_none(), "another target's list must not preview");
+
+        // The right target, but the console did not report the walked width (an
+        // older console): the loads could be either kind, so no preview.
+        st.chains_owner = Some(ChainOwner::new(target(0x1111, OLD_TITLE), 0));
+        assert!(st.chain_owner_now().is_none(), "an unknown walked width must not preview");
+        // The normaliser keeps only the two widths that mean something.
+        assert_eq!(ChainOwner::new(target(0x1111, OLD_TITLE), 6).width, 0);
+        assert_eq!(ChainOwner::new(target(0x1111, OLD_TITLE), 4).width, 4);
+
+        // No stamp at all (an offline dump): no preview either.
+        st.chains_owner = None;
+        assert!(st.chain_owner_now().is_none());
+        // ... and neither when the console reports no process.
+        st.chains_owner = Some(ChainOwner::new(target(0x1111, OLD_TITLE), 8));
+        st.target = None;
+        assert!(st.chain_owner_now().is_none());
     }
 
     #[test]
@@ -2191,14 +2500,34 @@ impl App {
                 }
                 self.st.busy = false;
             }
-            Ev::Chains(chains, truncated) => {
+            Ev::Chains { chains, truncated, owner } => {
                 self.st.chains_truncated = truncated;
                 self.st.log(format!("{} pointer chain(s)", chains.len()));
                 self.st.chains = chains;
+                self.st.chains_owner = owner;
+                // The previous list's export describes chains that are no longer
+                // on screen, and possibly a target that is no longer running.
+                self.st.cheat_text.clear();
+                self.st.cheat_preview = false;
+                self.st.cheat_chain = 0;
+                match owner {
+                    Some(owner) if owner.width == 4 || owner.width == 8 => {
+                        self.st.log(format!("chain list walked with {}-byte pointers", owner.width));
+                    }
+                    Some(_) => self.st.log(
+                        "chain list width unknown (the console did not report it): \
+                         Generate code asks the console, local preview is off"),
+                    None => self.st.log(
+                        "chain list has no owner stamp (offline dump?): \
+                         Generate code asks the console, local preview is off"),
+                }
                 self.st.busy = false;
             }
             Ev::Cheat(text) => {
                 self.st.cheat_text = text;
+                // The console's answer is authoritative; a local preview must never
+                // be mistaken for it.
+                self.st.cheat_preview = false;
                 self.st.busy = false;
             }
             Ev::BreakHits(hits) => {
@@ -2722,6 +3051,10 @@ impl App {
         self.drop_target_state();
         let _ = self.cmd_tx.send(Cmd::FetchModules);
         let _ = self.cmd_tx.send(Cmd::FetchMappings);
+        // The metadata describes a process (`process_id`/`program_id`, main base,
+        // ASLR region): the previous game's must not keep answering the pointer
+        // width question for the new one.
+        let _ = self.cmd_tx.send(Cmd::FetchMetadata);
     }
 
     /// Drop the register bar and the code listing: both belong to the thread the

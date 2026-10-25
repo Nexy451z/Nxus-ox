@@ -412,19 +412,24 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
         .id_salt("sec-pointer")
         .show(ui, |ui| {
         ui.group(|ui| {
-        // One line that says what the scan actually runs with: the GUI has no
-        // width selector, so it always asks the console for automatic (0) and
-        // the console decides from the title.  This is also what the 540F/580F
-        // pointer load and the 640F/680F value write follow.
-        let pointer_width = app.st.pointer_width();
+        // One line that says what the scan actually runs with AND why: the GUI has
+        // no width selector, so it always asks the console for automatic (0) and
+        // the console decides from the title.  The evidence is printed with the
+        // number (`pointer_width_with_reason`), because a plain "auto (64-bit)"
+        // hid the case that mattered: a 64-bit title whose mappings all sit below
+        // 4 GiB used to be explained - and coded - as 32-bit.
+        let (pointer_width, width_reason) = app.st.pointer_width_with_reason();
         ui.label(RichText::new(format!(
-            "pointer width: auto ({}-bit) - sent as 0, the console infers it from the title",
-            if pointer_width == 4 { 32 } else { 64 }
+            "width: auto (assumed {}-bit from {}) - sent as 0, the console decides",
+            if pointer_width == 4 { 32 } else { 64 }, width_reason
         )).color(DIM))
-            .on_hover_text("the shared rule: any mapping ending above 4 GiB means \
-                            8-byte pointers (580F loads, 8-byte value writes), \
-                            otherwise 4 (540F loads, 4-byte value writes). The \
-                            value write always uses the same width as the pointer walk");
+            .on_hover_text("the shared rule, in the console's order: the process's own \
+                            address space (dmnt aslr_base/aslr_size: above 4 GiB can only \
+                            be AArch64, a region inside 4 GiB only AArch32), then any \
+                            mapping ending above 4 GiB, then the main module base, then \
+                            the AArch64 default. 8-byte pointers mean 580F loads and \
+                            8-byte value writes (680F); 4-byte pointers mean 540F loads \
+                            and 640F writes.");
         ui.horizontal(|ui| {
             ui.label("depth");
             ui.add(egui::DragValue::new(&mut app.prefs.ptr_depth).range(1..=8));
@@ -478,22 +483,58 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         let chains = app.st.chains.clone();
+        // What the console actually walked with, and for which process.  The local
+        // preview below is gated on this stamp still naming the target that runs
+        // now: a chain is a module-relative root plus offsets, so another title's
+        // list would format into something that looks valid.
+        if let Some(owner) = app.st.chains_owner {
+            let trusted = app.st.chain_owner_now().is_some();
+            let width = if owner.width == 4 || owner.width == 8 {
+                format!("{}-byte pointers", owner.width)
+            } else {
+                "an unreported width".to_string()
+            };
+            ui.label(RichText::new(format!(
+                "this list was walked with {} for process {:#x}{}",
+                width, owner.target.process_id,
+                if trusted { "" } else { " - NOT the current target: preview disabled" }
+            )).color(if trusted { DIM } else { YELLOW }).size(11.0));
+        }
         if app.st.chains_truncated {
             // authoritative console flag: a capped list must not look complete
             ui.colored_label(egui::Color32::from_rgb(0xE0, 0xA0, 0x40),
                              format!("{} chains - TRUNCATED (narrow the offset range or use PC scan)", chains.len()));
         }
-        for (_index, chain) in chains.iter().enumerate().take(8) {
+        for (index, chain) in chains.iter().enumerate().take(8) {
             let steps: String = chain.steps.iter().map(|s| format!(" +{:#x}", s)).collect();
             ui.horizontal(|ui| {
-                if ui.selectable_label(false, format!("main+{:#x}{} +{:#x}",
-                                                      chain.root_offset, steps, chain.final_offset)).clicked() {
-                    let val = parse_value(&app.prefs.cheat_value, 4);
-                    // 540F vs 580F follows the title's pointer width, not a
-                    // hard-coded "32-bit": a 64-bit chain needs 580F loads - and
-                    // the value write uses the same width (680F, not 640F).
-                    app.st.cheat_text = crate::dump::format_cheat(
-                        chain, val, pointer_width, pointer_width == 4, "Nxus");
+                let selected = app.st.cheat_chain == index;
+                if ui.selectable_label(selected, format!("main+{:#x}{} +{:#x}",
+                                                         chain.root_offset, steps, chain.final_offset)).clicked() {
+                    app.st.cheat_chain = index;
+                    // Clicking a chain is a PREVIEW at most.  It is formatted
+                    // locally only while `chain_owner_now()` proves the list is this
+                    // target's and knows the walked width; otherwise nothing is
+                    // shown, because a block built from an unstamped or foreign list
+                    // is exactly the wrong code the console refuses to export.
+                    match app.st.chain_owner_now() {
+                        Some(owner) => {
+                            let val = parse_value(&app.prefs.cheat_value, 4);
+                            // 540F vs 580F follows the WALKED width, not a
+                            // hard-coded "32-bit": a 64-bit chain needs 580F loads
+                            // - and the value write uses the same width (680F).
+                            app.st.cheat_text = crate::dump::format_cheat(
+                                chain, val, owner.width, owner.width == 4, "Nxus");
+                            app.st.cheat_preview = true;
+                        }
+                        None => {
+                            app.st.cheat_text.clear();
+                            app.st.cheat_preview = false;
+                            app.st.log("no local preview: this chain list is not stamped with \
+                                        the current target (Generate code asks the console, \
+                                        which checks the owner)");
+                        }
+                    }
                 }
             });
         }
@@ -502,21 +543,25 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
             ui.add(egui::TextEdit::singleline(&mut app.prefs.cheat_value).desired_width(90.0));
             if ui.button("Generate code").clicked() {
                 let val = parse_value(&app.prefs.cheat_value, 4);
-                if let Some(first) = chains.first() {
-                    // Same width for the value as for the pointer walk: a 64-bit
-                    // title stores 8 bytes (680F), never the old 4 (640F).
-                    app.st.cheat_text = crate::dump::format_cheat(
-                        first, val, pointer_width, pointer_width == 4, "Nxus");
-                } else {
-                    app.send(Cmd::Cheat { index: 0, value: val, width: pointer_width },
-                             "generating cheat");
-                }
+                // ALWAYS the console's export.  It owns the chain list, checks the
+                // owner and answers BAD_STATE for a list that belongs to an earlier
+                // target - the check this GUI used to bypass by formatting the block
+                // locally.  The index is the row the user picked.
+                let index = app.st.cheat_chain.min(chains.len().saturating_sub(1)) as u32;
+                app.send(Cmd::Cheat { index, value: val, width: pointer_width },
+                         "generating cheat on the console");
             }
             if !app.st.cheat_text.is_empty() && ui.button("Copy").clicked() {
                 ui.ctx().copy_text(app.st.cheat_text.clone());
             }
         });
         if !app.st.cheat_text.is_empty() {
+            if app.st.cheat_preview {
+                ui.label(RichText::new(
+                    "PREVIEW - formatted on the PC from the chain list above; \
+                     use Generate code for the console's own owner-checked block")
+                    .color(YELLOW).size(11.0));
+            }
             ui.label(RichText::new(&app.st.cheat_text).monospace().size(12.0).color(GREEN));
         }
         });

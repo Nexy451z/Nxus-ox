@@ -438,6 +438,25 @@ impl Status {
     }
 }
 
+/// Architecture a process's address space proves (mirror of `NxusPtrScanArch`).
+///
+/// This is the metadata half of the console's `ptrScanProcessArch()`: dmnt's
+/// `CheatProcessMetadata` carries no architecture bit, but the kernel hands an
+/// AArch32 process `aslr_base = 0x00200000 / aslr_size = 0xFFE00000` (the pair
+/// sums to exactly 4 GiB - the measured MHXX values) and an AArch64 process
+/// `0x08000000 / 0x7FF8000000` (512 GiB), so the size of the region answers the
+/// question.  Anything inconsistent stays [`AddressSpaceArch::Unknown`], never a
+/// guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddressSpaceArch {
+    /// No usable metadata: an old console (zeroed tail) or dmnt closed.
+    Unknown,
+    /// The whole address space fits below 4 GiB: only AArch32 gets that.
+    Aarch32,
+    /// Larger than a 32-bit pointer can describe: only AArch64 gets that.
+    Aarch64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Metadata {
     pub process_id: u64,
@@ -448,7 +467,12 @@ pub struct Metadata {
     pub heap_size: u64,
     pub alias_base: u64,
     pub alias_size: u64,
+    /// Start of the process's ASLR region (dmnt `CheatProcessMetadata.aslr_base`).
+    /// Part of the fixed 0x70-byte tail, so a console that predates it sends 0.
     pub aslr_base: u64,
+    /// Size of that region in bytes - the process's whole address space.  0 means
+    /// "no answer" (old console / dmnt closed), NOT "32-bit": see
+    /// [`Metadata::address_space_arch`].
     pub aslr_size: u64,
     pub build_id: [u8; 0x20],
 }
@@ -478,6 +502,35 @@ impl Metadata {
     }
     pub fn build_id_hex(&self) -> String {
         self.build_id.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Architecture the process's address space proves (see [`AddressSpaceArch`]).
+    ///
+    /// The PC used to decide the title's pointer width from the mapping table
+    /// alone, which is wrong for a 64-bit title that ASLR'd below 4 GiB (AArch64
+    /// normally places main at 0x00700000 and the heap around 0x36000000): every
+    /// mapping ended below 4 GiB, so the PC said 4 while the console - which also
+    /// looks at the process itself - said 8.  These two dmnt fields are that
+    /// process-level evidence.
+    ///
+    /// This mirrors `nxusPtrScanArchFromAddressSpace()` (core/nxus_ptrscan.c)
+    /// exactly, including its guard against a hostile `aslr_base + aslr_size`
+    /// wrapping into "inside 4 GiB" (written as a subtraction for that reason).
+    pub fn address_space_arch(&self) -> AddressSpaceArch {
+        /// End of the 32-bit address space.  A region ending exactly here still
+        /// covers only 32-bit-addressable bytes, so it does not prove 8.
+        const LIMIT: u64 = 0x1_0000_0000;
+        // Larger than a 32-bit pointer can describe: only AArch64 gets such a space.
+        if self.aslr_size > LIMIT {
+            return AddressSpaceArch::Aarch64;
+        }
+        // The whole region sits inside the AArch32 address space.
+        if self.aslr_size != 0 && self.aslr_base < LIMIT && self.aslr_size <= LIMIT - self.aslr_base {
+            return AddressSpaceArch::Aarch32;
+        }
+        // No size at all, or a region that starts below 4 GiB and ends above it:
+        // this metadata cannot answer.
+        AddressSpaceArch::Unknown
     }
 }
 
@@ -2971,5 +3024,69 @@ mod tests {
         let zero = FrozenReleased::parse(&frozen_released_payload(0, &[0xDEAD]));
         assert_eq!(zero.count, 0);
         assert!(zero.addresses.is_empty());
+    }
+
+    // ---- the process's own address space (pointer-width evidence) -------
+
+    fn metadata_with_aslr(aslr_base: u64, aslr_size: u64) -> Metadata {
+        Metadata { aslr_base, aslr_size, ..Default::default() }
+    }
+
+    /// dmnt hands the two architectures unmistakably different pairs, so the size
+    /// of the ASLR region answers "is this process 64-bit" even though the
+    /// metadata has no architecture bit.  This is the evidence the second half of
+    /// the pointer-width rule must consult (nxusPtrScanArchFromAddressSpace).
+    #[test]
+    fn the_address_space_size_names_the_architecture() {
+        // the measured MHXX (AArch32) pair: 0x200000 + 0xFFE00000 == exactly 4 GiB
+        assert_eq!(metadata_with_aslr(0x0020_0000, 0xFFE0_0000).address_space_arch(),
+                   AddressSpaceArch::Aarch32);
+        // a real AArch64 pair: 0x8000000 + 0x7FF8000000 == 512 GiB
+        assert_eq!(metadata_with_aslr(0x0800_0000, 0x7FF8_0000_00).address_space_arch(),
+                   AddressSpaceArch::Aarch64);
+        // The same pair with the fields swapped is nonsense, not AArch32: a base
+        // above 4 GiB never fits inside the 32-bit address space.
+        assert_eq!(metadata_with_aslr(0x7FF8_0000_00, 0x0800_0000).address_space_arch(),
+                   AddressSpaceArch::Unknown);
+    }
+
+    /// "No size" is UNKNOWN, never "32-bit": an old console zeroes the appended
+    /// tail and dmnt answers nothing while it is closed, and reading either as
+    /// AArch32 is exactly the mismatch this rule exists to remove.
+    #[test]
+    fn a_missing_address_space_is_unknown() {
+        assert_eq!(Metadata::default().address_space_arch(), AddressSpaceArch::Unknown);
+        assert_eq!(metadata_with_aslr(0x0020_0000, 0).address_space_arch(),
+                   AddressSpaceArch::Unknown);
+        // starts below 4 GiB, ends above it: this metadata cannot answer
+        assert_eq!(metadata_with_aslr(0x8000_0000, 0x9000_0000).address_space_arch(),
+                   AddressSpaceArch::Unknown);
+    }
+
+    /// A hostile aslr_base + aslr_size must not wrap into "fits in 4 GiB".
+    #[test]
+    fn an_overflowing_address_space_does_not_wrap_into_32bit() {
+        assert_eq!(metadata_with_aslr(0xFFFF_FFFF_0000_0000, 0x1000).address_space_arch(),
+                   AddressSpaceArch::Unknown);
+        assert_eq!(metadata_with_aslr(u64::MAX, u64::MAX).address_space_arch(),
+                   AddressSpaceArch::Aarch64);
+    }
+
+    /// The two fields really decode out of the fixed 0x70-byte tail (offsets 64
+    /// and 72) - a shift would silently describe another field as the aslr size.
+    #[test]
+    fn metadata_decodes_the_aslr_tail() {
+        let mut data = vec![0u8; Metadata::SIZE];
+        data[0..8].copy_from_slice(&0x1234u64.to_le_bytes());        // process id
+        data[64..72].copy_from_slice(&0x0020_0000u64.to_le_bytes()); // aslr_base
+        data[72..80].copy_from_slice(&0xFFE0_0000u64.to_le_bytes()); // aslr_size
+        let metadata = Metadata::parse(&data);
+        assert_eq!(metadata.process_id, 0x1234);
+        assert_eq!(metadata.aslr_base, 0x0020_0000);
+        assert_eq!(metadata.aslr_size, 0xFFE0_0000);
+        assert_eq!(metadata.address_space_arch(), AddressSpaceArch::Aarch32);
+        // A pre-Round console sends 0x70 bytes with the tail zeroed: unknown.
+        assert_eq!(Metadata::parse(&vec![0u8; Metadata::SIZE]).address_space_arch(),
+                   AddressSpaceArch::Unknown);
     }
 }

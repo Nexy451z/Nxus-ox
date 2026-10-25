@@ -80,6 +80,9 @@ s32  nxusSessionLastResult(void);
  * publishes the counters when its pass returns. */
 u32  nxusSessionBaselineWriteFailed(void);
 bool nxusSessionBaselineDegraded(void);
+/* Reports 0 while the stored list has been discarded as belonging to an earlier
+   target (nxusSessionInvalidateHits), so Status never advertises hits that
+   ScanGetHits refuses to serve. */
 u32  nxusSessionHitCount(void);
 u32  nxusSessionMappingCount(void);
 u64  nxusSessionProcessId(void);
@@ -179,6 +182,51 @@ const NxusScanRegion *nxusSessionRegions(u32 *out_count);
  *     unpin of such a token is a logged no-op).  Do not use a view across Exit.
  */
 const NxusHitList      *nxusSessionHits(void);
+
+/* ---- result ownership (does the stored result belong to THIS target?) ----
+ * hits and the mapping snapshot are keyed to the process they were taken from.
+ * ForceOpen to another title, a relaunch (same title, new pid) or a DebugAttach to
+ * a different process leaves every address / mapping_idx in them pointing at a
+ * process that is gone - or at the NEW one at the same numeric address, which looks
+ * perfectly valid to the PC.  The pointer-scan chain list already refuses to serve a
+ * list from an earlier target (ptrChainOwnerCheck in nxus_server.c); the hit list
+ * records its owner and is checked the same way:
+ *
+ *   - nxusSessionScanBegin() stamps {pid, program_id, session_id} when it arms a
+ *     list, after refreshing the identity and taking the mapping snapshot, so the
+ *     stamp describes the same read of the target,
+ *   - nxusSessionHitsMatchTarget() compares that stamp with the identity the session
+ *     currently holds.  A pid or program id that is 0 on either side is "unknown",
+ *     not a mismatch (an explicit DebugAttach can leave the title unknown, and
+ *     refusing the session's own list would break scan-then-attach).  With no pid at
+ *     all the scan generation is the token, exactly like the chain list,
+ *   - nxusSessionInvalidateHits() discards hits + mapping snapshot.
+ *
+ * Detection is the server's job: fillStatus() and the 1 Hz identity tick call
+ * MatchTarget() and InvalidateHits() when it returns false, and every reader of a
+ * stored address (sendHits, ScanNext) checks it first.
+ */
+/* True while the stored hit list may be served to the current target.  Also false
+   after nxusSessionInvalidateHits() until a new scan stamps a list, so one detection
+   is enough for every later reader.  An empty session (no list ever built) matches:
+   there is nothing that could be stale. */
+bool nxusSessionHitsMatchTarget(void);
+
+/* Discard the stored hits and the mapping snapshot because they describe an earlier
+   target, and ask a pass that is still reading it to cancel.  Idempotent, cheap to
+   repeat, and SAFE FROM ANY THREAD (the connection thread's status path and the main
+   thread's tick both call it):
+ *
+ *   - the hit arrays are NOT freed here: the connection thread may be inside
+ *     sendHits() walking them.  They become unservable (MatchTarget() is false and
+ *     nxusSessionHitCount() reports 0) and are reclaimed by the next
+ *     ScanBegin / Reset / Exit,
+ *   - the published views are pin-protected, but the worker walks the region list and
+ *     the mapping table WITHOUT a pin while it runs, so they are dropped only when no
+ *     pass is active; otherwise the drop is left to the next call,
+ *   - the worker is only asked to cancel (no join), so this can never stall the tick.
+ */
+void nxusSessionInvalidateHits(void);
 
 /* Identified view pin: `id` 0 means "no pin" - it is never handed out and unpin
    clears it.  `generation` names the view publication the pin was taken in, so a

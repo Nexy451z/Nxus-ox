@@ -68,10 +68,55 @@ typedef struct {
     u32 watchdog_timeout_ms;
 
     u64 process_id, program_id, main_base, main_size;
+
+    /* Which target the stored results belong to (see the ownership block below):
+       stamped by ScanBegin from the identity its mapping snapshot was taken with,
+       so serving the previous title's hits after a switch is detectable. */
+    u64 hits_owner_pid, hits_owner_program_id;
+    u32 hits_owner_session_id;
+    bool hits_owner_valid;
 } Session;
 
 static Session g_Session;
 static Mutex   g_SessionMutex;
+
+/* ---- result ownership --------------------------------------------------
+ *
+ * hits and the mapping snapshot are keyed to the process they were taken from.
+ * ForceOpen to another title, a relaunch (same title, new pid) or a DebugAttach to
+ * a different process leaves every address and mapping_idx in them pointing at a
+ * process that is gone - or at the NEW one at the same numeric address, which looks
+ * perfectly valid to the PC.  The pointer-scan chain list already refuses to hand
+ * out a list from an earlier target (ptrChainOwnerCheck in nxus_server.c); the hit
+ * list records its owner here and answers the same question.
+ *
+ * g_HitsStale is the "discarded, not replaced yet" latch.  Invalidating must not
+ * free the hit arrays (the connection thread may be walking them inside sendHits),
+ * so the discarded list stays allocated and every accessor refuses to serve it until
+ * ScanBegin stamps a new one.
+ */
+static atomic_int g_HitsStale;
+
+static bool hitsStale(void) {
+    return atomic_load_explicit(&g_HitsStale, memory_order_acquire) != 0;
+}
+
+/* Remember the identity a freshly armed hit list belongs to.  Callers pass the
+   session's own cached identity: ScanBegin refreshes it (cacheProcessInfo) and takes
+   the mapping snapshot immediately before stamping, so all three describe the same
+   read of the target. */
+static void hitsOwnerStamp(void) {
+    g_Session.hits_owner_pid = g_Session.process_id;
+    g_Session.hits_owner_program_id = g_Session.program_id;
+    g_Session.hits_owner_session_id = g_Session.session_id;
+    g_Session.hits_owner_valid = true;
+}
+
+/* No list is tied to a target any more (Reset): nothing to compare, nothing to
+   refuse. */
+static void hitsOwnerClear(void) {
+    g_Session.hits_owner_valid = false;
+}
 
 /* Guards double initialisation.  A second nxusSessionInit() must not memset a
    live session (see the lifecycle section).  Declared up here because the view
@@ -130,8 +175,9 @@ static void sessionStateStore(NxusScanState state) {
  * sees either the old view or an explicitly empty one, never a pointer into
  * memory that is already back in the allocator.
  *
- * Writers are all on the server thread (publish / drop / buildRegions), so the
- * two views can share a single seqlock counter without a lock of their own.
+ * Writers are the publish / drop / buildRegions calls; they share a single seqlock
+ * counter, and g_ViewPublishMutex keeps two writer THREADS out of the pair (see its
+ * declaration below).
  *
  * A consistent sample is still only a sample: the block it points at stays the
  * same memory until somebody replaces it.  Callers outside the connection thread
@@ -212,12 +258,23 @@ static u64  g_ViewLeaked;            /* blocks kept alive past the ring (never f
 static Mutex g_ViewRetireMutex;
 static bool  g_ViewRetireInited;
 
+/* Serialises the two published views across WRITER THREADS.  Every publish used to
+   come from the connection thread, but nxusSessionInvalidateHits() can drop them from
+   the main thread (the 1 Hz identity tick) while a handler on the connection thread
+   publishes a new snapshot; two writers inside viewUpdateBegin/End would interleave
+   the odd/even sequence and a reader could then accept a pair that is being written.
+   Readers never take this lock (that is what the seqlock is for), and a writer only
+   ever holds it across the two plain stores, so it cannot block a scan. */
+static Mutex g_ViewPublishMutex;
+
 static void viewUpdateBegin(void) {
+    mutexLock(&g_ViewPublishMutex);
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* odd */
 }
 
 static void viewUpdateEnd(void) {
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* even */
+    mutexUnlock(&g_ViewPublishMutex);
 }
 
 /* Outstanding pins of both kinds.  Caller holds g_ViewRetireMutex: the token count
@@ -766,10 +823,13 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     if (g_Inited) return;      /* already initialised: keep the live session */
     mutexInit(&g_SessionMutex);
     mutexInit(&g_ViewRetireMutex);
+    /* Before any publish/drop can run (they are all behind a live session). */
+    mutexInit(&g_ViewPublishMutex);
     memset(&g_Session, 0, sizeof(g_Session));
     atomic_init(&g_Session.state, NxusScanState_Idle);
     atomic_init(&g_Session.cancel, 0);
     atomic_init(&g_ViewSeq, 0);   /* both published views start empty/stable */
+    atomic_init(&g_HitsStale, 0); /* no results to discard in a fresh session */
     /* A fresh session starts with no pins and an empty retire ring: Exit() freed
        every block it knew about and invalidated every token, and the published
        views are gone with the memset above (see the view contract in
@@ -838,6 +898,10 @@ bool nxusSessionBaselineDegraded(void)    { return g_Session.baseline_degraded; 
    only fingerprints), so report the candidate count the baseline covered: the
    status then reads "N candidates" instead of "0 hits". */
 u32  nxusSessionHitCount(void)      {
+    /* A discarded list (see nxusSessionInvalidateHits) is reported empty: Status
+       must never advertise hits that ScanGetHits refuses to serve, and those
+       candidates belong to the previous target's baseline. */
+    if (hitsStale()) return 0;
     if (g_Session.baseline.active) {
         return (g_Session.baseline.candidate_count > 0xFFFFFFFFull)
                    ? 0xFFFFFFFFu : (u32)g_Session.baseline.candidate_count;
@@ -880,6 +944,66 @@ u64  nxusSessionMainSize(void)      { return g_Session.main_size; }
 const NxusHitList *nxusSessionHits(void) {
     if (sessionStateLoad() == NxusScanState_Running) return NULL;
     return &g_Session.hits;
+}
+
+/* Does the retained hit list still belong to the target the session is on?
+   See the ownership block at the top of this file and the contract in
+   nxus_session.h. */
+bool nxusSessionHitsMatchTarget(void) {
+    /* A discarded list is not replaced until a new scan arms one, and it must stay
+       refused in the meantime (the arrays are still there, see
+       nxusSessionInvalidateHits). */
+    if (hitsStale()) return false;
+    /* Nothing was ever built for a target: nothing can be stale. */
+    if (!g_Session.hits_owner_valid) return true;
+
+    if (g_Session.hits_owner_pid != 0) {
+        /* Both sides know a pid, so that is the identity.  The program id is only
+           compared when BOTH sides have one: an explicit DebugAttach can leave it 0
+           (dmnt metadata unavailable then), and refusing the session's own list for
+           a missing title would break the scan-then-attach flow - the same rule
+           ptrChainOwnerCheck() uses for the chain list. */
+        if (g_Session.hits_owner_pid != g_Session.process_id) return false;
+        const u64 saved_title = g_Session.hits_owner_program_id;
+        const u64 now_title = g_Session.program_id;
+        return saved_title == 0 || now_title == 0 || saved_title == now_title;
+    }
+
+    /* No pid when the scan started (dmnt had no metadata): the scan generation is
+       the only per-target token the session publishes, because nxusSessionId()
+       changes on every ScanBegin/Reset. */
+    return g_Session.hits_owner_session_id == g_Session.session_id;
+}
+
+void nxusSessionInvalidateHits(void) {
+    /* Publish "unservable" first, so any reader that arrives while the rest of this
+       runs already sees the discard. */
+    atomic_store_explicit(&g_HitsStale, 1, memory_order_release);
+    hitsOwnerClear();
+
+    /* A pass that is still reading the old process must not keep scanning it.  Only
+       the cancel flag is touched here: this also runs on the main thread (the 1 Hz
+       identity tick), which must not block behind an in-flight chunk read waiting
+       for the worker to exit. */
+    (void)nxusSessionScanCancel();
+
+    /* While the worker is inside a pass it walks the region list and the mapping
+       table WITHOUT a pin, so freeing them here would be a use-after-free.  The
+       cancel lands within one chunk; the next call (the server calls this from the
+       status path and the tick) drops them then.  Nothing stale is served in the
+       meantime: the hits are already refused above. */
+    if (sessionStateLoad() == NxusScanState_Running) return;
+
+    /* Readers of these views are pin-protected (see the view contract in
+       nxus_session.h), so dropping them is safe from any thread. */
+    mappingSnapshotDrop();
+    regionListDrop();
+
+    /* The results described the discarded list: leaving "Done / N hits" in place
+       would make Status report the previous title's work as this target's. */
+    g_Session.progress = 0;
+    g_Session.last_result = 0;
+    sessionStateStore(NxusScanState_Idle);
 }
 
 /* Never returns a dangling table: the pair is only readable while g_ViewSeq is
@@ -1566,6 +1690,13 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     }
 
     g_Session.session_id++;
+    /* Stamp the list with the identity its mapping snapshot was just taken from
+       (cacheProcessInfo() at the top of this function refreshed it): a later title
+       switch is then detectable by nxusSessionHitsMatchTarget() instead of serving
+       these addresses against the new process.  A fresh list also ends the previous
+       discard: nothing stale is left in it. */
+    hitsOwnerStamp();
+    atomic_store_explicit(&g_HitsStale, 0, memory_order_release);
     sessionStateStore(NxusScanState_Idle);
     Result jr = startJob(true);
     if (R_FAILED(jr)) baselineDiscard();   /* no worker: the dump is dead weight */
@@ -1577,6 +1708,17 @@ Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsil
     if (req == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    /* Refining a list that belongs to an earlier target would compare the new
+       process's memory against the old one's addresses - the worker reads the wrong
+       bytes at the right offsets and reports them as matches.  Discard first, then
+       refuse: the client has to rescan.  This also covers a list the server already
+       discarded (hitsStale): the arrays are still in memory but must not be refined,
+       and a baseline that belongs to the old target must not be either. */
+    if (!nxusSessionHitsMatchTarget()) {
+        NXUS_LOG("refine: the hit list belongs to an earlier target - discarding");
+        nxusSessionInvalidateHits();
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
     /* An Unknown scan's first pass deliberately pushes no hits: everything lives
        in the baseline until the refine pass materialises the matches.  So an
@@ -1608,6 +1750,10 @@ Result nxusSessionScanUndo(void) {
     if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
+    /* Undoing a discarded list would re-publish "Done" over the results of the
+       previous target (and pop an entry the client never saw).  The list is gone
+       from the client's point of view, so the undo has nothing legitimate to do. */
+    if (hitsStale()) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     if (nxusHitListUndo(&g_Session.hits) != NXUS_SCAN_OK) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
@@ -1625,6 +1771,10 @@ void nxusSessionReset(void) {
     }
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
+    /* No list is left that could belong to a target: the next ScanBegin stamps a
+       fresh owner, and nothing must be refused as "earlier target" in between. */
+    hitsOwnerClear();
+    atomic_store_explicit(&g_HitsStale, 0, memory_order_release);
     /* Results and identifiers are reset under the release store: a reader that
        sees Idle must not see the previous scan's progress/result. */
     g_Session.session_id++;
