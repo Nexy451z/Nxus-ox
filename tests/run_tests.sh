@@ -28,6 +28,7 @@ run_test() {
 run_test test_scan test_scan.c ../core/nxus_scan.c
 run_test test_ptrscan test_ptrscan.c ../core/nxus_ptrscan.c ../core/nxus_scan.c
 run_test test_snapshot test_snapshot.c ../core/nxus_snapshot.c ../core/nxus_scan.c
+run_test test_budget test_budget.c
 run_test test_scantypes test_scantypes.c ../core/nxus_scan.c
 run_test test_hotkey test_hotkey.c ../core/nxus_hotkey.c
 

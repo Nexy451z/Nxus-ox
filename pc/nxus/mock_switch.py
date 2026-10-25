@@ -11,6 +11,13 @@ switch/source/nxus_server.c and core/nxus_scan.c, including:
     runs, Cancel/Reset (opt in with MockSwitch(scan_async=True))
   * pause + heartbeat + watchdog auto-resume (emitting NxusEvent_AutoResume)
   * error Results encoded as NXUS_MAKE_RESULT(...)
+  * a hit-list cap (hit_list_limit) that ends the published list the way
+    nxusHitList stops recording at max_capacity, and sets
+    NXUS_HITBATCH_TRUNCATED on ScanGetHits like sendHits() does
+  * fault injection for the PC-side error paths: fail_next (one queued Result
+    per command number), drop_after_bytes (cut a reply short and hang up),
+    empty_mappings (0-entry mapping table) and dmnt_not_attached (dmnt's
+    0x0032C80D CheatNotAttached instead of a NXUS_MAKE_RESULT())
 """
 from __future__ import annotations
 
@@ -311,9 +318,33 @@ def _compare(cur: bytes, prev: bytes | None, target: int, size: int, mode: int,
 
 # --- server --------------------------------------------------------------
 
+# dmnt:cheat's "no cheat process" Result (shared/nxus_dmntcht.c:95).  It is a
+# dmnt Result word, so it must go on the wire verbatim - NXUS_MAKE_RESULT() would
+# turn it into a different code and the PC's repair/retry path keys on the real
+# value.
+DMNT_CHEAT_NOT_ATTACHED = 0x0032C80D
+
+# Commands the console serves through dmnt:cheat.  With dmnt_not_attached set
+# they answer DMNT_CHEAT_NOT_ATTACHED, exactly like a sysmodule whose cheat
+# process is gone; everything that does not touch the target (Status, Config,
+# LogGet, ...) keeps working so a test can observe the failure.
+_DMNT_COMMANDS = frozenset((
+    P.CMD['GetMetadata'], P.CMD['GetModules'], P.CMD['GetProcesses'],
+    P.CMD['GetMappingCount'], P.CMD['GetMappings'], P.CMD['Query'],
+    P.CMD['Read'], P.CMD['Write'],
+    P.CMD['ScanBegin'], P.CMD['ScanNext'], P.CMD['SnapshotCapture'],
+    P.CMD['PtrScanBegin'], P.CMD['FrozenEnable'],
+))
+
+
 class MockSwitch:
+    # The stock mock never fills a hit list; a subclass may set a cap here, and
+    # MockSwitch(hit_list_limit=N) sets it on the instance (0 = unlimited).
+    hit_list_limit = 0
+
     def __init__(self, host: str = '127.0.0.1', port: int = 0, watchdog_ms: int = 15000,
-                 money: int = 6440, scan_async: bool = False):
+                 money: int = 6440, scan_async: bool = False,
+                 hit_list_limit: int = 0):
         # A real scan is a worker thread (nxus_session.c:891-919): ScanBegin
         # answers with NxusScanState_Running, the PC polls ScanStatus and watches
         # progress_permille climb, and ScanGetHits / SnapshotCapture /
@@ -373,6 +404,20 @@ class MockSwitch:
         self.max_read = 1024 * 1024 - 16
         self.read_sizes = []              # every READ size the client asked for
         self.short_read_bytes = 0         # >0 truncates READ replies (short-read test)
+        # ---- fault injection: everything below is off by default ----
+        #
+        # These exist because the PC side has error paths (dmnt losing its cheat
+        # process, a mapping table that shrank to nothing, a link that dies
+        # mid-reply) that no happy-path scan can reach.  Without them the mock
+        # cannot make the client take those branches at all.
+        if hit_list_limit:
+            self.hit_list_limit = int(hit_list_limit)      # 0 = unlimited
+        # command number -> Result, answered ONCE and consumed (a single bad reply)
+        self.fail_next: dict[int, int] = {}
+        # >0: send that many bytes of the reply and close the connection
+        self.drop_after_bytes = 0
+        self.empty_mappings = False       # GetMappingCount / GetMappings answer 0
+        self.dmnt_not_attached = False    # dmnt-backed commands answer 0x0032C80D
         self.last_result = 0
         self.value_size = 4
         self.scan_state = P.SCAN_STATE['NxusScanState_Idle']
@@ -463,12 +508,33 @@ class MockSwitch:
             if payload is None:
                 return
             response = self._handle(mtype, payload)
-            self._send(conn, mtype, seq, response)
+            if not self._send(conn, mtype, seq, response):
+                return
 
     def _send(self, conn, mtype: int, seq: int, response):
+        """Send one reply.  Returns False when the connection was cut (drop test).
+
+        drop_after_bytes mimics a link that dies mid-reply: the client gets a
+        truncated frame plus EOF, not a clean "your reply is complete, goodbye".
+        """
         flags, body = (response if isinstance(response, tuple) else (0, response))
+        packet = P.pack_header(mtype, flags, len(body), seq) + body
+        limit = self.drop_after_bytes
         with self._send_lock:
-            conn.sendall(P.pack_header(mtype, flags, len(body), seq) + body)
+            if limit:
+                conn.sendall(packet[:limit])
+                self._drop_connection(conn)
+                return False
+            conn.sendall(packet)
+        return True
+
+    @staticmethod
+    def _drop_connection(conn):
+        """Hang up mid-reply; the accept loop closes the socket itself."""
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def send_event(self, event_type: int, payload: bytes = b''):
         if self._client_sock is None:
@@ -592,6 +658,19 @@ class MockSwitch:
     def _error(self, desc: int):
         return (P.FLAG_ERROR, struct.pack('<i', self._result_i32(desc)))
 
+    def _error_code(self, result: int):
+        """Reply with a Result word the caller already encoded.
+
+        fail_next accepts either a bare nxus descriptor (P.ERR_BUSY) or a full
+        Result (P.make_result(...), or a foreign one such as dmnt's
+        0x0032C80D), so a test can inject whichever the PC side has to handle.
+        """
+        result &= 0xFFFFFFFF
+        if result <= 0x1FF:
+            result = P.make_result(result)
+        signed = result - 0x100000000 if result & 0x80000000 else result
+        return (P.FLAG_ERROR, struct.pack('<i', signed))
+
     @staticmethod
     def _result_i32(desc: int) -> int:
         """NXUS_MAKE_RESULT(...) as the signed i32 the wire carries."""
@@ -618,6 +697,14 @@ class MockSwitch:
                              0, 8 * 1024 * 1024, self.max_read)
 
     def _handle(self, cmd: int, payload: bytes):
+        # --- fault injection (before any handler, so no state is touched) ----
+        # A queued failure is consumed by the command it names: a test can make
+        # one reply fail without poisoning the rest of the session.
+        queued = self.fail_next.pop(cmd, None) if self.fail_next else None
+        if queued is not None:
+            return self._error_code(queued)
+        if self.dmnt_not_attached and cmd in _DMNT_COMMANDS:
+            return self._error_code(DMNT_CHEAT_NOT_ATTACHED)
         if cmd == P.CMD['Nop']:
             return b''
         if cmd == P.CMD['Heartbeat']:
@@ -640,9 +727,13 @@ class MockSwitch:
                                            MAIN_BASE, MAIN_SIZE, HEAP_BASE, HEAP_SIZE,
                                            0, 0, 0, 0, BUILD_ID)
         if cmd == P.CMD['GetMappingCount']:
-            return struct.pack('<Q', len(self.target.mappings))
+            return struct.pack('<Q', 0 if self.empty_mappings else len(self.target.mappings))
         if cmd == P.CMD['GetMappings']:
             offset, max_count, _res = P.MAPPINGS_REQUEST.unpack(payload)
+            if self.empty_mappings:
+                # nxus_session.c: the table exists but is empty - the PC has to
+                # cope with a count of 0 and with a short (0-entry) reply
+                return b''
             out = b''
             for m in self.target.mappings[offset:offset + max_count]:
                 out += P.MEMORY_INFO.pack(m['base'], m['size'], m.get('type', 2), 0, m['perm'], 0, 0, 0)
@@ -1440,8 +1531,17 @@ class MockSwitch:
                     hits.append((idx, base_off + off, cur))
         return hits
 
+    def _limit_hits(self, hits: list) -> list:
+        """Stop the published list at hit_list_limit, like nxusHitList on the
+        console: it refuses to grow past max_capacity, so the list the PC reads
+        (and the count NxusStatus reports) simply ends there."""
+        if self.hit_list_limit and len(hits) > self.hit_list_limit:
+            return hits[:self.hit_list_limit]
+        return hits
+
     def _publish_scan(self, hits: list):
         """Install a finished pass, or start the emulated worker (scan_async)."""
+        hits = self._limit_hits(hits)
         if not self.scan_async:
             # direct completion: the shape the Python client tests assume
             self.hits = hits
@@ -1506,12 +1606,19 @@ class MockSwitch:
         offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
         count = min(count, len(self.hits) - offset) if offset < len(self.hits) else 0
         bases = [m['base'] for m in self.target.mappings]
+        # sendHits()'s truncation rule (switch/source/nxus_server.c:699-703): a
+        # list sitting at its capacity may have had hits that were never
+        # collected, so say so instead of letting the PC present a cut-off list
+        # as final.  0 = unlimited, the stock mock's behaviour.
+        reserved = 0
+        if self.hit_list_limit and len(self.hits) >= self.hit_list_limit:
+            reserved |= P.HITBATCH_TRUNCATED
         # The scan session id the PC matches hit batches against lives here, in
         # NxusHitBatchHeader (nxus_protocol.h:336-344) - NxusStatus has no field
         # for it.  A new ScanBegin (or a Reset) bumps it, so a stale batch from a
         # previous scan cannot be mistaken for the current one.
         header = P.HIT_BATCH_HEADER.pack(self.session_id, count, len(self.hits),
-                                         self.value_size, len(bases), 0)
+                                         self.value_size, len(bases), reserved)
         body = header + b''.join(struct.pack('<Q', b) for b in bases)
         for i in range(offset, offset + count):
             idx, off, value = self.hits[i]

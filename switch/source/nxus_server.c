@@ -74,6 +74,110 @@ static NxusPtrScanStats g_PtrStats;
 static u64              g_PtrTarget;
 static u64              g_PtrModuleBase;
 
+/* ---- 8 MB heap budget -------------------------------------------------- */
+
+/*
+ * The sysmodule's inner heap (main.c: INNER_HEAP_SIZE) is 8 MB shared by the
+ * rx buffer, the hit list, the snapshot slots, the scan buffers and every
+ * per-command allocation.  The pointer scan is the one command that adds its
+ * own working set (scratch, region array and, on success, a chain reply) on
+ * top of everything the session still holds, so it is refused up front when
+ * the conservative peak estimate no longer fits.
+ *
+ * estimateHeapPeak() sums the upper bounds of the allocations that can be
+ * resident in one session.  Every term is derived from the same constant the
+ * allocator uses:
+ *
+ *   persistent
+ *     network rx buffer     NXUS_NET_BUF_SIZE                      1 MiB
+ *     changed-block cache   NXUS_SNAPSHOT_MAX_CHANGED * 16 B       256 KiB
+ *     mapping table         4096 * sizeof(NxusMappingEntry)        128 KiB
+ *     scan region list      4096 * sizeof(NxusScanRegion)          128 KiB
+ *   per snapshot slot
+ *     hashes + addresses    NXUS_SNAPSHOT_MAX_BLOCKS * 2 * 8 B     256 KiB
+ *                           (lazily allocated by nxus_snapshot_srv.c,
+ *                            never freed before reboot)
+ *   hit list                retained capacity, <= NXUS_SESSION_HIT_BUDGET_BYTES
+ *                           (8 B NxusHitAddress + value_size per hit; the
+ *                            estimate reads the live capacity, so an empty or
+ *                            reset list costs nothing and only a full list
+ *                            reaches the 3.0 MiB bound)
+ *   scan working set        NXUS_SESSION_DEFAULT_CHUNK + WINDOW    2.0 MiB
+ *                           (one is live per pass; both are counted as a
+ *                            conservative reserve)
+ *   snapshot capture        chunk_size in nxus_snapshot_srv.c     256 KiB
+ *   pointer scan            max(scratch + region array,           1.0 MiB
+ *                               1 MiB chain reply)
+ *                           = max(256 KiB + 4097*24 B, 1 MiB)
+ *
+ * With the hit list at its cap and no snapshot slot the estimate is
+ * 8,052,736 B (7.68 MiB); one slot adds 256 KiB (7.93 MiB, still inside the
+ * budget) and the A/B pair adds 512 KiB, crossing 8 MiB at 8,577,024 B
+ * (8.18 MiB).  That is exactly the "snapshot 2 slots + pointer scan + maximum
+ * hit list" combination the guard in handlePtrScanBegin() refuses.  With an
+ * empty/reset hit list the same two slots give 5,505,024 B (5.25 MiB), so the
+ * guard does not fire; without a held snapshot it never runs at all, which
+ * keeps the previous behaviour of PtrScanBegin unchanged.
+ */
+#define NXUS_HEAP_BUDGET_BYTES         (8u * 1024u * 1024u)
+/* Session hard caps (nxus_session.c: mapping/region lists are clamped to 4096). */
+#define NXUS_HEAP_MAX_MAPPINGS         4096u
+#define NXUS_HEAP_MAX_REGIONS          4096u
+/* nxus_snapshot_srv.c allocates this capture scratch per SnapshotCapture. */
+#define NXUS_HEAP_SNAPSHOT_CHUNK_BYTES (256u * 1024u)
+/* nxus_server.c: handlePtrScanBegin() allocates this scan scratch. */
+#define NXUS_HEAP_PTRSCAN_SCRATCH_BYTES (256u * 1024u)
+
+/* Bit n set: snapshot slot n has its hash/address arrays allocated.  The
+   service allocates the slot on first use (before it validates the request)
+   and never frees it, so any SnapshotCapture for slot 0/1 can leave 256 KiB
+   resident even when the capture itself failed. */
+static u32 g_HeldSnapshotSlots;
+
+static u64 estimateHeapPeak(void) {
+    const u64 persistent =
+        (u64)NXUS_NET_BUF_SIZE +
+        (u64)NXUS_SNAPSHOT_MAX_CHANGED * (u64)sizeof(NxusChangedBlock) +
+        (u64)NXUS_HEAP_MAX_MAPPINGS * (u64)sizeof(NxusMappingEntry) +
+        (u64)NXUS_HEAP_MAX_REGIONS * (u64)sizeof(NxusScanRegion);
+
+    /* hashes + addresses, one array each, u64 per block */
+    const u64 slot_bytes = (u64)NXUS_SNAPSHOT_MAX_BLOCKS * 2u * (u64)sizeof(u64);
+
+    /* The chain reply (up to one net buffer) is built after the scratch has
+       been freed; taking the larger of the two keeps the estimate independent
+       of that ordering. */
+    const u64 ptr_work = (u64)NXUS_HEAP_PTRSCAN_SCRATCH_BYTES +
+                         (u64)(NXUS_HEAP_MAX_MAPPINGS + 1u) * (u64)sizeof(NxusPtrRegion);
+    const u64 ptr_peak = (ptr_work > (u64)NXUS_NET_BUF_SIZE) ? ptr_work
+                                                             : (u64)NXUS_NET_BUF_SIZE;
+
+    u64 held = 0;
+    for (u32 slot = 0; slot < 2; slot++) {
+        if (g_HeldSnapshotSlots & (1u << slot)) held += slot_bytes;
+    }
+
+    /* The hit list survives between scans; use its real capacity so an empty
+       or reset session is not charged for results it does not hold.  PtrScanBegin
+       runs behind the BUSY gate, so no worker can realloc the arrays while this
+       is read; nxusSessionHits() returns NULL for a running scan, in which case
+       the full budget is the safe bound. */
+    u64 hit_bytes = (u64)NXUS_SESSION_HIT_BUDGET_BYTES;
+    const NxusHitList *hits = nxusSessionHits();
+    if (hits != NULL) {
+        hit_bytes = (u64)hits->capacity * (8u + (u64)hits->value_size);
+        if (hit_bytes > (u64)NXUS_SESSION_HIT_BUDGET_BYTES)
+            hit_bytes = (u64)NXUS_SESSION_HIT_BUDGET_BYTES;
+    }
+
+    return persistent + held +
+           hit_bytes +
+           (u64)NXUS_SESSION_DEFAULT_CHUNK +
+           (u64)NXUS_SESSION_DEFAULT_WINDOW +
+           (u64)NXUS_HEAP_SNAPSHOT_CHUNK_BYTES +
+           ptr_peak;
+}
+
 /* Fired from the HID thread: freeze the target without touching the PC.
    Goes through the same serverPause() as the PC command: dmnt stops the cheat
    process first (65004 is a real svc::BreakDebugProcess and keeps the dmnt
@@ -557,6 +661,27 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     }
     NxusPtrScanRequest req;
     memcpy(&req, payload, sizeof(req));
+
+    /* Refuse before the mapping refresh and before allocating anything: the
+       pointer scan needs its scratch (256 KiB), region array (~96 KiB) and a
+       chain reply (up to 1 MiB) on top of the retained hit list and snapshot
+       slots.  The estimate reads the hit list's real capacity, so it only
+       exceeds the budget with a (nearly) full list: an empty or reset session
+       is allowed, and so is a single snapshot slot.  With the A/B pair and a
+       maximum hit list it is 8.18 MiB and a pointer scan would be the
+       allocation that pushes the 8 MB heap over.  The client gets BUSY and can
+       retry after ScanReset / a narrower scan shrinks the retained list. */
+    if (g_HeldSnapshotSlots != 0) {
+        const u64 peak = estimateHeapPeak();
+        if (peak > (u64)NXUS_HEAP_BUDGET_BYTES) {
+            NXUS_LOG("ptrscan: snapshot 保持中の ptrscan はメモリ予算超過 "
+                     "(estimate=%llu B > budget=%u B, slots=0x%X) - refusing",
+                     (unsigned long long)peak, (unsigned)NXUS_HEAP_BUDGET_BYTES,
+                     (unsigned)g_HeldSnapshotSlots);
+            replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+            return;
+        }
+    }
 
     Result rc = nxusSessionRefreshMappings();
     if (R_FAILED(rc)) { replyError(fd, type, seq, rc); return; }
@@ -1120,6 +1245,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             NxusSnapshotRequest req;
             memcpy(&req, payload, sizeof(req));
+            /* nxusSnapshotTake() allocates the slot arrays on first use, before
+               it validates scope/target, and never frees them.  Mark the slot
+               even when the capture fails so the heap estimate reflects the
+               memory that is actually resident from now on. */
+            if (req.slot <= 1) g_HeldSnapshotSlots |= (1u << req.slot);
             NxusSnapshotSummary summary;
             memset(&summary, 0, sizeof(summary));
             rc = nxusSnapshotTake(req.slot, req.scope, req.range_begin, req.range_end,

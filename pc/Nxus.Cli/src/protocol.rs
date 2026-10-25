@@ -817,6 +817,22 @@ impl ThreadEntry {
     }
 }
 
+// NXUS_THREADCTX_FLAG_* - bits of `NxusThreadContext.reserved`.  The word is a
+// bit set, not padding, and the two directions reuse it:
+//
+//   * RegsSet (PC -> console) understands bit 0 only: "x[0..28] is
+//     authoritative", i.e. [ThreadContext::encode] sent the 64-bit view rather
+//     than the r[] alias.  Both PC encoders hard-code it.
+//   * GetRegs (console -> PC) sets bit 1 for an AArch32 context.  Bit 0 already
+//     means the request thing, so AArch32 had to take the next bit - a 32-bit
+//     title therefore reports a reply with bit 1 set and bit 0 clear.
+//
+// A 32-bit reply leaves the sp/lr/fp header fields zeroed; the live values are
+// cpu_gprs[13] / cpu_gprs[14] / cpu_gprs[11], which nxusDebugGetRegs() mirrors
+// into x[13] / x[14] / x[11] (r13/r14/r11 in AArch32 terms).
+pub const NXUS_THREADCTX_FLAG_X_AUTHORITATIVE: u32 = 0x0001;
+pub const NXUS_THREADCTX_FLAG_AARCH32: u32 = 0x0002;
+
 #[derive(Debug, Clone)]
 pub struct ThreadContext {
     pub thread_id: u64,
@@ -826,6 +842,8 @@ pub struct ThreadContext {
     pub fp: u64,
     pub cpsr: u32,
     pub r: [u32; 13],
+    /// `NxusThreadContext.reserved`: NXUS_THREADCTX_FLAG_* bits.
+    pub flags: u32,
     pub x: [u64; 29],
 }
 
@@ -839,6 +857,7 @@ impl Default for ThreadContext {
             fp: 0,
             cpsr: 0,
             r: [0u32; 13],
+            flags: 0,
             x: [0u64; 29],
         }
     }
@@ -846,6 +865,8 @@ impl Default for ThreadContext {
 
 impl ThreadContext {
     pub const SIZE: usize = 332;
+    /// Offset of `reserved` (the flag word): after cpsr + the 13 r[] words.
+    pub const FLAGS_OFFSET: usize = 96;
 
     pub fn parse(data: &[u8]) -> ThreadContext {
         let mut r = [0u32; 13];
@@ -870,8 +891,19 @@ impl ThreadContext {
             fp: rd_u64(data, 32),
             cpsr: rd_u32(data, 40),
             r,
+            // Short replies (down to the 96 bytes regs_get accepts) decode as 0,
+            // which is "no flags" - i.e. never a made-up AArch32 context.
+            flags: rd_u32(data, Self::FLAGS_OFFSET),
             x,
         }
+    }
+
+    /// Did GetRegs report an AArch32 (32-bit) context?
+    ///
+    /// When true the sp/lr/fp header fields are zero on purpose and the live
+    /// values live in [`ThreadContext::x`] at 13/14/11 (r13/r14/r11).
+    pub fn is_aarch32(&self) -> bool {
+        self.flags & NXUS_THREADCTX_FLAG_AARCH32 != 0
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -885,7 +917,9 @@ impl ThreadContext {
         for i in 0..13 {
             put_u32(&mut out, (self.x[i] & 0xFFFF_FFFF) as u32);
         }
-        put_u32(&mut out, 1); // reserved bit 0: x[0..28] authoritative
+        // RegsSet direction: x[0..28] is authoritative.  NXUS_THREADCTX_FLAG_AARCH32
+        // is a reply-only bit, so it is not echoed back here.
+        put_u32(&mut out, NXUS_THREADCTX_FLAG_X_AUTHORITATIVE);
         for &val in &self.x {
             put_u64(&mut out, val);
         }
@@ -2370,6 +2404,38 @@ mod tests {
         // u32 width; u32 reserved}, i.e. 24 packed bytes, matching protocol.py's
         // '<QQII'.  Pin the stride here so either side drifting fails the test.
         assert_eq!(FrozenEntry::SIZE, 24);
+    }
+
+    #[test]
+    fn threadctx_flags_match_the_c_header() {
+        // Bit 0 is the RegsSet request flag, bit 1 the GetRegs AArch32 marker: a
+        // drift here would make is_aarch32() answer for the wrong bit.
+        assert_eq!(header_define(HEADER, "NXUS_THREADCTX_FLAG_X_AUTHORITATIVE"), Some(NXUS_THREADCTX_FLAG_X_AUTHORITATIVE));
+        assert_eq!(header_define(HEADER, "NXUS_THREADCTX_FLAG_AARCH32"), Some(NXUS_THREADCTX_FLAG_AARCH32));
+    }
+
+    #[test]
+    fn aarch32_reply_is_detected_from_the_reserved_word() {
+        // A 32-bit reply: header sp/lr/fp stay zero, the live values sit in
+        // x[13]/x[14]/x[11], and reserved carries bit 1.
+        let mut data = vec![0u8; ThreadContext::SIZE];
+        data[40..44].copy_from_slice(&0x6000_0000u32.to_le_bytes());   // cpsr
+        data[ThreadContext::FLAGS_OFFSET..ThreadContext::FLAGS_OFFSET + 4]
+            .copy_from_slice(&NXUS_THREADCTX_FLAG_AARCH32.to_le_bytes());
+        for (i, reg) in [(13usize, 0x3600_F000u64), (14, 0x1B00_4001), (11, 0x3600_0FF0)] {
+            let off = 100 + i * 8;
+            data[off..off + 8].copy_from_slice(&reg.to_le_bytes());
+        }
+        let ctx = ThreadContext::parse(&data);
+        assert!(ctx.is_aarch32());
+        assert_eq!(ctx.cpsr, 0x6000_0000);
+        assert_eq!((ctx.x[13], ctx.x[14], ctx.x[11]), (0x3600_F000, 0x1B00_4001, 0x3600_0FF0));
+        // A 64-bit reply (bit 0 from an echo, or nothing at all) is not AArch32.
+        let mut data64 = data.clone();
+        data64[ThreadContext::FLAGS_OFFSET..ThreadContext::FLAGS_OFFSET + 4]
+            .copy_from_slice(&NXUS_THREADCTX_FLAG_X_AUTHORITATIVE.to_le_bytes());
+        assert!(!ThreadContext::parse(&data64).is_aarch32());
+        assert!(!ThreadContext::parse(&[]).is_aarch32());
     }
 
     #[test]

@@ -51,6 +51,18 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
   - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `341k` hits for `u8`, `307k` for `u16`, `256k` for `u32`).
 - **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps peak RAM usage well within the Switch `System` pool partition.
+- **Incomplete results are never silent**: three independent limits can cut a result
+  short, and each one is reported instead of being presented as complete —
+  - hit list full → `NxusHitBatchHeader.reserved & NXUS_HITBATCH_TRUNCATED` on every
+    hit reply (the client surfaces it as `truncated` / `last_scan_truncated`),
+  - pointer scan stopped on `max_results` or on the read budget →
+    `NxusPtrChainListHeader.truncated` (plus `reads_blocked` in the stats),
+  - snapshot diff blocked by a block-size mismatch → an explicit `BAD_STATE`
+    error instead of "0 blocks changed".
+
+  A read that fails because the *budget* ran out is never cached as "unmapped":
+  the difference between a fault and a skipped read decides whether a pointer
+  path is ruled out, so it is kept distinct internally.
 
 ### 2. Multi-Core Kernel Hardware Debugger (Watchpoints & Breakpoints) (`switch/source/nxus_debug.c`)
 - **Seamless `dmnt:cht` Hand-off**: Automatically calls `ForceCloseCheatProcess` before attaching via `svcDebugActiveProcess`, and restores `ForceOpenCheatProcess` on detach.

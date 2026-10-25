@@ -537,14 +537,16 @@ typedef struct NXUS_PACKED {
 } NxusThreadContext;
 NXUS_STATIC_ASSERT(sizeof(NxusThreadContext) == 332, "NxusThreadContext must be 332 bytes");
 
-/* NxusThreadContext.reserved flags.  The field is a bit set, not padding:
-   bit0 (NXUS_THREADCTX_FLAG_AARCH32) marks an AArch32 context.  A 32-bit title
-   reports zeros in the sp/lr/fp header fields; the live SP, LR and FP are
-   cpu_gprs[13], cpu_gprs[14] and cpu_gprs[11], which nxusDebugGetRegs() mirrors
-   into x[13]/x[14]/x[11] (the r[] alias covers r0..r12 only).
-   Bit 0 already means "x[0..28] is authoritative" in the RegsSet direction
-   (both PC encoders hard-code it as 1), so AArch32 uses bit 1: the reply can
-   carry it without changing the meaning of any existing request bit. */
+/* NxusThreadContext.reserved flags.  The field is a bit set, not padding.
+   The two directions use different bits: bit 0 is a REQUEST flag ("x[0..28] is
+   authoritative", both PC encoders already send it as 1) and bit 1 is a REPLY
+   flag (an AArch32 context).
+
+   An AArch32 title reports zeros in the sp/lr/fp header fields; the live SP, LR
+   and FP are cpu_gprs[13], cpu_gprs[14] and cpu_gprs[11], which
+   nxusDebugGetRegs() mirrors into x[13]/x[14]/x[11] as well (the r[] alias only
+   covers r0..r12).  Clients should trust bit 1 rather than guessing from
+   sp==lr==0, because a genuine 32-bit fault frame may have SP == 0. */
 #define NXUS_THREADCTX_FLAG_X_AUTHORITATIVE 0x0001u   /* request (RegsSet) */
 #define NXUS_THREADCTX_FLAG_AARCH32         0x0002u   /* reply (GetRegs) */
 

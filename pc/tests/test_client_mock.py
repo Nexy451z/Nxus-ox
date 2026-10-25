@@ -14,10 +14,10 @@ PC = os.path.dirname(HERE)
 sys.path.insert(0, PC)
 
 from nxus import protocol as P                      # noqa: E402
-from nxus.client import NxusClient, NxusError       # noqa: E402
+from nxus.client import NxusClient, NxusError, NxusDisconnected   # noqa: E402
 from nxus.mock_switch import (MockSwitch, MONEY_ADDRESS, MAIN_BASE, DATA_BASE,  # noqa: E402
-                               HEAP_BASE, REC_OFFSET,
-                              BUILD_ID)
+                               HEAP_BASE, REC_OFFSET, BUILD_ID,
+                              DMNT_CHEAT_NOT_ATTACHED)
 
 
 class ReadSplit(unittest.TestCase):
@@ -415,32 +415,11 @@ class ScanBreakHitIsolation(unittest.TestCase):
         self.assert_scan_hits_readable(9999999)
 
 
-class HitListCapMockSwitch(MockSwitch):
-    """A console that reached its hit-list limit.
-
-    The firmware stops recording at NXUS_MAX_HITS and sets NXUS_HITBATCH_TRUNCATED
-    in the reply header (core/nxus_protocol.h:349) so the PC can warn instead of
-    presenting a cut-off list as final.  The stock mock never fills a list - its
-    ``_get_hits()`` always packs flags=0 - and mock_switch.py is out of scope for
-    this change, so this subclass reproduces the console's reply at the wire
-    level: same header layout, capped list, flag set.
-    """
-
-    hit_list_limit = 8              # 0 = unlimited, the stock mock's behaviour
-
-    def _get_hits(self, payload):
-        offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
-        if not self.hit_list_limit or len(self.hits) <= self.hit_list_limit:
-            return super()._get_hits(payload)
-        first = min(offset, self.hit_list_limit)
-        shown = max(0, min(count, self.hit_list_limit - first))
-        bases = [m['base'] for m in self.target.mappings]
-        body = P.HIT_BATCH_HEADER.pack(self.session_id, shown, self.hit_list_limit,
-                                       self.value_size, len(bases), P.HITBATCH_TRUNCATED)
-        body += b''.join(struct.pack('<Q', b) for b in bases)
-        for idx, off, value in self.hits[first:first + shown]:
-            body += P.HIT.pack(off, idx, self.value_type, int.from_bytes(value, 'little'))
-        return body
+# The firmware stops recording at its hit-list capacity and sets
+# NXUS_HITBATCH_TRUNCATED in the reply header (core/nxus_protocol.h:349) so the PC
+# can warn instead of presenting a cut-off list as final.  The mock reproduces
+# that at the wire level via MockSwitch(hit_list_limit=N) - 0 means unlimited.
+HIT_LIST_LIMIT = 8
 
 
 class ScanTruncation(unittest.TestCase):
@@ -452,7 +431,7 @@ class ScanTruncation(unittest.TestCase):
     """
 
     def setUp(self):
-        self.server = HitListCapMockSwitch(watchdog_ms=100000).start()
+        self.server = MockSwitch(hit_list_limit=HIT_LIST_LIMIT, watchdog_ms=100000).start()
         self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
 
     def tearDown(self):
@@ -464,24 +443,24 @@ class ScanTruncation(unittest.TestCase):
         # 4-byte slot holds 0, so an Equal scan of 0 finds more than the cap.
         window_begin, window_end = MAIN_BASE + 0x0C, MAIN_BASE + 0x40
         expected = len(range(window_begin, window_end, 4))
-        self.assertGreater(expected, HitListCapMockSwitch.hit_list_limit)
+        self.assertGreater(expected, HIT_LIST_LIMIT)
 
         self.client.scan_reset()
         st = self.client.scan_begin(0, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
                                     scope=P.SCOPE['NxusScope_Custom'],
                                     range_begin=window_begin, range_end=window_end)
         self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
-        self.assertEqual(st['hits'], expected,
-                         "the mock target's zero window changed size")
+        self.assertEqual(st['hits'], HIT_LIST_LIMIT,
+                         'the published list must stop at the hit-list capacity')
 
         batch = self.client.scan_hits(0, 4096)
         self.assertTrue(batch['truncated'], 'the hit-list limit was not reported')
-        self.assertEqual(batch['count'], HitListCapMockSwitch.hit_list_limit)
-        self.assertEqual(batch['total'], HitListCapMockSwitch.hit_list_limit)
+        self.assertEqual(batch['count'], HIT_LIST_LIMIT)
+        self.assertEqual(batch['total'], HIT_LIST_LIMIT)
 
         # scan_all_hits() must surface it too instead of pretending it is final
         hits = self.client.scan_all_hits()
-        self.assertEqual(len(hits), HitListCapMockSwitch.hit_list_limit)
+        self.assertEqual(len(hits), HIT_LIST_LIMIT)
         self.assertTrue(self.client.last_scan_truncated)
 
     def test_normal_scan_is_not_truncated(self):
@@ -498,6 +477,148 @@ class ScanTruncation(unittest.TestCase):
 
         self.assertEqual(len(self.client.scan_all_hits()), 1)
         self.assertFalse(self.client.last_scan_truncated)
+
+
+class FaultInjectionE2E(unittest.TestCase):
+    """The PC error paths a happy-path scan can never reach.
+
+    A sysmodule can lose its dmnt cheat process, report an empty mapping table,
+    or have the link die mid-reply.  MockSwitch exposes one knob per failure (see
+    its module docstring); these tests pin the client's contract for each: a
+    decoded error, or a bounded disconnect - never a hang.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    # ---- helpers ----
+
+    def restart(self, **kwargs):
+        """Replace console + client, so constructor-only knobs can be exercised."""
+        self.client.close()
+        self.server.stop()
+        self.server = MockSwitch(watchdog_ms=100000, **kwargs).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    @staticmethod
+    def zero_gap_slots() -> int:
+        """Aligned 4-byte slots in MAIN's zero gap: more hits than HIT_LIST_LIMIT."""
+        return len(range(MAIN_BASE + 0x0C, MAIN_BASE + 0x40, 4))
+
+    def scan_zero_gap(self) -> dict:
+        """Equal-scan of 0 over the zero gap, where every word matches."""
+        self.client.scan_reset()
+        return self.client.scan_begin(0, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                      scope=P.SCOPE['NxusScope_Custom'],
+                                      range_begin=MAIN_BASE + 0x0C,
+                                      range_end=MAIN_BASE + 0x40)
+
+    # ---- 1. the hit list reached its capacity ----
+
+    def test_hit_limit_sets_truncation_flag(self):
+        self.restart(hit_list_limit=HIT_LIST_LIMIT)
+        expected = self.zero_gap_slots()
+        self.assertGreater(expected, HIT_LIST_LIMIT)
+
+        st = self.scan_zero_gap()
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        # the console stops recording at the cap, so even the status count is capped
+        self.assertEqual(st['hits'], HIT_LIST_LIMIT)
+
+        batch = self.client.scan_hits(0, 4096)
+        self.assertIs(batch['truncated'], True, 'the hit-list limit was not reported')
+        self.assertEqual(batch['count'], HIT_LIST_LIMIT)
+        self.assertEqual(batch['total'], HIT_LIST_LIMIT)
+
+        self.assertEqual(len(self.client.scan_all_hits()), HIT_LIST_LIMIT)
+        self.assertTrue(self.client.last_scan_truncated)
+
+        # 0 = unlimited (the stock mock): the same scan now reports every hit
+        self.server.hit_list_limit = 0
+        st = self.scan_zero_gap()
+        self.assertEqual(st['hits'], expected)
+        batch = self.client.scan_hits(0, 4096)
+        self.assertIs(batch['truncated'], False)
+        self.assertEqual(batch['count'], expected)
+        self.assertEqual(batch['total'], expected)
+        self.assertEqual(len(self.client.scan_all_hits()), expected)
+        self.assertFalse(self.client.last_scan_truncated)
+
+    # ---- 2. dmnt lost its cheat process ----
+
+    def test_dmnt_not_attached_is_reported(self):
+        self.server.dmnt_not_attached = True
+        started = time.time()
+        with self.assertRaises(NxusError) as ctx:
+            self.scan_zero_gap()
+        elapsed = time.time() - started
+        # the sysmodule forwards dmnt:cheat's own Result word, not a wrapped one
+        self.assertEqual(ctx.exception.result, DMNT_CHEAT_NOT_ATTACHED)
+        self.assertLess(elapsed, 2.0, 'the client blocked instead of reporting the failure')
+
+        # every dmnt-backed command reports it, and the session keeps answering
+        for call in (lambda: self.client.read(HEAP_BASE, 4),
+                     self.client.get_metadata,
+                     self.client.get_mapping_count):
+            with self.assertRaises(NxusError) as ctx:
+                call()
+            self.assertEqual(ctx.exception.result, DMNT_CHEAT_NOT_ATTACHED)
+        self.assertEqual(self.client.get_status()['proto'], P.PROTO_VERSION)
+
+    # ---- 3. the mapping table is empty ----
+
+    def test_empty_mappings_is_reported(self):
+        self.server.empty_mappings = True
+        self.assertEqual(self.client.get_mapping_count(), 0)
+        self.assertEqual(self.client.get_mappings(0, 8), [])
+
+        # A scan with no process to resolve must fail with NO_PROCESS instead of
+        # blocking.  The mock's empty_mappings only shrinks the mapping replies, so
+        # the Result is injected through fail_next - the same reply the sysmodule
+        # would send - rather than fabricated in the subclass.
+        self.server.fail_next[P.CMD['ScanBegin']] = P.ERR_NO_PROCESS
+        started = time.time()
+        with self.assertRaises(NxusError) as ctx:
+            self.scan_zero_gap()
+        self.assertLess(time.time() - started, 2.0)
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_NO_PROCESS))
+
+        # one-shot: the queued failure is consumed, so the client recovers
+        self.assertNotIn(P.CMD['ScanBegin'], self.server.fail_next)
+        st = self.scan_zero_gap()
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(self.client.get_mapping_count(), 0)
+
+    # ---- 4. the link dies mid-reply ----
+
+    def test_disconnect_mid_reply_is_an_error(self):
+        # half a frame header, then EOF: the reply cannot be decoded
+        self.server.drop_after_bytes = 8
+        started = time.time()
+        with self.assertRaises(NxusDisconnected):
+            self.client.read(HEAP_BASE, 0x10000)
+        self.assertLess(time.time() - started, 2.0)
+
+        # NxusClient does not reconnect on its own (connect() is explicit), so the
+        # contract for the next call is a clear, bounded error - not a hang.
+        self.client.timeout = 1.0
+        started = time.time()
+        with self.assertRaises((NxusDisconnected, OSError, TimeoutError)):
+            self.client.get_status()
+        self.assertLess(time.time() - started, 3.0)
+
+        # the console itself survived the dropped peer: a fresh link works
+        self.server.drop_after_bytes = 0
+        fresh = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+        try:
+            self.assertEqual(fresh.get_status()['proto'], P.PROTO_VERSION)
+        finally:
+            fresh.close()
 
 
 class AsyncScanE2E(unittest.TestCase):

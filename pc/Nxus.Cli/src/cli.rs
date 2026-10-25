@@ -562,6 +562,12 @@ fn execute(opts: &Opts) -> Result<()> {
             println!("thread 0x{:X}:", ctx.thread_id);
             println!("  pc = {:016X}  lr = {:016X}  sp = {:016X}  fp = {:016X}  cpsr = {:08X}",
                      ctx.pc, ctx.lr, ctx.sp, ctx.fp, ctx.cpsr);
+            // A 32-bit title zeroes the sp/lr/fp header fields on purpose (the flag
+            // word says so); say where the live values actually are instead of
+            // letting the zeros above read as a broken context.
+            if ctx.is_aarch32() {
+                println!("  AArch32 context (SP/LR/FP in r13/r14/r11)");
+            }
             for row in (0..29).step_by(4) {
                 let mut line = String::from(" ");
                 for i in row..(row + 4).min(29) {
