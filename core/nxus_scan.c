@@ -1607,6 +1607,7 @@ int nxusScanNextFromBaseline(NxusBaseline *bl,
     u32 done_blocks = 0;
     u32 dropped = 0;
     int rc = NXUS_SCAN_OK;
+    int truncated = 0;   /* hit list filled up before the pass ended */
     int stop = 0;
 
     for (u32 r = 0; r < bl->region_count && !stop && rc == NXUS_SCAN_OK; r++) {
@@ -1732,8 +1733,9 @@ int nxusScanNextFromBaseline(NxusBaseline *bl,
                 if (!match) continue;
 
                 /* A full hit list is a limit, not a failure: keep what fits and
-                   report success, so the caller never sees a dead scan. */
-                if (hits->count >= hits->max_capacity) { stop = 1; break; }
+                   report success.  Whether the list was truncated is reported out
+                   of band (hit count == capacity), see sendHits(). */
+                if (hits->count >= hits->max_capacity) { stop = 1; truncated = 1; break; }
 
                 const u64 off = base_off + s;
                 if (off > 0xFFFFFFFFull) continue;   /* u32 offset limit */
@@ -1743,6 +1745,8 @@ int nxusScanNextFromBaseline(NxusBaseline *bl,
                 memcpy(stored, cur, window);
                 if (hitListPush(hits, br->mapping_idx, (u32)off, stored, value_type) != NXUS_SCAN_OK) {
                     stop = 1;
+                    /* push only fails on FULL (OOM reports NXUS_SCAN_ERR_NOMEM). */
+                    if (hits->count >= hits->max_capacity) truncated = 1;
                     break;
                 }
             }
@@ -1761,5 +1765,9 @@ int nxusScanNextFromBaseline(NxusBaseline *bl,
 
     bl->active = 0;
     hits->prev_count = initial_count;
-    return rc;      /* NXUS_SCAN_OK also when the hit list filled up */
+    /* The pass may end on the hit-list capacity; the hits collected up to that
+       point are valid, so this is still success.  sendHits() marks the batch when
+       count == max_capacity so a client can tell "complete" from "cut off". */
+    (void)truncated;
+    return rc;
 }

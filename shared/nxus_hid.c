@@ -95,6 +95,10 @@ static void hidThread(void *arg) {
     g_InitResult = openInput();
     if (R_FAILED(g_InitResult)) {
         NXUS_LOG("hotkey: input unavailable - the hotkey stays disabled");
+        /* Clear the live flag on the way out: leaving it set made nxusHidStart()
+           refuse for the rest of the boot, so the hotkey could never come back. */
+        g_Available = false;
+        atomic_store_explicit(&g_ThreadLive, false, memory_order_release);
         return;
     }
 

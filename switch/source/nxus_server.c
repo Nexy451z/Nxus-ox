@@ -554,7 +554,12 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     if (R_FAILED(rc)) { replyError(fd, type, seq, rc); return; }
 
     const NxusMappingTable *maps = nxusSessionMappings();
-    if (maps->count == 0) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS)); return; }
+    /* nxusSessionMappings() publishes NULL when there is no table (never
+       snapshotted, or already released), so the count needs the NULL guard. */
+    if (maps == NULL || maps->count == 0) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS));
+        return;
+    }
 
     u32 region_cap = maps->count + 1;
     NxusPtrRegion *regions = (NxusPtrRegion *)calloc(region_cap, sizeof(NxusPtrRegion));
@@ -683,6 +688,9 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     NxusHitBatchHeader header;
     memset(&header, 0, sizeof(header));
     header.session_id = nxusSessionId();
+    /* A list sitting exactly at its capacity may have more hits that were never
+       collected: say so instead of letting the client present it as complete. */
+    if (hits->count >= hits->max_capacity) header.reserved |= NXUS_HITBATCH_TRUNCATED;
     header.count = count;
     header.total = hits->count;
     header.value_size = hits->value_size;
@@ -1314,6 +1322,15 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
 
+            /* Taking the debug handle moves the same state a pause does (g_Debug,
+               the pause flag, the HW slots).  Claim the pause slot so a hotkey
+               pause cannot run attach/detach concurrently: the loser gets BUSY
+               instead of closing a handle the winner is still using. */
+            if (!pauseTryEnter()) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
+
             /* Read dmnt's metadata BEFORE taking the process.  After
                svcDebugActiveProcess dmnt is closed and this is the only source of
                program_id / main NSO base, so losing it here would make --scope main
@@ -1374,13 +1391,21 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 nxusDebugGetStatus(&st);
                 reply(fd, type, seq, &st, sizeof(st));
             }
+            pauseLeave();
             break;
         }
 
         case NxusCmd_DebugDetach:
+            /* Same serialisation as DebugAttach: the detach joins the event thread
+               and closes g_Debug, which a concurrent hotkey pause would be using. */
+            if (!pauseTryEnter()) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
             /* The detach (thread join + handle close) runs outside the state
                lock; only the resulting pause/flag change is committed under it. */
             rc = nxusDebugDetach();
+            pauseLeave();
             if (R_SUCCEEDED(rc) && pauseReleaseDebugSessionPause()) {
                 /* Detaching ends a pause that went through the session: keep the
                    reported pause flag in step with the released target. */

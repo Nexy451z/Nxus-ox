@@ -338,10 +338,15 @@ typedef struct NXUS_PACKED {
     u32 total;           /* total hits in the session */
     u32 value_size;
     u32 mapping_count;   /* number of u64 bases following the header */
-    u32 reserved;
+    u32 reserved;        /* NXUS_HITBATCH_* flags (0 on older servers) */
     /* u64 mapping_bases[mapping_count]; NxusHit hits[count]; */
 } NxusHitBatchHeader;
 NXUS_STATIC_ASSERT(sizeof(NxusHitBatchHeader) == 24, "NxusHitBatchHeader must be 24 bytes");
+
+/* reserved flags: the hit list stopped because it reached max_capacity, so more
+   hits exist but were not collected.  Clients that ignore the field keep working
+   (older servers always send 0). */
+#define NXUS_HITBATCH_TRUNCATED 0x0001u
 
 typedef struct NXUS_PACKED {
     u32 offset;          /* offset from mapping base */

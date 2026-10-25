@@ -532,6 +532,8 @@ pub struct HitBatch {
     pub session_id: u32,
     pub total: u32,
     pub value_size: u32,
+    /// The console hit its hit-list capacity, so the list may be incomplete.
+    pub truncated: bool,
     pub hits: Vec<Hit>,
 }
 
@@ -543,7 +545,7 @@ impl HitBatch {
     pub const HIT_SIZE: usize = 16;
 
     pub fn empty() -> HitBatch {
-        HitBatch { session_id: 0, total: 0, value_size: 0, hits: Vec::new() }
+        HitBatch { session_id: 0, total: 0, value_size: 0, truncated: false, hits: Vec::new() }
     }
 
     /// Decode a `SCAN_GET_HITS` reply.
@@ -560,6 +562,8 @@ impl HitBatch {
         let session_id = rd_u32(data, 0);
         let total = rd_u32(data, 8);
         let value_size = rd_u32(data, 12);
+        // Bit 0 marks "the console filled its hit list, results may be cut off".
+        let truncated = (rd_u32(data, 20) & 1) != 0;
         let mut pos = Self::HEADER_SIZE;
 
         let mapping_count = (rd_u32(data, 16) as usize).min((data.len() - pos) / 8);
@@ -585,7 +589,7 @@ impl HitBatch {
                 value,
             });
         }
-        HitBatch { session_id, total, value_size, hits }
+        HitBatch { session_id, total, value_size, truncated, hits }
     }
 }
 

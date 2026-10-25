@@ -477,7 +477,20 @@ static Result snapshotMappings(void) {
     rc = nxusDmntGetMappings(raw, (size_t)count, 0, &got);
     if (R_FAILED(rc)) { free(raw); return rc; }
 
-    NxusMappingEntry *entries = (NxusMappingEntry *)calloc(got ? got : 1, sizeof(NxusMappingEntry));
+    /* dmnt reported mappings but handed none back: publishing an empty table
+       would make nxusSessionMappings() return NULL for a call that "succeeded",
+       and every caller would then have to defend against a table that is not
+       there.  Report the inconsistency instead (and drop the stale table, since
+       the process may have changed underneath us). */
+    if (got == 0) {
+        NXUS_LOG("mappings: dmnt reported %llu entries but returned 0 - dropping the table",
+                 (unsigned long long)count);
+        mappingSnapshotDrop();
+        free(raw);
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+
+    NxusMappingEntry *entries = (NxusMappingEntry *)calloc(got, sizeof(NxusMappingEntry));
     if (entries == NULL) { free(raw); return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory); }
 
     for (size_t i = 0; i < got; i++) {
