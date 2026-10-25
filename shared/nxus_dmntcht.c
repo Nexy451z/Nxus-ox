@@ -114,7 +114,19 @@ u32 nxusDmntTargetIncarnation(void) {
 /* One new cheat process was opened: publish the next incarnation (release, so a
    reader that observes N also observes the process N describes).  Returned value is
    the counter AFTER the bump, which is what the log line (and the tests) expect. */
+static atomic_bool g_AdoptNextOpen;
+
+/* The kernel debugger takes dmnt's process away and reopens the same one on detach.
+   That reopen is not a new title instance, so callers in that path ask the next
+   successful ForceOpen to keep the current incarnation. */
+void nxusDmntAdoptNextOpen(void) {
+    atomic_store_explicit(&g_AdoptNextOpen, true, memory_order_release);
+}
+
 static u32 dmntTargetOpened(void) {
+    if (atomic_exchange_explicit(&g_AdoptNextOpen, false, memory_order_acq_rel))
+        return (u32)atomic_load_explicit(&g_TargetIncarnation, memory_order_acquire);
+
     const u32 now = (u32)atomic_fetch_add_explicit(&g_TargetIncarnation, 1u,
                                                    memory_order_release) + 1u;
     NXUS_LOG("dmnt: target incarnation %u", (unsigned)now);

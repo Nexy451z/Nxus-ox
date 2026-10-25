@@ -1723,6 +1723,9 @@ static Result debugDetachExclusive(bool wait_for_claim) {
     /* dmnt may still be tearing the old cheat process down: give it 50 ms, then
        one 100 ms retry instead of leaving the cheat VM closed for the session. */
     svcSleepThread(50000000ull);
+    /* Reopening the process we just left is not a new title instance: keep the
+       scan incarnation so attach -> detach does not throw the hit list away. */
+    nxusDmntAdoptNextOpen();
     Result rc = nxusDmntForceOpen();
     if (R_FAILED(rc)) {
         NXUS_LOG("dmnt ForceOpenCheatProcess first attempt rc=0x%08X - retrying in 100 ms",

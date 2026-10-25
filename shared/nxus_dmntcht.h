@@ -95,6 +95,9 @@ Result nxusDmntForceClose(void);
  * Reads are acquire loads, bumps release => a reader that observes the new value
  * also observes the process it describes.  Logged as "dmnt: target incarnation N". */
 u32    nxusDmntTargetIncarnation(void);
+/* The next successful ForceOpen keeps the current incarnation: used when the
+   kernel debugger reopens the very same process on detach. */
+void   nxusDmntAdoptNextOpen(void);
 /* Pause/Resume the cheat process through dmnt itself.  These are the real
    commands (65004/65005): Atmosphère implements them as svc::BreakDebugProcess /
    svc::ContinueDebugProcess on the debug handle dmnt already owns.  The title
