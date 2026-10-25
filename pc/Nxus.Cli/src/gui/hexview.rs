@@ -8,6 +8,7 @@
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, Vec2};
 
+use std::fmt::Write as _;
 use std::sync::mpsc::Sender;
 
 use super::{Cmd, Prefs, State};
@@ -373,6 +374,15 @@ impl HexView {
         let selection = self.selection();
         let flash = st.started.elapsed().as_secs_f64() < self.pending_until;
 
+        // Reused scratch buffers for the cell text.  Formatting each cell with
+        // `format!` / `to_string()` meant ~1960 short-lived `String`s per frame on
+        // a 960-cell page (16 hex + 16 ascii cells per row); clearing and
+        // refilling one buffer per kind produces byte-identical text with no
+        // allocation of our own.
+        let mut row_addr_text = String::with_capacity(8);
+        let mut hex_text = String::with_capacity(2);
+        let mut ascii_text = String::with_capacity(1);
+
         for row in 0..rows_visible {
             let index = self.scroll_row + row;
             let y = origin.y + row as f32 * row_h;
@@ -380,8 +390,10 @@ impl HexView {
             if index >= total_rows {
                 continue;
             }
+            row_addr_text.clear();
+            let _ = write!(row_addr_text, "{:08X}", row_address);
             painter.text(egui::pos2(origin.x, y), Align2::LEFT_TOP,
-                         format!("{:08X}", row_address), font.clone(),
+                         row_addr_text.as_str(), font.clone(),
                          Color32::from_rgb(0x8A, 0x92, 0xA0));
 
             for col in 0..ROW {
@@ -419,11 +431,14 @@ impl HexView {
                 } else {
                     Color32::from_rgb(0xE6, 0xE9, 0xEE)
                 };
-                painter.text(egui::pos2(x_hex, y), Align2::LEFT_TOP, format!("{:02X}", byte),
+                hex_text.clear();
+                let _ = write!(hex_text, "{:02X}", byte);
+                painter.text(egui::pos2(x_hex, y), Align2::LEFT_TOP, hex_text.as_str(),
                              font.clone(), hex_color);
                 let printable = byte >= 32 && byte < 127;
-                painter.text(egui::pos2(x_ascii, y), Align2::LEFT_TOP,
-                             if printable { (byte as char).to_string() } else { ".".to_string() },
+                ascii_text.clear();
+                let _ = write!(ascii_text, "{}", if printable { byte as char } else { '.' });
+                painter.text(egui::pos2(x_ascii, y), Align2::LEFT_TOP, ascii_text.as_str(),
                              font.clone(),
                              if printable { Color32::from_rgb(0x5A, 0xD0, 0x8A) }
                              else { Color32::from_rgb(0x55, 0x5B, 0x66) });

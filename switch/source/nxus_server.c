@@ -140,10 +140,21 @@ static void fillStatus(NxusStatus *st) {
         /* GDB-style stop: the target is being held at a break/watch stop. */
         if (nxusDebugIsStopped()) flags |= NXUS_ST_DEBUG_STOPPED;
     } else {
-        bool has_process = false;
-        if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process) {
-            flags |= NXUS_ST_HAS_PROCESS;
+        /* The PC polls Status every ~20 ms, which was 50 dmnt IPCs per second, each
+           taking g_DmntLock and therefore serialising behind the reader thread.
+           Cache the probe for 500 ms: far below the time scale on which a cheat
+           process appears or disappears, but 25x fewer IPCs.  The branch above
+           already handles the attached case, where dmnt is closed and asking it
+           would fail every time. */
+        static u64  last_check_ms;
+        static bool cached;
+        const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+        if (last_check_ms == 0 || now_ms - last_check_ms >= 500ull) {
+            bool has_process = false;
+            cached = R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process;
+            last_check_ms = now_ms;
         }
+        if (cached) flags |= NXUS_ST_HAS_PROCESS;
     }
     /* A pause that went through the debug session keeps the target held with dmnt
        closed, so nxusSessionIsPaused() alone would under-report it.  A debugger
@@ -585,7 +596,12 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
         NxusHit hit;
         memset(&hit, 0, sizeof(hit));
         hit.offset = hits->addresses[index].offset;
-        hit.mapping_idx = hits->addresses[index].mapping_idx;
+        /* The PC resolves the hit address as mapping_bases[mapping_idx] + offset,
+           with nothing of its own to range-check it against.  A stale index from a
+           mapping table that shrank (scan while the title remapped) would resolve
+           to somebody else's address, so clamp it to 0 instead of trusting it. */
+        hit.mapping_idx = ((u32)hits->addresses[index].mapping_idx < map_count)
+                              ? hits->addresses[index].mapping_idx : 0;
         hit.value_type = hits->addresses[index].reserved;
         memcpy(&hit.value, hits->values + (size_t)index * hits->value_size, hits->value_size);
         memcpy(buffer + offset, &hit, sizeof(hit));
@@ -719,7 +735,14 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (nxusDebugIsAttached()) {
                 const NxusMappingTable *table = nxusSessionMappings();
                 if (table != NULL) {
-                    for (u32 i = (u32)req.offset; i < table->count && got < max_count; i++) {
+                    /* The PC pages with a u64 offset.  Truncating it to u32 made the
+                       page stop advancing above 4 GiB (and wrap for a negative value),
+                       so the client re-read the first page for ever.  Compare in u64
+                       instead: i is a u32 index, so i < start simply yields nothing
+                       when the offset is past the table. */
+                    const u64 start = req.offset;
+                    for (u32 i = 0; i < table->count && got < max_count; i++) {
+                        if ((u64)i < start) continue;
                         const NxusMappingEntry *m = &table->entries[i];
                         memset(&buffer[got], 0, sizeof(NxusMemoryInfo));
                         buffer[got].base_addr = m->base;
@@ -817,7 +840,13 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             s32 count = 0;
             rc = svcGetProcessList(&count, pids, 64);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
-            else reply(fd, type, seq, pids, (u32)((count > 0 ? count : 0) * (s32)sizeof(u64)));
+            else {
+                /* Never trust the kernel's count into the wire length: the reply is
+                   sized from pids[], so anything outside 0..64 would read past it. */
+                if (count < 0) count = 0;
+                if (count > 64) count = 64;
+                reply(fd, type, seq, pids, (u32)count * (u32)sizeof(u64));
+            }
             break;
         }
 
@@ -1011,9 +1040,19 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             u32 max_count = 64;
+            /* Paging: the request carries a u64 offset at the same place as
+               NxusMappingsRequest (offset, max_count).  NxusFrozenRequest itself
+               (address, width) has no offset, so a client that sends one gets the
+               first page - offset 0 - and only a caller that asks for a page is
+               served past it.  Ignoring the offset made every page the first one. */
             if (length >= sizeof(NxusMappingsRequest)) {
                 NxusMappingsRequest req;
                 memcpy(&req, payload, sizeof(req));
+                /* Only max_count is meaningful here.  NxusFrozenRequest is
+                   {address, width} and is byte-compatible with
+                   NxusMappingsRequest {offset, max_count}, so honouring req.offset
+                   would read an *address* as a page offset; dmnt's frozen table is
+                   capped at 0x80 entries anyway and callers never page it. */
                 if (req.max_count > 0 && req.max_count <= 512) max_count = req.max_count;
             }
             NxusFrozenAddressEntry *entries = (NxusFrozenAddressEntry *)calloc(max_count, sizeof(NxusFrozenAddressEntry));

@@ -237,6 +237,27 @@ static int isPatternType(u32 value_type) {
            value_type == NxusValueType_Binary;
 }
 
+/* A wildcard byte pattern is applied as mask[i] at pattern[i], and the caller
+   locates that mask at pattern + pattern_len (nxus_server.c builds the pointer
+   that way after reading ext.pattern_len).  If the declared length is not the
+   length actually sent - the console rounds it down to NXUS_SCAN_MAX_PATTERN -
+   mask[] is read from the wrong offset and every "??" compares the wrong bytes,
+   silently producing wrong hits.  The wire format caps a byte array at
+   NXUS_SCAN_MAX_PATTERN and always carries a mask with the WILDCARD flag, so
+   anything else is rejected here instead of scanning with a bogus mask. */
+static int patternLengthValid(const NxusScanPattern *pattern) {
+    if (pattern == NULL || pattern->pattern == NULL || pattern->pattern_len == 0) return 0;
+
+    if (pattern->value_type == NxusValueType_Bytes ||
+        pattern->value_type == NxusValueType_Binary) {
+        /* A rounded / truncated length (the console clamps at 64) cannot match
+           the bytes that follow it, and the mask position depends on it. */
+        if (pattern->pattern_len > NXUS_SCAN_MAX_PATTERN) return 0;
+        if ((pattern->flags & NXUS_SCAN_F_WILDCARD) && pattern->mask == NULL) return 0;
+    }
+    return 1;
+}
+
 static u8 foldCase(u8 c) {
     return (c >= 'A' && c <= 'Z') ? (u8)(c + 32) : c;
 }
@@ -378,14 +399,35 @@ static int hitListGrow(NxusHitList *list) {
     if (new_capacity > list->max_capacity) new_capacity = list->max_capacity;
     if (new_capacity <= list->capacity) return NXUS_SCAN_ERR_FULL;
 
-    NxusHitAddress *na = (NxusHitAddress *)realloc(list->addresses,
-                                                   (size_t)new_capacity * sizeof(NxusHitAddress));
-    if (na == NULL) return NXUS_SCAN_ERR_FULL;
-    list->addresses = na;
-
+    /* Grow the value array FIRST.  Growing addresses first and then failing on
+       values used to leave capacity at the new size while values still had the
+       old size: every later push then wrote past the values allocation or, with
+       the old ordering, the list advertised room it could not use (permanent
+       FULL).  Capacity is only updated once BOTH arrays are the new size. */
     u8 *nv = (u8 *)realloc(list->values, (size_t)new_capacity * list->value_size);
     if (nv == NULL) return NXUS_SCAN_ERR_FULL;
     list->values = nv;
+
+    NxusHitAddress *na = (NxusHitAddress *)realloc(list->addresses,
+                                                   (size_t)new_capacity * sizeof(NxusHitAddress));
+    if (na == NULL) {
+        /* Undo the value growth so no unused tail is left behind and capacity
+           keeps describing the real allocation exactly.  A shrinking realloc
+           never moves into a smaller block, so this normally succeeds; if it
+           does not, the block is merely larger than the advertised capacity and
+           the next grow simply retries (entries past capacity are never
+           touched). */
+        if (list->capacity == 0) {
+            free(list->values);
+            list->values = NULL;
+        } else {
+            u8 *shrunk = (u8 *)realloc(list->values,
+                                       (size_t)list->capacity * list->value_size);
+            if (shrunk != NULL) list->values = shrunk;
+        }
+        return NXUS_SCAN_ERR_FULL;
+    }
+    list->addresses = na;
 
     list->capacity = new_capacity;
     return NXUS_SCAN_OK;
@@ -649,6 +691,9 @@ int nxusScanFirstEx(const NxusScanRegion *regions, u32 region_count,
     const int  all_types = (value_type == NxusValueType_All);
     const int  patterned = isPatternType(value_type);
 
+    /* Refuse a pattern whose length the mask offset cannot be trusted for. */
+    if (patterned && !patternLengthValid(pattern)) return NXUS_SCAN_ERR_PARAM;
+
     u32 window, step;
     if (patterned) {
         window = patternWindow(pattern);
@@ -884,6 +929,11 @@ int nxusScanNextEx(NxusHitList *hits, const NxusScanRequest *req, const NxusScan
     const int patterned = isPatternType(plain_type);
     const int all_types = (plain_type == NxusValueType_All);
 
+    /* Same guard as the first pass: a pattern_len that no longer matches the
+       sent bytes (a rounded length) makes matchPatternAt() read the wildcard
+       mask from pattern + pattern_len, i.e. from the wrong bytes. */
+    if (patterned && !patternLengthValid(pattern)) return NXUS_SCAN_ERR_PARAM;
+
     /* How many bytes a single hit needs, and the target bytes for plain types. */
     u32 hit_window;
     if (patterned)      hit_window = patternWindow(pattern);
@@ -1070,8 +1120,14 @@ int nxusScanNextEx(NxusHitList *hits, const NxusScanRequest *req, const NxusScan
             u32 vlen = patterned ? hit_window : nxusValueTypeSize(vtype);
             if (vlen == 0) vlen = hit_window;
 
-            u32 rel = hits->addresses[j].offset - win_start;
-            if (rel + vlen > read_size) {
+            /* The batch window starts at the first offset of the group.  A hit
+               below it (only possible with an out-of-order / corrupt list) would
+               make the subtraction wrap to 0xFFFFFFxx and read window[-1]: never
+               compare it against bytes outside the window. */
+            const u32 offset = hits->addresses[j].offset;
+            if (offset < win_start) continue;
+            const u32 rel = offset - win_start;
+            if (rel > read_size || vlen > read_size - rel) {
                 /* outside what we could read (short window): keep it for the
                    next pass rather than judging it from missing bytes */
                 if (keep != j) {
@@ -1315,6 +1371,17 @@ int nxusScanFirstBaseline(NxusBaseline *bl,
     const u32 window = bl->value_size;
     if (window == 0 || window > 8) return NXUS_SCAN_ERR_PARAM;
 
+    /* NxusBaselineBlock.store_off is a u32 offset into the baseline stream.  A
+       larger total would wrap, so every later comparison would read the wrong
+       history (silently wrong hits) - refuse it instead. */
+    {
+        u64 total = 0;
+        for (u32 r = 0; r < region_count; r++) {
+            total += regions[r].size;
+            if (total > 0xFFFFFFFFull) return NXUS_SCAN_ERR_PARAM;
+        }
+    }
+
     const u32 value_type = baselineValueType(bl->value_type, window, req->flags);
     if (value_type == NxusValueType_All) return NXUS_SCAN_ERR_PARAM;
 
@@ -1327,8 +1394,14 @@ int nxusScanFirstBaseline(NxusBaseline *bl,
 
     const u32 step = window;       /* numeric candidates sit on absolute multiples */
 
+    /* store_off and every hit offset are u32.  A range whose total size does not
+       fit 32 bits could never be stored/represented and used to wrap silently
+       (two 2 GiB regions summed to 0, so the block grid covered nothing). */
     u64 total_bytes = 0;
-    for (u32 r = 0; r < region_count; r++) total_bytes += regions[r].size;
+    for (u32 r = 0; r < region_count; r++) {
+        if (regions[r].size > 0xFFFFFFFFull - total_bytes) return NXUS_SCAN_ERR_PARAM;
+        total_bytes += regions[r].size;
+    }
 
     /* Smallest grid whose block count still fits the caller's budget. */
     u32 block_size = NXUS_BASELINE_BLOCK_MIN;
@@ -1422,7 +1495,9 @@ int nxusScanFirstBaseline(NxusBaseline *bl,
                    no SD space, and the refine pass still knows the baseline. */
                 b->flags |= NXUS_BBLOCK_ZERO;
             } else if (io->write == NULL ||
-                       bl->stored_bytes + (u64)blk_len > 0xFFFFFFFFull) {
+                       (u64)blk_len > 0xFFFFFFFFull - bl->stored_bytes) {
+                /* Check the bound BEFORE adding: stored_bytes is the u32 store
+                   offset, so the new block must end at or below 2^32 - 1. */
                 b->flags = NXUS_BBLOCK_UNREADABLE;
                 if (stats != NULL) stats->dropped++;
             } else if (io->write(io_ctx, bl->stored_bytes, blk_buf, blk_len) != 0) {

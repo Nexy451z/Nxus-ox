@@ -354,6 +354,43 @@ static void testRefusedWindowRead(void) {
     check(g_hits.count == found, "every still-matching hit kept (no bogus compare)");
 }
 
+/* A hit below the window start (an out-of-order / corrupt hit list) made
+   'offset - win_start' wrap to 0xFFFFFFFF.  For a 1-byte value 'rel + vlen'
+   then wrapped to 0, so the bounds check passed and the compare read
+   window + 0xFFFFFFFF - 4 GiB past the buffer (it crashed when this test was
+   added).  The guard must skip the entry instead of letting the wrapped
+   subtraction decide the read address. */
+static void testRefineOffsetUnderflow(void) {
+    printf("- refine rejects an offset below the window start\n");
+    setup();
+    g_memory[1] = 0x11;
+
+    hitListInit(1);                          /* value_size 1: rel + vlen wraps */
+    NxusScanPattern pat;
+    memset(&pat, 0, sizeof(pat));
+    pat.value_type = NxusValueType_U8;
+
+    NxusScanRequest req = baseRequest(NxusCmp_Equal, 0x11, 0);
+    req.value_size = 1;
+
+    /* Deliberately out of order: the window starts at 1, the second hit is 0. */
+    g_hits.addresses[0].offset = 1;
+    g_hits.addresses[0].mapping_idx = 0;
+    g_hits.addresses[0].reserved = NxusValueType_U8;
+    g_hits.values[0] = 0x11;
+    g_hits.addresses[1].offset = 0;
+    g_hits.addresses[1].mapping_idx = 0;
+    g_hits.addresses[1].reserved = NxusValueType_U8;
+    g_hits.values[1] = 0x22;
+    g_hits.count = 2;
+
+    NxusScanStats stats;
+    int rc = nxusScanNextEx(&g_hits, &req, &pat, &g_maps, fakeRead, NULL,
+                            g_window + 1, 8192, 256, &stats, NULL);
+    check(rc == NXUS_SCAN_OK, "refine with an out-of-order hit completes");
+    check(g_hits.count == 1, "the in-window hit survives, the below-window one is skipped");
+}
+
 /* S1: the specialized equal-compare loops for the four integer widths must find
    exactly the same hits as the generic compare (the width switch is hoisted and
    each loop uses a constant-size load). */
@@ -1199,6 +1236,46 @@ static void testBaselineMatchesFirstPass(void) {
     nxusHitListFree(&g_ref_hits);
 }
 
+/* The baseline's store offsets and hit offsets are u32: a range set whose total
+   size does not fit 32 bits must be refused instead of wrapping (the sum used to
+   wrap silently and the blocks were then stored at colliding offsets). */
+static void testBaselineRejectsHugeRegion(void) {
+    printf("- dense baseline rejects a range set larger than the u32 store\n");
+    setup();
+    memset(g_memory, 0x11, FAKE_SIZE);
+
+    NxusScanRequest req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 4;
+    baselineInit(4, NxusValueType_U32);
+
+    NxusScanStats stats;
+
+    NxusScanRegion single;
+    memset(&single, 0, sizeof(single));
+    single.base = g_base;
+    single.addr_base = g_base;
+    single.size = 0x100000000ull;             /* 4 GiB */
+    single.mapping_idx = 0;
+    check(nxusScanFirstBaseline(&g_bl, &single, 1, &req, fakeRead, NULL, &g_store_io, NULL,
+                                g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_ERR_PARAM,
+          "a single 4 GiB region is rejected");
+    check(g_bl.active == 0, "the rejected baseline is not left active");
+    check(g_store_writes == 0, "nothing was written to the store");
+
+    /* Two 2 GiB regions are each fine, but their SUM overflows the u32 store. */
+    NxusScanRegion big[2];
+    memset(big, 0, sizeof(big));
+    big[0].base = g_base;                 big[0].addr_base = g_base;
+    big[0].size = 0x80000000ull;          big[0].mapping_idx = 0;
+    big[1].base = g_base + 0x80000000ull; big[1].addr_base = g_base;
+    big[1].size = 0x80000000ull;          big[1].mapping_idx = 0;
+    check(nxusScanFirstBaseline(&g_bl, big, 2, &req, fakeRead, NULL, &g_store_io, NULL,
+                                g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_ERR_PARAM,
+          "the summed range size is checked, not just one region");
+    check(g_bl.active == 0, "the summed case is not left active either");
+    check(g_store_writes == 0, "the summed case stores nothing either");
+}
+
 int main(void) {
     printf("Nxus scan-type tests\n");
     testFloat();
@@ -1211,6 +1288,7 @@ int main(void) {
     testEqualFastPaths();
     testDenseRunRefine();
     testRefusedWindowRead();
+    testRefineOffsetUnderflow();
     testClippedRegionOffsets();
     testRefusedChunkRead();
     testRegionBuilding();
@@ -1226,6 +1304,7 @@ int main(void) {
     testBaselineBlockSizing();
     testBaselineHitCap();
     testBaselineMatchesFirstPass();
+    testBaselineRejectsHugeRegion();
 
     printf("\n%d checks, %d failure(s)\n", checks, failures);
     if (failures == 0) printf("ALL SCAN-TYPE TESTS PASSED\n");

@@ -439,6 +439,21 @@ static void serveClient(int fd) {
 
 /* ---- accept loop -------------------------------------------------------- */
 
+/* True for the source addresses a home LAN / VPN actually uses.  The protocol has
+   no authentication, so this is the cheap guard that keeps it off the internet:
+   127/8 (loopback), 10/8, 172.16/12, 192.168/16 (RFC1918), 169.254/16 (link-local)
+   and 100.64/10 (CGNAT - Tailscale and friends hand out addresses from there). */
+static bool nxusNetPeerIsPrivate(const struct sockaddr_in *peer) {
+    const u32 ip = ntohl(peer->sin_addr.s_addr);
+    if ((ip >> 24) == 127u) return true;                        /* 127.0.0.0/8   */
+    if ((ip >> 24) == 10u) return true;                         /* 10.0.0.0/8    */
+    if ((ip >> 20) == 0xAC1u) return true;                      /* 172.16.0.0/12 */
+    if ((ip >> 16) == 0xC0A8u) return true;                     /* 192.168.0.0/16*/
+    if ((ip >> 16) == 0xA9FEu) return true;                     /* 169.254.0.0/16*/
+    if ((ip >> 22) == 0x64u) return true;                       /* 100.64.0.0/10 */
+    return false;
+}
+
 static void serverThread(void *arg) {
     (void)arg;
     u64 last_health = armGetSystemTick();
@@ -503,12 +518,31 @@ static void serverThread(void *arg) {
 
         if (!(pfd.revents & POLLIN)) continue;
 
-        const int fd = accept(g_ListenFd, NULL, NULL);
+        struct sockaddr_in peer;
+        memset(&peer, 0, sizeof(peer));
+        socklen_t peer_len = (socklen_t)sizeof(peer);
+        const int fd = accept(g_ListenFd, (struct sockaddr *)&peer, &peer_len);
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             NXUS_LOG("accept() failed errno=%d - rebuilding listener", errno);
             rebuildListener(true);
             last_health = armGetSystemTick();
+            continue;
+        }
+
+        /* Nxus speaks an unauthenticated read/write/debug protocol, so it must not
+           be reachable from outside the LAN: a port-forward or a misconfigured
+           network would otherwise let anyone on the internet edit memory and take
+           the debug handle.  Only private / loopback sources are served; anything
+           else is closed immediately (and logged, so a mistake is visible). */
+        if (!nxusNetPeerIsPrivate(&peer)) {
+            NXUS_LOG("accept: refused non-private peer %u.%u.%u.%u:%u",
+                     (unsigned)(ntohl(peer.sin_addr.s_addr) >> 24) & 0xFF,
+                     (unsigned)(ntohl(peer.sin_addr.s_addr) >> 16) & 0xFF,
+                     (unsigned)(ntohl(peer.sin_addr.s_addr) >> 8) & 0xFF,
+                     (unsigned)ntohl(peer.sin_addr.s_addr) & 0xFF,
+                     (unsigned)ntohs(peer.sin_port));
+            close(fd);
             continue;
         }
 

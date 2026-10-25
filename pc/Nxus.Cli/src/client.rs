@@ -556,10 +556,30 @@ impl NxusClient {
         Ok(HitBatch { session_id, total, value_size, hits })
     }
 
+    /// Upper bound on the pre-allocation [`NxusClient::scan_all_hits`] derives from
+    /// the total the console reports in its first reply.
+    ///
+    /// 8 M entries is the console's own `max_hits` ceiling and the PC scanner's
+    /// `DEFAULT_MAX_HITS`, so a corrupt or hostile `total` can never turn into an
+    /// arbitrarily large `Vec::with_capacity`.
+    pub const MAX_ALL_HITS: usize = crate::pcscan::DEFAULT_MAX_HITS;
+
     pub fn scan_all_hits(&self, page: u32) -> Result<Vec<Hit>> {
-        let mut all = Vec::new();
+        // Collected hits are only ever appended, so every growth step used to
+        // copy everything gathered so far (thousands of pages -> ~15 reallocs and
+        // tens of millions of copied `Hit`s for a big scan).  The first reply
+        // already carries the final count, so size the vector once from it.
+        let mut all: Vec<Hit> = Vec::new();
+        let mut sized = false;
         loop {
             let batch = self.scan_hits(all.len() as u32, page)?;
+            if !sized {
+                sized = true;
+                let want = (batch.total as usize).min(Self::MAX_ALL_HITS);
+                if want > all.capacity() {
+                    all.reserve_exact(want - all.capacity());
+                }
+            }
             if batch.hits.is_empty() {
                 return Ok(all);
             }

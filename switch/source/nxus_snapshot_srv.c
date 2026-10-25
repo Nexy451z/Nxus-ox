@@ -39,8 +39,12 @@ static void snapshotSlotEnsure(u32 slot) {
 }
 
 Result nxusSnapshotServiceInit(void) {
-    g_Changed = (NxusChangedBlock *)calloc(NXUS_SNAPSHOT_MAX_CHANGED, sizeof(NxusChangedBlock));
-    if (g_Changed == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    /* Called again on re-init: only the first call allocates, otherwise the
+       previous buffer would leak (its pointer is overwritten). */
+    if (g_Changed == NULL) {
+        g_Changed = (NxusChangedBlock *)calloc(NXUS_SNAPSHOT_MAX_CHANGED, sizeof(NxusChangedBlock));
+        if (g_Changed == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
     NXUS_LOG("snapshot: %u blocks max, default block %u bytes, slots lazily allocated",
              (unsigned)NXUS_SNAPSHOT_MAX_BLOCKS, (unsigned)g_BlockSize);
     return 0;
@@ -54,8 +58,8 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
 
     if (block_size == 0) block_size = NXUS_SNAPSHOT_DEFAULT_BLOCK_SIZE;
     if (block_size < 256) block_size = 256;
-    /* Each block is hashed through a 64 KB read chunk, so anything larger would
-       only cover the block's first 64 KB and silently miss later changes. */
+    /* A block is hashed from one read of at most chunk_size bytes, so a block
+       larger than the chunk would silently miss everything past the chunk. */
     if (block_size > 64u * 1024u) block_size = 64u * 1024u;
     block_size = (block_size + 0xFFu) & ~0xFFu;
 
@@ -70,8 +74,11 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     g_Truncated = 0;      /* this capture's own state, not the previous one's */
     g_SlotTruncated[slot] = 0;
 
-    /* Chunk buffer kept modest: the snapshot only needs one block per read. */
-    const u32 chunk_size = 64 * 1024;
+    /* Bigger chunk = fewer read round trips: the capture coalesces a run of
+       whole blocks into one read, up to 16 of them.  1 MB would be comfortable,
+       but the sysmodule only has an 8 MB inner heap (the two snapshot slots
+       alone take 2 x 256 KB), so cap the scratch buffer at 256 KB. */
+    const u32 chunk_size = 256 * 1024;
     u8 *chunk = (u8 *)malloc(chunk_size);
     if (chunk == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
 
