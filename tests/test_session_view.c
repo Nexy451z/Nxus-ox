@@ -539,6 +539,10 @@ static bool armHitList(u32 capacity) {
 #define RESCUE_B2 0x30020000ull
 #define RESCUE_RW (NXUS_PERM_R | NXUS_PERM_W)
 
+/* Target incarnation the dmnt stub below reports.  Tests set it to drive
+   hitsOwnerStamp()/the ownership checks; 0 is the boot value. */
+static u32 g_FakeIncarnation;
+
 static void rescuePublishThree(void) {
     fakeClearMappings();
     fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
@@ -764,6 +768,158 @@ static void testHitsRescueUnsortedTable(void) {
               (unsigned long long)a1);
         nxusSessionViewRelease();
     }
+}
+
+/* ---- target incarnation -------------------------------------------------
+ *
+ * pid + program id + mapping generation all survive a relaunch in a FIXED layout:
+ * the title comes back under the same pid and dmnt walks the same mappings, so every
+ * recorded address still resolves - against a different process.  With the
+ * absolute-address rescue in place that is no longer detectable by "the check fails",
+ * so the list is stamped with dmnt's target incarnation and refused when it moved.
+ * g_FakeIncarnation drives the stub at the bottom of this file.
+ */
+
+static void testHitsIncarnationMismatch(void) {
+    printf("- a hit list from an earlier target incarnation is refused\n");
+    freshSession();
+    g_FakeIncarnation = 3;
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed in incarnation 3");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x11);
+    CHECK(g_Session.hits_owner_incarnation == 3u,
+          "the list carries the incarnation it was armed in (%u)",
+          (unsigned)g_Session.hits_owner_incarnation);
+    CHECK(nxusSessionHitsMatchTarget(), "a fresh list matches its own incarnation");
+
+    /* dmnt reopened the process.  pid, title and the mapping table are unchanged -
+       this is exactly the fixed-layout restart - only the incarnation moved. */
+    g_FakeIncarnation = 4;
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsMatchTarget(),
+          "the same pid in a new incarnation is a different target");
+    CHECK(strstr(g_LastLog, "earlier incarnation (was 3, now 4)") != NULL,
+          "the mismatch names both incarnations: \"%s\"", g_LastLog);
+    CHECK(g_Session.hits.count == 1u,
+          "refusing the list does not mutate it here (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(!nxusSessionHitsMatchTargetIdentity(),
+          "the identity-only check (the 1 Hz tick) refuses it as well");
+
+    fakeClearMappings();
+    g_FakeIncarnation = 0;
+}
+
+/* The rescue repairs ORDINALS, so it must not be reachable across an incarnation:
+ * a restarted title resolves every address perfectly and is still the wrong target. */
+static void testHitsRevalidateOnlySameIncarnation(void) {
+    printf("- the address rescue never crosses an incarnation\n");
+    freshSession();
+    g_FakeIncarnation = 5;
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed in incarnation 5");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x11);
+
+    /* Positive control: a rebuilt table WITHIN the same incarnation is rescued. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x2000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "rebuilt table published");
+    g_LastLog[0] = '\0';
+    CHECK(nxusSessionHitsMatchTarget(), "same incarnation: the list is rescued");
+    CHECK(strstr(g_LastLog, "revalidated 1 hit(s)") != NULL,
+          "the rescue ran: \"%s\"", g_LastLog);
+
+    /* A rebuild that the rescue WOULD repair, plus a reopened process. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(0x30008000ull, 0x1000, RESCUE_RW);      /* shifts both ordinals */
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "shifted table published");
+    const u32 stamped_generation = g_Session.hits_owner_mapping_generation;
+    g_FakeIncarnation = 6;
+
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsRevalidate(),
+          "revalidate refuses across incarnations: nothing is repaired");
+    CHECK(strstr(g_LastLog, "earlier incarnation (was 5, now 6)") != NULL,
+          "the refusal names both incarnations: \"%s\"", g_LastLog);
+    CHECK(g_Session.hits.count == 1u,
+          "the refused list keeps its entries (%u)", (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.addresses[0].mapping_idx == 1u &&
+          g_Session.hits.addresses[0].offset == 0x40u,
+          "the stored index was NOT rewritten (%u/%u)",
+          (unsigned)g_Session.hits.addresses[0].mapping_idx,
+          (unsigned)g_Session.hits.addresses[0].offset);
+    CHECK(g_Session.hits_owner_mapping_generation == stamped_generation,
+          "the stamp still names the old table (%u/%u)",
+          (unsigned)g_Session.hits_owner_mapping_generation, (unsigned)stamped_generation);
+    CHECK(!nxusSessionHitsMatchTarget(),
+          "and the full check does not serve it either");
+
+    /* Servable again only once a scan stamps the new incarnation. */
+    CHECK(armHitList(8), "a new scan arms a list in the new incarnation");
+    CHECK(g_Session.hits_owner_incarnation == 6u, "stamped with the current one (%u)",
+          (unsigned)g_Session.hits_owner_incarnation);
+    CHECK(nxusSessionHitsMatchTarget(), "and that list matches");
+
+    fakeClearMappings();
+    g_FakeIncarnation = 0;
+}
+
+/* A hit is only resolvable when its whole VALUE fits inside the mapping: offset <
+   size proves the first byte is mapped, not that reading value_size bytes from there
+   stays inside the region the refine would read. */
+static void testHitsRescueValueMustFitMapping(void) {
+    printf("- a hit whose value straddles the mapping end is dropped\n");
+    freshSession();
+    g_FakeIncarnation = 0;
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed");
+    hitAppend(1, 0xFFE, RESCUE_B1 + 0xFFE, 0x66);   /* 2 bytes left, value is 4 */
+    hitAppend(2, 0x80, RESCUE_B2 + 0x80, 0x77);
+
+    /* Same base order (the fast path), B1 shrank so the straddling hit no longer fits
+       while its address is still mapped. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0xFFF, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "shrunken table published");
+
+    g_LastLog[0] = '\0';
+    CHECK(nxusSessionHitsMatchTarget(), "the fully-inside hit keeps the list alive");
+    CHECK(g_Session.hits.count == 1u, "the straddling hit is gone (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.addresses[0].address == RESCUE_B2 + 0x80,
+          "the survivor is the one that fully fits (0x%llX)",
+          (unsigned long long)g_Session.hits.addresses[0].address);
+    CHECK(strstr(g_LastLog, "1 hit(s) can no longer be resolved - dropped") != NULL,
+          "the drop is logged: \"%s\"", g_LastLog);
+
+    /* Same rule through the address resolver (a shifted table). */
+    freshSession();
+    g_FakeIncarnation = 0;
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed (shifted case)");
+    hitAppend(1, 0xFFE, RESCUE_B1 + 0xFFE, 0x66);
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(0x30008000ull, 0x1000, RESCUE_RW);      /* shifts both ordinals */
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "shifted table published");
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsMatchTarget(),
+          "the only hit cannot be rescued when its value would cross the end");
+    CHECK(g_Session.hits.count == 0u, "the list is emptied (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(strstr(g_LastLog, "can no longer be resolved") != NULL,
+          "the refusal names the cause: \"%s\"", g_LastLog);
+
+    fakeClearMappings();
 }
 
 /* Exit() is terminal for views: it frees the ring even with an outstanding pin,
@@ -1143,6 +1299,13 @@ Result nxusDmntGetMetadata(NxusProcessMetadata *out) {
     return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
 }
 
+/* dmnt's cheat-process incarnation (nxusDmntTargetIncarnation).  The real counter
+   lives in shared/nxus_dmntcht.c and only moves when dmnt opens a process; here the
+   tests drive it directly so "the same pid in a restarted process" is expressible. */
+u32 nxusDmntTargetIncarnation(void) {
+    return g_FakeIncarnation;
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(void) {
@@ -1161,6 +1324,9 @@ int main(void) {
     testHitsRescueDropsOnlyUnresolvable();
     testHitsRescueSameBaseReuse();
     testHitsRescueUnsortedTable();
+    testHitsIncarnationMismatch();
+    testHitsRevalidateOnlySameIncarnation();
+    testHitsRescueValueMustFitMapping();
     testExitIsTerminal();
     testConcurrentReaders();
     testTargetIdentitySnapshot();

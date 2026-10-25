@@ -84,6 +84,12 @@ typedef struct {
        so serving the previous title's hits after a switch is detectable. */
     u64 hits_owner_pid, hits_owner_program_id;
     u32 hits_owner_session_id;
+    /* dmnt's target incarnation when the list was armed (nxusDmntTargetIncarnation).
+       A relaunch in a fixed layout comes back under the SAME pid and the same
+       mappings, so this is the only thing that still separates "this process" from
+       "the process that now has its pid".  A list stamped with another incarnation
+       is never rescued, however well its addresses resolve. */
+    u32 hits_owner_incarnation;
     /* Generation of the mapping snapshot the hit indices belong to (see the
        mapping-generation block below).  A hit stores mapping_idx, an ORDINAL into
        the published table, so it is only meaningful while that exact table is the
@@ -249,6 +255,13 @@ static NxusTargetIdentity identitySample(void) {
  * region (see the mapping-generation block below).  Identity and generation are
  * compared together by nxusSessionHitsMatchTarget().
  *
+ * And it carries the dmnt target INCARNATION (nxusDmntTargetIncarnation), because
+ * pid + program_id cannot answer the one case that matters most: a title restarted
+ * into the same pid with the same layout.  The identity is "the same" and every
+ * recorded address resolves through the new mapping table, so only a counter bumped
+ * by dmnt itself can tell the two processes apart.  A list from another incarnation
+ * is refused outright - it is not a rebuild the rescue below may repair.
+ *
  * g_HitsStale is the "discarded, not replaced yet" latch.  Invalidating must not
  * free the hit arrays (the connection thread may be walking them inside sendHits),
  * so the discarded list stays allocated and every accessor refuses to serve it until
@@ -366,12 +379,16 @@ static void hitsStampMapBases(void);
    pid and program_id are taken from ONE identity snapshot: two separate accessor
    calls could stamp the pid of one write with the title of the next.
    The base stamp is taken here too, so a later rebuild can prove (or repair) the
-   mapping_idx values this list is about to be filled with. */
+   mapping_idx values this list is about to be filled with.  The target INCARNATION
+   (nxusDmntTargetIncarnation) is read here as well: a title restarted into the same
+   pid with the same layout is a NEW process, and the rescue below must never
+   re-resolve these hits against it. */
 static void hitsOwnerStamp(void) {
     const NxusTargetIdentity id = identitySample();
     g_Session.hits_owner_pid = id.pid;
     g_Session.hits_owner_program_id = id.program_id;
     g_Session.hits_owner_session_id = g_Session.session_id;
+    g_Session.hits_owner_incarnation = nxusDmntTargetIncarnation();
     g_Session.hits_owner_mapping_generation = mappingGenerationLoad();
     g_Session.hits_owner_valid = true;
     hitsStampMapBases();
@@ -1413,10 +1430,33 @@ const NxusHitList *nxusSessionHits(void) {
     return &g_Session.hits;
 }
 
-/* Identity half of the ownership check (pid / program id / scan generation), shared
-   by the full match and by the identity-only variant the main-thread tick uses.  The
-   caller has already checked hitsStale() and hits_owner_valid. */
+/* Does the stored list describe the dmnt cheat process that is open NOW?
+ *
+ * pid + program id answer "which title", which is not the same question: a title
+ * restarted with a fixed layout comes back under the SAME pid and dmnt walks the
+ * same mappings, so every stored address still resolves - against a new process.  The
+ * incarnation changes exactly when dmnt opens a new process, so a difference is a
+ * different target no matter how well the numbers line up.  This is the check the
+ * absolute-address rescue must not get around: the rescue exists for a table REBUILD
+ * within one process, not for a restart. */
+static bool hitsOwnerIncarnationMatches(void) {
+    const u32 now = nxusDmntTargetIncarnation();
+    if (g_Session.hits_owner_incarnation == now) return true;
+    NXUS_LOG("hits: hit list belongs to an earlier incarnation (was %u, now %u) - "
+             "discarding",
+             (unsigned)g_Session.hits_owner_incarnation, (unsigned)now);
+    return false;
+}
+
+/* Identity half of the ownership check (pid / program id / target incarnation / scan
+   generation), shared by the full match and by the identity-only variant the
+   main-thread tick uses.  The caller has already checked hitsStale() and
+   hits_owner_valid. */
 static bool hitsOwnerIdentityMatches(void) {
+    /* A new dmnt process is a new target before any field is compared: with a reused
+       pid the fields below can all be equal and still name a process that is gone. */
+    if (!hitsOwnerIncarnationMatches()) return false;
+
     /* ONE identity snapshot for both compared fields: sampling the pid and the
        program id separately could compare the stamp against the pid of one write
        and the title of the next (the stamp itself is written from one snapshot). */
@@ -1465,7 +1505,15 @@ static bool hitsOwnerIdentityMatches(void) {
  *     instead of the whole list,
  *   - "resolvable" means: inside the current table, read permission, size != 0 and
  *     base <= address < base + size.  A reused base with a smaller size, a mapping
- *     turned read-only and a vanished mapping all count as unresolvable.
+ *     turned read-only and a vanished mapping all count as unresolvable,
+ *   - the whole VALUE has to fit inside that mapping: offset + value_size <= size
+ *     (value_size is the hit list's).  offset < size only proves the first byte is
+ *     mapped; a hit whose bytes straddle the mapping end is dropped as unresolvable,
+ *     so a later refine cannot read past the region it was recorded in,
+ *   - only a list stamped with the CURRENT dmnt target incarnation is rescued at all
+ *     (hitsOwnerIncarnationMatches).  A restart into the same pid with the same
+ *     layout is not a rebuild: its addresses resolve perfectly and still belong to a
+ *     process that is gone.
  *
  * On success the owner stamp is re-pointed at the generation published now and the
  * base stamp is re-recorded from the very table that was verified, so no later reader
@@ -1551,6 +1599,14 @@ static bool mapResolverFind(const NxusMapResolver *r, u64 address, u32 *out_inde
 bool nxusSessionHitsRevalidate(void) {
     if (hitsStale()) return false;
     if (!g_Session.hits_owner_valid) return false;
+    /* The rescue repairs mapping ORDINALS; it never makes an address belong to
+       another process.  A restart into the same pid and the same layout resolves
+       perfectly and is still the wrong target, so a list stamped with an older
+       incarnation is refused here too - not only through the identity check that
+       normally runs before this one.  This entry point is reachable directly
+       (nxus_session.h documents it as such), and a caller must not be able to turn
+       "dmnt reopened the process" into a rescue. */
+    if (!hitsOwnerIncarnationMatches()) return false;
     if (sessionStateLoad() == NxusScanState_Running) return false;
 
     /* Sampled BEFORE the table: a stamp is only allowed to name a generation whose
@@ -1611,15 +1667,24 @@ bool nxusSessionHitsRevalidate(void) {
             if (idx < maps->count) {
                 const NxusMappingEntry *m = &maps->entries[idx];
                 offset = (u64)cur.offset;
+                /* The VALUE has to fit too: a hit whose window straddles the end of
+                   its mapping would be replayed (refine / next compare) as a read of
+                   `value_size` bytes that runs into whatever mapping comes next - or
+                   into nothing at all.  offset < size alone only proves the first
+                   byte is mapped. */
                 ok = m->size != 0 && offset < m->size &&
                      (m->reserved & NXUS_PERM_R) != 0 && m->valid != 0 &&
-                     m->base + offset == cur.address;
+                     m->base + offset == cur.address &&
+                     (u64)value_size <= m->size - offset;
             }
         } else if (have_resolver && mapResolverFind(&resolver, cur.address, &idx)) {
             /* The recorded address is the ground truth; the offset is measured from
                the mapping base, never from a clipped region start (addr_base). */
             offset = cur.address - maps->entries[idx].base;
-            ok = offset <= 0xFFFFFFFFull;      /* the wire field is 32 bits */
+            /* Same bound as above: the 32-bit wire offset AND the value within the
+               mapping (mapResolverFind already proved offset < size). */
+            ok = offset <= 0xFFFFFFFFull &&
+                 (u64)value_size <= maps->entries[idx].size - offset;
         }
 
         if (!ok) { dropped++; continue; }

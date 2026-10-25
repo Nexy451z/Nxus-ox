@@ -2,7 +2,7 @@
 
 **Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)**.
 
-Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.33 MiB` plus the `32 KiB` stack, and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
+Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.40 MiB` plus the `32 KiB` stack, and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
 
 ---
 
@@ -81,7 +81,7 @@ error into a success — merely because a field is missing.
   - Instead of pushing every address into the hit list on Pass 1 (which would truncate at 150k hits), `Unknown` scans use a **2-stage Dense Baseline → Lazy Hit Materialization** pipeline on both the Switch (`sdmc:/nxus/scan_base.bin` + RAM hybrid) and the PC (`pcscan.rs`).
   - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
   - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `341k` hits for `u8`, `307k` for `u16`, `256k` for `u32`).
-- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.33 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.33 MiB` in total, inside the Switch `System` pool partition.
+- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.40 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.40 MiB` in total, inside the Switch `System` pool partition.
 - **Incomplete results are never silent**: three independent limits can cut a result
   short, and each one is reported instead of being presented as complete —
   - hit list full → `NxusHitBatchHeader.reserved & NXUS_HITBATCH_TRUNCATED` on every
@@ -305,7 +305,7 @@ Nxus-ox/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
     tests/    Cross-language protocol parity & end-to-end test suite (121 tests)
-  tests/      Host C unit test suite (1,633 checks across 8 test binaries)
+  tests/      Host C unit test suite (1,738 checks across 8 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
 
@@ -328,7 +328,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,697 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 40, scantypes 275, hotkey 11, session_view 252, snapshot_owner 202)
+# 1. Host C Core Tests (1,738 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 40, scantypes 275, hotkey 11, session_view 293, snapshot_owner 202)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)

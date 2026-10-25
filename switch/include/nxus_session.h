@@ -247,10 +247,10 @@ const NxusHitList      *nxusSessionHits(void);
  * list from an earlier target (ptrChainOwnerCheck in nxus_server.c); the hit list
  * records its owner and is checked the same way:
  *
- *   - nxusSessionScanBegin() stamps {pid, program_id, session_id} when it arms a
- *     list, after refreshing the identity and taking the mapping snapshot, so the
- *     stamp describes the same read of the target.  The stamp also carries the
- *     MAPPING-TABLE GENERATION the scan published (see
+ *   - nxusSessionScanBegin() stamps {pid, program_id, session_id, dmnt target
+ *     incarnation} when it arms a list, after refreshing the identity and taking the
+ *     mapping snapshot, so the stamp describes the same read of the target.  The stamp
+ *     also carries the MAPPING-TABLE GENERATION the scan published (see
  *     nxusSessionMappingGeneration()); a re-snapshot replaces the table, and a
  *     mapping_idx is an ordinal into that table, so the same target can still hand
  *     back indices that now name different regions,
@@ -269,6 +269,13 @@ const NxusHitList      *nxusSessionHits(void);
  *     (re-pointing its stamp at the new generation), so a refine keeps working.  A
  *     different target still discards, and so does a rebuild after which no single
  *     hit survives,
+ *   - the dmnt target INCARNATION (nxusDmntTargetIncarnation, nxus_dmntcht.h) is the
+ *     one token that still separates a relaunch in a fixed layout from the process
+ *     the list came from: a title restarted in place keeps its pid, its program id
+ *     and its mappings, so every recorded address resolves - against a new process.
+ *     An incarnation mismatch is therefore a mismatch, and the rescue below refuses
+ *     to run across one; the log line names it ("earlier incarnation (was N, now
+ *     M)"),
  *   - nxusSessionInvalidateHits() discards hits + mapping snapshot.
  *
  * Detection is the server's job: fillStatus() and sendHits(), plus ScanNext() inside
@@ -300,7 +307,11 @@ bool nxusSessionHitsMatchTarget(void);
  *      before the recorded ones: the addresses survive, the indices are repaired,
  *   3. a hit is resolvable only inside a mapping with read permission, a non-zero
  *      size and base <= address < base + size.  A reused base whose size shrank, a
- *      mapping turned read-only and a vanished mapping are all unresolvable,
+ *      mapping turned read-only and a vanished mapping are all unresolvable.  The
+ *      whole VALUE must fit as well (offset + value_size <= size, value_size being
+ *      the list's): offset < size only proves that the FIRST byte is mapped, and a
+ *      value that straddles the mapping end would later be read out of the next
+ *      region,
  *   4. unresolvable hits are DROPPED (the list is compacted in place); the log line
  *      is "hits: %u hit(s) can no longer be resolved - dropped".
  *
@@ -311,9 +322,11 @@ bool nxusSessionHitsMatchTarget(void);
  *              "hits: revalidated %u hit(s) across a mapping rebuild",
  *   - false -> NOT ONE hit survives (all dropped: the table is gone, or none of the
  *              recorded addresses is mapped any more).  The caller discards the list,
- *              so refine/undo answer BAD_STATE.  Also false when a pass is Running, or
- *              the list was never stamped / is already discarded - there is no
- *              consistent list to walk.
+ *              so refine/undo answer BAD_STATE.  Also false when a pass is Running,
+ *              when the list belongs to an EARLIER dmnt target incarnation (the
+ *              process was reopened: not a rebuild, never rescueable), or when the
+ *              list was never stamped / is already discarded - there is no consistent
+ *              list to walk.
  *
  * Callers: nxusSessionHitsMatchTarget() on a generation mismatch (and through it
  * scan refine, undo and the hit readers).  Runs on the connection thread, which is
@@ -321,11 +334,11 @@ bool nxusSessionHitsMatchTarget(void);
  * rewrites. */
 bool nxusSessionHitsRevalidate(void);
 
-/* Identity half of the check above: the same pid / program id / scan-generation
-   comparison, WITHOUT the mapping-table generation.  Meant for the 1 Hz identity
-   tick, which must not act on a re-snapshot: ScanBegin (and the other re-snapshot
-   call sites) publishes the new table before it stamps the hit owner, so for a
-   moment the new generation and the old stamp coexist.  Discarding on that
+/* Identity half of the check above: the same pid / program id / target-incarnation /
+   scan-generation comparison, WITHOUT the mapping-table generation.  Meant for the
+   1 Hz identity tick, which must not act on a re-snapshot: ScanBegin (and the other
+   re-snapshot call sites) publishes the new table before it stamps the hit owner, so
+   for a moment the new generation and the old stamp coexist.  Discarding on that
    transient would drop the table the on-going command is building.  Readers that
    can serve a stored mapping_idx - fillStatus / sendHits / ScanNext - run on the
    connection thread that publishes, so they use the full nxusSessionHitsMatchTarget()

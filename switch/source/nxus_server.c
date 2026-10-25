@@ -397,6 +397,12 @@ static NxusPtrScanStats g_PtrStats;
  * the session's current identity first (ptrChainOwnerCheck()).
  *
  * Identity is (strongest first):
+ *   dmnt target incarnation    - which dmnt cheat process the walk ran in.  This is
+ *                                the only field a relaunch in a FIXED layout changes:
+ *                                the title restarts under the same pid, dmnt walks
+ *                                the same mappings, so the roots and offsets below
+ *                                resolve to plausible-but-wrong addresses in the new
+ *                                process (see nxusDmntTargetIncarnation).
  *   pid + program id            - what dmnt reports for the cheat process; both
  *                                 change when another title is launched.
  *   session id + target address - the fallback when dmnt had no metadata (no
@@ -406,6 +412,7 @@ static NxusPtrScanStats g_PtrStats;
  */
 typedef struct {
     bool valid;           /* the fields below were stamped for g_Chains       */
+    u32  incarnation;     /* dmnt target generation the walk ran in            */
     u64  pid;             /* process the walk ran in (0 = dmnt had no metadata) */
     u64  program_id;      /* title id of that process (0 = unknown)            */
     u32  session_id;      /* nxusSessionId() at Begin (fallback identity)      */
@@ -2130,6 +2137,12 @@ static void sendChainList(int fd, u32 seq, u16 type) {
  * is worse than refusing it.  Every reader therefore compares the stamp taken at
  * Begin with the session's current identity before handing chains out.
  *
+ * The identity includes the dmnt target INCARNATION, and that comparison comes first:
+ * pid + title cannot see a title that was restarted in a fixed layout - same pid,
+ * same mappings, so the exported roots still resolve, just in another process.  A
+ * bumped incarnation (nxusDmntTargetIncarnation) is therefore a different target on
+ * its own, whatever the pid says.
+ *
  * Callers run on the connection thread and have already refused BUSY while the
  * worker owns g_Chains (CheatExport checks that at its top, PtrScanGet by state),
  * so the plain reads/writes below cannot race with ptrScanPublish().
@@ -2152,16 +2165,31 @@ static Result ptrChainOwnerCheck(void) {
 
     const u64 now_pid = nxusSessionProcessId();
     const u64 now_title = nxusSessionProgramId();
-    bool same;
+    const u32 now_incarnation = nxusDmntTargetIncarnation();
+
+    /* The strongest token first: dmnt opened another cheat process after this list
+       was found.  pid/title below can be IDENTICAL in that case (a restart in a fixed
+       layout), and the roots still resolve against the new mapping table, so this is
+       the only check that catches it.  Compare it unconditionally - including in the
+       no-pid fallback, where the session generation alone would not notice a restart
+       of the same title. */
+    bool same = true;
+    if (g_ChainOwner.incarnation != now_incarnation) {
+        NXUS_LOG("ptrscan: chain list belongs to an earlier incarnation "
+                 "(was %u, now %u) - discarding",
+                 (unsigned)g_ChainOwner.incarnation, (unsigned)now_incarnation);
+        same = false;
+    }
+
     if (g_ChainOwner.pid != 0) {
         /* Both sides know a pid, so that is the identity.  A program id that is 0
            on either side (dmnt metadata unavailable at Begin or at an explicit
            attach) is treated as unknown, not as a mismatch: refusing a list that
            cannot be proven stale would break scan-then-attach flows. */
-        same = (g_ChainOwner.pid == now_pid) &&
-               (g_ChainOwner.program_id == 0 || now_title == 0 ||
-                g_ChainOwner.program_id == now_title);
-        if (!same) {
+        const bool identity_same = (g_ChainOwner.pid == now_pid) &&
+                                   (g_ChainOwner.program_id == 0 || now_title == 0 ||
+                                    g_ChainOwner.program_id == now_title);
+        if (!identity_same) {
             NXUS_LOG("ptrscan: chain list belongs to an earlier target "
                      "(saved pid=%llu, current pid=%llu) - discarding",
                      (unsigned long long)g_ChainOwner.pid, (unsigned long long)now_pid);
@@ -2172,16 +2200,17 @@ static Result ptrChainOwnerCheck(void) {
                          (unsigned long long)g_ChainOwner.program_id,
                          (unsigned long long)now_title);
             }
+            same = false;
         }
     } else {
         /* No pid when the walk ran, so dmnt had no metadata: the scan generation is
            the only per-target token the session publishes (nxusSessionId() changes
            on every ScanBegin/Reset). */
-        same = (g_ChainOwner.session_id == nxusSessionId());
-        if (!same) {
+        if (g_ChainOwner.session_id != nxusSessionId()) {
             NXUS_LOG("ptrscan: chain list belongs to an earlier scan generation "
                      "(saved session=%u, current session=%u) - discarding",
                      (unsigned)g_ChainOwner.session_id, (unsigned)nxusSessionId());
+            same = false;
         }
     }
     if (same) return 0;
@@ -2396,13 +2425,15 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
         NxusChainOwner owner;
         memset(&owner, 0, sizeof(owner));
         owner.valid = true;
+        owner.incarnation = nxusDmntTargetIncarnation();
         owner.pid = nxusSessionProcessId();
         owner.program_id = nxusSessionProgramId();
         owner.session_id = nxusSessionId();
         owner.target_address = req.target_address;
         g_PtrJob.owner = owner;
-        NXUS_LOG_DEBUG("ptrscan: stamping the chain list with pid=%llu title=%016llX "
-                       "session=%u target=%08llX",
+        NXUS_LOG_DEBUG("ptrscan: stamping the chain list with incarnation=%u pid=%llu "
+                       "title=%016llX session=%u target=%08llX",
+                       (unsigned)owner.incarnation,
                        (unsigned long long)owner.pid,
                        (unsigned long long)owner.program_id,
                        (unsigned)owner.session_id,

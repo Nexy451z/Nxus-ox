@@ -148,7 +148,7 @@ int main(void) {
     printf("[test] hit list cap = HIT_BUDGET / (8 B address + value_size)\n");
     const u32 widths[4] = { 1u, 2u, 4u, 8u };
     for (u32 i = 0; i < 4; i++) {
-        const u64 row = 8u + widths[i];
+        const u64 row = sizeof(NxusHitAddress) + widths[i];   /* the hit record is 16 B now */
         const u64 cap = (u64)HIT_BUDGET_BYTES / row;
         CHECK(cap * row <= (u64)HIT_BUDGET_BYTES,
               "u%u: %llu hits * %llu B overflows the hit budget",

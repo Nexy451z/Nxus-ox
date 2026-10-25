@@ -30,6 +30,12 @@ static volatile bool g_AutoReopen = true;
    worker exists before nxusDmntInitialize() anyway. */
 static atomic_bool g_ForceOpenBusy;
 
+/* How many times dmnt has opened a NEW cheat process (see the accessor's comment in
+   the header).  Bumped only where a process was actually opened, and published with
+   a release store so a reader that sees the new value also sees the process behind
+   it.  Zero-initialised: "nothing opened yet". */
+static atomic_uint g_TargetIncarnation;
+
 void nxusDmntSetAutoReopen(bool enabled) {
     g_AutoReopen = enabled;
 }
@@ -82,6 +88,37 @@ void nxusDmntExit(void) {
 
 bool nxusDmntIsActive(void) {
     return g_DmntActive;
+}
+
+/* ---- target incarnation -------------------------------------------------
+ *
+ * Counts the dmnt cheat processes this console has OPENED, and nothing else.
+ *
+ * "Same pid, same title, same layout" is the case identity cannot catch: a title
+ * restarted in place is a NEW process, yet dmnt reports the same pid and walks the
+ * same mappings, so every stored address still resolves - to the new target.  The
+ * absolute-address rescue makes that worse, because it no longer even fails: it
+ * re-resolves the old hits against a table that looks identical.
+ *
+ * The rule is therefore "a new open is a new target": the counter is bumped exactly
+ * where dmnt goes from holding no cheat process to holding one.  It must NOT move
+ * for a ForceOpen against the process that is already open - callers re-assert
+ * ownership routinely (the 1 Hz identity tick's repair path, a re-attach on a title
+ * that never stopped), and every one of those would otherwise invalidate the results
+ * that are still perfectly good.
+ */
+u32 nxusDmntTargetIncarnation(void) {
+    return (u32)atomic_load_explicit(&g_TargetIncarnation, memory_order_acquire);
+}
+
+/* One new cheat process was opened: publish the next incarnation (release, so a
+   reader that observes N also observes the process N describes).  Returned value is
+   the counter AFTER the bump, which is what the log line (and the tests) expect. */
+static u32 dmntTargetOpened(void) {
+    const u32 now = (u32)atomic_fetch_add_explicit(&g_TargetIncarnation, 1u,
+                                                   memory_order_release) + 1u;
+    NXUS_LOG("dmnt: target incarnation %u", (unsigned)now);
+    return now;
 }
 
 /* ---- automatic cheat-process recovery ---------------------------------- */
@@ -285,11 +322,32 @@ Result nxusDmntPeekMetadata(NxusProcessMetadata *out) {
     return opGetMetadata(out);
 }
 
+/* Explicit open.  The only place that can create a target incarnation besides the
+   repair retry in dmntRunCommand (which goes through here).
+ *
+ * "Did this really open something?" is answered by 65000 HasCheatProcess, a pure
+ * query: when dmnt already holds a cheat process, ForceOpen is a no-op for it and
+ * the incarnation must stay where it is.  The probe and the ForceOpen run in the
+ * SAME critical section, so the answer describes the state the open acts on and a
+ * second ForceOpen cannot slip in between (the repair path is additionally
+ * serialised by g_ForceOpenBusy, but the server's ForceOpen handler and the debug
+ * session's restore call this directly).
+ *
+ * A failed probe leaves the question open; a successful explicit open is then
+ * counted as an open.  That is the safe direction: a needless incarnation bump only
+ * loses a stored hit list, while a missed one lets the previous process's addresses
+ * be served against the new one. */
 Result nxusDmntForceOpen(void) {
     if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
     dmntLock();
+    bool already_open = false;
+    const Result probe_rc = serviceDispatchOut(&g_DmntSrv, 65000, already_open);
     Result rc = serviceDispatch(&g_DmntSrv, 65003);
     dmntUnlock();
+
+    if (R_SUCCEEDED(rc) && (R_FAILED(probe_rc) || !already_open)) {
+        (void)dmntTargetOpened();
+    }
     return rc;
 }
 

@@ -74,6 +74,27 @@ Result nxusDmntGetMetadata(NxusProcessMetadata *out);
 Result nxusDmntPeekMetadata(NxusProcessMetadata *out);
 Result nxusDmntForceOpen(void);
 Result nxusDmntForceClose(void);
+
+/* Generation of the dmnt cheat process this console has seen: how many times dmnt
+ * has OPENED a new cheat process since boot (0 = it never opened one).
+ *
+ * pid / program_id cannot answer "is this the same process?" on their own.  A title
+ * restarted with a fixed layout comes back under the SAME pid, and dmnt hands back
+ * the same mappings, so every stored address still resolves - against a different
+ * process.  With the absolute-address rescue (nxusSessionHitsRevalidate) that is no
+ * longer even detectably "stale": the addresses are simply valid for the new target.
+ * This counter is the missing token: it changes exactly when dmnt takes on a new
+ * process, so a hit list / chain list stamped with an older value is refused.
+ *
+ * It is bumped ONLY by a successful EXPLICIT open of a process dmnt did not already
+ * hold (nxusDmntForceOpen(), including the repair retry inside dmntRunCommand).  A
+ * ForceOpen against the process that is already open is a no-op and must NOT change
+ * the value: every caller that re-asserts "dmnt should own it" would otherwise
+ * invalidate the results it is about to use.
+ *
+ * Reads are acquire loads, bumps release => a reader that observes the new value
+ * also observes the process it describes.  Logged as "dmnt: target incarnation N". */
+u32    nxusDmntTargetIncarnation(void);
 /* Pause/Resume the cheat process through dmnt itself.  These are the real
    commands (65004/65005): Atmosphère implements them as svc::BreakDebugProcess /
    svc::ContinueDebugProcess on the debug handle dmnt already owns.  The title
