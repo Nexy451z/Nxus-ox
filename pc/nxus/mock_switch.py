@@ -1286,8 +1286,20 @@ class MockSwitch:
     def _read_target(self, address: int, size: int):
         return self.target.read(address, size)
 
+    def _note_walk_width(self, payload: bytes) -> None:
+        """Mirror the console: value_width 0 means "infer", 4/8 is explicit."""
+        if len(payload) < P.PTRSCAN_REQUEST.size:
+            return
+        requested = P.PTRSCAN_REQUEST.unpack_from(payload, 0)[5]
+        if requested in (4, 8):
+            self.ptr_scan_width = requested
+        else:
+            # the mock's main module sits below 4 GiB, so inference yields 32-bit
+            self.ptr_scan_width = 4
+
     def _ptr_scan(self, payload: bytes):
         """Synchronous shape: walk and publish inside the command."""
+        self._note_walk_width(payload)
         chains, truncated = self._walk_chains(payload)
         self.chains = chains
         self.ptr_truncated = truncated
@@ -1299,6 +1311,7 @@ class MockSwitch:
         return self._chain_list()
 
     def _ptr_scan_start(self, payload: bytes):
+        self._note_walk_width(payload)
         """Asynchronous shape: accept the walk, let PtrScanGet carry the list.
 
         PtrScanBegin answers NXUS_ERR_PTRSCAN_STARTED instead of the chain list
