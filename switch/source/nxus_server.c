@@ -594,6 +594,8 @@ static void onHotkeyFired(void *user) {
 
 /* Defined with the pointer scan worker, further down. */
 static void ptrScanInit(void);
+/* Defined with the terminal shutdown (next to g_ServerExited), further down. */
+static void serverExitGateReset(void);
 
 void nxusServerInit(void) {
     memset(&g_Config, 0, sizeof(g_Config));
@@ -623,6 +625,12 @@ void nxusServerInit(void) {
 
     /* Pointer scan worker state (defined with the worker, further down). */
     ptrScanInit();
+
+    /* Re-arm the terminal gate.  nxusServerExit() sets it for good, so a re-Init
+       after an Exit (the test harness boots the server twice in one process) would
+       otherwise start with every command and every tick refused by the flag the
+       previous round left behind.  This is the only place the gate is cleared. */
+    serverExitGateReset();
 }
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -1291,12 +1299,40 @@ static bool        g_PtrThreadLive;
    and the shutdown runs concurrently with the connection thread, so the right to touch
    the slot is claimed atomically here instead of being decided by g_PtrThreadLive. */
 static atomic_bool g_PtrThreadReaping;
-/* Set by nxusServerExit() (the claim is also its idempotency guard): no new pointer
-   scan may start after that point, or a worker created during the shutdown would
-   outlive the session and the debug handle it reads - the very leak the exit path
-   exists to close.  Atomic because handlePtrScanBegin() on the connection thread
-   re-checks it under the slot claim. */
+/* The terminal gate.  Set by nxusServerExit() (the compare-exchange is also its
+   idempotency guard) and cleared only by nxusServerInit(), through
+   serverExitGateReset() below.
+
+   Everything that a handler or the tick could touch - the pointer-scan worker and
+   its Thread slot, the scan worker, the session, the mapping/region views and the
+   debug handle - is released by the exit path, in that order, and a new one must
+   never be created behind it.  The flag therefore guards three readers, all of them
+   on threads that outlive nxusServerExit():
+     - nxusServerHandle()  (connection thread): the first check in the dispatcher,
+       so no handler runs and no worker is created after the exit started;
+     - nxusServerTick()    (main thread): makes the tick after Exit a no-op instead
+       of letting it re-publish session state (frozen release, watchdog resume,
+       stale-session reapers, the pointer-scan deadman);
+     - handlePtrScanBegin()/nxusServerExit(): re-checked UNDER the pointer-scan
+       Thread-slot claim, which is what makes the shutdown's cancel/join final.
+
+   Atomic because the connection thread, the main thread and the exit path read and
+   write it concurrently (the two gate checks are acquire loads, the set and the
+   re-arm are release stores / acq_rel RMW).  The zero-initialised static is the
+   boot state: false, i.e. "running". */
 static atomic_bool g_ServerExited;
+
+/* Put the gate back to "running".  Only nxusServerInit() calls this: the flag is
+   terminal for one server lifetime - nxusServerExit() must never be followed by a
+   handler that brings state back - but a second Init in the same process (the test
+   harness boots the server, exits it and boots it again) has to start unrefused,
+   or every command and every tick of the second round would hit the first round's
+   gate.  Init runs before the listener exists and after the previous Exit joined
+   every worker, so this store cannot race a reader. */
+static void serverExitGateReset(void) {
+    atomic_store_explicit(&g_ServerExited, false, memory_order_release);
+}
+
 /* How long nxusServerExit() is willing to wait for the worker Thread slot, and the
    granularity it re-issues the sticky cancel at.  The slot is only ever held across
    a handful of kernel calls (threadCreate/threadStart in handlePtrScanBegin, one join
@@ -2145,6 +2181,45 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
     const u16 type = header->type;
     const u32 seq = header->seq;
     Result rc = 0;
+
+    /* Terminal gate, first statement for a reason: nxusServerExit() runs while this
+       thread is still serving - the network is only shut down afterwards (main.c
+       step 4) - so a client that keeps polling, or that reconnects during the
+       teardown, reaches the dispatcher with the session, the mapping/region views
+       and the pointer-scan Thread slot already released.  Every handler below reads
+       at least one of them, so nothing may run after the gate: it sits before the
+       heartbeat and before g_CommandActive, which also keeps the watchdog from
+       treating the refusal as a long handler.
+
+       The answer is BAD_STATE with the BUSY reason - the same refusal PtrScanBegin
+       hands out for the same situation - because nothing will clear the flag until
+       the next Init: "the console is going away, reconnect" rather than "your
+       request was malformed".
+
+       Nop is the only command that stays served.  It carries no payload, touches no
+       session/worker state and is the protocol's "are you still there?" probe, so
+       answering it keeps a client's poll from turning into an error reply per
+       packet during the teardown.  Nothing else qualifies: the protocol has no
+       Shutdown command (the PC stops the sysmodule itself), and Heartbeat writes the
+       session's idle clock - it is refused like the rest, which is also how the PC
+       learns that the console is gone. */
+    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
+        if (type == NxusCmd_Nop) {
+            reply(fd, type, seq, NULL, 0);
+        } else {
+            /* Once per process: a client that keeps polling would otherwise fill the
+               log ring with one line per packet while the console is going down. */
+            static bool gate_logged;
+            if (!gate_logged) {
+                gate_logged = true;
+                NXUS_LOG("command 0x%04X arrived after nxusServerExit - refusing "
+                         "(BAD_STATE, everything but Nop is gated)", (unsigned)type);
+            }
+            replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                             NXUS_REASON_BUSY_STATE);
+        }
+        return;
+    }
 
     /* Any traffic counts as "the PC is still here": without this the pause
        watchdog would resume the target during a long scan or a hex-edit session,
@@ -3412,6 +3487,13 @@ static void reapExitedDebugSession(void) {
 #define NXUS_SCAN_ABANDON_AFTER_MS 60000ull
 
 void nxusServerTick(void) {
+    /* Terminal gate, the tick's half of the one in nxusServerHandle().  After
+       nxusServerExit() the session, the views and the pointer-scan slot are gone, so
+       everything below would either read released state or re-create what the exit
+       path just tore down (frozen release, the watchdog resume, both session reapers,
+       the pointer-scan deadman).  __appExit() does not tick again, but a re-Init
+       sequence does - "the tick after Exit" must be a no-op, not a resurrection. */
+    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) return;
     {
         static u64 last_client_ms;
         const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;

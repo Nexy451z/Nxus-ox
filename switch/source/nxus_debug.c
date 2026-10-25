@@ -49,7 +49,15 @@ static bool   g_EventMutexReady;
 /* True while nxusDebugAttach()/Detach() is handing the process between dmnt and
    our own debug session.  dmnt's auto-reopen must not run in that window (it
    would take the process back and make svcDebugActiveProcess fail), and the
-   session identity refresh must not call into dmnt either (it would reopen it). */
+   session identity refresh must not call into dmnt either (it would reopen it).
+ *
+ * This is a PUBLISHED SIGNAL for readers outside this file, not a lock: nothing
+ * gates entry on it, and it is written only by the thread that holds the teardown
+ * claim (g_TeardownOwner below).  The mutual exclusion between attach and detach is
+ * the claim - keeping a second "busy" lock here would mean two locks with different
+ * holders, which is how a handler ends up waiting for a flag that its own claim
+ * holder is supposed to clear.  Order: the claim holder sets this true after
+ * claiming and clears it before releasing the claim. */
 static atomic_bool g_HandoffBusy;
 /* The scan worker reads/writes through g_Debug while the command thread may be
    detaching.  svcCloseHandle() frees the handle slot, and the kernel reuses it for
@@ -119,6 +127,96 @@ static bool debugDrainWait(u32 budget_ms) {
         svcSleepThread(1000000ull);
     }
     return atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0;
+}
+
+/* ---- teardown claim ------------------------------------------------------
+ *
+ * A debug session's teardown is NOT idempotent: svcCloseHandle() frees the handle
+ * number, threadClose() frees the event thread object, the register wipe and the
+ * dmnt ForceOpen act on state the second caller would find already released.  Two
+ * detaches used to be able to run side by side, because nxusDebugDetach() had no
+ * exclusion of its own: the server-side pause claim (g_PauseBusy in nxus_server.c)
+ * only covers SOME pairs of callers, while nxusDebugExit() (the shutdown path) and
+ * the abort path inside nxusDebugAttach() reach the teardown without it - and a
+ * detach that raced an attach could close the handle the attach was publishing.
+ * svcCloseHandle()/threadClose() could therefore run twice, and the second close
+ * then names whatever object the kernel handed the recycled handle to.
+ *
+ * g_TeardownOwner is that exclusion: 0 means "nobody owns the session hand-off",
+ * any other value is the Thread handle of the one thread that does.  It is taken by
+ * nxusDebugDetach(), nxusDebugAttach() and the abort path inside nxusDebugAttach(),
+ * i.e. by every path that closes the handle or starts/joins the event thread, so
+ * exactly ONE claim holder performs the teardown and no attach can begin while a
+ * detach is taking the session apart (or the other way round).
+ *
+ * Re-entrancy: nxusDebugAttach() calls nxusDebugDetach() on its pid-mismatch path
+ * while it already holds the claim.  Blocking there would self-deadlock, and letting
+ * the nested detach release the claim would expose a half-finished attach to another
+ * hand-off, so the claim is counted: g_TeardownDepth belongs to the owner thread and
+ * the claim is only freed when the OUTERMOST holder releases it. */
+static atomic_ullong g_TeardownOwner;   /* 0 = free, else the owning Thread handle */
+static atomic_uint   g_TeardownDepth;   /* re-entry depth of g_TeardownOwner        */
+
+/* How long a second detach waits for the current claim holder.  Same budget as the
+ * staged handle drain (NXUS_DEBUG_OP_DRAIN_TOTAL_MS = 2 s): a healthy teardown is
+ * far shorter, and a holder still busy after that is wedged rather than slow. */
+#define NXUS_DEBUG_CLAIM_WAIT_MS NXUS_DEBUG_OP_DRAIN_TOTAL_MS
+
+static Result debugDetachExclusive(bool wait_for_claim);
+
+static bool debugTeardownClaim(void) {
+    const unsigned long long me = (unsigned long long)CUR_THREAD_HANDLE;
+    unsigned long long expected = 0;
+    /* Success: nobody owned it.  On failure compare_exchange_strong() wrote the
+       current owner into `expected`, which is how the re-entrant call recognises
+       that it is the owner itself and not a second hand-off. */
+    if (atomic_compare_exchange_strong(&g_TeardownOwner, &expected, me)) {
+        atomic_store_explicit(&g_TeardownDepth, 1u, memory_order_relaxed);
+        return true;
+    }
+    if (expected == me) {
+        atomic_fetch_add_explicit(&g_TeardownDepth, 1u, memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+static void debugTeardownRelease(void) {
+    /* Only the owner may release; a caller that never claimed must not free a claim
+       somebody else holds. */
+    if (atomic_load_explicit(&g_TeardownOwner, memory_order_relaxed) !=
+        (unsigned long long)CUR_THREAD_HANDLE) {
+        return;
+    }
+    /* An unbalanced release would wrap the depth (and then never free the claim), so
+       an uncounted release is ignored instead of corrupting it. */
+    if (atomic_load_explicit(&g_TeardownDepth, memory_order_relaxed) == 0u) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&g_TeardownDepth, 1u, memory_order_acq_rel) > 1u) {
+        return;   /* a nested claim of this thread is still open */
+    }
+    /* Outermost release: zero the depth BEFORE publishing "free", so the thread that
+       wins the claim next can never observe this thread's leftover depth. */
+    atomic_store_explicit(&g_TeardownDepth, 0u, memory_order_relaxed);
+    atomic_store_explicit(&g_TeardownOwner, 0ull, memory_order_release);
+}
+
+/* Bounded wait for the claim holder to finish.  The waiter never takes the claim
+   over here - the caller decides what to do once the session is quiet again (see
+   debugDetachExclusive()).  A short spin first (a teardown that is already a few
+   instructions from its release does not deserve a sleep), then 1 ms steps, the
+   same shape as debugDrainWait().  True as soon as the claim is free - also on the
+   very last step, so a holder that releases just in time is not reported busy. */
+static bool debugTeardownWaitIdle(u32 budget_ms) {
+    for (u32 spin = 0; spin < 64u; spin++) {
+        if (atomic_load_explicit(&g_TeardownOwner, memory_order_acquire) == 0ull) return true;
+    }
+    for (u32 waited = 0; waited < budget_ms; waited++) {
+        if (atomic_load_explicit(&g_TeardownOwner, memory_order_acquire) == 0ull) return true;
+        svcSleepThread(1000000ull);
+    }
+    return atomic_load_explicit(&g_TeardownOwner, memory_order_acquire) == 0ull;
 }
 
 /* Why the current stop exists.  The event loop uses it to tell an explicit
@@ -1072,6 +1170,9 @@ void nxusDebugInit(void) {
     }
     atomic_init(&g_ExitSeen, false);
     atomic_init(&g_HandoffBusy, false);
+    /* No hand-off owns the session yet (see g_TeardownOwner). */
+    atomic_init(&g_TeardownOwner, 0ull);
+    atomic_init(&g_TeardownDepth, 0u);
     atomic_init(&g_DebugOpUsers, 0);
     atomic_init(&g_DebugClosing, false);
     atomic_init(&g_Stopped, false);
@@ -1085,7 +1186,12 @@ void nxusDebugInit(void) {
 }
 
 void nxusDebugExit(void) {
-    nxusDebugDetach();
+    /* Shutdown path: the process is going away, so there is nothing to wait for.
+       If another thread still owns the claim, the session is already being torn down
+       by it and this call must not touch the handle (a second close would name a
+       recycled handle) - it only logs and returns.  Every other caller goes through
+       nxusDebugDetach(), which waits for the claim first. */
+    (void)debugDetachExclusive(false);
 }
 
 bool nxusDebugIsAttached(void) { return g_Attached; }
@@ -1171,6 +1277,15 @@ bool nxusDmntHandoffBlocked(void) {
  * The session state around it (g_Attached, the break/thread tables, the stop state,
  * dmnt's auto-reopen) stays the CALLER's job: this helper only guarantees that no
  * counted operation and no unacknowledged debug event can survive the close.
+ *
+ * EXCLUSION: this is called ONLY by the thread that holds the teardown claim
+ * (g_TeardownOwner, taken at the top of nxusDebugAttach()/debugDetachExclusive()).
+ * The claim is what makes the svcCloseHandle() below run exactly once: a second
+ * detach never reaches this function (it waits for the claim and then either finds a
+ * session that is already gone - the no-op path in debugDetachExclusive() - or takes
+ * the claim itself, after which it is the one allowed to close).  Do not call this
+ * from anywhere that does not hold the claim; that is precisely the double-close this
+ * helper used to make possible.
  */
 static void debugReleaseHandleDrained(void) {
     const Handle handle = g_Debug;
@@ -1233,13 +1348,34 @@ static void debugReleaseHandleDrained(void) {
 }
 
 Result nxusDebugAttach(u64 pid) {
-    if (g_Attached) return 0;
-    if (pid == 0) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+    /* The hand-off claim (see g_TeardownOwner) is the exclusion between an attach
+       and a detach.  It replaces the bare g_Attached check as the gate: g_Attached is
+       cleared in the MIDDLE of a detach, so checking only that could start a new
+       session while the old handle was still being drained and closed, overwriting
+       g_Debug/g_EventThread underneath the teardown.  A held claim answers BUSY
+       (never a blocking wait): the PC asked for a session while another hand-off owns
+       the console, and a retry a moment later succeeds. */
+    if (!debugTeardownClaim()) {
+        NXUS_LOG("debug attach: a detach/attach hand-off (thread 0x%llX) still owns the "
+                 "session - not starting a second one",
+                 (unsigned long long)atomic_load_explicit(&g_TeardownOwner,
+                                                          memory_order_relaxed));
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    if (g_Attached) {
+        debugTeardownRelease();
+        return 0;
+    }
+    if (pid == 0) {
+        debugTeardownRelease();
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+    }
     /* A session whose debugee exited is collected by nxusServerTick() (the event
        thread cannot join itself).  Starting a second session before that would
        overwrite g_EventThread/g_Debug and leak both. */
     if (g_EventThreadLive || atomic_load_explicit(&g_ExitSeen, memory_order_relaxed)) {
         NXUS_LOG("debug attach: the previous session is still being released");
+        debugTeardownRelease();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
 
@@ -1287,6 +1423,7 @@ Result nxusDebugAttach(u64 pid) {
         nxusDmntForceOpen();
         nxusDmntSetAutoReopen(true);
         atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
+        debugTeardownRelease();
         return rc;
     }
 
@@ -1370,9 +1507,14 @@ Result nxusDebugAttach(u64 pid) {
                session has been handed to the PC yet, but the ContextID breakpoint
                is already armed and dmnt's cheat process is closed, so the abort has
                to clear the slots, close the handle (which resumes the target) and
-               ForceOpen dmnt again.  Detach also leaves g_HandoffBusy clear. */
+               ForceOpen dmnt again.  This attach holds the teardown claim, so the
+               nested detach re-enters it instead of waiting for itself (see
+               g_TeardownDepth); it clears g_HandoffBusy as usual.  The claim stays
+               with this attach until it returns, so no other hand-off can start in
+               the middle of the abort. */
             nxusDebugDetach();
             g_LastResult = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+            debugTeardownRelease();
             return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
         }
     }
@@ -1430,17 +1572,78 @@ Result nxusDebugAttach(u64 pid) {
         nxusDmntForceOpen();
         nxusDmntSetAutoReopen(true);
         atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
+        debugTeardownRelease();
         return rc;
     }
     g_EventThreadLive = true;
     threadStart(&g_EventThread);
     atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
+    /* The session is up and published: release the hand-off claim so a detach (or
+       the next attach after this one ends) can take it.  Released last, after the
+       hand-off signal is cleared. */
+    debugTeardownRelease();
     NXUS_LOG("debug mode active (pid=%llu, watch style=%u)", (unsigned long long)pid,
              (unsigned)g_Config.style);
     return 0;
 }
 
-Result nxusDebugDetach(void) {
+/* The one teardown, reachable only through the claim.  wait_for_claim is false for
+   the shutdown path (nxusDebugExit()): the process is going away, so it must never
+   block and never touch a handle another thread is closing.
+ *
+ * EXCLUSION: everything below - the thread join, the register wipe, the staged
+ * handle drain and the svcCloseHandle() inside it - runs for exactly one claim
+ * holder.  A concurrent detach does NOT run it a second time: it waits for the claim
+ * (bounded by NXUS_DEBUG_CLAIM_WAIT_MS, the same 2 s budget as the handle drain) and
+ * then either finds the session already gone (the no-op path below) or takes the
+ * claim itself and finishes what the other hand-off left.  A concurrent ATTACH is
+ * refused with BUSY for the whole claim (see nxusDebugAttach), so an attach can
+ * never publish g_Debug/g_EventThread underneath this function. */
+static Result debugDetachExclusive(bool wait_for_claim) {
+    if (!debugTeardownClaim()) {
+        const unsigned long long owner =
+            (unsigned long long)atomic_load_explicit(&g_TeardownOwner,
+                                                     memory_order_relaxed);
+        if (!wait_for_claim) {
+            /* Exit path: the other thread is already tearing the session down and
+               the console is shutting down.  Waiting would only delay the restart,
+               and doing any part of the teardown here would close/threadClose a
+               second time - which is exactly the double release this claim exists to
+               prevent.  Log and leave the work to the owner. */
+            NXUS_LOG("debug exit: teardown already owned by thread 0x%llX - "
+                     "not waiting on the exit path", owner);
+            return 0;
+        }
+        NXUS_LOG("debug detach: teardown already owned by thread 0x%llX - "
+                 "waiting up to %u ms for it to finish",
+                 owner, (unsigned)NXUS_DEBUG_CLAIM_WAIT_MS);
+        if (!debugTeardownWaitIdle(NXUS_DEBUG_CLAIM_WAIT_MS)) {
+            /* Level 0: something is counted here that never came back.  Every state
+               this call would have to touch is owned by that thread, so reporting the
+               session as released is the only honest answer left (the teardown IS in
+               progress, this call simply is not the one performing it). */
+            NXUS_LOG_ERROR("debug detach: teardown still owned by thread 0x%llX after "
+                           "%u ms - leaving the release to it",
+                           (unsigned long long)atomic_load_explicit(&g_TeardownOwner,
+                                                                    memory_order_relaxed),
+                           (unsigned)NXUS_DEBUG_CLAIM_WAIT_MS);
+            return 0;
+        }
+        /* The owner is gone.  Take the claim ourselves instead of just reporting
+           success: the winner may have been an attach, in which case the session is
+           LIVE and this request ("release it") still has to be honoured - reporting
+           "released" while a session is attached is the no-op success this module
+           refuses everywhere else.  When the winner was a detach, the state below is
+           already down and this call takes the documented no-op path. */
+        if (!debugTeardownClaim()) {
+            /* A third hand-off claimed it between the wait and here. */
+            NXUS_LOG("debug detach: another hand-off started meanwhile - leaving the "
+                     "session to it");
+            return 0;
+        }
+        NXUS_LOG("debug detach: the concurrent hand-off finished - completing the release");
+    }
+
     if (!g_Attached && !g_EventThreadLive) {
         atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
         /* Nothing is attached, so nothing is known: keep the two flags consistent
@@ -1449,6 +1652,7 @@ Result nxusDebugDetach(void) {
         atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
         atomic_store_explicit(&g_SessionPid, 0, memory_order_release);
         nxusDmntSetAutoReopen(true);
+        debugTeardownRelease();
         return 0;
     }
 
@@ -1546,7 +1750,17 @@ Result nxusDebugDetach(void) {
     mutexUnlock(&g_Mutex);
     NXUS_LOG("debug: hit ring cleared (attach/detach)");
     NXUS_LOG("debug mode released");
+    /* Last statement of the teardown: from here on another hand-off may take the
+       claim (and find a fully released session / start a new one). */
+    debugTeardownRelease();
     return 0;
+}
+
+Result nxusDebugDetach(void) {
+    /* Every ordinary caller (DebugDetach request, idle reap, exit-session collect,
+       Pause/Resume hand-back) comes through here, so they all share the claim and a
+       second detach waits for the first instead of closing the handle again. */
+    return debugDetachExclusive(true);
 }
 
 void nxusDebugGetStatus(NxusDebugStatus *out) {

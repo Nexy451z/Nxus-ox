@@ -26,9 +26,34 @@
 #define NXUS_DEBUG_MAX_BREAKS 10
 
 void   nxusDebugInit(void);
+/* Shutdown path only.  Never blocks: if another thread is already tearing the
+ * session down, this logs and returns instead of waiting for it - the process is
+ * exiting and the other thread owns every object the teardown touches (closing the
+ * handle a second time would name a recycled handle).  Ordinary detach requests must
+ * use nxusDebugDetach(). */
 void   nxusDebugExit(void);
 
+/* Take the process over with our own kernel debug session.
+ *
+ * Returns NXUS_ERR_BUSY (retryable) while another attach/detach hand-off owns the
+ * session: attach never queues behind a detach, because the caller reports that BUSY
+ * to the PC and a retry a moment later succeeds.  The hand-off is exclusive
+ * (nxus_debug.c: g_TeardownOwner), so an attach can never publish g_Debug / the event
+ * thread underneath a teardown that is still draining and closing the old handle. */
 Result nxusDebugAttach(u64 pid);
+/* Release the session: join the event thread, drain the counted debug operations,
+ * close the debug handle and hand the process back to dmnt.  This is the one
+ * teardown, and it runs EXACTLY ONCE even when several callers ask for it at the same
+ * time (DebugDetach request, idle reap, Pause/Resume hand-back, exit collection):
+ *
+ *   - the caller that takes the hand-off claim performs the teardown;
+ *   - a caller that finds the claim held waits for it - bounded by the same 2 s
+ *     budget as the handle drain, with a short spin and a log line - and then either
+ *     finds the session already released (no-op) or completes the release itself;
+ *   - the shutdown path (nxusDebugExit()) does not wait at all, as documented there.
+ *
+ * Returns 0 once the session is released; a concurrent teardown is reported as
+ * "released" rather than as an error, because that is what the caller asked for. */
 Result nxusDebugDetach(void);
 bool   nxusDebugIsAttached(void);
 void   nxusDebugGetStatus(NxusDebugStatus *out);
@@ -67,6 +92,14 @@ bool   nxusDebugTargetIs64BitKnown(void);
  * nxusDebugHitTotal(), nxusDebugGetConfig(), nxusDebugIsStopped() and friends -
  * which only read in-process state under g_Mutex or an atomic and never touch the
  * handle. */
+/* Hand-off exclusivity: the count above keeps the HANDLE alive while an operation is
+ * in flight; it does not serialise two teardowns.  That is the job of the hand-off
+ * claim in nxus_debug.c (g_TeardownOwner): only its holder may join the event thread,
+ * wipe the slots or call svcCloseHandle(), and attach refuses to start while it is
+ * held.  Every entry point listed above may therefore run concurrently with a detach
+ * (they are refused or drained), but only one detach/attach can be inside the teardown
+ * at any moment.  nxusDebugIsHandoff() reports that hand-off window to readers outside
+ * this module; it is a signal, not a lock. */
 Result nxusDebugSetBreak(const NxusBreakRequest *request);
 Result nxusDebugClearBreak(u32 slot);
 u32    nxusDebugGetBreaks(NxusBreakEntry *out, u32 max_entries);

@@ -265,15 +265,24 @@ void __appInit(void) {
  *                cancel a running scan, then release the session (nxusSessionExit
  *                joins the scan worker and frees the views).  Both workers read the
  *                target through the debug handle and the session, so they must be
- *                gone before either is destroyed.  Before the network as well: the
- *                connection thread is what starts those workers, and once the
- *                session is terminal a handler that is still draining answers
- *                BAD_STATE/Idle instead of touching released memory.
+ *                gone before either is destroyed.  Before the network as well:
+ *                the connection thread is what starts those workers, and this call
+ *                raises the terminal gate (g_ServerExited) that keeps it out of
+ *                everything released here.  From that moment - the socket itself
+ *                lives until step 4 - nxusServerHandle() answers every packet with
+ *                BAD_STATE + NXUS_REASON_BUSY_STATE ("the console is going away")
+ *                instead of running a handler, Nop excepted (the liveness probe,
+ *                which touches no state), and nxusServerTick() returns without
+ *                doing anything, so a client that is still polling, draining or
+ *                reconnecting cannot start a scan/pointer scan/debug session, nor
+ *                re-create what this step just freed.
  *   3. DEBUG   - nxusDebugExit(): join the event thread, close the debug handle,
  *                hand the process back to dmnt (ForceOpen).  Only now, with no
  *                reader left, can the handle be closed at all.  Kept before the
  *                network: a client that is still connected must not be able to
- *                attach/detach or read through the handle while it is closed.
+ *                attach/detach or read through the handle while it is closed - and
+ *                the gate raised in step 2 is already refusing exactly those
+ *                commands.
  *   4. NET     - nxusNetExit(): shut the socket down and join the connection thread.
  *                Before the log, because that thread and every handler log.
  *   5. DMNT    - nxusDmntExit(): close dmnt:cht.  Must follow nxusDebugExit() (a

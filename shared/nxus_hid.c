@@ -178,8 +178,44 @@ static void hidThread(void *arg) {
        g_ThreadOpen. */
 }
 
+/* nxusHidExit()'s bounded wait for nxusHidStart() to publish its thread: ~1 s in
+   50 us slices.  The slice is intentionally much finer than 1 ms - a start
+   publishes within a few hundred microseconds on the normal path, and a 1 ms
+   sleep per iteration turned that into a full millisecond of exit time - and the
+   slice count is logged, so a hardware log shows how long the wait really was and
+   whether a start is stuck inside threadCreate()/threadStart(). */
+#define NXUS_HID_EXIT_SPIN_MAX   20000u
+#define NXUS_HID_EXIT_SPIN_NS    50000ull
+
+/* True when the calling thread IS the HID worker.  The hotkey callback runs on
+   that thread and may call nxusHidExit() from inside it; joining our own Thread
+   (threadWaitForExit) would never return, and threadClose() would destroy the
+   object we are running on.  threadGetSelf() is libnx's "which Thread am I" query
+   (NULL for a thread libnx did not create); the handle comparison is a fallback
+   for a libnx build that hands back a different Thread object for the same
+   thread, and it is only trusted while g_ThreadOpen says the handle is live
+   (threadClose() does not zero g_Thread, and handle numbers can be reused). */
+static bool hidExitIsSelf(void) {
+    if (threadGetSelf() == &g_Thread) return true;
+    if (!atomic_load_explicit(&g_ThreadOpen, memory_order_acquire)) return false;
+    const Handle self = threadGetCurHandle();
+    return self != 0 && self == g_Thread.handle;
+}
+
 void nxusHidExit(void) {
     atomic_store_explicit(&g_Stop, true, memory_order_relaxed);
+
+    /* Self-join guard FIRST, before g_ThreadClosing is claimed: a callback may run
+       this on the worker thread, and there is nothing safe to join or close there.
+       The stop flag above already ends the worker's loop, g_ThreadLive stays set,
+       so a later exit from another thread (or process exit) still reaps the
+       handle. */
+    if (hidExitIsSelf()) {
+        NXUS_LOG_ERROR("hotkey: nxusHidExit() called from the HID worker itself - "
+                       "skipping the join/close (the stop flag ends the loop; the "
+                       "handle is reaped by the next exit or by process exit)");
+        return;
+    }
 
     /* Exactly one exit may join and close g_Thread: the compare-exchange is both
        the teardown lock and the flag that makes a double threadClose() impossible.
@@ -194,10 +230,22 @@ void nxusHidExit(void) {
        make threadWaitForExit() wait on a Thread that was never started (it would
        block for ever).  threadCreate()/threadStart() cannot block on this caller,
        and g_ThreadStarting is cleared only after g_ThreadLive is published, so wait
-       for that claim to settle instead of guessing. */
-    for (u32 spin = 0; spin < 1000u; spin++) {
+       for that claim to settle - in short slices, counting them for the log. */
+    u32 spin = 0;
+    for (; spin < NXUS_HID_EXIT_SPIN_MAX; spin++) {
         if (!atomic_load_explicit(&g_ThreadStarting, memory_order_acquire)) break;
-        svcSleepThread(1000000ull);
+        svcSleepThread(NXUS_HID_EXIT_SPIN_NS);
+    }
+    NXUS_LOG("hotkey: exit waited %u spin slice(s) of %llu us (%llu us) for "
+             "nxusHidStart() to publish its thread",
+             (unsigned)spin, (unsigned long long)(NXUS_HID_EXIT_SPIN_NS / 1000ull),
+             (unsigned long long)((u64)spin * NXUS_HID_EXIT_SPIN_NS / 1000ull));
+    if (spin == NXUS_HID_EXIT_SPIN_MAX) {
+        NXUS_LOG_ERROR("hotkey: nxusHidStart() still owns the create/start section after "
+                       "%u spin slice(s) (~%llu ms) - joining anyway; the section may be "
+                       "stuck in threadCreate()/threadStart()",
+                       (unsigned)spin,
+                       (unsigned long long)((u64)spin * NXUS_HID_EXIT_SPIN_NS / 1000000ull));
     }
 
     /* Reap the handle whenever one is still open, not only while the worker is
