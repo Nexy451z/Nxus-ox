@@ -322,19 +322,24 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
                 report(bool(meta.get('role')) and bool(meta.get('name')),
                        "metadata has name + role")
                 # probe never listens and must never be a boot2 module
+                has_flag = os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag'))
+                # metadata.json must describe the folder as it is; that check holds in
+                # both the normal and the staged (NXUS_STAGE_PROBE=1) layout.
+                report(meta.get('boot2_flag') is has_flag,
+                       f"metadata boot2_flag matches the folder ({str(has_flag).lower()})")
+
                 if folder_tid == PROBE_TID:
                     report(int(meta.get('tcp_port', -1)) == 0,
                            f"probe metadata advertises no TCP port ({meta.get('tcp_port')})")
-                    report(meta.get('boot2_flag') is False, "probe metadata says boot2_flag=false")
-                    report(not os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag')),
-                           "probe folder has NO flags/boot2.flag")
+                    staged = os.environ.get('NXUS_STAGE_PROBE', '') == '1'
+                    if staged:
+                        report(has_flag, "probe folder HAS flags/boot2.flag (staging)")
+                    else:
+                        report(not has_flag, "probe folder has NO flags/boot2.flag")
                 elif folder_tid == TID:
-                    staged_probe = os.environ.get('NXUS_STAGE_PROBE', '') == '1'
-                    report(meta.get('boot2_flag') is True, "main metadata says boot2_flag=true")
-                    has_flag = os.path.isfile(os.path.join(dist_dir, 'flags', 'boot2.flag'))
-                    if staged_probe:
-                        # tools/build.sh with NXUS_STAGE_PROBE=1 deliberately swaps
-                        # which folder boots, so the flag is expected to be absent.
+                    staged = os.environ.get('NXUS_STAGE_PROBE', '') == '1'
+                    if staged:
+                        # NXUS_STAGE_PROBE=1 deliberately swaps which folder boots.
                         report(not has_flag,
                                "main folder has no boot2.flag (NXUS_STAGE_PROBE=1 staging)")
                     else:

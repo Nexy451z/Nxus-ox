@@ -87,6 +87,9 @@ PYEOF
             rm -f "$boot2_flag"
         fi
     fi
+    # Report what actually happened, not the requested default: staging swaps which
+    # folder boots, and metadata.json/README must describe the real folder.
+    if [ -f "$boot2_flag" ]; then boot2=1; else boot2=0; fi
 
     # Identification metadata.
     #

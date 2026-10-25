@@ -96,6 +96,17 @@ bool nxusDmntIsActive(void) {
 /* Upper bound for a mapping count accepted from dmnt (sanity, not protocol). */
 #define NXUS_DMNT_MAX_MAPPINGS 8192ull
 
+/* A hex view over an unmapped page can fail hundreds of times per second, and every
+   NXUS_LOG line is an SD write.  Log the first few, then only every 256th, so a
+   broken range cannot flood the card while the cause stays visible. */
+static u32 g_ReadFailLogs;
+static u32 g_WriteFailLogs;
+
+static bool dmntShouldLogFailure(u32 *counter) {
+    const u32 n = (*counter)++;
+    return n < 4u || (n % 256u) == 0u;
+}
+
 static bool dmntResultIsCheatNotAttached(Result rc) {
     if (R_SUCCEEDED(rc)) return false;
 
@@ -425,8 +436,10 @@ Result nxusDmntRead(u64 address, void *buffer, size_t size) {
        cheat process once and retry before reporting an error to the caller. */
     Result rc = dmntRunCommand(opRead, &ctx, true, "Read");
     if (R_FAILED(rc)) {
-        NXUS_LOG("dmnt: Read(%08llX,%u) rc=0x%08X",
-                 (unsigned long long)address, (unsigned)size, (unsigned)rc);
+        if (dmntShouldLogFailure(&g_ReadFailLogs)) {
+            NXUS_LOG("dmnt: Read(%08llX,%u) rc=0x%08X (repeats suppressed)",
+                     (unsigned long long)address, (unsigned)size, (unsigned)rc);
+        }
     }
     return rc;
 }
@@ -448,8 +461,10 @@ Result nxusDmntWrite(u64 address, const void *buffer, size_t size) {
     DmntWriteCtx ctx = { address, (u64)size, buffer };
     Result rc = dmntRunCommand(opWrite, &ctx, true, "Write");
     if (R_FAILED(rc)) {
-        NXUS_LOG("dmnt: Write(%08llX,%u) rc=0x%08X",
-                 (unsigned long long)address, (unsigned)size, (unsigned)rc);
+        if (dmntShouldLogFailure(&g_WriteFailLogs)) {
+            NXUS_LOG("dmnt: Write(%08llX,%u) rc=0x%08X (repeats suppressed)",
+                     (unsigned long long)address, (unsigned)size, (unsigned)rc);
+        }
     }
     return rc;
 }
