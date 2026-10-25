@@ -42,6 +42,10 @@ class NxusClient:
         self._pending_lock = threading.Lock()
         self.events: queue.Queue = queue.Queue()
         self.last_error: int | None = None
+        # FROZEN_LIST bookkeeping: the addresses the previous reply reported, and
+        # the ones the console dropped since then (see frozen_list_diff()).
+        self._last_frozen: list[int] = []
+        self._released_frozen: list[int] = []
 
     # ---- lifecycle ----
 
@@ -354,12 +358,62 @@ class NxusClient:
 
     # ---- freeze / config ----
 
+    def frozen_list(self) -> list[dict]:
+        """Current frozen entries (`FrozenList`).
+
+        The console answers with a bare `NxusFrozenEntry[]` and the count is
+        implied by the payload length, so an empty payload is a valid "nothing is
+        frozen".  Every reply becomes the baseline for frozen_list_diff().
+        """
+        _, _, body = self.request(P.CMD['FrozenList'])
+        entries = []
+        for i in range(len(body) // P.FROZEN_ENTRY.size):
+            address, value, width, _res = P.FROZEN_ENTRY.unpack_from(body, i * P.FROZEN_ENTRY.size)
+            entries.append(dict(address=address, value=value, width=width))
+        self._record_frozen([entry['address'] for entry in entries])
+        return entries
+
+    def frozen_list_diff(self) -> list[int]:
+        """Addresses that were frozen at the previous frozen_list() and are gone.
+
+        The console releases every address Nxus itself froze once the last client
+        has been gone for ~30 s (`releaseOwnedFrozen()` in
+        switch/source/nxus_server.c) and only writes that to its own log ring / SD
+        file, never on the wire.  This difference is therefore the only material
+        the PC has; an address that appeared is a new freeze, not a release.
+        """
+        return list(self._released_frozen)
+
+    def last_frozen(self) -> list[int]:
+        """Addresses the last frozen_list() reported (empty before the first)."""
+        return list(self._last_frozen)
+
+    def _record_frozen(self, addresses: list[int]) -> None:
+        current = list(addresses)
+        self._released_frozen = sorted({a for a in self._last_frozen if a not in current})
+        self._last_frozen = current
+
+    def _note_frozen_enabled(self, address: int) -> None:
+        """Remember a freeze this client made: it is neither a release nor a
+        missing baseline entry."""
+        self._released_frozen = [a for a in self._released_frozen if a != address]
+        if address not in self._last_frozen:
+            self._last_frozen.append(address)
+
+    def _note_frozen_disabled(self, address: int) -> None:
+        """A freeze this client removed on purpose must not look like the console
+        releasing it."""
+        self._released_frozen = [a for a in self._released_frozen if a != address]
+        self._last_frozen = [a for a in self._last_frozen if a != address]
+
     def frozen_enable(self, address: int, width: int) -> int:
         _, _, body = self.request(P.CMD['FrozenEnable'], P.FROZEN_REQUEST.pack(address, width, 0))
+        self._note_frozen_enabled(address)
         return int.from_bytes(body[:8], 'little')
 
     def frozen_disable(self, address: int):
         self.request(P.CMD['FrozenDisable'], address.to_bytes(8, 'little'))
+        self._note_frozen_disabled(address)
 
     # ---- debug mode ----
 

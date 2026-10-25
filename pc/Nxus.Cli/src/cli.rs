@@ -3,6 +3,7 @@
 //! Same protocol as the GUI; useful for scripting and for quick checks.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::client::{NxusClient, NxusError, ScanSpec};
@@ -52,6 +53,8 @@ memory
                                   convert an NDMP dump into a PointerSearcher-SE EDZN dump
   freeze <address> --width N      server-side freeze (no PC polling)
   unfreeze <address>
+  frozen list                     list the server-side frozen addresses; warns when
+                                  the console released some while the PC was away
 
 scanning
   scan begin <value|text|bytes> [--type VALUE-TYPE] [--cmp SCAN-TYPE] [--scope S]
@@ -377,7 +380,20 @@ fn execute(opts: &Opts) -> Result<()> {
     let client = NxusClient::connect(&opts.host, opts.port)?;
     // One status round trip teaches the client the console's largest read (the
     // scan/chunk paths would otherwise stay at the conservative 64 KB default).
-    let _ = client.status();
+    let initial_status = client.status().ok();
+    // The console releases its frozen addresses on its own once the client has
+    // been gone for a while, and never says so on the wire (see
+    // `FrozenBaseline`).  Seed the client with what the last run saw, so this
+    // run can name the addresses that disappeared.
+    if let Some(status) = &initial_status {
+        if let Some(baseline) = load_frozen_baseline(&opts.host, opts.port) {
+            // Another title id means the remembered addresses belong to a process
+            // that is no longer running: comparing them would invent a release.
+            if baseline.title == status.program_id {
+                client.seed_frozen_baseline(baseline.addresses);
+            }
+        }
+    }
 
     match command {
         "status" => {
@@ -405,6 +421,25 @@ fn execute(opts: &Opts) -> Result<()> {
             }
             if st.heap_total > 0 {
                 println!("heap         : {} / {} bytes used", st.heap_used, st.heap_total);
+            }
+            // An empty frozen list after a reconnect is ambiguous: it can mean
+            // "never froze anything", or that the console released the addresses
+            // itself while the PC was away (>30 s without a client).  The console
+            // only logs that locally, so the comparison with the previous run is
+            // the one hint we can give - and only when it went from some to none.
+            if !st.debug_attached() {
+                if let Ok(entries) = client.frozen_list() {
+                    let released = client.frozen_list_diff();
+                    if entries.is_empty() && !released.is_empty() {
+                        eprintln!("hint: nothing is frozen - the console releases frozen addresses by itself \
+                                   {} s after the client disappears, so they were probably released automatically \
+                                   (freeze them again if they were meant to stay)", FROZEN_RELEASE_AFTER_S);
+                    }
+                    save_frozen_baseline(&opts.host, opts.port, &FrozenBaseline {
+                        title: st.program_id,
+                        addresses: client.frozen_addresses(),
+                    });
+                }
             }
         }
 
@@ -647,12 +682,63 @@ fn execute(opts: &Opts) -> Result<()> {
             let width = opts.num("width").unwrap_or(4);
             let value = client.frozen_enable(address, width as u32)?;
             println!("freezing {:08X} (width {}), current value {}", address, width, value);
+            // Keep the remembered set in step with what this command changed:
+            // unfreezing an address later must not look like a console release.
+            if let Some(status) = &initial_status {
+                let mut baseline = load_frozen_baseline(&opts.host, opts.port)
+                    .filter(|baseline| baseline.title == status.program_id)
+                    .unwrap_or(FrozenBaseline { title: status.program_id, addresses: Vec::new() });
+                if !baseline.addresses.contains(&address) {
+                    baseline.addresses.push(address);
+                }
+                save_frozen_baseline(&opts.host, opts.port, &baseline);
+            }
         }
 
         "unfreeze" => {
             let address = parse_address(&client, opts.positional.get(1).ok_or_else(|| usage("unfreeze <address>"))?)?;
             client.frozen_disable(address)?;
             println!("unfrozen {:08X}", address);
+            if let Some(status) = &initial_status {
+                if let Some(mut baseline) = load_frozen_baseline(&opts.host, opts.port)
+                    .filter(|baseline| baseline.title == status.program_id) {
+                    baseline.addresses.retain(|frozen| *frozen != address);
+                    save_frozen_baseline(&opts.host, opts.port, &baseline);
+                }
+            }
+        }
+
+        "frozen" => {
+            let sub = opts.positional.get(1).map(|s| s.as_str()).unwrap_or("list");
+            if sub != "list" {
+                return Err(usage("frozen list"));
+            }
+            let debug_attached = initial_status.as_ref().map(|st| st.debug_attached()).unwrap_or(false);
+            if debug_attached {
+                // dmnt - and with it the frozen table - is closed while a debug
+                // session is held, so the server answers with an empty list that
+                // says nothing about releases.
+                println!("(the debug session holds dmnt closed: there is no frozen list to read)");
+                return Ok(());
+            }
+            let entries = client.frozen_list()?;
+            let released = client.frozen_list_diff();
+            if !released.is_empty() {
+                eprintln!("warning: the console released {} frozen address(es) (the client was gone for >{} s): {}",
+                          released.len(), FROZEN_RELEASE_AFTER_S, format_address_list(&released));
+            }
+            if entries.is_empty() {
+                println!("(nothing is frozen)");
+            }
+            for entry in &entries {
+                println!("{:08X}  {:>2} byte(s)  value {}", entry.address, entry.width, entry.value);
+            }
+            if let Some(status) = &initial_status {
+                save_frozen_baseline(&opts.host, opts.port, &FrozenBaseline {
+                    title: status.program_id,
+                    addresses: client.frozen_addresses(),
+                });
+            }
         }
 
         "config" => {
@@ -1953,6 +2039,99 @@ fn parse_range_flag(opts: &Opts) -> (u64, u64) {
 
 fn usage(what: &str) -> NxusError {
     NxusError { message: format!("usage: {}", what), result: None }
+}
+
+// ---- remembering the frozen set between CLI runs --------------------------
+
+/// How long a frozen address survives a vanished client on the console
+/// (`NXUS_FROZEN_RELEASE_AFTER_MS` in switch/source/nxus_server.c).
+const FROZEN_RELEASE_AFTER_S: u64 = 30;
+
+/// Version tag of the small per-console state file; a mismatch is ignored rather
+/// than misread.
+const FROZEN_BASELINE_HEADER: &str = "nxus-frozen 1";
+
+/// What the last CLI run saw in `FrozenList`.
+///
+/// The console is the one that releases frozen addresses (`releaseOwnedFrozen()`
+/// runs its tick loop once no client is connected for 30 s) and it only writes
+/// the line to its own log ring / SD file - nothing on the wire.  A reconnect
+/// therefore shows an empty list and no explanation, which is the "my settings
+/// silently vanished" complaint.  A one-shot CLI has no earlier reply of its own
+/// to compare against, so the address set of the previous run is kept here.
+/// The file is advisory: if it is missing or unreadable the commands still work,
+/// they just cannot report what the console released.
+struct FrozenBaseline {
+    /// Title id the addresses belong to; a different one means they are stale.
+    title: u64,
+    addresses: Vec<u64>,
+}
+
+fn frozen_baseline_path(host: &str, port: u16) -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(|home| PathBuf::from(home).join(".local").join("state")))
+        .unwrap_or_else(std::env::temp_dir);
+    // One file per console: two consoles (or a mock on another port) must not
+    // overwrite each other's baseline.  Keep the name free of path separators.
+    let safe_host: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Some(base.join("nxus").join(format!("frozen-{}-{}.txt", safe_host, port)))
+}
+
+fn load_frozen_baseline(host: &str, port: u16) -> Option<FrozenBaseline> {
+    let text = std::fs::read_to_string(frozen_baseline_path(host, port)?).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next()? != FROZEN_BASELINE_HEADER {
+        return None;
+    }
+    let mut baseline = FrozenBaseline { title: 0, addresses: Vec::new() };
+    for line in lines {
+        let Some((key, value)) = line.split_once(char::is_whitespace) else { continue };
+        let Ok(parsed) = u64::from_str_radix(value.trim(), 16) else { continue };
+        match key {
+            "title" => baseline.title = parsed,
+            "address" => baseline.addresses.push(parsed),
+            _ => {}
+        }
+    }
+    Some(baseline)
+}
+
+fn save_frozen_baseline(host: &str, port: u16, baseline: &FrozenBaseline) {
+    let Some(path) = frozen_baseline_path(host, port) else { return };
+    let mut text = String::new();
+    text.push_str(FROZEN_BASELINE_HEADER);
+    text.push('\n');
+    text.push_str(&format!("title {:016X}\n", baseline.title));
+    for address in &baseline.addresses {
+        text.push_str(&format!("address {:08X}\n", address));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Written beside the target and renamed over it: a torn file would read as
+    // garbage on the next run, and `status` writes this on every call.
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, text).is_ok() {
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+fn format_address_list(addresses: &[u64]) -> String {
+    addresses
+        .iter()
+        .map(|address| format!("{:08X}", address))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn encode_write(spec: &str) -> Result<Vec<u8>> {

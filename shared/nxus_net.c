@@ -61,6 +61,29 @@ static atomic_bool     g_ResetRequested = false;
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
 static volatile u64    g_LastActivityTick = 0;
 
+/* ---- Result handling ----------------------------------------------------
+ *
+ * The error flag of a HOS Result is bit 31, but libnx defines R_FAILED(res) as
+ * (res)!=0, so a success-shaped non-zero code (0x00001759 was observed on
+ * hardware) used to be reported as a failure here: nxusNetInit() then returned
+ * it, main.c retried forever and the module never came up even though the bsd
+ * session was fine.  Under the SDK's bit-31 R_FAILED() the opposite happens and
+ * the code is accepted silently, which leaves a failure-looking "rc=0x........"
+ * in the log with no explanation.
+ *
+ * Decide on the bit, and name the step when the code is ambiguous: bit 31 clear
+ * means "the call worked, the value is odd", which is reported and treated as
+ * success.  Anything with bit 31 set, or a failed socket/bind/listen afterwards,
+ * still reaches the caller as a real failure.
+ */
+static bool netCallSucceeded(Result rc, const char *what) {
+    if (rc == 0) return true;
+    if ((((u32)rc) & 0x80000000u) != 0) return false;
+    NXUS_LOG("%s: non-zero success code 0x%08X (no error bit) - continuing",
+             what, (unsigned)rc);
+    return true;
+}
+
 static int setClientFd(int fd) {
     mutexLock(&g_ClientMutex);
     g_ClientFd = fd;
@@ -216,7 +239,7 @@ static void rebuildListener(bool full_bsd_reset) {
         if (!g_Running) break;
 
         Result rc = socketInitializeDefault();
-        if (R_FAILED(rc)) {
+        if (!netCallSucceeded(rc, "socketInitializeDefault")) {
             NXUS_LOG("listener: socketInitializeDefault failed rc=0x%08X (attempt %u/%u)",
                      (unsigned)rc, (unsigned)(attempt + 1),
                      (unsigned)NXUS_NET_REBUILD_MAX_ATTEMPTS);
@@ -692,7 +715,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
 #endif
 
     Result rc = socketInitializeDefault();
-    if (R_FAILED(rc)) {
+    if (!netCallSucceeded(rc, "socketInitializeDefault")) {
         NXUS_RESULT("socketInitializeDefault", rc);
         return rc;
     }

@@ -46,7 +46,10 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits);
    the initialised state, so Init() after Exit() starts a fresh session.
    Exit is TERMINAL for published views: it frees the blocks behind every pointer
    nxusSessionMappings()/nxusSessionRegions() ever returned, including ones whose
-   pin was never released, so no view may be used across Exit. */
+   pin was never released, so no view may be used across Exit.  It also invalidates
+   every view pin: an outstanding token is reported in the Exit log line (and by
+   nxusSessionViewPinnedCount() before the call), and unpinning it afterwards is a
+   logged no-op that cannot touch the next session's pins. */
 void nxusSessionExit(void);
 
 /* ---- status ---- */
@@ -114,7 +117,9 @@ int nxusSessionReadMemory(u64 address, void *buffer, u32 size);
    scan; the snapshot service reuses it. */
 Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end);
 /* Non-NULL return pins the list (see the lifetime contract below): release it with
-   nxusSessionViewRelease() when the walk/capture is done. */
+   nxusSessionViewRelease() when the walk/capture is done.  COMPAT API kept for
+   existing callers - new code pins with nxusSessionViewPinCurrent() and samples
+   with nxusSessionRegionsPinned(). */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count);
 
 /* ---- results ---- */
@@ -132,24 +137,81 @@ const NxusScanRegion *nxusSessionRegions(u32 *out_count);
  *     is retired, not freed, until every pin is gone.  So a reader may keep using
  *     the pointer across a later publish/refresh (the snapshot service holds the
  *     region list for a whole capture) without hitting freed memory.
- *   - release the pin with nxusSessionViewRelease(), exactly once per non-NULL
- *     return, as soon as the view is no longer used.  NULL takes no pin and must
- *     not be released.
- *   - callers that never release remain MEMORY-SAFE: the block is simply never
+ *   - OWNERSHIP IS PER TOKEN.  New code takes a named pin with
+ *     nxusSessionViewPinCurrent() and drops that exact pin with
+ *     nxusSessionViewUnpin().  A pin can only be dropped by the owner of its
+ *     token: an extra/repeated unpin, or a token from somebody else, is a logged
+ *     no-op, so one caller's stray release can no longer consume another caller's
+ *     pin (the old single counter could, and a forgotten release then looked
+ *     "safe" forever).  A pin that is never unpinned is reported by
+ *     nxusSessionViewPinnedCount(), so a forgotten release is DETECTABLE instead
+ *     of silently leaking the retire ring.
+ *   - a caller that never releases remains MEMORY-SAFE: the block is simply never
  *     freed (no use-after-free).  The price is that the pin lasts for the life of
  *     the session, so every later publish retains its predecessor: the retire
  *     ring holds 4 generations, and past that the old blocks are kept and only
  *     logged (at the first overflow and then every 64), i.e. a non-releasing
- *     caller turns publish traffic into a slow leak.  New code must release;
- *     existing call sites should be migrated.
+ *     caller turns publish traffic into a slow leak.
  *   - the pin protects the BLOCK, not the struct fields.  NxusMappingTable is
  *     returned by address and its entries/count pair is re-published in place, so
  *     a caller that re-reads table->entries sees the current publication: capture
  *     the pair you intend to walk right after the call returns.
  *   - nxusSessionExit() is terminal for views: it frees every retained block, even
- *     ones whose pin was never released.  Do not use a view across Exit.
+ *     ones whose pin was never released, and invalidates every token (a later
+ *     unpin of such a token is a logged no-op).  Do not use a view across Exit.
  */
 const NxusHitList      *nxusSessionHits(void);
+
+/* Identified view pin: `id` 0 means "no pin" - it is never handed out and unpin
+   clears it.  `generation` names the view publication the pin was taken in, so a
+   token cannot be confused with a later pin that happens to reuse the same slot. */
+typedef struct {
+    u32 id;
+    u32 generation;
+} NxusViewPin;
+
+/* Pin the CURRENT view publication and fill *out.  This is the only pin a new
+   caller should take: it names the pin, so only its owner can drop it.  Use it
+   exactly like this, and unpin on EVERY path out of the block:
+
+       NxusViewPin pin;
+       if (nxusSessionViewPinCurrent(&pin)) {
+           const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
+           ... walk table ...
+           nxusSessionViewUnpin(&pin);
+       }
+
+   Returns false when the session is not live or all 8 token slots are taken
+   (an outstanding-pin bug on some other caller; nxusSessionViewPinnedCount()
+   shows it).  The pin is view-agnostic: it keeps the publication alive, and
+   whether the mapping table or the region list is readable is decided by the
+   sampler below. */
+bool nxusSessionViewPinCurrent(NxusViewPin *out);
+/* Drop `pin` and invalidate it (pin->id becomes 0), so calling it twice is a
+   no-op.  An id/generation that does not name a live pin - a double unpin, a
+   foreign token, a token from an earlier session - changes nothing and only logs,
+   so it can never decrement another caller's pin. */
+void nxusSessionViewUnpin(NxusViewPin *pin);
+/* Outstanding view pins: the identified tokens above plus the compat pins taken by
+   nxusSessionMappings()/nxusSessionRegions().  0 means nothing is pinned and the
+   retire ring has been drained.  A value that does not return to 0 once a request
+   is finished is the "somebody forgot to unpin" signal. */
+u32  nxusSessionViewPinnedCount(void);
+
+/* Sample the published view while `pin` is held.  These take NO additional pin:
+   the caller's token is the pin, which is what makes a forgotten unpin visible.
+   A token that is not live yields NULL (+ a log line) instead of a walk without a
+   pin.  NULL also means "no view right now", exactly like the compat API. */
+const NxusMappingTable *nxusSessionMappingsPinned(const NxusViewPin *pin);
+const NxusScanRegion   *nxusSessionRegionsPinned(const NxusViewPin *pin, u32 *out_count);
+
+/* ---- compat view API (pins internally; existing callers unchanged) ------ */
+/* Both sample the view and take ONE anonymous pin; drop it with
+   nxusSessionViewRelease(), exactly once per non-NULL return, as soon as the view
+   is no longer used.  NULL takes no pin and must not be released.  These pins are
+   anonymous, so an extra release cannot be attributed to a caller: it is clamped
+   (and now logged) rather than allowed to eat a live pin.  Migrated callers use
+   the token API above, which is why a leaked pin can be detected there. */
 const NxusMappingTable *nxusSessionMappings(void);
 /* Drop the pin taken by the last successful nxusSessionMappings() /
    nxusSessionRegions() call.  Also frees retained old blocks when this was the

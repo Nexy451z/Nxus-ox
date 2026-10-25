@@ -979,6 +979,60 @@ class AsyncScanProgressE2E(unittest.TestCase):
                             'a new scan reused the previous session id')
 
 
+class FrozenRelease(unittest.TestCase):
+    """The console drops frozen addresses on its own (`releaseOwnedFrozen()`, 30 s
+    after the last client disappears) and only logs that locally, so the PC has to
+    turn the shrinking FrozenList into a visible difference."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = MockSwitch().start()
+        cls.client = NxusClient('127.0.0.1', cls.server.port, timeout=5.0).connect()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+        cls.server.stop()
+
+    def test_frozen_list_reports_a_console_release_once(self):
+        address = MONEY_ADDRESS
+        value = self.client.frozen_enable(address, 4)
+        entries = self.client.frozen_list()
+        self.assertEqual([e['address'] for e in entries], [address])
+        self.assertEqual(entries[0]['value'], value)
+        self.assertEqual(entries[0]['width'], 4)
+        self.assertEqual(self.client.frozen_list_diff(), [], 'nothing was released yet')
+
+        # no client was connected for >30 s: the console disabled everything
+        self.server.simulate_frozen_release()
+        self.assertEqual(self.client.frozen_list(), [])
+        self.assertEqual(self.client.frozen_list_diff(), [address],
+                         'the release has to be named, not silently swallowed')
+        # reported once: the emptied list is the new baseline
+        self.assertEqual(self.client.frozen_list(), [])
+        self.assertEqual(self.client.frozen_list_diff(), [])
+
+    def test_own_unfreeze_is_not_reported_as_a_console_release(self):
+        address = MONEY_ADDRESS
+        self.client.frozen_enable(address, 4)
+        self.client.frozen_list()
+        self.client.frozen_disable(address)
+        self.assertEqual(self.client.frozen_list(), [])
+        self.assertEqual(self.client.frozen_list_diff(), [],
+                         'an unfreeze the PC asked for is not a console release')
+        self.assertEqual(self.client.last_frozen(), [])
+
+    def test_frozen_list_is_empty_while_a_debug_session_is_held(self):
+        # dmnt - and with it the frozen table - is closed for a debug session: the
+        # empty answer must not be mistaken for a release.
+        self.server.attached = True
+        try:
+            self.assertEqual(self.client.frozen_list(), [])
+            self.assertEqual(self.client.frozen_list_diff(), [])
+        finally:
+            self.server.attached = False
+
+
 def batch_total(batch):
     return batch['total']
 

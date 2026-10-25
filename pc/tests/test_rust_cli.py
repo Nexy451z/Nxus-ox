@@ -606,6 +606,38 @@ class RustCli(unittest.TestCase):
 
         self.assert_ok(self.run_nxus('detach'))
 
+    def test_27_frozen_list_warns_when_the_console_released_it(self):
+        """The console disables frozen addresses itself 30 s after the client is
+        gone and only logs that locally, so the CLI has to compare with what the
+        previous run saw and say so instead of showing a silent empty list."""
+        address = MONEY_ADDRESS
+        self.assert_ok(self.run_nxus('freeze', hex(address), '--width', '4'))
+        text = self.assert_ok(self.run_nxus('frozen', 'list'))
+        self.assertIn(f'{address:08X}', text)
+        self.assertNotIn('the console released', text)
+
+        # the console gave up on the vanished client and dropped everything
+        self.server.simulate_frozen_release()
+
+        code, text = self.run_nxus('frozen', 'list')
+        self.assertEqual(code, 0, text)
+        self.assertIn('warning: the console released 1 frozen address(es) '
+                      '(the client was gone for >30 s)', text)
+        self.assertIn(f'{address:08X}', text)
+        # repeated once only: the empty list became the new baseline
+        text = self.assert_ok(self.run_nxus('frozen', 'list'))
+        self.assertNotIn('the console released', text)
+
+        # 'status' hints at the automatic release instead of pretending the list
+        # was never set up ...
+        self.assert_ok(self.run_nxus('freeze', hex(address), '--width', '4'))
+        self.server.simulate_frozen_release()
+        text = self.assert_ok(self.run_nxus('status'))
+        self.assertIn('hint: nothing is frozen', text)
+        # ... and says it once: the second run already knows the list is empty
+        text = self.assert_ok(self.run_nxus('status'))
+        self.assertNotIn('hint: nothing is frozen', text)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

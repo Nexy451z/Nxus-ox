@@ -45,6 +45,7 @@
 #define NXUS_REASON_BAD_SLOT        7u   /* snapshot / breakpoint slot outside its table */
 #define NXUS_REASON_BAD_CONFIG      8u   /* CONFIG payload length matches neither shape */
 #define NXUS_REASON_BAD_ARG         9u   /* field value outside its allowed set (width/kind/scope) */
+#define NXUS_REASON_HEAP_BUDGET    10u   /* held snapshots + full hit list would exceed the 8 MiB heap */
 
 /* ---- packet header flags ---- */
 #define NXUS_FLAG_ASYNC       0x0001u  /* Switch-initiated event; seq is not a request id */

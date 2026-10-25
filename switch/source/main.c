@@ -47,6 +47,13 @@ u32 __nx_fs_num_sessions = 1;
  */
 #define INNER_HEAP_SIZE (8 * 1024 * 1024)
 
+/* Build identity for the boot marker.  Nothing in the C tree defines NXUS_VERSION
+   (only tools/build.sh knows it), and the SD log has to answer "is the module I
+   just copied onto the card actually the one running?" - so the compiler's own
+   timestamp is used instead of inventing a second version source that can drift
+   from build.sh. */
+#define NXUS_BUILD_ID (__DATE__ " " __TIME__)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -78,12 +85,25 @@ void __libnx_initheap(void) {
 static bool g_SdMounted = false;   /* fsdevMountSdmc() succeeded */
 static bool g_LogReady  = false;   /* nxusLogInit() has run */
 
-#define NXUS_BOOT_FAIL_PATH (NXUS_SESSION_BASELINE_DIR "/boot_fail.txt")
+#define NXUS_BOOT_FAIL_PATH  (NXUS_SESSION_BASELINE_DIR "/boot_fail.txt")
+/* One appended line per start: the cumulative boot number. */
+#define NXUS_BOOT_COUNT_PATH (NXUS_SESSION_BASELINE_DIR "/boot_count.txt")
 
 /* Write one line: through the log once it exists, otherwise as an append to
    boot_fail.txt.  Nothing is attempted before the SD mount - fopen() on an
    unmounted sdmc:/ would fail, and NXUS_LOG() would take a mutex that
    nxusLogInit() has not initialised yet. */
+/* boot_fail.txt is append-only across boots, so a line from three boots ago read
+   like a fresh symptom.  Rotate it once per boot (keeping one previous generation)
+   and stamp each line with the uptime and build id. */
+static void bootFailRotate(void) {
+    if (!g_SdMounted) return;
+    char old_path[96];
+    snprintf(old_path, sizeof(old_path), "%s.1", NXUS_BOOT_FAIL_PATH);
+    remove(old_path);
+    rename(NXUS_BOOT_FAIL_PATH, old_path);
+}
+
 static void bootNoteWrite(const char *msg) {
     if (g_LogReady) {
         NXUS_LOG("%s", msg);
@@ -119,6 +139,31 @@ static void bootFail(const char *stage, Result rc) {
     diagAbortWithResult(rc);
 }
 
+/* Append one line per start to boot_count.txt, holding the cumulative boot
+   number.  The log alone cannot tell "never installed" from "installed but never
+   started" from "started": a missing file, an unchanged line count and one new
+   line do.  Best effort only - no SD card, a read-only card or a full card must
+   never turn into a boot failure.  Returns 0 when no line could be written. */
+static unsigned recordBootCount(void) {
+    if (!g_SdMounted) return 0;
+
+    unsigned previous = 0;
+    FILE *in = fopen(NXUS_BOOT_COUNT_PATH, "rb");
+    if (in != NULL) {
+        char line[32];
+        while (fgets(line, sizeof(line), in) != NULL) previous++;
+        fclose(in);
+    }
+
+    FILE *out = fopen(NXUS_BOOT_COUNT_PATH, "ab");
+    if (out == NULL) return 0;
+
+    const unsigned current = previous + 1;
+    const int wrote = fprintf(out, "%u\n", current);
+    fclose(out);
+    return (wrote > 0) ? current : 0;
+}
+
 void __appInit(void) {
     Result rc;
 
@@ -144,12 +189,39 @@ void __appInit(void) {
        log and boot_fail.txt live in the same directory.  EEXIST is expected; any
        other failure is not fatal because the session falls back to a RAM buffer. */
     (void)mkdir(NXUS_SESSION_BASELINE_DIR, 0777);
+    if (g_SdMounted) {
+        /* A crash or reboot leaves the streaming baseline behind (it can grow to the
+           u32 store limit).  It is only valid for the scan that created it, so drop
+           it now instead of leaving it on the card until the next Unknown scan. */
+        if (remove(NXUS_SESSION_BASELINE_DIR "/scan_base.bin") == 0)
+            NXUS_LOG("boot: removed the stale scan_base.bin from a previous session");
+    }
 
-    /* SD is reachable: the log starts here, before every remaining init step, so
-       failures below are written to sdmc:/nxus/nxus.log before the abort. */
-    nxusLogInit(1);
+    /* The log starts here, before every remaining init step, so failures below are
+       written before the abort.  Without an SD card nothing can reach the file
+       system, so the ring buffer is the only sink - and the PC can read it back with
+       `nxus log` once it connects.  Do NOT claim the file log works: the old code
+       set g_LogReady regardless, and every failure then vanished silently. */
+    nxusLogInit(g_SdMounted ? 1 : 0);
     g_LogReady = true;
-    NXUS_LOG("boot: sdmc mounted, log started");
+    if (g_SdMounted) {
+        NXUS_LOG("boot: sdmc mounted, log started");
+    } else {
+        NXUS_LOG("boot: sdmc NOT mounted - logging to RAM only "
+                 "(connect and run `nxus log`); no log/boot_fail file this boot");
+    }
+
+    /* One generation of boot_fail.txt per boot: an old line must not read like a
+       fresh symptom. */
+    bootFailRotate();
+
+    /* Bumped before any later init step can abort, so a module that dies in the
+       chain is still recorded as "it did start". */
+    {
+        const unsigned boot_no = recordBootCount();
+        if (boot_no != 0)
+            NXUS_LOG("boot #%u (sdmc:/nxus/boot_count.txt)", boot_no);
+    }
 
     /* Firmware version is informational - a failure only costs the number in the
        log header, so record it and keep booting. */
@@ -211,6 +283,33 @@ static void logMetadata(void) {
              (unsigned long long)md.heap_base, (unsigned long long)md.heap_size);
 }
 
+/* ---- Result sanity ------------------------------------------------------
+ *
+ * The error flag of a HOS Result is bit 31.  A code such as 0x00001759 has no
+ * error bit, so it is neither a success nor an error: the official SDK's
+ * R_FAILED() would call it success, while libnx defines R_FAILED(res) as
+ * (res)!=0 and calls it a failure.  Either way the log ends up contradicting
+ * itself ("server listening" next to rc=0x........), which is what misled the
+ * on-device diagnostics.
+ *
+ * This helper answers one question only: "is this code unambiguous?"  It is NOT
+ * an error predicate - use R_FAILED() for that.
+ *
+ *   0x00000000               -> valid (clean success)
+ *   bit 31 set               -> valid (a real error; R_FAILED() reports it)
+ *   bit 31 clear, rc != 0    -> NOT valid (success-shaped but non-zero)
+ *
+ * The bit is tested explicitly instead of through R_SUCCEEDED()/R_FAILED(),
+ * because those two macros disagree between libnx and the SDK - and the code
+ * seen on hardware only has to be flagged once, under either convention.
+ * Deliberately two branches: a richer heuristic would just add a third opinion
+ * about codes that neither libnx nor HOS documents.
+ */
+static bool resultLooksValid(Result rc) {
+    if (rc == 0) return true;
+    return (((u32)rc & 0x80000000u) != 0);
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
@@ -223,6 +322,13 @@ int main(int argc, char *argv[]) {
         nxusLogInit(1);
         g_LogReady = true;
     }
+
+    /* Verbosity: 0=error, 1=info (default), 2=debug.  The live value is
+       NxusConfig.log_level, which the Config handler (nxus_server.c, case
+       NxusCmd_Config) has to forward with nxusLogSetLevel().  This call only pins
+       the documented default; nxusLogInit() deliberately leaves the level alone,
+       so a settings change is never reset by a re-init. */
+    nxusLogSetLevel(NXUS_LOG_LEVEL_INFO);
 
     NXUS_LOG("==============================================");
     NXUS_LOG("Nxus sysmodule (protocol v%u)", (unsigned)NXUS_PROTO_VERSION);
@@ -256,14 +362,29 @@ int main(int argc, char *argv[]) {
        (Wi-Fi not associated yet), and without this line the log looked identical
        to a boot that died halfway.  "ready" is logged separately once the
        listener is actually up. */
-    NXUS_LOG("boot ok: init chain complete (dmnt/session/debug/snapshot/server)");
+    NXUS_LOG("boot ok: init chain complete (dmnt/session/debug/snapshot/server) build %s",
+             NXUS_BUILD_ID);
 
     /* A boot2 sysmodule usually starts before Wi-Fi is associated, so a single
        failure must not park the module for the whole boot.  nxusNetInit() cleans
        up after itself on failure (socketExit), so retrying is safe. */
+    bool ambiguous_rc_logged = false;
     for (u32 attempt = 1; ; attempt++) {
         rc = nxusNetInit(NXUS_DEFAULT_PORT, nxusServerHandle, NULL);
         if (R_SUCCEEDED(rc)) break;
+        /* Not every non-zero Result is a failure.  A code without bit 31 is
+           success-shaped (0x00001759 was seen on hardware); retrying it would
+           park the module in this loop over a listener that may well be up, so
+           accept it - but name it once instead of letting a log reader guess
+           whether "rc=0x........" meant anything. */
+        if (!resultLooksValid(rc)) {
+            if (!ambiguous_rc_logged) {
+                ambiguous_rc_logged = true;
+                NXUS_LOG("tcp: nxusNetInit returned non-zero success code 0x%08X "
+                         "(no error bit) - continuing", (unsigned)rc);
+            }
+            break;
+        }
         if (attempt == 1 || (attempt % 20u) == 0) {
             NXUS_LOG("TCP server failed to start rc=0x%08X (attempt %u) - retrying in 3 s",
                      (unsigned)rc, (unsigned)attempt);

@@ -302,6 +302,12 @@ pub struct NxusClient {
     /// Shared with the reader thread; an `AtomicBool` (not a `Mutex<bool>`) so `Drop`
     /// can flag it without ever blocking behind a busy lock.
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Addresses the previous `frozen_list()` reported.  Kept so a later reply can
+    /// be compared against it; see [`NxusClient::frozen_list_diff`].
+    last_frozen: Mutex<Vec<u64>>,
+    /// Addresses that were in `last_frozen` and are missing from the newest
+    /// `frozen_list()` reply - the console (or another dmnt user) released them.
+    released_frozen: Mutex<Vec<u64>>,
 }
 
 /// Text for an I/O error that is safe to show in the GUI.
@@ -350,6 +356,7 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
         7 => Some("slot number out of range"),
         8 => Some("bad config payload (expected 16 or 32+ bytes)"),
         9 => Some("argument outside the accepted range"),
+        10 => Some("8 MiB heap budget: release the snapshots (or reset) and retry"),
         _ => None,
     }
 }
@@ -408,6 +415,8 @@ impl NxusClient {
             events: Mutex::new(event_rx),
             seq: Mutex::new(0),
             running,
+            last_frozen: Mutex::new(Vec::new()),
+            released_frozen: Mutex::new(Vec::new()),
         })
     }
 
@@ -894,9 +903,52 @@ impl NxusClient {
     /// (offset u64, max_count u32), but dmnt's table is capped at 0x80 entries
     /// and the default page already covers it, so the empty request asks for the
     /// first page with the server's default count.
+    ///
+    /// Every reply is also remembered as the new baseline for
+    /// [`NxusClient::frozen_list_diff`]: the console releases frozen addresses
+    /// itself once the client has been gone for a while and has no way to tell
+    /// the PC, so a shrinking list is the only signal there is.
     pub fn frozen_list(&self) -> Result<Vec<FrozenEntry>> {
         let (_, body) = self.request(cmd::FROZEN_LIST, &[])?;
-        Ok(parse_frozen_list(&body))
+        let entries = parse_frozen_list(&body);
+        self.record_frozen_addresses(&entries);
+        Ok(entries)
+    }
+
+    /// Remember the addresses a previous run saw.
+    ///
+    /// The CLI is one process per command, so it has no earlier reply of its own
+    /// to compare against; it loads the addresses of the last run from its small
+    /// state file and seeds them here, which keeps the release detection working
+    /// across a disconnect/reconnect.
+    pub fn seed_frozen_baseline(&self, addresses: Vec<u64>) {
+        *lock(&self.last_frozen) = addresses;
+        lock(&self.released_frozen).clear();
+    }
+
+    /// Addresses reported by the last [`NxusClient::frozen_list`] (empty until
+    /// the first one).
+    pub fn frozen_addresses(&self) -> Vec<u64> {
+        lock(&self.last_frozen).clone()
+    }
+
+    /// Addresses that were frozen the previous time [`NxusClient::frozen_list`]
+    /// ran and are gone from the newest reply (sorted, unique).
+    ///
+    /// An empty list means either "nothing vanished" or "no previous reply".  A
+    /// non-empty one after a reconnect is the console's `releaseOwnedFrozen()`
+    /// at work: it disables the addresses it enabled 30 s after the last client
+    /// disappeared (`NXUS_FROZEN_RELEASE_AFTER_MS` in switch/source/nxus_server.c)
+    /// and only logs that to its own ring/SD file, never on the wire.
+    pub fn frozen_list_diff(&self) -> Vec<u64> {
+        lock(&self.released_frozen).clone()
+    }
+
+    fn record_frozen_addresses(&self, entries: &[FrozenEntry]) {
+        let current: Vec<u64> = entries.iter().map(|entry| entry.address).collect();
+        let released = released_addresses(&lock(&self.last_frozen), &current);
+        *lock(&self.released_frozen) = released;
+        *lock(&self.last_frozen) = current;
     }
 
     pub fn frozen_enable(&self, address: u64, width: u32) -> Result<u64> {
@@ -908,13 +960,26 @@ impl NxusClient {
         if body.len() < 8 {
             return Err(NxusError { message: "short frozen handle reply".into(), result: None });
         }
+        // A freeze the PC asked for is not a release when lists are compared
+        // later; keep the baseline in step with it (and with `frozen_disable`).
+        lock(&self.released_frozen).retain(|frozen| *frozen != address);
+        {
+            let mut last = lock(&self.last_frozen);
+            if !last.contains(&address) {
+                last.push(address);
+            }
+        }
         Ok(rd_u64(&body, 0))
     }
 
     pub fn frozen_disable(&self, address: u64) -> Result<()> {
         let mut payload = Vec::new();
         put_u64(&mut payload, address);
-        self.request(cmd::FROZEN_DISABLE, &payload).map(|_| ())
+        self.request(cmd::FROZEN_DISABLE, &payload).map(|_| ())?;
+        // An explicit unfreeze must not surface as "the console released it".
+        lock(&self.released_frozen).retain(|frozen| *frozen != address);
+        lock(&self.last_frozen).retain(|frozen| *frozen != address);
+        Ok(())
     }
 
     // ---- debug mode ----
@@ -1072,6 +1137,26 @@ impl NxusClient {
     }
 }
 
+/// Addresses in `previous` that are missing from `current`, sorted and unique.
+///
+/// The console never tells the PC that it dropped a frozen address: 30 s after
+/// the last client disappears `releaseOwnedFrozen()` (switch/source/nxus_server.c)
+/// disables every address Nxus itself froze and writes the line to its own log
+/// ring/SD file only.  Comparing two `FROZEN_LIST` replies is therefore the only
+/// material the PC has, and this is that comparison.  Addresses that appear in
+/// `current` but not in `previous` are new freezes, not releases, so they are
+/// deliberately not reported.
+fn released_addresses(previous: &[u64], current: &[u64]) -> Vec<u64> {
+    let mut gone: Vec<u64> = previous
+        .iter()
+        .copied()
+        .filter(|address| !current.contains(address))
+        .collect();
+    gone.sort_unstable();
+    gone.dedup();
+    gone
+}
+
 impl Drop for NxusClient {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
@@ -1177,7 +1262,7 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text};
+    use super::{error_from_reply, error_reason_text, released_addresses};
     use crate::protocol::put_u32;
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
@@ -1230,5 +1315,36 @@ mod tests {
             );
         }
         assert_eq!(error_reason_text(0), None, "0 means 'no detail', never sent");
+    }
+
+    #[test]
+    fn frozen_diff_is_empty_without_a_previous_list() {
+        assert!(released_addresses(&[], &[0x1000, 0x2000]).is_empty());
+        assert!(released_addresses(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn frozen_diff_reports_the_address_the_console_released() {
+        assert_eq!(
+            released_addresses(&[0x1FA1234, 0x1FA1238], &[0x1FA1238]),
+            vec![0x1FA1234]
+        );
+    }
+
+    #[test]
+    fn frozen_diff_of_a_cleared_list_is_the_old_list_in_order() {
+        // releaseOwnedFrozen() drops everything at once: the warning has to name
+        // every address, sorted so the output is stable.
+        assert_eq!(
+            released_addresses(&[0x3000, 0x1000, 0x2000], &[]),
+            vec![0x1000, 0x2000, 0x3000]
+        );
+    }
+
+    #[test]
+    fn frozen_diff_ignores_new_freezes_and_repeats() {
+        // a new address is not a release, and a duplicate must not print twice
+        assert!(released_addresses(&[0x1000], &[0x1000, 0x5000]).is_empty());
+        assert_eq!(released_addresses(&[0x1000, 0x1000], &[]), vec![0x1000]);
     }
 }

@@ -617,9 +617,16 @@ static Result serverResume(void) {
 /* ---- module detection -------------------------------------------------- */
 
 static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
-    const NxusMappingTable *maps = nxusSessionMappings();
-    if (maps == NULL) return 0;                       /* NULL never pins */
-    if (maps->count == 0) { nxusSessionViewRelease(); return 0; }
+    /* Token pin: the sampled table is only valid while this pin is held, and only
+       this call knows the id that can drop it (a stray release elsewhere can no
+       longer consume it).  Every early return below therefore unpins. */
+    NxusViewPin pin;
+    if (!nxusSessionViewPinCurrent(&pin)) return 0;   /* no session / pin table full */
+    const NxusMappingTable *maps = nxusSessionMappingsPinned(&pin);
+    if (maps == NULL) {                               /* no snapshot: NULL is no view */
+        nxusSessionViewUnpin(&pin);
+        return 0;
+    }
 
     u32 found = 0;
     u8 page[0x200];
@@ -646,15 +653,21 @@ static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
             break;
         }
     }
-    nxusSessionViewRelease();
+    nxusSessionViewUnpin(&pin);
     return found;
 }
 
 /* ---- pointer scan ------------------------------------------------------ */
 
 static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_base) {
-    const NxusMappingTable *maps = nxusSessionMappings();
-    if (maps == NULL) {          /* NULL never pins; the caller reports NO_MAPPINGS */
+    NxusViewPin pin;
+    if (!nxusSessionViewPinCurrent(&pin)) {   /* no session / pin table full */
+        *out_module_base = nxusSessionMainBase();
+        return 0;
+    }
+    const NxusMappingTable *maps = nxusSessionMappingsPinned(&pin);
+    if (maps == NULL) {          /* no snapshot; the caller reports NO_MAPPINGS */
+        nxusSessionViewUnpin(&pin);
         *out_module_base = nxusSessionMainBase();
         return 0;
     }
@@ -678,7 +691,7 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
         out[n].reserved = m->reserved;
         n++;
     }
-    nxusSessionViewRelease();
+    nxusSessionViewUnpin(&pin);
     return n;
 }
 
@@ -748,7 +761,8 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
                      "(estimate=%llu B > budget=%u B, slots=0x%X) - refusing",
                      (unsigned long long)peak, (unsigned)NXUS_HEAP_BUDGET_BYTES,
                      (unsigned)g_HeldSnapshotSlots);
-            replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+            replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
+                             NXUS_REASON_HEAP_BUDGET);   /* not "a scan is running" */
             return;
         }
     }
@@ -756,10 +770,18 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     Result rc = nxusSessionRefreshMappings();
     if (R_FAILED(rc)) { replyError(fd, type, seq, rc); return; }
 
-    const NxusMappingTable *maps = nxusSessionMappings();
-    /* nxusSessionMappings() publishes NULL when there is no table (never
-       snapshotted, or already released), so the count needs the NULL guard. */
+    NxusViewPin pin;
+    if (!nxusSessionViewPinCurrent(&pin)) {   /* no live session / pin table full */
+        /* Nobody holds a view pin we could use: that is a session-level condition,
+           not "this process has no mappings". */
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+        return;
+    }
+    const NxusMappingTable *maps = nxusSessionMappingsPinned(&pin);
+    /* The compat accessor published NULL when there is no table (never
+       snapshotted, or already dropped), and so does the token sample. */
     if (maps == NULL) {
+        nxusSessionViewUnpin(&pin);
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS),
                          NXUS_REASON_NO_MAPPINGS);
         return;
@@ -768,7 +790,7 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
        array is sized, or the retire ring can never drain and every later publish
        leaks its old block (about 40 runs to OOM on a 1000-mapping title). */
     u32 region_cap = maps->count + 1;
-    nxusSessionViewRelease();
+    nxusSessionViewUnpin(&pin);
 
     NxusPtrRegion *regions = (NxusPtrRegion *)calloc(region_cap, sizeof(NxusPtrRegion));
     u8 *scratch = (u8 *)malloc(256 * 1024);
@@ -864,8 +886,19 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
 /* ---- scan results ------------------------------------------------------ */
 
 static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
+    /* One token pin covers both views for the whole reply: the hit list arrays and
+       the mapping table are walked while it is held.  Every early return below
+       unpins exactly this token, so no path can leak the pin - and a stray release
+       in some other handler can no longer drop it. */
+    NxusViewPin pin;
+    if (!nxusSessionViewPinCurrent(&pin)) {
+        /* Pin table exhausted (an unpin was forgotten somewhere): refusing is
+           better than serving mapping bases nobody owns. */
+        replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+        return;
+    }
     const NxusHitList *hits = nxusSessionHits();
-    const NxusMappingTable *maps = nxusSessionMappings();
+    const NxusMappingTable *maps = nxusSessionMappingsPinned(&pin);
 
     /* Both views are published by nxus_session.c: the hit list is NULL while a
        scan is running, and the mapping table is NULL when nothing has been
@@ -873,7 +906,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
        client from crashing the whole sysmodule. */
     if (hits == NULL) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
-        nxusSessionViewRelease();
+        nxusSessionViewUnpin(&pin);
         return;
     }
 
@@ -892,7 +925,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
                             (u64)count * (u64)sizeof(NxusHit);
     if (payload_u64 > (u64)NXUS_NET_BUF_SIZE) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
-        nxusSessionViewRelease();
+        nxusSessionViewUnpin(&pin);
         return;
     }
     const u32 payload_size = (u32)payload_u64;
@@ -900,7 +933,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     u8 *buffer = (u8 *)malloc(payload_size);
     if (buffer == NULL) {
         replyError(fd, NxusCmd_ScanGetHits, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
-        nxusSessionViewRelease();
+        nxusSessionViewUnpin(&pin);
         return;
     }
 
@@ -943,7 +976,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
 
     reply(fd, NxusCmd_ScanGetHits, seq, buffer, payload_size);
     free(buffer);
-    nxusSessionViewRelease();
+    nxusSessionViewUnpin(&pin);
 }
 
 /* ---- main dispatch ----------------------------------------------------- */
@@ -1043,10 +1076,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             u64 count = 0;
             if (nxusDebugIsAttached()) {
                 /* dmnt is closed: answer from the snapshot the session built with
-                   svcQueryDebugProcessMemory instead of failing. */
-                const NxusMappingTable *table = nxusSessionMappings();
-                count = table ? table->count : 0;
-                if (table != NULL) nxusSessionViewRelease();
+                   svcQueryDebugProcessMemory instead of failing.  The token pin is
+                   dropped on both paths (the table may legitimately be NULL). */
+                NxusViewPin pin;
+                if (!nxusSessionViewPinCurrent(&pin)) {
+                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                    break;
+                }
+                const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
+                if (table != NULL) count = table->count;
+                nxusSessionViewUnpin(&pin);
                 reply(fd, type, seq, &count, sizeof(count));
                 break;
             }
@@ -1072,7 +1111,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
             size_t got = 0;
             if (nxusDebugIsAttached()) {
-                const NxusMappingTable *table = nxusSessionMappings();
+                /* Token pin: the table is walked while it is held, and the pin is
+                   dropped on every path out of this branch (a NULL table is a
+                   legitimate "no snapshot", not an error, but the pin still goes). */
+                NxusViewPin pin;
+                if (!nxusSessionViewPinCurrent(&pin)) {
+                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                    free(buffer);
+                    break;
+                }
+                const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
                 if (table != NULL) {
                     /* The PC pages with a u64 offset.  Truncating it to u32 made the
                        page stop advancing above 4 GiB (and wrap for a negative value),
@@ -1092,8 +1140,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                         buffer[got].perm = m->reserved;
                         got++;
                     }
-                    nxusSessionViewRelease();   /* table != NULL here: it pinned */
                 }
+                nxusSessionViewUnpin(&pin);
             } else {
                 rc = nxusDmntGetMappings(buffer, max_count, (size_t)req.offset, &got);
                 if (R_FAILED(rc)) {
@@ -1967,6 +2015,9 @@ static void reapExitedDebugSession(void) {
    enough to survive a client restart, short enough that the user does not need a
    reboot when the PC crashed. */
 #define NXUS_FROZEN_RELEASE_AFTER_MS 30000ull
+/* Longer than the frozen grace: a client that reconnects right away should find
+   its scan still running rather than silently cancelled. */
+#define NXUS_SCAN_ABANDON_AFTER_MS 60000ull
 
 void nxusServerTick(void) {
     {
@@ -1980,6 +2031,16 @@ void nxusServerTick(void) {
             if (last_client_ms == 0 || now_ms - last_client_ms >= NXUS_FROZEN_RELEASE_AFTER_MS) {
                 releaseOwnedFrozen();
             }
+        }
+
+        /* A scan started by a client that then disappeared keeps the worker, the SD
+           baseline and the SCANNING flag alive for minutes, and a reconnecting client
+           only ever gets BUSY.  Cancel it once nobody has been connected for a while. */
+        if (nxusNetClientFd() < 0 && nxusSessionScanState() == NxusScanState_Running &&
+            last_client_ms != 0 && now_ms - last_client_ms >= NXUS_SCAN_ABANDON_AFTER_MS) {
+            NXUS_LOG("scan: no client for %llu ms - cancelling the abandoned scan",
+                     (unsigned long long)(now_ms - last_client_ms));
+            (void)nxusSessionScanCancel();
         }
     }
 

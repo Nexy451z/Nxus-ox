@@ -232,6 +232,14 @@ HOW
     sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
       -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
 
+  ALTERNATIVE without a build: create this folder's flag BY HAND (an empty file)
+
+    sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag
+
+  after moving the main module's flag away, then reboot.  Delete it again once
+  probe.txt exists.  The release zip deliberately ships no flag so the two
+  modules cannot both boot by accident.
+
   Reboot, wait for probe.txt, then restore that flag and make sure THIS folder
   has no flag at all:
 

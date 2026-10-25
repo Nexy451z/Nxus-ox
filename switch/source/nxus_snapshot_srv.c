@@ -66,8 +66,16 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     Result rc = nxusSessionPrepareRegions(scope, range_begin, range_end);
     if (R_FAILED(rc)) return rc;
 
+    /* Token pin: the capture below walks the region list for its whole duration,
+       so the pin must cover it and only this function can drop it.  Every early
+       return from here on unpins. */
+    NxusViewPin pin;
+    if (!nxusSessionViewPinCurrent(&pin)) {
+        NXUS_LOG("snapshot: no view pin available - refusing the capture");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
     u32 region_count = 0;
-    const NxusScanRegion *regions = nxusSessionRegions(&region_count);
+    const NxusScanRegion *regions = nxusSessionRegionsPinned(&pin, &region_count);
 
     nxusSnapshotInit(&g_Snapshots[slot], g_Hashes[slot], g_Addresses[slot],
                      NXUS_SNAPSHOT_MAX_BLOCKS, block_size);
@@ -81,18 +89,18 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     const u32 chunk_size = 256 * 1024;
     u8 *chunk = (u8 *)malloc(chunk_size);
     if (chunk == NULL) {
-        /* The region list is pinned: release it before bailing out, or the retire
-           ring never drains and every later publish leaks its old block. */
-        nxusSessionViewRelease();
+        /* The token pin is held: drop it before bailing out, or the retire ring
+           never drains and every later publish leaks its old block. */
+        nxusSessionViewUnpin(&pin);
         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     }
 
     NxusScanStats stats;
     int src = nxusSnapshotCapture(&g_Snapshots[slot], regions, region_count,
                                   nxusSessionReadCallback, NULL, chunk, chunk_size, &stats, NULL);
-    /* The region list was pinned by nxusSessionRegions(): drop it now that the
-       capture is finished, or the next rebuild has to keep the old block alive. */
-    nxusSessionViewRelease();
+    /* The region list was pinned by the token above: drop it now that the capture
+       is finished, or the next rebuild has to keep the old block alive. */
+    nxusSessionViewUnpin(&pin);
     free(chunk);
 
     NXUS_LOG("snapshot %c: blocks=%u reads=%llu dropped=%u rc=%d",

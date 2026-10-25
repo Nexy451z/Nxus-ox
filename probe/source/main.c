@@ -1155,6 +1155,14 @@ int main(int argc, char *argv[]) {
         static const char *const markers[] = { "sdmc:/nxus/probe_started.txt",
                                                "sdmc:/probe_started.txt" };
         for (unsigned i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+            /* Rotate the previous run's marker first: the file only means "this
+               boot wrote it" if it was not left behind by an older run. */
+            {
+                char prev[96];
+                snprintf(prev, sizeof(prev), "%s.1", markers[i]);
+                remove(prev);
+                rename(markers[i], prev);
+            }
             FILE *m = fopen(markers[i], "wb");
             if (m == NULL) continue;
             u32 v = hosversionGet();

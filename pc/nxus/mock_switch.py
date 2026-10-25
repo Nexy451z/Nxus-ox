@@ -393,6 +393,12 @@ class MockSwitch:
         self.changed: list = []
         self.changed_truncated = 0
         self.hotkey = dict(mask=0, hold_ms=0, enabled=0)
+        # dmnt's frozen table as the sysmodule reports it (NxusFrozenEntry):
+        # one dict per address, in the order they were frozen.  The real table is
+        # global (another tool's freezes show up here too) and is dropped when
+        # dmnt closes, which is why FrozenList answers an empty list while a debug
+        # session is attached.
+        self.frozen: list[dict] = []
         # NxusDebugConfig.auto_continue (0 = GDB-style hold, the sysmodule default;
         # 1 = resume after a hit) and the thread the console is holding
         # (NxusDebugStatus.stopped_thread_low).
@@ -965,7 +971,12 @@ class MockSwitch:
                 return self._error(P.ERR_BUSY)
             return self._get_hits(payload)
         if cmd == P.CMD['FrozenList']:
-            return b''
+            if self.attached:
+                # nxus_server.c: dmnt (and with it the frozen table) is closed while
+                # the sysmodule holds its own debug session - an empty list is the
+                # honest answer, not "everything was released".
+                return b''
+            return self._frozen_list(payload)
         if cmd == P.CMD['FrozenEnable']:
             address, width, _res = P.FROZEN_REQUEST.unpack(payload)
             if self.attached:
@@ -976,8 +987,17 @@ class MockSwitch:
                 return self._error(P.ERR_BAD_STATE)
             data = self.target.read(address, width)      # honour the width, not a fixed 4
             value = int.from_bytes(data, 'little') if data else 0
+            entry = next((f for f in self.frozen if f['address'] == address), None)
+            if entry is None:
+                self.frozen.append(dict(address=address, value=value, width=width))
+            else:
+                entry['value'] = value
+                entry['width'] = width
             return struct.pack('<Q', value)
         if cmd == P.CMD['FrozenDisable']:
+            if len(payload) >= 8:
+                address = int.from_bytes(payload[:8], 'little')
+                self.frozen = [f for f in self.frozen if f['address'] != address]
             return b''
         if cmd == P.CMD['Config']:
             # The console accepts two shapes (switch/source/nxus_server.c): a bare
@@ -1092,6 +1112,32 @@ class MockSwitch:
         for h in reversed(self.break_hits):    # newest first, like the sysmodule
             out += self._pack_hit(h)
         return out
+
+    def _frozen_list(self, payload: bytes) -> bytes:
+        """NxusFrozenEntry[] as the sysmodule packs it (no count in the reply).
+
+        The request may carry a NxusMappingsRequest (offset, max_count); the server
+        only honours max_count - `NxusFrozenRequest` shares that layout, so the
+        offset would be an address, and the frozen page is always the first one.
+        """
+        max_count = 64
+        if len(payload) >= P.MAPPINGS_REQUEST.size:
+            _offset, count, _res = P.MAPPINGS_REQUEST.unpack_from(payload, 0)
+            if 0 < count <= 512:
+                max_count = count
+        return b''.join(P.FROZEN_ENTRY.pack(entry['address'], entry['value'], entry['width'], 0)
+                        for entry in self.frozen[:max_count])
+
+    def simulate_frozen_release(self):
+        """Pretend nxusServerTick() ran releaseOwnedFrozen().
+
+        That is what the console does 30 s after the last client disappears: it
+        disables every address Nxus froze and only writes the line to its own log
+        ring / SD file, so the PC sees nothing but an empty FrozenList.  Making
+        that situation reachable is the point of this hook - the client has to
+        recognise the release by comparing the list with what it saw before.
+        """
+        self.frozen = []
 
     def simulate_hotkey(self):
         """Pretend the controller combo fired: the sysmodule pauses and tells us."""

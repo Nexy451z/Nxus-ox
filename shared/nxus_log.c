@@ -5,6 +5,10 @@
 #include <string.h>
 
 #define NXUS_LOG_RING_SIZE 16384
+/* One assembled line: the uptime prefix plus the caller's message.  The old 512
+   bytes were sized for the message alone; the prefix eats up to ~16 of them and
+   the longest existing format (the debug "set break" line) is already ~200. */
+#define NXUS_LOG_LINE_SIZE 1024
 #define NXUS_LOG_PATH      "sdmc:/nxus/nxus.log"
 #define NXUS_LOG_OLD_PATH  "sdmc:/nxus/nxus.log.1"
 /* Rotate instead of growing without bound: a sysmodule that runs for days (and
@@ -16,6 +20,10 @@ static char   g_Ring[NXUS_LOG_RING_SIZE];
 static size_t g_RingLen = 0;      /* bytes used, buffer is always NUL terminated */
 static Mutex  g_LogMutex;
 static bool   g_LogToSd = false;
+/* Verbosity threshold (see nxus_log.h).  Not reset by nxusLogInit(): the level is
+   runtime policy, not buffer state, and the boot path may call init twice.  An
+   aligned u32 store/load is atomic on the target, so no lock is taken to read it. */
+static u32    g_LogLevel = NXUS_LOG_LEVEL_INFO;
 /* Keeping the file open turns one fopen+fwrite+fclose (three SD round trips) per
    line into a single buffered write plus fflush.  The flush keeps the crash
    diagnostics intact - an unflushed buffer would lose exactly the lines that
@@ -38,6 +46,15 @@ void nxusLogInit(int write_to_sd) {
     g_LogToSd = write_to_sd != 0;
     g_LogFile = NULL;
     g_LogBytes = 0;
+}
+
+void nxusLogSetLevel(u32 level) {
+    if (level > NXUS_LOG_LEVEL_DEBUG) level = NXUS_LOG_LEVEL_DEBUG;
+    g_LogLevel = level;
+}
+
+u32 nxusLogGetLevel(void) {
+    return g_LogLevel;
 }
 
 void nxusLogExit(void) {
@@ -125,21 +142,71 @@ static void ringAppend(const char *text, size_t len) {
     g_Ring[g_RingLen] = 0;
 }
 
-void nxusLogWrite(const char *fmt, ...) {
-    char line[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
-    va_end(ap);
+/* Uptime prefix, fixed width so a tail dump stays column aligned:
+   "[  12345.678] " - seconds in a 7-wide field, milliseconds zero padded, then
+   one space.  Past 9 999 999 s (~115 days) the field just grows by a digit; a
+   sysmodule is never up that long, and truncating the number would be worse than
+   a shifted colon.  Integer math on purpose: "%f" would pull the soft-float
+   formatter (and the FPU context) into every single log line. */
+static size_t logPrefix(char *out, size_t capacity) {
+    const u64 ns = armTicksToNs(armGetSystemTick());
+    int n = snprintf(out, capacity, "[%7llu.%03llu] ",
+                     (unsigned long long)(ns / 1000000000ull),
+                     (unsigned long long)((ns / 1000000ull) % 1000ull));
+    if (n < 0) {
+        out[0] = 0;
+        return 0;
+    }
+    if ((size_t)n >= capacity) n = (int)capacity - 1;
+    return (size_t)n;
+}
+
+/* Assemble "<prefix><message>\n" into one buffer and hand the finished line to
+   the ring buffer and the SD stream.  The prefix is written first and the message
+   is formatted into the rest of the same buffer, so a line that does not fit is
+   truncated once (by vsnprintf) instead of via an extra copy. */
+static void logEmit(const char *fmt, va_list ap) {
+    char line[NXUS_LOG_LINE_SIZE];
+    const size_t prefix = logPrefix(line, sizeof(line));
+    const size_t room = sizeof(line) - prefix;   /* includes the NUL slot */
+
+    int n = vsnprintf(line + prefix, room, fmt, ap);
     if (n < 0) return;
-    if ((size_t)n > sizeof(line) - 2) n = (int)sizeof(line) - 2;
-    line[n++] = '\n';
-    line[n] = 0;
+    size_t len = (size_t)n;
+    if (len > room - 2) len = room - 2;          /* keep room for '\n' + NUL */
+
+    size_t pos = prefix + len;
+    line[pos++] = '\n';
+    line[pos] = 0;
 
     mutexLock(&g_LogMutex);
-    ringAppend(line, (size_t)n);
-    logWriteLocked(line, (size_t)n);
+    ringAppend(line, pos);
+    logWriteLocked(line, pos);
     mutexUnlock(&g_LogMutex);
+}
+
+void nxusLogWrite(const char *fmt, ...) {
+    /* Checked before formatting: a suppressed line costs one call, no vsnprintf. */
+    if (g_LogLevel < NXUS_LOG_LEVEL_INFO) return;
+    va_list ap;
+    va_start(ap, fmt);
+    logEmit(fmt, ap);
+    va_end(ap);
+}
+
+void nxusLogWriteDebug(const char *fmt, ...) {
+    if (g_LogLevel < NXUS_LOG_LEVEL_DEBUG) return;
+    va_list ap;
+    va_start(ap, fmt);
+    logEmit(fmt, ap);
+    va_end(ap);
+}
+
+void nxusLogWriteError(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    logEmit(fmt, ap);
+    va_end(ap);
 }
 
 void nxusLogEvent(u32 event_id, const char *fmt, ...) {
