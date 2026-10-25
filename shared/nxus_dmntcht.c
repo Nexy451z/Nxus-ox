@@ -73,6 +73,8 @@ bool nxusDmntIsActive(void) {
    leave the console permanently unable to Read/GetMappings (snapshot capture then
    failed with 0x0032C80D).  ForceOpen once and repeat the failed command once. */
 #define NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED 0x0032C80Du
+/* Upper bound for a mapping count accepted from dmnt (sanity, not protocol). */
+#define NXUS_DMNT_MAX_MAPPINGS 8192ull
 
 static bool dmntResultIsCheatNotAttached(Result rc) {
     if (R_SUCCEEDED(rc)) return false;
@@ -273,7 +275,11 @@ static Result opGetMappingCount(void *ctx) {
 Result nxusDmntGetMappingCount(u64 *out_count) {
     if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
     if (out_count == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    return dmntRunCommand(opGetMappingCount, out_count, false, "GetMappingCount");
+    Result rc = dmntRunCommand(opGetMappingCount, out_count, false, "GetMappingCount");
+    /* Sanity cap: the mapping count is used to size PC-side loops, so a garbage
+       value would keep a client paging forever. */
+    if (R_SUCCEEDED(rc) && *out_count > NXUS_DMNT_MAX_MAPPINGS) *out_count = NXUS_DMNT_MAX_MAPPINGS;
+    return rc;
 }
 
 typedef struct {
@@ -305,7 +311,12 @@ Result nxusDmntGetMappings(NxusMemoryInfo *buffer, size_t max_count, size_t offs
     DmntMappingsCtx ctx = { buffer, max_count, offset, &count };
     Result rc = dmntRunCommand(opGetMappings, &ctx, false, "GetMappings");
 
-    if (R_SUCCEEDED(rc) && out_count != NULL) *out_count = (size_t)count;
+    /* dmnt answers with the number of entries it wrote; never trust it further
+       than the buffer we actually handed over (a larger value would make the
+       caller walk past its own allocation). */
+    if (R_SUCCEEDED(rc) && out_count != NULL) {
+        *out_count = (count > (u64)max_count) ? max_count : (size_t)count;
+    }
     return rc;
 }
 
@@ -440,7 +451,9 @@ Result nxusDmntGetFrozenEntries(NxusFrozenAddressEntry *buffer, size_t max_count
     DmntFrozenCtx ctx = { buffer, max_count, offset, &count };
     Result rc = dmntRunCommand(opGetFrozenEntries, &ctx, false, "GetFrozenEntries");
 
-    if (R_SUCCEEDED(rc) && out_count != NULL) *out_count = (size_t)count;
+    if (R_SUCCEEDED(rc) && out_count != NULL) {
+        *out_count = (count > (u64)max_count) ? max_count : (size_t)count;
+    }
     return rc;
 }
 

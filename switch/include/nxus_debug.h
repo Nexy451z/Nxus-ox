@@ -71,6 +71,8 @@ Result nxusDebugBreak(void);
    so it only raises this flag; nxusServerTick() collects the session and restores
    dmnt.  While set, nxusDebugAttach() refuses to start a second session. */
 bool   nxusDebugExitedPending(void);
+/* True while dmnt <-> own debug session ownership is being handed over. */
+bool   nxusDebugIsHandoff(void);
 
 void   nxusDebugConfigure(const NxusDebugConfig *config);
 void   nxusDebugGetConfig(NxusDebugConfig *out);

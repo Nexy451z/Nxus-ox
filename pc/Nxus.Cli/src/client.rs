@@ -147,6 +147,13 @@ type Response = Option<(u16, u16, Vec<u8>)>;
 /// Conservative default until the server tells us its real limit.
 pub const DEFAULT_MAX_READ: u32 = 64 * 1024;
 
+/// Largest payload this client will accept from the console.
+///
+/// `shared/nxus_net.h` caps a single reply at `NXUS_NET_BUF_SIZE` (1 MiB); this
+/// leaves headroom for the header and for a future bump, while still rejecting a
+/// garbage length outright instead of trying to allocate it.
+pub const MAX_PAYLOAD: u32 = 8 * 1024 * 1024;
+
 pub struct NxusClient {
     max_read: std::sync::atomic::AtomicU32,
     stream: Mutex<TcpStream>,
@@ -878,6 +885,13 @@ fn reader_loop(mut stream: TcpStream, pending: Arc<Mutex<HashMap<u32, Sender<Res
         let length = rd_u32(&header, 8);
         let seq = rd_u32(&header, 12);
 
+        // The header is attacker-controlled on a hostile or broken peer: a length
+        // of 0xFFFFFFFF used to become a 4 GiB `vec![0u8; ...]` and abort the
+        // process (the GUI then stayed "busy" forever).  The console never sends
+        // more than one net buffer, so anything larger is a framing error.
+        if length > MAX_PAYLOAD {
+            break;
+        }
         let mut payload = vec![0u8; length as usize];
         if length > 0 && !read_exact(&mut stream, &mut payload) {
             break;

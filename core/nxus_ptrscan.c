@@ -307,7 +307,12 @@ int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
     if (options->value_width != 4 && options->value_width != 8) return NXUS_SCAN_ERR_PARAM;
     if (options->max_depth == 0 || options->max_depth > NXUS_PTRSCAN_MAX_DEPTH) return NXUS_SCAN_ERR_PARAM;
 
-    PtrScan scan;
+    /* ~38 KB (dead_set/dead_depth/window-cache tables): far too large for the
+       32 KB server-thread stack this is called from, where it silently
+       overflowed into .bss.  nxusPtrScan is non-reentrant (one ptrscan per
+       connection, the server serialises commands), so a static instance is
+       the cheapest way to keep it off the stack. */
+    static PtrScan scan;
     memset(&scan, 0, sizeof(scan));
     scan.regions = regions;
     scan.region_count = region_count;

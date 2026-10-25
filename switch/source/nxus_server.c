@@ -20,7 +20,7 @@ static volatile bool g_CommandActive;
 /* When the current command started, so a handler that never returns (blocked dmnt
    call, stalled send) cannot suppress the watchdog and reaper for the whole boot. */
 static volatile u64  g_CommandStartedMs;
-#define NXUS_COMMAND_GRACE_MS 30000u
+#define NXUS_COMMAND_GRACE_MS 120000u
 
 /* Break-list reply size.  The debugger tracks every hardware slot now (ten: six
    instruction + four watch, NXUS_DEBUG_MAX_BREAKS), and nxus_server.h still carries
@@ -1420,6 +1420,11 @@ void nxusServerTick(void) {
            the target would stay paused with no watchdog and no reaper. */
         const u64 started = g_CommandStartedMs;
         const u64 now = armTicksToNs(armGetSystemTick()) / 1000000ull;
+        /* Never declare a running scan "stuck": it legitimately holds the
+           connection thread for minutes, and clearing the flag here would let the
+           reaper close the debug handle under it (the use-after-free the grace
+           period exists to prevent). */
+        if (nxusSessionScanState() == NxusScanState_Running) return;
         if (started != 0 && now - started < NXUS_COMMAND_GRACE_MS) return;
         NXUS_LOG("a command has been running for %llu ms - watchdog re-enabled",
                  (unsigned long long)(now - started));

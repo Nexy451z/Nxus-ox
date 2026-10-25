@@ -505,7 +505,7 @@ Result nxusSessionRefreshIdentity(void) {
        attach hand-off) are kept.  Do not even call nxusDmntGetMetadata() here: it
        auto-reopens dmnt after a failure, which would fight with the debug session
        that owns the process. */
-    if (nxusDebugIsAttached()) return 0;
+    if (nxusDebugIsAttached() || nxusDebugIsHandoff()) return 0;
     NxusProcessMetadata md;
     memset(&md, 0, sizeof(md));
     Result rc = nxusDmntGetMetadata(&md);

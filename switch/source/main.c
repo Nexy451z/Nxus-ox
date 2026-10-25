@@ -96,6 +96,7 @@ void __appExit(void) {
     nxusDebugExit();
     nxusSessionExit();
     nxusDmntExit();
+    nxusLogExit();
     fsdevUnmountAll();
     fsExit();
 }

@@ -6,17 +6,94 @@
 
 #define NXUS_LOG_RING_SIZE 16384
 #define NXUS_LOG_PATH      "sdmc:/nxus/nxus.log"
+#define NXUS_LOG_OLD_PATH  "sdmc:/nxus/nxus.log.1"
+/* Rotate instead of growing without bound: a sysmodule that runs for days (and
+   logs a line per hit burst) must not fill the SD card.  256 KiB is ~10x the
+   useful history and one rename is far cheaper than a full disk. */
+#define NXUS_LOG_MAX_BYTES (256u * 1024u)
 
 static char   g_Ring[NXUS_LOG_RING_SIZE];
 static size_t g_RingLen = 0;      /* bytes used, buffer is always NUL terminated */
 static Mutex  g_LogMutex;
 static bool   g_LogToSd = false;
+/* Keeping the file open turns one fopen+fwrite+fclose (three SD round trips) per
+   line into a single buffered write plus fflush.  The flush keeps the crash
+   diagnostics intact - an unflushed buffer would lose exactly the lines that
+   explain a hang. */
+static FILE  *g_LogFile = NULL;
+static u64    g_LogBytes = 0;
+/* Unflushed bytes + the last flush time.  fflush() per line turned every log line
+   into an SD write; a 4 KiB / 500 ms policy keeps the data loss window short for
+   crash diagnostics (nxusLogExit flushes) while cutting the write count by ~97%. */
+static u32    g_LogPending = 0;
+static u64    g_LogLastFlush = 0;
+#define NXUS_LOG_FLUSH_BYTES    4096u
+#define NXUS_LOG_FLUSH_INTERVAL 500000000ull   /* 500 ms in ns */
 
 void nxusLogInit(int write_to_sd) {
     mutexInit(&g_LogMutex);
     g_Ring[0] = 0;
     g_RingLen = 0;
     g_LogToSd = write_to_sd != 0;
+    g_LogFile = NULL;
+    g_LogBytes = 0;
+}
+
+void nxusLogExit(void) {
+    mutexLock(&g_LogMutex);
+    if (g_LogFile != NULL) {
+        fflush(g_LogFile);
+        fclose(g_LogFile);
+        g_LogFile = NULL;
+    }
+    mutexUnlock(&g_LogMutex);
+}
+
+/* Open (or reopen after a rotation) the append stream and learn its size. */
+static bool logOpenLocked(const char *mode) {
+    if (g_LogFile != NULL) { fclose(g_LogFile); g_LogFile = NULL; }
+    g_LogFile = fopen(NXUS_LOG_PATH, mode);
+    g_LogBytes = 0;
+    if (g_LogFile == NULL) return false;
+    if (mode[0] == 'a') {
+        if (fseek(g_LogFile, 0, SEEK_END) == 0) {
+            long size = ftell(g_LogFile);
+            g_LogBytes = (size > 0) ? (u64)size : 0;
+        }
+    }
+    return true;
+}
+
+static void logRotateLocked(void) {
+    if (g_LogFile != NULL) { fclose(g_LogFile); g_LogFile = NULL; }
+    remove(NXUS_LOG_OLD_PATH);
+    /* A failed rename (e.g. the old copy could not be removed) still must not let
+       the log grow forever, so fall through to truncation. */
+    if (rename(NXUS_LOG_PATH, NXUS_LOG_OLD_PATH) != 0) {
+        (void)logOpenLocked("wb");
+        return;
+    }
+    (void)logOpenLocked("ab");
+}
+
+static void logWriteLocked(const char *line, size_t len) {
+    if (!g_LogToSd) return;
+    if (g_LogFile == NULL && !logOpenLocked("ab")) return;
+    if (g_LogBytes >= NXUS_LOG_MAX_BYTES) {
+        logRotateLocked();
+        if (g_LogFile == NULL) return;
+    }
+    if (fwrite(line, 1, len, g_LogFile) == len) {
+        g_LogBytes += len;
+        g_LogPending += (u32)len;
+        const u64 now = armGetSystemTick();
+        if (g_LogPending >= NXUS_LOG_FLUSH_BYTES || g_LogLastFlush == 0 ||
+            armTicksToNs(now - g_LogLastFlush) >= NXUS_LOG_FLUSH_INTERVAL) {
+            fflush(g_LogFile);
+            g_LogPending = 0;
+            g_LogLastFlush = now;
+        }
+    }
 }
 
 static void ringAppend(const char *text, size_t len) {
@@ -47,14 +124,7 @@ void nxusLogWrite(const char *fmt, ...) {
 
     mutexLock(&g_LogMutex);
     ringAppend(line, (size_t)n);
-
-    if (g_LogToSd) {
-        FILE *f = fopen(NXUS_LOG_PATH, "ab");
-        if (f != NULL) {
-            fwrite(line, 1, (size_t)n, f);
-            fclose(f);
-        }
-    }
+    logWriteLocked(line, (size_t)n);
     mutexUnlock(&g_LogMutex);
 }
 
@@ -79,5 +149,11 @@ size_t nxusLogTail(char *out, size_t capacity) {
 }
 
 void nxusLogFlush(void) {
-    /* the SD file is opened/closed per line, so there is nothing buffered */
+    mutexLock(&g_LogMutex);
+    if (g_LogFile != NULL) {
+        fflush(g_LogFile);
+        g_LogPending = 0;
+        g_LogLastFlush = armGetSystemTick();
+    }
+    mutexUnlock(&g_LogMutex);
 }

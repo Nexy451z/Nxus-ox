@@ -5,6 +5,8 @@
 #include <stddef.h>
 
 void nxusLogInit(int write_to_sd);
+/* Flush and close the SD stream (it stays open for the whole run). */
+void nxusLogExit(void);
 void nxusLogWrite(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void nxusLogEvent(u32 event_id, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 

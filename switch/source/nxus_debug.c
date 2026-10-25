@@ -39,6 +39,41 @@ static atomic_bool g_StopLoop;
    thread that is not the event thread (detach joins it).  nxusServerTick() does
    that and restores dmnt; until then nxusDebugAttach() refuses to start again. */
 static atomic_bool g_ExitSeen;
+/* svcGetDebugEvent / svcContinueDebugEvent must never be issued by two threads at
+   once: the event thread and the command thread (continue / step / break) both
+   drain the queue, and an interleaved pair makes the kernel answer Busy or, worse,
+   resumes while the other side still believes the target is held.  Recursive so
+   continueAllOnce() can call drainDebugEvents() while holding it. */
+static RMutex g_EventMutex;
+static bool   g_EventMutexReady;
+/* True while nxusDebugAttach()/Detach() is handing the process between dmnt and
+   our own debug session.  dmnt's auto-reopen must not run in that window (it
+   would take the process back and make svcDebugActiveProcess fail), and the
+   session identity refresh must not call into dmnt either (it would reopen it). */
+static atomic_bool g_HandoffBusy;
+/* The scan worker reads/writes through g_Debug while the command thread may be
+   detaching.  svcCloseHandle() frees the handle slot, and the kernel reuses it for
+   the next object, so a read that started before the close can end up touching an
+   unrelated handle.  Detach marks g_DebugClosing and waits for the in-flight count
+   to reach zero before it closes. */
+static atomic_int  g_DebugOpUsers;
+static atomic_bool g_DebugClosing;
+
+static Result debugOpBegin(void) {
+    if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire)) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    }
+    atomic_fetch_add_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
+    if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire) || !g_Attached) {
+        atomic_fetch_sub_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    }
+    return 0;
+}
+
+static void debugOpEnd(void) {
+    atomic_fetch_sub_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
+}
 
 /* Why the current stop exists.  The event loop uses it to tell an explicit
    debugger stop (Pause, Step) apart from a stop left over from auto_continue == 0
@@ -106,30 +141,52 @@ static u64 hwBreakValue(u32 kind, u64 address) {
 
 /* ---- per-core hardware breakpoint arming -------------------------------- */
 
+/* One register write: slot 0..5 = instruction breakpoint, 0x10..0x13 = watchpoint. */
+typedef struct {
+    u32 slot;
+    u64 ctrl;
+    u64 value;
+} HwSlotWrite;
+
 /* svcSetHardwareBreakPoint only programs the DBGB*R of the core the calling
    thread is currently executing on, and Nxus runs on core 3 by default while the
    game runs on cores 0-2.  Every armed slot must therefore be written once per
    core: migrate the calling thread through cores 0-3 and re-issue the call on
    each, then restore its original affinity.  This mirrors Atmosphère's
-   dmnt2_hardware_breakpoint.cpp. */
-static Result setHardwareBreakPointAllCores(u32 slot, u64 ctrl, u64 value) {
+   dmnt2_hardware_breakpoint.cpp.
+
+   The migration itself is the expensive part (it stops the thread and moves it),
+   so program a whole *batch* while parked on each core instead of migrating once
+   per slot: a detach that wipes ten slots costs 4 migrations instead of 40, and
+   the hit path's disarm/re-arm pair drops from ~200 SVCs to ~30. */
+static Result programSlotsAllCores(const HwSlotWrite *writes, u32 count) {
+    if (count == 0) return 0;
+
     s32 orig_core = 0;
     u64 orig_mask = 0;
     Result mrc = svcGetThreadCoreMask(&orig_core, &orig_mask, CUR_THREAD_HANDLE);
     Result first_err = 0;
+
     for (s32 core = 0; core < 4; core++) {
         if (R_SUCCEEDED(mrc)) {
             svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (1ull << core));
         }
-        Result rc = svcSetHardwareBreakPoint(slot, ctrl, value);
-        if (R_FAILED(rc) && R_SUCCEEDED(first_err)) {
-            first_err = rc;
+        for (u32 i = 0; i < count; i++) {
+            Result rc = svcSetHardwareBreakPoint(writes[i].slot, writes[i].ctrl, writes[i].value);
+            if (R_FAILED(rc) && R_SUCCEEDED(first_err)) {
+                first_err = rc;
+            }
         }
     }
     if (R_SUCCEEDED(mrc)) {
         svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
     }
     return first_err;
+}
+
+static Result setHardwareBreakPointAllCores(u32 slot, u64 ctrl, u64 value) {
+    HwSlotWrite write = { slot, ctrl, value };
+    return programSlotsAllCores(&write, 1);
 }
 
 /* Wipe every hardware breakpoint/watchpoint register on every core.
@@ -139,12 +196,11 @@ static Result setHardwareBreakPointAllCores(u32 slot, u64 ctrl, u64 value) {
    kernel does not reset the debug breakpoint/watchpoint registers on handle
    close - so both attach and detach clear the entire set, unconditionally. */
 static void clearAllHardwareSlots(void) {
-    for (u32 slot = 0; slot <= 5; slot++) {
-        setHardwareBreakPointAllCores(slot, 0, 0);
-    }
-    for (u32 slot = 0x10; slot <= 0x13; slot++) {
-        setHardwareBreakPointAllCores(slot, 0, 0);
-    }
+    HwSlotWrite writes[10];
+    u32 n = 0;
+    for (u32 slot = 0; slot <= 5; slot++) writes[n++] = (HwSlotWrite){ slot, 0, 0 };
+    for (u32 slot = 0x10; slot <= 0x13; slot++) writes[n++] = (HwSlotWrite){ slot, 0, 0 };
+    programSlotsAllCores(writes, n);
 }
 
 /* svcContinueDebugEvent returns ResultBusy (0xF401) while even one queued debug
@@ -503,13 +559,19 @@ static void noteThread(u64 thread_id) {
    every style now, and clearing it would break the link of every execution
    breakpoint. */
 static void disarmAllBreaks(void) {
+    HwSlotWrite writes[NXUS_DEBUG_MAX_BREAKS + 1];
+    u32 n = 0;
     mutexLock(&g_Mutex);
     for (u32 i = 0; i < g_BreakCount; i++) {
         if (g_Breaks[i].enabled) {
-            setHardwareBreakPointAllCores(g_Breaks[i].slot, 0, 0);
+            writes[n++] = (HwSlotWrite){ g_Breaks[i].slot, 0, 0 };
         }
     }
-    setHardwareBreakPointAllCores(styleLinkSlot(g_Config.style), 0, 0);
+    writes[n++] = (HwSlotWrite){ styleLinkSlot(g_Config.style), 0, 0 };
+    /* One core migration for the whole batch (see programSlotsAllCores).  Kept
+       under g_Mutex: nxusDebugDetach() sets g_Attached=false and wipes the slots
+       under the same lock, so a late write can never land after the wipe. */
+    programSlotsAllCores(writes, n);
     mutexUnlock(&g_Mutex);
 }
 
@@ -528,14 +590,21 @@ static void rearmAllBreaks(void) {
         mutexUnlock(&g_Mutex);
         return;
     }
+    HwSlotWrite writes[NXUS_DEBUG_MAX_BREAKS + 1];
+    u32 n = 0;
     const u64 ctx_ctrl = (0x3ull << 20) | 0x1E1ull;
-    setHardwareBreakPointAllCores(styleLinkSlot(g_Config.style), ctx_ctrl, (u64)g_Debug);
+    writes[n++] = (HwSlotWrite){ styleLinkSlot(g_Config.style), ctx_ctrl, (u64)g_Debug };
     for (u32 i = 0; i < g_BreakCount; i++) {
         if (g_Breaks[i].enabled) {
-            setHardwareBreakPointAllCores(g_Breaks[i].slot, g_Breaks[i].ctrl,
-                                          hwBreakValue(g_Breaks[i].kind, g_Breaks[i].address));
+            writes[n++] = (HwSlotWrite){
+                g_Breaks[i].slot, g_Breaks[i].ctrl,
+                hwBreakValue(g_Breaks[i].kind, g_Breaks[i].address) };
         }
     }
+    /* Batch: a hot watchpoint hit does disarm+rearm, so this halves the number of
+       core migrations on the hottest debugger path.  Under g_Mutex so it cannot
+       race the detach wipe. */
+    programSlotsAllCores(writes, n);
     mutexUnlock(&g_Mutex);
 }
 
@@ -609,7 +678,7 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
    queue first for exactly that reason.  A bounded drain is used so a process
    that produces events faster than they are consumed cannot starve anything
    else on this thread forever. */
-static u32 drainDebugEvents(bool *had_break) {
+static u32 drainDebugEventsLocked(bool *had_break) {
     u32 processed = 0;
     for (u32 n = 0; n < 64; n++) {
         DebugEventInfo event;
@@ -619,6 +688,15 @@ static u32 drainDebugEvents(bool *had_break) {
         if (handleDebugEvent(&event) && had_break != NULL) *had_break = true;
     }
     return processed;
+}
+
+/* Locking wrapper: serialises the debug-event queue against the command thread
+   (see g_EventMutex).  Callers keep using the original name. */
+static u32 drainDebugEvents(bool *had_break) {
+    if (g_EventMutexReady) rmutexLock(&g_EventMutex);
+    u32 n = drainDebugEventsLocked(had_break);
+    if (g_EventMutexReady) rmutexUnlock(&g_EventMutex);
+    return n;
 }
 
 static void eventThread(void *arg) {
@@ -747,7 +825,14 @@ void nxusDebugInit(void) {
     g_Attached = false;
     g_Debug = INVALID_HANDLE;
     atomic_init(&g_StopLoop, true);
+    if (!g_EventMutexReady) {
+        rmutexInit(&g_EventMutex);
+        g_EventMutexReady = true;
+    }
     atomic_init(&g_ExitSeen, false);
+    atomic_init(&g_HandoffBusy, false);
+    atomic_init(&g_DebugOpUsers, 0);
+    atomic_init(&g_DebugClosing, false);
     atomic_init(&g_Stopped, false);
     atomic_init(&g_StoppedThread, 0);
     atomic_init(&g_StopReason, (unsigned)StopReason_Hit);
@@ -765,6 +850,10 @@ bool nxusDebugExitedPending(void) {
     return atomic_load_explicit(&g_ExitSeen, memory_order_relaxed);
 }
 
+bool nxusDebugIsHandoff(void) {
+    return atomic_load_explicit(&g_HandoffBusy, memory_order_relaxed);
+}
+
 Result nxusDebugAttach(u64 pid) {
     if (g_Attached) return 0;
     if (pid == 0) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
@@ -780,6 +869,7 @@ Result nxusDebugAttach(u64 pid) {
        auto-reopen dmnt and race the hand-off.  Restored on every failure path and
        on detach. */
     nxusDmntSetAutoReopen(false);
+    atomic_store_explicit(&g_HandoffBusy, true, memory_order_release);
 
     /* Ask for the process FIRST.
      *
@@ -813,6 +903,7 @@ Result nxusDebugAttach(u64 pid) {
            "dmnt owned it and the retry still failed" path recover. */
         nxusDmntForceOpen();
         nxusDmntSetAutoReopen(true);
+        atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
         return rc;
     }
 
@@ -846,10 +937,12 @@ Result nxusDebugAttach(u64 pid) {
         clearAllHardwareSlots();
         nxusDmntForceOpen();
         nxusDmntSetAutoReopen(true);
+        atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
         return rc;
     }
     g_EventThreadLive = true;
     threadStart(&g_EventThread);
+    atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
     NXUS_LOG("debug mode active (pid=%llu, watch style=%u)", (unsigned long long)pid,
              (unsigned)g_Config.style);
     return 0;
@@ -861,6 +954,11 @@ Result nxusDebugDetach(void) {
         nxusDmntSetAutoReopen(true);
         return 0;
     }
+
+    /* Handing the process back to dmnt: block the auto-reopen/identity paths
+       until ForceOpen() has run, otherwise a concurrent read failure re-opens
+       dmnt underneath us. */
+    atomic_store_explicit(&g_HandoffBusy, true, memory_order_release);
 
     /* Stop and JOIN the event thread FIRST.  Once threadWaitForExit() returns,
        no thread can be inside rearmAllBreaks()/disarmAllBreaks() any more, so the
@@ -914,7 +1012,15 @@ Result nxusDebugDetach(void) {
             NXUS_RESULT("ContinueDebugEvent (detach ack)", crc);
         }
 
+        /* Wait for in-flight svcRead/Write/QueryDebugProcessMemory calls: the
+           handle number is reusable the moment it is closed. */
+        atomic_store_explicit(&g_DebugClosing, true, memory_order_release);
+        for (int wait = 0; wait < 500; wait++) {
+            if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) break;
+            svcSleepThread(1000000ull);
+        }
         svcCloseHandle(g_Debug);   /* detaches and resumes the target */
+        atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
         g_Debug = INVALID_HANDLE;
     }
 
@@ -930,6 +1036,7 @@ Result nxusDebugDetach(void) {
     }
     NXUS_RESULT("dmnt ForceOpenCheatProcess (restore)", rc);
     nxusDmntSetAutoReopen(true);
+    atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
     NXUS_LOG("debug mode released");
     return 0;
 }
@@ -952,6 +1059,12 @@ void nxusDebugGetStatus(NxusDebugStatus *out) {
 }
 
 Result nxusDebugSetBreak(const NxusBreakRequest *request) {
+    /* A size outside {1,2,4,8} makes watchBas() shift by more than 63 bits (and
+       wraps its u32 arithmetic), so reject it before any control word is built. */
+    if (request != NULL && (request->size != 1 && request->size != 2 &&
+                            request->size != 4 && request->size != 8)) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
     if (request == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
 
     /* Serialised against detach (and against nxusDebugClearBreak): the whole
@@ -1063,6 +1176,18 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
 }
 
 Result nxusDebugClearBreak(u32 slot) {
+    /* Only real breakpoint/watchpoint slots may be cleared.  In particular the
+       ContextID link slot (4 or 5) must keep its breakpoint: clearing it silently
+       unlinks every execution breakpoint and they stop firing. */
+    const bool is_bp_slot = (slot <= 5);
+    const bool is_wp_slot = (slot >= 0x10 && slot <= 0x13);
+    if (!is_bp_slot && !is_wp_slot) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+    if (is_bp_slot && slot == styleLinkSlot(g_Config.style)) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+
     /* Same serialisation as SetBreak, for the same reason: a clear that runs
        concurrently with detach could reprogram (here: wipe) a register after the
        detach wiped them, and a clear that loses the race must not touch the
@@ -1251,13 +1376,18 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
    debug event is still queued and then resumes NOTHING, so the queue is drained
    and the call retried instead of leaving the title stopped. */
 static Result continueAllOnce(void) {
+    if (g_EventMutexReady) rmutexLock(&g_EventMutex);
     Result rc = 0;
     for (int retry = 0; retry < 8; retry++) {
         rc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
-        if (R_SUCCEEDED(rc)) return 0;
+        if (R_SUCCEEDED(rc)) {
+            if (g_EventMutexReady) rmutexUnlock(&g_EventMutex);
+            return 0;
+        }
         if (!isDebugBusyResult(rc)) break;
         if (drainDebugEvents(NULL) == 0) svcSleepThread(1000000ull);
     }
+    if (g_EventMutexReady) rmutexUnlock(&g_EventMutex);
     return rc;
 }
 
@@ -1527,24 +1657,31 @@ Result nxusDebugBreak(void) {
 }
 
 Result nxusDebugReadMemory(u64 address, void *buffer, u32 size) {
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
-    return svcReadDebugProcessMemory(buffer, g_Debug, address, size);
+    Result rc = debugOpBegin();
+    if (R_FAILED(rc)) return rc;
+    rc = svcReadDebugProcessMemory(buffer, g_Debug, address, size);
+    debugOpEnd();
+    return rc;
 }
 
 Result nxusDebugWriteMemory(u64 address, const void *buffer, u32 size) {
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
-    return svcWriteDebugProcessMemory(g_Debug, buffer, address, size);
+    Result rc = debugOpBegin();
+    if (R_FAILED(rc)) return rc;
+    rc = svcWriteDebugProcessMemory(g_Debug, buffer, address, size);
+    debugOpEnd();
+    return rc;
 }
 
 Result nxusDebugQueryMemory(u64 address, NxusMemoryInfo *out) {
     if (out == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    Result begin_rc = debugOpBegin();
+    if (R_FAILED(begin_rc)) return begin_rc;
 
     MemoryInfo info;
     u32 page_info = 0;
     memset(&info, 0, sizeof(info));
     Result rc = svcQueryDebugProcessMemory(&info, &page_info, g_Debug, address);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) { debugOpEnd(); return rc; }
 
     out->base_addr = info.addr;
     out->size = info.size;
@@ -1554,6 +1691,7 @@ Result nxusDebugQueryMemory(u64 address, NxusMemoryInfo *out) {
     out->device_refcount = info.device_refcount;
     out->ipc_refcount = info.ipc_refcount;
     out->padding = 0;
+    debugOpEnd();
     return 0;
 }
 
