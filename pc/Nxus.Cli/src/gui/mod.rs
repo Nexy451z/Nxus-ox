@@ -71,7 +71,18 @@ pub enum Cmd {
     /// 0 = automatic, i.e. the console infers it from the title (the GUI always
     /// sends 0 - a hard-coded 4 made every 64-bit title unaddressable).
     PtrScan { target: u64, module_base: u64, depth: u32, max_offset: u32, width: u32 },
-    PtrScanPc { target: u64, module_base: u64, depth: u32, max_offset: u32, dump_path: Option<String> },
+    /// PC-side pointer scan: capture the target (or load a dump) on the PC and
+    /// walk it there.
+    ///
+    /// `width` is the title's pointer width from the shared rule
+    /// ([`crate::client::pointer_width_with_reason`], 4 or 8), used by the LIVE
+    /// capture so the PC walk matches what the console would walk - including the
+    /// process's own address space, which the captured mapping table alone cannot
+    /// prove (a 64-bit title can sit entirely below 4 GiB).  0 = derive it from
+    /// the dump's own mapping table, which is the only option for an OFFLINE file
+    /// (it may be another title's dump).
+    PtrScanPc { target: u64, module_base: u64, depth: u32, max_offset: u32,
+                dump_path: Option<String>, width: u32 },
     SaveDump { path: String, scope: u32, begin: u64, end: u64 },
     /// Generate the cheat block for a chain the console published.
     ///
@@ -452,7 +463,7 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                     let _ = tx.send(Ev::Disconnected);
                     let _ = tx.send(Ev::Message("disconnected".into()));
                 }
-                Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: Some(path) } => {
+                Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: Some(path), .. } => {
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                     if crate::edizon::is_edizon_file(&path) {
                         let dump = crate::edizon::EdizonDump::load(&path).map_err(|e| e.to_string())?;
@@ -792,7 +803,8 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                                                 chains.len(), note, width_note)));
                             let _ = tx.send(Ev::Chains { chains, truncated, owner });
                         }
-                        Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: None } => {
+                        Cmd::PtrScanPc { target, module_base, depth, max_offset, dump_path: None,
+                                         width: title_width } => {
                             cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                             // The dump is captured from the live target, so the
                             // chains describe it: stamp them with the identity the
@@ -809,13 +821,21 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let dump = crate::dump::MemoryDump::capture(c, Scope::Writable, 0, 0, &cancel, &mut progress)?;
                             let (inf_base, inf_size) = dump.infer_main_module();
                             let module_base = if module_base != 0 { module_base } else { inf_base };
-                            // Same rule as the console-side scan: a 64-bit title
-                            // needs 8-byte pointers, not the old fixed 4.  The
-                            // captured dump's mapping table is the evidence.
-                            let width = crate::client::pointer_width_for(
-                                &Metadata { main_base: module_base, ..Default::default() },
-                                Some(&dump.infos),
-                            );
+                            // Same rule as the console-side scan, with the SAME
+                            // evidence: the UI's shared width first (it sees the
+                            // process's address space, which the captured mapping
+                            // table cannot prove - a 64-bit title can sit entirely
+                            // below 4 GiB), and only then the dump's own table.
+                            // This used to be the table alone, so a low-placed
+                            // 64-bit title was walked here with 4-byte loads while
+                            // the console walked the same title with 8.
+                            let width = match title_width {
+                                4 | 8 => title_width,
+                                _ => crate::client::pointer_width_for(
+                                    &Metadata { main_base: module_base, ..Default::default() },
+                                    Some(&dump.infos),
+                                ),
+                            };
                             let res = crate::dump::ptrscan_dump(
                                 &dump,
                                 &crate::dump::PtrScanOptions {
@@ -2724,6 +2744,9 @@ impl App {
         });
 
         self.st.chains = vec![PtrChain { root_offset: 0x81000, final_offset: 4, steps: vec![0x20] }];
+        // Stamped like a real walk of this (32-bit) demo target, so the
+        // --screenshot run shows the owner line and the preview gate too.
+        self.st.chains_owner = self.st.target.map(|target| ChainOwner::new(target, 4));
         self.st.cheat_text = "[Nxus]\n540F0000 00081000\n540F1000 00000020\n780F0000 00000004\n640F0000 00000000 0098967F\n".into();
         let mut hit = BreakHit::default();
         hit.index = 3;

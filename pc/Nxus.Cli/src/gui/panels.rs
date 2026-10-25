@@ -430,6 +430,16 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                             the AArch64 default. 8-byte pointers mean 580F loads and \
                             8-byte value writes (680F); 4-byte pointers mean 540F loads \
                             and 640F writes.");
+        // Width for the LIVE PC-side walk: the dump it captures carries the mapping
+        // table itself, so only the process-level evidence - which no dump can
+        // carry - has to come from here.  0 = "derive it from the captured table",
+        // which is also what an offline dump scan needs (another title's file must
+        // not be walked with this title's width).
+        let pc_scan_width = match width_reason {
+            crate::client::WIDTH_REASON_PROCESS_64
+            | crate::client::WIDTH_REASON_PROCESS_32 => pointer_width,
+            _ => 0,
+        };
         ui.horizontal(|ui| {
             ui.label("depth");
             ui.add(egui::DragValue::new(&mut app.prefs.ptr_depth).range(1..=8));
@@ -448,6 +458,9 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                         depth: app.prefs.ptr_depth,
                         max_offset: app.prefs.ptr_max_offset,
                         dump_path: None,
+                        // The process-level evidence the captured table cannot
+                        // prove (0 = let the worker read the dump's own table).
+                        width: pc_scan_width,
                     }, "scanning for pointers (PC)");
                 } else {
                     app.send(Cmd::PtrScan {
@@ -478,6 +491,10 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                         depth: app.prefs.ptr_depth,
                         max_offset: app.prefs.ptr_max_offset,
                         dump_path: Some(path.to_string_lossy().to_string()),
+                        // 0 = derive the width from the dump's own mapping table:
+                        // an offline file may be another title's dump, so the live
+                        // title's width must not be applied to it.
+                        width: 0,
                     }, "scanning dump");
                 }
             }

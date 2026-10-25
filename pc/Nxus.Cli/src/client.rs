@@ -48,20 +48,26 @@ pub type Result<T> = std::result::Result<T, NxusError>;
 /// in `nxusPtrScanAutoWidthFor()`).
 pub const WIDTH_LIMIT: u64 = 0x1_0000_0000;
 
-// Why [`pointer_width_with_reason`] answered what it answered.  The wording
-// mirrors `NXUS_PTRSCAN_WIDTH_REASON_*` (core/nxus_ptrscan.h) so a console log
-// line and a PC display agree about the same title, and the UI can render
-// "width: auto (assumed 64-bit from ...)" without inventing its own explanation.
+// Why [`pointer_width_with_reason`] answered what it answered.  One constant per
+// branch, not one per step: "the process address space" can decide either way,
+// and an operator reading 4 vs 8 needs to know which evidence won.
 //
-// One constant per branch, not one per step: "the process address space" can
-// decide either way, and an operator reading 4 vs 8 needs to know which.
-pub const WIDTH_REASON_PROCESS_64: &str = "the process address space is 64-bit";
-pub const WIDTH_REASON_PROCESS_32: &str = "the process address space fits in 32 bits";
-pub const WIDTH_REASON_MAPPINGS_64: &str = "the highest mapping end is above 4 GiB";
-pub const WIDTH_REASON_MAPPINGS_32: &str = "every mapping ends within 4 GiB";
-pub const WIDTH_REASON_MAIN_BASE_64: &str = "the main module base is at or above 4 GiB";
-pub const WIDTH_REASON_MAIN_BASE_32: &str = "the main module base is below 4 GiB";
-pub const WIDTH_REASON_DEFAULT: &str = "nothing is known, AArch64 is the default";
+// They are worded to complete "assumed {N}-bit from ...", which is exactly what
+// the GUI prints ("width: auto (assumed 64-bit from the process address space,
+// which is wider than 4 GiB)").  The branches correspond one to one with the
+// console's NXUS_PTRSCAN_WIDTH_REASON_* (core/nxus_ptrscan.h), whose own strings
+// are console-log terse ("process is 64-bit", "mapping ends").
+pub const WIDTH_REASON_PROCESS_64: &str =
+    "the process address space, which is wider than 4 GiB";
+pub const WIDTH_REASON_PROCESS_32: &str =
+    "the process address space, which fits in 4 GiB";
+pub const WIDTH_REASON_MAPPINGS_64: &str =
+    "the mapping table, whose highest end is above 4 GiB";
+pub const WIDTH_REASON_MAPPINGS_32: &str =
+    "the mapping table, whose every end is within 4 GiB";
+pub const WIDTH_REASON_MAIN_BASE_64: &str = "the main module base, at or above 4 GiB";
+pub const WIDTH_REASON_MAIN_BASE_32: &str = "the main module base, below 4 GiB";
+pub const WIDTH_REASON_DEFAULT: &str = "the AArch64 default, because nothing is known";
 
 /// The title's pointer width in bytes (4 or 8) *and the evidence for it* - the
 /// ONE width rule on the PC.
