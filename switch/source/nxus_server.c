@@ -558,12 +558,21 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     const NxusHitList *hits = nxusSessionHits();
     const NxusMappingTable *maps = nxusSessionMappings();
 
+    /* Both views are published by nxus_session.c: the hit list is NULL while a
+       scan is running, and the mapping table is NULL when nothing has been
+       snapshotted (or after Exit).  Answering with an empty batch keeps a stale
+       client from crashing the whole sysmodule. */
+    if (hits == NULL) {
+        replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        return;
+    }
+
     u32 count = req->count;
     if (count > NXUS_MAX_HITS_PER_BATCH) count = NXUS_MAX_HITS_PER_BATCH;
     if (req->offset >= hits->count) count = 0;
     else if (req->offset + count > hits->count) count = hits->count - req->offset;
 
-    u32 map_count = maps->count;
+    const u32 map_count = (maps != NULL) ? maps->count : 0;
     u32 payload_size = (u32)sizeof(NxusHitBatchHeader) + map_count * (u32)sizeof(u64) + count * (u32)sizeof(NxusHit);
     if (payload_size > NXUS_NET_BUF_SIZE) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));

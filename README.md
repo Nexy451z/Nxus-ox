@@ -18,6 +18,11 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 >    - Maintain a verified **NAND backup** and **SD card backup**.
 >    - Keep a recovery method ready (e.g., booting hekate UMS to remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` if a session hangs).
 >    - Strictly intended for **offline educational, debugging, and reverse-engineering research**.
+> 5. **Network exposure**: the console protocol has **no authentication** — anyone who can
+>    reach port `7332` can read/write the target's memory and take the debug handle. The
+>    sysmodule therefore **only accepts connections from private/LAN addresses**
+>    (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `100.64/10`) and closes
+>    anything else, logging the refused peer. Do **not** port-forward `7332`.
 
 ---
 

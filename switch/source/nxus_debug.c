@@ -120,8 +120,14 @@ static s32             g_LastResult;
 static Mutex           g_Mutex;
 
 /* Whether the debugged process was created as AArch64.  A 32-bit process keeps
-   SP/LR/FP in r13/r14/r11, and libnx does not copy them into the header fields. */
-static bool            g_Is64Bit = false;
+   SP/LR/FP in r13/r14/r11, and libnx does not copy them into the header fields.
+   The event thread writes this when the CreateProcess event arrives while the
+   command thread reads it in nxusDebugGetRegs()/SetRegs()/recordHit(): with a
+   plain bool a 32-bit title could observe a torn/false value for a moment and
+   would then read (or worse, write) the AArch64 header SP/LR, destroying the
+   wrong registers.  Release/acquire publishes the flag together with the rest of
+   the session state. */
+static atomic_bool     g_Is64Bit;
 
 /* ---- control word construction ----------------------------------------- */
 
@@ -216,9 +222,12 @@ static bool isDebugBusyResult(Result rc) {
 }
 
 /* A 32-bit process reports zeros in the SP/LR/FP header fields of ThreadContext
-   while the live values sit in the general-purpose registers. */
+   while the live values sit in the general-purpose registers.  The flag is read
+   with acquire so a caller that sees the AArch32 state also sees the session
+   state published with it. */
 static bool isContextAArch32(const ThreadContext *ctx) {
-    return !g_Is64Bit ||
+    const bool is64 = atomic_load_explicit(&g_Is64Bit, memory_order_acquire);
+    return !is64 ||
            (ctx->sp == 0 && ctx->lr == 0 &&
             (ctx->cpu_gprs[13].r != 0 || ctx->cpu_gprs[14].r != 0));
 }
@@ -625,14 +634,17 @@ static bool anyBreakEnabled(void) {
 static bool handleDebugEvent(const DebugEventInfo *event) {
     bool is_break = false;
     switch (event->type) {
-        case DebugEventType_CreateProcess:
+        case DebugEventType_CreateProcess: {
             /* The flags bit 0 tells whether the process is AArch64; the
-               32-bit view keeps SP/LR/FP in r13/r14/r11. */
-            g_Is64Bit = (event->info.create_process.flags & 1u) != 0;
+               32-bit view keeps SP/LR/FP in r13/r14/r11.  Release-published so the
+               command thread never observes a half-updated session state. */
+            const bool is64 = (event->info.create_process.flags & 1u) != 0;
+            atomic_store_explicit(&g_Is64Bit, is64, memory_order_release);
             NXUS_LOG("debug: process created (pid=%llu, %s)",
                      (unsigned long long)event->info.create_process.process_id,
-                     g_Is64Bit ? "AArch64" : "AArch32");
+                     is64 ? "AArch64" : "AArch32");
             break;
+        }
         case DebugEventType_CreateThread:
             noteThread(event->thread_id);
             break;
@@ -821,7 +833,7 @@ void nxusDebugInit(void) {
        "record the hit and keep running" behaviour sets auto_continue = 1 in
        NxusDebugConfig. */
     g_Config.auto_continue = 0;
-    g_Is64Bit = false;
+    atomic_init(&g_Is64Bit, false);
     g_Attached = false;
     g_Debug = INVALID_HANDLE;
     atomic_init(&g_StopLoop, true);

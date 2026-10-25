@@ -28,7 +28,11 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user);
 void   nxusNetExit(void);
 bool   nxusNetIsRunning(void);
 
-/* -1 when no client is connected. */
+/* -1 when no client is connected.  Intended for status/logging and the
+   "is this still my session?" loops, NOT as the source of a send target: a value
+   read here can be closed and its descriptor number recycled into a new client
+   before the write starts.  The send helpers take the lock first and read the
+   registered descriptor themselves. */
 int    nxusNetClientFd(void);
 
 /* armGetSystemTick() of the last packet byte received or of the last complete
@@ -36,7 +40,10 @@ int    nxusNetClientFd(void);
    time) from a long handler that merely starved the watchdog thread. */
 u64    nxusNetLastActivityTick(void);
 
-/* Thread-safe.  Returns an error if no client is connected or the write fails. */
+/* Thread-safe.  Returns an error if no client is connected or the write fails.
+   `fd` must be the client the packet handler was called for: it is validated
+   against the registered descriptor under the send lock, so a stale (closed and
+   recycled) number is refused instead of being written to another session. */
 Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length);
 Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length);
 

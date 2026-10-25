@@ -7,7 +7,20 @@
 #include <string.h>
 
 static Thread   g_Thread;
-static bool     g_ThreadLive = false;
+/* Lifecycle of g_Thread.  The worker is created lazily by nxusHidStart() and
+   joined+closed by nxusHidExit(); the worker itself never clears these flags (it
+   used to clear g_ThreadLive on return, which made the exit path skip
+   threadClose() and leak the thread object).
+     - g_ThreadLive    : g_Thread holds a created, started, not-yet-closed thread.
+     - g_ThreadStarting: a start owns threadCreate()/threadStart(); claimed by
+                         compare-exchange so two starts cannot both create a thread.
+     - g_ThreadClosing : an exit owns threadWaitForExit()/threadClose(); it is both
+                         the start lock (a start that sees it refuses to run) and
+                         the flag that makes a double close impossible, because only
+                         the compare-exchange winner ever closes g_Thread. */
+static atomic_bool g_ThreadLive;
+static atomic_bool g_ThreadStarting;
+static atomic_bool g_ThreadClosing;
 static bool     g_Available = false;
 static Result   g_InitResult = 0;
 static atomic_bool g_Stop;
@@ -25,6 +38,9 @@ static Mutex    g_Mutex;
 void nxusHidInit(void) {
     mutexInit(&g_Mutex);
     atomic_init(&g_Stop, false);
+    atomic_init(&g_ThreadLive, false);
+    atomic_init(&g_ThreadStarting, false);
+    atomic_init(&g_ThreadClosing, false);
 }
 
 void nxusHidSetCallback(NxusHotkeyCallback callback, void *user) {
@@ -117,7 +133,15 @@ static void hidThread(void *arg) {
             mutexUnlock(&g_Mutex);
 
             NXUS_LOG("hotkey: combo fired (buttons=%08llX)", (unsigned long long)buttons);
-            if (callback != NULL) callback(user);
+            /* Only run the callback while the session is still live: a stop that
+               arrives here must not start a new callback, and an in-flight one is
+               covered by threadWaitForExit() in nxusHidExit() because the close of
+               the thread object happens strictly after this call returns. */
+            if (callback != NULL &&
+                atomic_load_explicit(&g_ThreadLive, memory_order_acquire) &&
+                !atomic_load_explicit(&g_ThreadClosing, memory_order_acquire)) {
+                callback(user);
+            }
         }
 
         svcSleepThread(10000000ull);             /* 10ms poll */
@@ -125,16 +149,41 @@ static void hidThread(void *arg) {
 
     if (g_Available) hidExit();
     g_Available = false;
-    g_ThreadLive = false;
+    /* g_ThreadLive stays true on purpose: only nxusHidExit() clears it, after it
+       has joined and closed g_Thread.  Clearing it here used to hide the live
+       thread from the exit path and leak the thread object. */
 }
 
 void nxusHidExit(void) {
     atomic_store_explicit(&g_Stop, true, memory_order_relaxed);
-    if (g_ThreadLive) {
+
+    /* Exactly one exit may join and close g_Thread: the compare-exchange is both
+       the teardown lock and the flag that makes a double threadClose() impossible.
+       A second (concurrent) exit returns without touching the object again. */
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&g_ThreadClosing, &expected, true,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+
+    /* A start that won g_ThreadStarting but has not published the thread yet would
+       make threadWaitForExit() wait on a Thread that was never started (it would
+       block for ever).  threadCreate()/threadStart() cannot block on this caller,
+       and g_ThreadStarting is cleared only after g_ThreadLive is published, so wait
+       for that claim to settle instead of guessing. */
+    for (u32 spin = 0; spin < 1000u; spin++) {
+        if (!atomic_load_explicit(&g_ThreadStarting, memory_order_acquire)) break;
+        svcSleepThread(1000000ull);
+    }
+
+    if (atomic_load_explicit(&g_ThreadLive, memory_order_acquire)) {
+        /* Paired join + close, executed only by the winner above. */
         threadWaitForExit(&g_Thread);
         threadClose(&g_Thread);
-        g_ThreadLive = false;
+        atomic_store_explicit(&g_ThreadLive, false, memory_order_release);
     }
+
+    atomic_store_explicit(&g_ThreadClosing, false, memory_order_release);
 }
 
 Result nxusHidReadOnce(u64 *out_buttons) {
@@ -154,14 +203,32 @@ Result nxusHidReadOnce(u64 *out_buttons) {
 /* Started lazily by the server once a hotkey is configured, so an unused
    sysmodule does not hold the input service open. */
 void nxusHidStart(void) {
-    if (g_ThreadLive) return;
+    /* Claim the create/start section; a second start loses and does nothing. */
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&g_ThreadStarting, &expected, true,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+    /* Already running, or an exit owns the join/close: never create a second thread
+       on top of g_Thread (that used to leak the first one and race its close). */
+    if (atomic_load_explicit(&g_ThreadLive, memory_order_acquire) ||
+        atomic_load_explicit(&g_ThreadClosing, memory_order_acquire)) {
+        atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
+        return;
+    }
+
     atomic_store_explicit(&g_Stop, false, memory_order_relaxed);
     alignas(0x1000) static u8 stack[0x4000];
     Result rc = threadCreate(&g_Thread, hidThread, NULL, stack, sizeof(stack), 0x2C, -2);
     if (R_FAILED(rc)) {
         NXUS_LOG("hotkey: threadCreate failed rc=0x%08X", (unsigned)rc);
+        atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
         return;
     }
-    g_ThreadLive = true;
     threadStart(&g_Thread);
+    /* Publish the thread only after it was started: any exit that observes this
+       flag then has a started Thread that threadWaitForExit() can really join.
+       The flag stays true until that exit has closed the object. */
+    atomic_store_explicit(&g_ThreadLive, true, memory_order_release);
+    atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
 }

@@ -9,7 +9,13 @@
 #include <string.h>
 
 typedef struct {
-    u32 state;                 /* NxusScanState */
+    /* Scan state.  Atomic on purpose: the server thread stores Running while the
+       worker stores Done/Error/Cancelled, and status pollers plus the server's
+       BUSY gates read it without holding g_SessionMutex.  Every store is a
+       release store and every load an acquire load (sessionStateStore /
+       sessionStateLoad), so observing a settled state also means observing the
+       results (hit list, regions, progress, last_result) it describes. */
+    atomic_int state;          /* NxusScanState */
     u32 session_id;
     u32 progress;
     s32 last_result;
@@ -62,6 +68,66 @@ static Result snapshotMappings(void);
 static void buildRegions(const NxusScanRequest *req);
 
 static u64 nowMs(void) { return armTicksToNs(armGetSystemTick()) / 1000000ull; }
+
+/* ---- state publication ------------------------------------------------- */
+
+/*
+ * g_Session.state is the session's publication barrier:
+ *
+ *   - the server thread prepares the job (job_req, pattern, regions, hit list)
+ *     and only then stores Running with release,
+ *   - the worker files its results (final progress, last_result) and only then
+ *     stores Done/Error/Cancelled with release,
+ *   - readers use acquire, so "state != Running" also means "the results are
+ *     final and visible".
+ *
+ * Ordering matters beyond the worker itself: the server's BUSY gates decide from
+ * this value whether the hit list / mapping / region arrays may be walked, so a
+ * plain u32 store here would let those arrays be read while they are rebuilt.
+ */
+static NxusScanState sessionStateLoad(void) {
+    return (NxusScanState)atomic_load_explicit(&g_Session.state, memory_order_acquire);
+}
+
+static void sessionStateStore(NxusScanState state) {
+    atomic_store_explicit(&g_Session.state, (int)state, memory_order_release);
+}
+
+/* ---- published views --------------------------------------------------- */
+
+/*
+ * Both views below are "published" to other threads (nxusSessionMappings /
+ * nxusSessionRegions) but owned by this module.  The rule everywhere is: clear
+ * the published pair BEFORE the free, so a reader either obtains the old, still
+ * live block or sees an explicitly empty view - never a pointer into freed
+ * memory.  (The fields themselves are plain u32/pointer; the release fence keeps
+ * the clearing visible ahead of the allocator's reuse of the block.)
+ */
+static void mappingSnapshotDrop(void) {
+    NxusMappingEntry *old = g_Session.map_entries;
+    g_Session.maps.entries = NULL;
+    g_Session.maps.count = 0;
+    g_Session.map_entries = NULL;
+    atomic_thread_fence(memory_order_release);
+    free(old);
+}
+
+static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
+    NxusMappingEntry *old = g_Session.map_entries;
+    g_Session.map_entries = entries;
+    g_Session.maps.entries = entries;
+    g_Session.maps.count = count;
+    atomic_thread_fence(memory_order_release);
+    free(old);
+}
+
+static void regionListDrop(void) {
+    NxusScanRegion *old = g_Session.regions;
+    g_Session.regions = NULL;
+    g_Session.region_count = 0;
+    atomic_thread_fence(memory_order_release);
+    free(old);
+}
 
 /* ---- baseline store (SD card, RAM fallback) ---------------------------- */
 
@@ -195,8 +261,14 @@ static int sessionRead(void *ctx, u64 address, void *buffer, u32 size) {
     /* dmnt rejects oversized single reads; the engine never asks for more than
        one window (<= 32KB) or one chunk, both well within limits.
        In debug mode dmnt is detached, so the debug session serves the reads. */
-    Result rc = nxusDebugIsAttached() ? nxusDebugReadMemory(address, buffer, size)
-                                      : nxusDmntRead(address, buffer, size);
+    /* Sample the attach state exactly ONCE for this read and branch on that
+       value: a detach that lands right after the check is nxus_debug's problem
+       (it retries / fails the read), and re-testing here would only move the
+       window, not close it.  One decision per read also keeps a mid-scan detach
+       from mixing the two backends inside a single read. */
+    const bool debug_attached = nxusDebugIsAttached();
+    Result rc = debug_attached ? nxusDebugReadMemory(address, buffer, size)
+                               : nxusDmntRead(address, buffer, size);
     return R_SUCCEEDED(rc) ? 0 : -1;
 }
 
@@ -205,7 +277,7 @@ static int sessionRead(void *ctx, u64 address, void *buffer, u32 size) {
 void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     mutexInit(&g_SessionMutex);
     memset(&g_Session, 0, sizeof(g_Session));
-    g_Session.state = NxusScanState_Idle;
+    atomic_init(&g_Session.state, NxusScanState_Idle);
     g_Session.chunk_size = chunk_size ? chunk_size : NXUS_SESSION_DEFAULT_CHUNK;
     g_Session.max_hits = max_hits ? max_hits : NXUS_SESSION_DEFAULT_MAXHITS;
     g_Session.window_size = NXUS_SESSION_DEFAULT_WINDOW;
@@ -224,14 +296,15 @@ void nxusSessionExit(void) {
     }
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
-    free(g_Session.map_entries);
-    free(g_Session.regions);
-    g_Session.map_entries = NULL;
-    g_Session.regions = NULL;
+    /* Unpublish before releasing: nxusSessionMappings() / nxusSessionRegions()
+       must never hand out a view whose backing block is already gone. */
+    mappingSnapshotDrop();
+    regionListDrop();
+    sessionStateStore(NxusScanState_Idle);
 }
 
 u32  nxusSessionId(void)            { return g_Session.session_id; }
-u32  nxusSessionScanState(void)     { return g_Session.state; }
+u32  nxusSessionScanState(void)     { return (u32)sessionStateLoad(); }
 u32  nxusSessionProgress(void)      { return g_Session.progress; }
 s32  nxusSessionLastResult(void)    { return g_Session.last_result; }
 /* While a baseline is live the hit list is intentionally empty (the first pass
@@ -271,8 +344,28 @@ void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size) {
 u64  nxusSessionProgramId(void)     { return g_Session.program_id; }
 u64  nxusSessionMainBase(void)      { return g_Session.main_base; }
 u64  nxusSessionMainSize(void)      { return g_Session.main_size; }
-const NxusHitList *nxusSessionHits(void) { return &g_Session.hits; }
-const NxusMappingTable *nxusSessionMappings(void) { return &g_Session.maps; }
+/* The hit list is embedded in the session, so the address itself never dangles -
+   but its arrays are realloc'd by the worker while a scan runs.  Callers must
+   therefore only walk it BEHIND THE BUSY GATE (the server rejects ScanGetHits
+   while Running) and must treat the count read from the list as the only
+   consistent sample.  While Running there is no consistent view at all, so it is
+   not exposed: the acquire load below pairs with the worker's release store. */
+const NxusHitList *nxusSessionHits(void) {
+    if (sessionStateLoad() == NxusScanState_Running) return NULL;
+    return &g_Session.hits;
+}
+
+/* Never returns a dangling table: mappingSnapshotDrop() clears the published
+   pair before free(), so a torn read can only yield an empty view.  Callers must
+   tolerate NULL (= no snapshot / after Exit) and must run behind the BUSY gate
+   (the pointer scan and module walk read the array the worker is using). */
+const NxusMappingTable *nxusSessionMappings(void) {
+    NxusMappingEntry *const entries = g_Session.maps.entries;
+    const u32 count = g_Session.maps.count;
+    atomic_thread_fence(memory_order_acquire);
+    if (count == 0 || entries == NULL) return NULL;
+    return &g_Session.maps;
+}
 
 void nxusSessionSetPaused(bool paused) {
     mutexLock(&g_SessionMutex);
@@ -295,7 +388,7 @@ void nxusSessionSetChunkSize(u32 chunk_size) {
     if (chunk_size == 0) return;
     /* The worker reads this to size its buffer; changing it mid-scan would let
        the engine read more bytes than the buffer holds. */
-    if (g_Session.state == NxusScanState_Running) return;
+    if (sessionStateLoad() == NxusScanState_Running) return;
     /* The scan chunk is a single blocking allocation inside an 8 MB heap shared
        with the rx buffer, the hit list and the snapshot slots, so the ceiling is
        the default rather than the theoretical maximum. */
@@ -361,10 +454,9 @@ static Result snapshotMappingsDebug(void) {
         address = next;
     }
 
-    free(g_Session.map_entries);
-    g_Session.map_entries = entries;
-    g_Session.maps.entries = entries;
-    g_Session.maps.count = n;
+    /* Publish first, release the old block after: a concurrent reader then sees
+       either the previous snapshot or the new one, never the freed one. */
+    mappingSnapshotPublish(entries, n);
     NXUS_LOG("debug snapshot: %u mappings", (unsigned)n);
     return n ? 0 : MAKERESULT(Module_Libnx, LibnxError_BadInput);
 }
@@ -395,10 +487,8 @@ static Result snapshotMappings(void) {
         entries[i].reserved = raw[i].perm;
         entries[i].type = raw[i].memory_type;
     }
-    free(g_Session.map_entries);
-    g_Session.map_entries = entries;
-    g_Session.maps.entries = entries;
-    g_Session.maps.count = (u32)got;
+    /* Same publish-then-release rule as the debug path above. */
+    mappingSnapshotPublish(entries, (u32)got);
     free(raw);
     return 0;
 }
@@ -429,9 +519,20 @@ Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end) {
     return g_Session.region_count ? 0 : MAKERESULT(Module_Libnx, LibnxError_BadInput);
 }
 
+/* Same contract as nxusSessionHits(): consumers (the snapshot service) run
+   behind the server's BUSY gate, because preparing a new scan rebuilds this list
+   under the running engine.  A cleared list is reported as (NULL, 0) instead of a
+   dangling pointer, and the acquire fence pairs with regionListDrop()'s release. */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count) {
-    if (out_count != NULL) *out_count = g_Session.region_count;
-    return g_Session.regions;
+    const NxusScanRegion *regions = g_Session.regions;
+    const u32 count = g_Session.region_count;
+    atomic_thread_fence(memory_order_acquire);
+    if (regions == NULL || count == 0) {
+        if (out_count != NULL) *out_count = 0;
+        return NULL;
+    }
+    if (out_count != NULL) *out_count = count;
+    return regions;
 }
 
 Result nxusSessionRefreshMappings(void) {
@@ -523,9 +624,10 @@ static void cacheProcessInfo(void) {
 /* ---- regions ----------------------------------------------------------- */
 
 static void buildRegions(const NxusScanRequest *req) {
-    free(g_Session.regions);
-    g_Session.regions = NULL;
-    g_Session.region_count = 0;
+    /* Unpublish the old list before releasing it (clear-before-free, see
+       regionListDrop): every scan rebuilds this list, and a reader must never
+       chase the block that the free below reused. */
+    regionListDrop();
 
     /* One region per mapping, and one per (mapping, range) pair in list mode.
        4096 entries bound this list to ~128 KB (NxusScanRegion is 32 bytes);
@@ -573,9 +675,11 @@ static void scanThread(void *arg) {
         if (chunk == NULL) {
             /* The worker cannot scan without its buffer.  Report a real OOM
                (not BadInput) so the client can shrink the chunk or free memory
-               instead of blaming the request. */
-            g_Session.state = NxusScanState_Error;
+               instead of blaming the request.  Result first, state last: a reader
+               that observes a settled state must also observe the error code
+               (release store). */
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte chunk allocation failed (out of memory)",
                      (unsigned)chunk_size);
             return;
@@ -616,8 +720,8 @@ static void scanThread(void *arg) {
         prev_buf = (u8 *)malloc(buf_size);
         if (cur_buf == NULL || prev_buf == NULL) {
             baselineDiscard();
-            g_Session.state = NxusScanState_Error;
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte baseline buffers failed (out of memory)",
                      (unsigned)buf_size);
             free(chunk);
@@ -644,8 +748,8 @@ static void scanThread(void *arg) {
     } else {
         window = (u8 *)malloc(g_Session.window_size);
         if (window == NULL) {
-            g_Session.state = NxusScanState_Error;
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte window allocation failed (out of memory)",
                      (unsigned)g_Session.window_size);
             return;
@@ -657,28 +761,35 @@ static void scanThread(void *arg) {
                             (int *)&g_Session.cancel);
     }
 
+    g_Session.progress = stats.permille;
+
+    NxusScanState final_state;
     switch (rc) {
         case NXUS_SCAN_OK:
-            g_Session.state = NxusScanState_Done;
+            final_state = NxusScanState_Done;
             g_Session.last_result = 0;
             break;
         case NXUS_SCAN_ERR_CANCELLED:
-            g_Session.state = NxusScanState_Cancelled;
+            final_state = NxusScanState_Cancelled;
             g_Session.last_result = 0;
             break;
         case NXUS_SCAN_ERR_FULL:
-            g_Session.state = NxusScanState_Error;
+            final_state = NxusScanState_Error;
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             break;
         default:
-            g_Session.state = NxusScanState_Error;
+            final_state = NxusScanState_Error;
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_BadInput);
             break;
     }
 
-    g_Session.progress = stats.permille;
+    /* Single release store as the very last publication step: the hit list is
+       complete, the baseline is gone, progress and last_result are in place, so
+       any reader that now sees "not Running" also sees the final results. */
+    sessionStateStore(final_state);
+
     NXUS_LOG("scan done: state=%u hits=%u candidates=%llu reads=%llu bytes=%llu dropped=%u",
-             (unsigned)g_Session.state, (unsigned)g_Session.hits.count,
+             (unsigned)final_state, (unsigned)g_Session.hits.count,
              (unsigned long long)candidates,
              (unsigned long long)stats.reads, (unsigned long long)stats.bytes_read,
              (unsigned)stats.dropped);
@@ -690,7 +801,7 @@ static void scanThread(void *arg) {
 }
 
 static Result startJob(bool first_pass) {
-    if (g_Session.state == NxusScanState_Running) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    if (sessionStateLoad() == NxusScanState_Running) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
 
     if (g_Session.thread_live) {
         threadWaitForExit(&g_Session.thread);
@@ -710,8 +821,11 @@ static Result startJob(bool first_pass) {
     Result rc = threadCreate(&g_Session.thread, scanThread, NULL, scanStack, sizeof(scanStack), 0x2C, -2);
     if (R_FAILED(rc)) return rc;
 
-    g_Session.state = NxusScanState_Running;
+    /* Publish Running only AFTER every worker input is in place (regions, mapping
+       snapshot, hit list, job request, thread_live): the release store pairs with
+       the acquire loads of the worker and of the server's BUSY gates. */
     g_Session.thread_live = true;
+    sessionStateStore(NxusScanState_Running);
     threadStart(&g_Session.thread);
     return 0;
 }
@@ -784,7 +898,7 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
        regions, mappings and hit list, and freeing them under it corrupts the
        session.  A finished thread is NOT busy - startJob() joins it before
        reusing the slot, so only the Running state gates here. */
-    if (g_Session.state == NxusScanState_Running) {
+    if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
     if (req->value_size != 1 && req->value_size != 2 && req->value_size != 4 && req->value_size != 8)
@@ -841,7 +955,7 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     }
 
     g_Session.session_id++;
-    g_Session.state = NxusScanState_Idle;
+    sessionStateStore(NxusScanState_Idle);
     Result jr = startJob(true);
     if (R_FAILED(jr)) baselineDiscard();   /* no worker: the dump is dead weight */
     return jr;
@@ -850,7 +964,7 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
 Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsilon_decimals,
                            const u8 *pattern, u32 pattern_len, const u8 *mask) {
     if (req == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    if (g_Session.state == NxusScanState_Running) {
+    if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
     /* An Unknown scan's first pass deliberately pushes no hits: everything lives
@@ -874,20 +988,20 @@ Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsil
 }
 
 Result nxusSessionScanCancel(void) {
-    if (g_Session.state != NxusScanState_Running) return 0;
+    if (sessionStateLoad() != NxusScanState_Running) return 0;
     atomic_store_explicit(&g_Session.cancel, 1, memory_order_relaxed);
     return 0;
 }
 
 Result nxusSessionScanUndo(void) {
-    if (g_Session.state == NxusScanState_Running) {
+    if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
     if (nxusHitListUndo(&g_Session.hits) != NXUS_SCAN_OK) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
-    g_Session.state = NxusScanState_Done;
     g_Session.progress = 1000;
+    sessionStateStore(NxusScanState_Done);
     return 0;
 }
 
@@ -900,8 +1014,10 @@ void nxusSessionReset(void) {
     }
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
-    g_Session.state = NxusScanState_Idle;
+    /* Results and identifiers are reset under the release store: a reader that
+       sees Idle must not see the previous scan's progress/result. */
     g_Session.session_id++;
     g_Session.progress = 0;
     g_Session.last_result = 0;
+    sessionStateStore(NxusScanState_Idle);
 }

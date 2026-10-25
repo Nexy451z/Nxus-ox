@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
@@ -30,6 +31,15 @@
 #define NXUS_NET_BACKLOG             8
 /* Wait between bsd session rebuild attempts (Wi-Fi may still be reconnecting). */
 #define NXUS_NET_REBUILD_DELAY_NS    500000000ull
+/* Upper bound for one rebuildListener() burst: 120 * 500 ms = 60 s.  A Wi-Fi
+   rejoin normally succeeds within a few tries; past this the network is simply
+   gone (flight mode, no AP in range) and spinning forever burns a core for
+   nothing.  Giving up keeps g_Running set, so the server loop / the next reset
+   request / a sleep-wake tick retries later. */
+#define NXUS_NET_REBUILD_MAX_ATTEMPTS 120u
+/* Pause between two rebuild bursts (see the server loop): without it a console
+   with no network at all would run the 60 s burst back to back forever. */
+#define NXUS_NET_REBUILD_RETRY_PAUSE_NS 10000000000ull
 
 static int             g_ListenFd = -1;
 static int             g_ClientFd = -1;
@@ -42,8 +52,10 @@ static void           *g_HandlerUser = NULL;
 static u16             g_Port = NXUS_DEFAULT_PORT;
 static u8             *g_RxBuffer = NULL;
 /* Set by nxusNetRequestReset() (any thread) and consumed by the server thread.
-   volatile: the polling loops re-read it every slice. */
-static volatile bool   g_ResetRequested = false;
+   atomic: the consumer clears it with exchange(), so a request raised while the
+   server thread is between its load and its clear can no longer be swallowed by
+   a plain read-then-store (lost update). */
+static atomic_bool     g_ResetRequested = false;
 /* Last armGetSystemTick() at which a packet was received or sent completely.
    Written by the server/sender threads and read by the watchdog in main.c; an
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
@@ -61,6 +73,38 @@ int nxusNetClientFd(void) {
     int fd = g_ClientFd;
     mutexUnlock(&g_ClientMutex);
     return fd;
+}
+
+/* g_ClientFd for a caller that already holds g_SendMutex.  Every close() of a
+   client descriptor (dropClient(), the serveClient() teardown) runs under that
+   same lock, so the number cannot be recycled into a new client until the caller
+   unlocks.  Reading it through nxusNetClientFd() *before* taking the send lock is
+   exactly the race that let one client's packet (or a reset's shutdown()) land on
+   the next client's socket. */
+static int clientFdLocked(void) {
+    return g_ClientFd;
+}
+
+/* Consume a pending reset request: exactly one reader wins.  The old
+   read-then-clear pair could lose a request that nxusNetRequestReset() raised
+   between the two steps. */
+static bool takeResetRequest(void) {
+    return atomic_exchange_explicit(&g_ResetRequested, false, memory_order_acq_rel);
+}
+
+static bool resetRequested(void) {
+    return atomic_load_explicit(&g_ResetRequested, memory_order_acquire);
+}
+
+/* Sleep in short slices instead of one long svcSleepThread(), returning early on
+   shutdown or on a reset request, so a sleep/wake wake-up is never delayed by a
+   backoff that is already running. */
+static void backoffSleep(u64 total_ns) {
+    const u64 slice_ns = 250000000ull;
+    for (u64 slept = 0; slept < total_ns; slept += slice_ns) {
+        if (!g_Running || resetRequested()) return;
+        svcSleepThread(slice_ns);
+    }
 }
 
 u64 nxusNetLastActivityTick(void) {
@@ -141,8 +185,11 @@ static bool listenerHealthy(void) {
         a dropped connection, the port still in TIME_WAIT);
      2. tear the bsd service session itself down and reconnect it
         (sleep/wake, Wi-Fi rejoin, a stale descriptor).  This retries every
-        500 ms until the network answers, so the sysmodule never stays offline
-        waiting for a manual restart.
+        500 ms, up to NXUS_NET_REBUILD_MAX_ATTEMPTS (60 s) per call, so a
+        reconnect during a normal Wi-Fi rejoin is immediate while a network that
+        is genuinely gone stops burning a core.  g_Running stays true when the
+        budget runs out: the server loop, the next explicit reset or the
+        sleep/wake tick simply calls us again.
 
    `full_bsd_reset` skips step 1 because the caller already knows the session is
    stale (explicit reset request, poll() error, dead listener). */
@@ -159,7 +206,8 @@ static void rebuildListener(bool full_bsd_reset) {
         return;
     }
 
-    for (u32 attempt = 0; g_Running && g_ListenFd < 0; attempt++) {
+    u32 attempt = 0;
+    for (; attempt < NXUS_NET_REBUILD_MAX_ATTEMPTS && g_Running && g_ListenFd < 0; attempt++) {
         /* Drop the (stale) session, give the Wi-Fi supplicant half a second to
            come back, then open a fresh one.  Retrying at 500 ms keeps the port
            unavailable for as short a time as the network allows. */
@@ -169,8 +217,9 @@ static void rebuildListener(bool full_bsd_reset) {
 
         Result rc = socketInitializeDefault();
         if (R_FAILED(rc)) {
-            NXUS_LOG("listener: socketInitializeDefault failed rc=0x%08X (attempt %u)",
-                     (unsigned)rc, (unsigned)(attempt + 1));
+            NXUS_LOG("listener: socketInitializeDefault failed rc=0x%08X (attempt %u/%u)",
+                     (unsigned)rc, (unsigned)(attempt + 1),
+                     (unsigned)NXUS_NET_REBUILD_MAX_ATTEMPTS);
             continue;
         }
         if (createListenerSocket()) {
@@ -178,17 +227,37 @@ static void rebuildListener(bool full_bsd_reset) {
                      (unsigned)g_Port, (unsigned)(attempt + 1));
             return;
         }
+        /* createListenerSocket() already logged the failing step (socket/bind/
+           listen); keep the attempt counter visible so the log shows progress. */
+        NXUS_LOG("listener: rebuild attempt %u/%u failed",
+                 (unsigned)(attempt + 1), (unsigned)NXUS_NET_REBUILD_MAX_ATTEMPTS);
     }
-    NXUS_LOG("listener: rebuild stopped (running=%d)", g_Running ? 1 : 0);
+
+    if (!g_Running) {
+        NXUS_LOG("listener: rebuild aborted after %u attempt(s) (shutdown)", (unsigned)attempt);
+        return;
+    }
+
+    NXUS_LOG("listener: giving up after %u attempts (~%u s) - the network is still "
+             "unreachable; the server loop retries on its next tick or reset request",
+             (unsigned)attempt,
+             (unsigned)(((u64)attempt * NXUS_NET_REBUILD_DELAY_NS) / 1000000000ull));
 }
 
 /* Drop the registered client.  Called from the server thread only.  The send
-   mutex is held while closing so a sender on another thread (debug events) can
-   never write into a descriptor that was just handed back to the kernel. */
+   mutex is held while the descriptor is read, unregistered and closed, so a
+   sender on another thread (debug events) can never write into a descriptor that
+   was just handed back to the kernel - and never into the descriptor number that
+   the kernel hands out to the next client. */
 static void dropClient(void) {
-    int fd = nxusNetClientFd();
-    if (fd < 0) return;
     mutexLock(&g_SendMutex);
+    const int fd = clientFdLocked();
+    if (fd < 0) {
+        mutexUnlock(&g_SendMutex);
+        return;
+    }
+    /* Unregister before close(), still inside the lock: any sender that takes the
+       mutex from here on sees -1 and refuses to send. */
     setClientFd(-1);
     shutdown(fd, SHUT_RDWR);
     close(fd);
@@ -224,7 +293,7 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
 
     while (got < length) {
         if (!g_Running) return false;
-        if (g_ResetRequested) {
+        if (resetRequested()) {
             NXUS_LOG("recv: reset requested while fd=%d was idle - dropping client", fd);
             return false;
         }
@@ -317,15 +386,18 @@ static bool sendAll(int fd, const void *buffer, u32 length, u32 *out_sent) {
     return sent == length;
 }
 
-Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length) {
+/* Core writer.  The caller must already hold g_SendMutex: that is the same lock
+   dropClient()/serveClient() take around close(), so the descriptor cannot be
+   closed (and its number recycled into a new client) between the check and the
+   last byte written. */
+static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
+                              const void *payload, u32 length) {
     if (fd < 0) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
     if (length > NXUS_NET_BUF_SIZE) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     if (length > 0 && payload == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
     NxusPacketHeader header;
     nxusHeaderInit(&header, type, flags, length, seq);
-
-    mutexLock(&g_SendMutex);
 
     /* Zero-copy write: the 16-byte header goes straight from the stack and the
        payload straight from the caller's buffer.  Copying both into one scratch
@@ -357,14 +429,34 @@ Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, 
         g_LastActivityTick = armGetSystemTick();
     }
 
+    return rc;
+}
+
+Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length) {
+    /* Lock first, look afterwards.  Resolving the fd through nxusNetClientFd()
+       before taking g_SendMutex was the injection bug: dropClient() could close
+       the descriptor and the kernel hand the very same number to the next client
+       in that window, so the event went to a session that never asked for it. */
+    mutexLock(&g_SendMutex);
+
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    /* Only the currently registered client is writable; a descriptor a handler
+       kept across a reconnect is stale and must not be reused either. */
+    if (fd >= 0 && fd == clientFdLocked()) {
+        rc = sendFrameLocked(fd, type, flags, seq, payload, length);
+    }
+
     mutexUnlock(&g_SendMutex);
     return rc;
 }
 
 Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length) {
-    int fd = nxusNetClientFd();
-    if (fd < 0) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    return nxusNetSendFd(fd, type, flags, seq, payload, length);
+    /* Same rule as nxusNetSendFd(): the descriptor is read under g_SendMutex,
+       never through nxusNetClientFd() before taking it. */
+    mutexLock(&g_SendMutex);
+    Result rc = sendFrameLocked(clientFdLocked(), type, flags, seq, payload, length);
+    mutexUnlock(&g_SendMutex);
+    return rc;
 }
 
 Result nxusNetSendAck(u32 seq)   { return nxusNetSend(seq, 0, seq, NULL, 0); }
@@ -399,6 +491,21 @@ static void serveClient(int fd) {
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /* SO_KEEPALIVE on the listen socket is NOT inherited by accepted sockets, so
+       it has to be set again here or a peer that vanished without a FIN is only
+       noticed by the 20 s idle timeout.  With the tuned probe a dead link is
+       reaped in ~16 s (10 s idle + 3 probes every 2 s), and the listen socket's
+       copy keeps the guard for anything accepted between the two calls. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    int keep_idle  = 10;   /* seconds of silence before the first probe */
+    int keep_intvl = 2;    /* seconds between probes                    */
+    int keep_cnt   = 3;    /* unanswered probes before the socket dies  */
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keep_idle,  sizeof(keep_idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keep_cnt,   sizeof(keep_cnt));
+#endif
 
     while (g_Running && nxusNetClientFd() == fd) {
         NxusPacketHeader header;
@@ -460,8 +567,7 @@ static void serverThread(void *arg) {
 
     while (g_Running) {
         /* 1. explicit reset (sleep/wake from main.c, external request). */
-        if (g_ResetRequested) {
-            g_ResetRequested = false;
+        if (takeResetRequest()) {
             NXUS_LOG("network reset requested - dropping client and rebuilding listener");
             dropClient();
             rebuildListener(true);
@@ -469,8 +575,15 @@ static void serverThread(void *arg) {
             continue;
         }
 
-        /* 2. no listener at all (previous rebuild was interrupted by shutdown). */
+        /* 2. no listener at all (a rebuild burst ran out of attempts, or the
+              previous rebuild was interrupted by shutdown).  Wait before asking
+              for another burst: rebuildListener() already retried for 60 s, so
+              hammering it again immediately would just reproduce the same loop on
+              a console that has no network.  The sleep is sliced and aborts on a
+              reset request, so a wake-up is still handled within ~250 ms. */
         if (g_ListenFd < 0) {
+            backoffSleep(NXUS_NET_REBUILD_RETRY_PAUSE_NS);
+            if (!g_Running) break;
             rebuildListener(true);
             last_health = armGetSystemTick();
             continue;
@@ -571,7 +684,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     g_Handler = handler;
     g_HandlerUser = user;
     g_Port = port;
-    g_ResetRequested = false;
+    atomic_store_explicit(&g_ResetRequested, false, memory_order_relaxed);
     g_LastActivityTick = armGetSystemTick();
 
 #ifdef SIGPIPE
@@ -615,21 +728,41 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
 
 void nxusNetRequestReset(const char *reason) {
     NXUS_LOG("network reset requested from outside (%s)", (reason != NULL) ? reason : "?");
-    g_ResetRequested = true;
+
+    /* Release store: the server thread's exchange() is the only consumer, so the
+       request is applied exactly once even if it lands mid-poll. */
+    atomic_store_explicit(&g_ResetRequested, true, memory_order_release);
 
     /* Also wake the protocol thread if it is blocked in recv(): shutdown() makes
        poll() report the hangup instead of waiting for the next slice.  The server
-       thread stays the only owner of the descriptor, so it does the close(). */
-    const int fd = nxusNetClientFd();
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+       thread stays the only owner of the descriptor, so it does the close().
+
+       The shutdown runs under g_SendMutex and re-checks the descriptor right
+       before using it: with the lock held, dropClient()/serveClient() cannot close
+       this number, so a socket that was dropped and whose number was recycled
+       into a brand-new client is never the one shut down here.  Without the lock
+       nxusNetClientFd() followed by shutdown() could hit the fresh connection.
+       The lock is taken with try-lock so this stays non-blocking for its callers
+       (HID/UI threads) even while a 1 MiB reply is being written; a missed
+       shutdown only costs one 200 ms poll slice, since the atomic flag above is
+       what actually drives the reset. */
+    if (!mutexTryLock(&g_SendMutex)) return;
+
+    const int fd = clientFdLocked();
+    if (fd >= 0 && fd == nxusNetClientFd()) shutdown(fd, SHUT_RDWR);
+    mutexUnlock(&g_SendMutex);
 }
 
 void nxusNetExit(void) {
     if (!g_Running) return;
     g_Running = false;
 
-    int fd = nxusNetClientFd();
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    /* Read and shut the client down under the send mutex: dropClient() closes
+       descriptors under the same lock, and an fd number freed in between could
+       already belong to an unrelated socket. */
+    mutexLock(&g_SendMutex);
+    if (g_ClientFd >= 0) shutdown(g_ClientFd, SHUT_RDWR);
+    mutexUnlock(&g_SendMutex);
     if (g_ListenFd >= 0) shutdown(g_ListenFd, SHUT_RDWR);
 
     threadWaitForExit(&g_ServerThread);

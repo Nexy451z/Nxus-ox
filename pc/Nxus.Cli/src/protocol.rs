@@ -317,16 +317,43 @@ pub fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Copy `N` little-endian bytes at `off`, or `None` when they are not all there.
+fn read_le<const N: usize>(data: &[u8], off: usize) -> Option<[u8; N]> {
+    // `checked_add` first: a caller-supplied offset near `usize::MAX` must not
+    // wrap around into a valid-looking (and in-bounds) range.
+    let end = off.checked_add(N)?;
+    let slice = data.get(off..end)?;
+    let mut buf = [0u8; N];
+    buf.copy_from_slice(slice);
+    Some(buf)
+}
+
+/// Bounds-checked little-endian readers.
+///
+/// Every payload decoded in this file comes from the console - or from whatever
+/// else happens to answer on that port - and a truncated reply used to index
+/// past the end of the slice.  That panic kills a GUI worker thread, which then
+/// never reports back, leaving the GUI on "busy" forever, so a missing tail is
+/// decoded as zeroes instead.
+///
+/// `rd_u16` / `rd_u32` / `rd_u64` keep their signatures: callers that want to
+/// distinguish a short payload test `data.len()` before the call.
 pub fn rd_u16(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([data[off], data[off + 1]])
+    read_le::<2>(data, off).map(u16::from_le_bytes).unwrap_or(0)
 }
 pub fn rd_u32(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    read_le::<4>(data, off).map(u32::from_le_bytes).unwrap_or(0)
 }
 pub fn rd_u64(data: &[u8], off: usize) -> u64 {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&data[off..off + 8]);
-    u64::from_le_bytes(b)
+    read_le::<8>(data, off).map(u64::from_le_bytes).unwrap_or(0)
+}
+/// `Some(value)` only when all four bytes are present.
+pub fn rd_u32_checked(data: &[u8], off: usize) -> Option<u32> {
+    read_le::<4>(data, off).map(u32::from_le_bytes)
+}
+/// `Some(value)` only when all eight bytes are present.
+pub fn rd_u64_checked(data: &[u8], off: usize) -> Option<u64> {
+    read_le::<8>(data, off).map(u64::from_le_bytes)
 }
 
 // ---- decoded structures ----
@@ -412,9 +439,13 @@ pub struct Metadata {
 
 impl Metadata {
     pub const SIZE: usize = 0x70;
+    /// A short reply decodes with zeroes for the missing tail; `NxusClient::metadata`
+    /// rejects anything under `SIZE` before it gets here.
     pub fn parse(data: &[u8]) -> Metadata {
         let mut build_id = [0u8; 0x20];
-        build_id.copy_from_slice(&data[0x50..0x70]);
+        if let Some(src) = data.get(0x50..0x70) {
+            build_id.copy_from_slice(src);
+        }
         Metadata {
             process_id: rd_u64(data, 0),
             program_id: rd_u64(data, 8),
@@ -502,6 +533,60 @@ pub struct HitBatch {
     pub total: u32,
     pub value_size: u32,
     pub hits: Vec<Hit>,
+}
+
+impl HitBatch {
+    /// Fixed header of a `NxusHitBatch` reply: session, count, total, value size,
+    /// mapping count, reserved.
+    pub const HEADER_SIZE: usize = 24;
+    /// Wire size of one `NxusHit` record (offset, mapping index, value type, value).
+    pub const HIT_SIZE: usize = 16;
+
+    pub fn empty() -> HitBatch {
+        HitBatch { session_id: 0, total: 0, value_size: 0, hits: Vec::new() }
+    }
+
+    /// Decode a `SCAN_GET_HITS` reply.
+    ///
+    /// Never panics and never trusts the counts blindly: the mapping table and
+    /// the hit records are limited to the bytes actually present (so a corrupt
+    /// or hostile `count` cannot turn into a multi-gigabyte `Vec::with_capacity`),
+    /// and a mapping index outside the table decodes as base 0.  A reply shorter
+    /// than the header yields an empty batch.
+    pub fn parse(data: &[u8]) -> HitBatch {
+        if data.len() < Self::HEADER_SIZE {
+            return HitBatch::empty();
+        }
+        let session_id = rd_u32(data, 0);
+        let total = rd_u32(data, 8);
+        let value_size = rd_u32(data, 12);
+        let mut pos = Self::HEADER_SIZE;
+
+        let mapping_count = (rd_u32(data, 16) as usize).min((data.len() - pos) / 8);
+        let mut bases = Vec::with_capacity(mapping_count);
+        for _ in 0..mapping_count {
+            bases.push(rd_u64(data, pos));
+            pos += 8;
+        }
+
+        let count = (rd_u32(data, 4) as usize).min((data.len() - pos) / Self::HIT_SIZE);
+        let mut hits = Vec::with_capacity(count);
+        for _ in 0..count {
+            let off = rd_u32(data, pos);
+            let mapping_idx = rd_u16(data, pos + 4);
+            let value_type = rd_u16(data, pos + 6);
+            let value = rd_u64(data, pos + 8);
+            pos += Self::HIT_SIZE;
+            let base = bases.get(mapping_idx as usize).copied().unwrap_or(0);
+            hits.push(Hit {
+                address: base.wrapping_add(off as u64),
+                mapping_idx,
+                value_type,
+                value,
+            });
+        }
+        HitBatch { session_id, total, value_size, hits }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1912,7 +1997,12 @@ impl ModuleInfo {
         ModuleInfo {
             base: rd_u64(data, 0),
             size: rd_u64(data, 8),
-            build_id: data[16..24].iter().map(|b| format!("{:02x}", b)).collect(),
+            // `chunks_exact(SIZE)` normally guarantees the range, but the helper
+            // is public: fall back to zeroes rather than slicing out of bounds.
+            build_id: data
+                .get(16..24)
+                .map(|id| id.iter().map(|b| format!("{:02x}", b)).collect())
+                .unwrap_or_default(),
         }
     }
 }

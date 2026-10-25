@@ -154,6 +154,71 @@ pub const DEFAULT_MAX_READ: u32 = 64 * 1024;
 /// garbage length outright instead of trying to allocate it.
 pub const MAX_PAYLOAD: u32 = 8 * 1024 * 1024;
 
+/// Deadline for the TCP handshake.
+///
+/// `TcpStream::connect` has no deadline of its own: an unreachable console (wrong
+/// IP, powered off, on another subnet) leaves it inside the OS retry loop for
+/// 20-30 s, and the GUI's worker thread cannot answer anything meanwhile, so the
+/// whole window looks hung.  Five seconds is well beyond a LAN handshake and
+/// still short enough to report "unreachable" promptly.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lock a mutex, ignoring poisoning.
+///
+/// A worker thread that panicked while holding one of these locks must not turn
+/// every later call into another panic: the data behind the lock is plain
+/// bookkeeping that stays usable, and a panicking worker is exactly the
+/// "GUI stuck on busy forever" failure this module tries to avoid.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Connect with the overall [`CONNECT_TIMEOUT`] split across the resolved
+/// addresses (a host name can resolve to both IPv4 and IPv6).
+fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+
+    let addrs = (host, port).to_socket_addrs().map_err(|e| NxusError {
+        message: format!("cannot resolve {}:{} - {}", host, port, net_error_text(&e)),
+        result: None,
+    })?;
+
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut last_error: Option<std::io::Error> = None;
+    let mut had_address = false;
+
+    for addr in addrs {
+        had_address = true;
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        // connect_timeout rejects a zero duration outright.
+        if left.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, left) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    let reason = match last_error {
+        Some(e) => net_error_text(&e),
+        None if !had_address => "the host name has no address".to_string(),
+        None => format!("no answer within {} s", CONNECT_TIMEOUT.as_secs()),
+    };
+    Err(NxusError {
+        message: format!(
+            "cannot connect to {}:{} - {}. Is the console running Nxus and is this the console's IP?",
+            host, port, reason
+        ),
+        result: None,
+    })
+}
+
 pub struct NxusClient {
     max_read: std::sync::atomic::AtomicU32,
     stream: Mutex<TcpStream>,
@@ -196,11 +261,7 @@ pub fn net_error_text(e: &std::io::Error) -> String {
 
 impl NxusClient {
     pub fn connect(host: &str, port: u16) -> Result<NxusClient> {
-        let stream = TcpStream::connect((host, port))
-            .map_err(|e| NxusError {
-                message: format!("cannot connect to {}:{} - {}. Is the console running Nxus                                   and is this the console's IP?", host, port, net_error_text(&e)),
-                result: None,
-            })?;
+        let stream = connect_with_timeout(host, port)?;
         stream.set_nodelay(true).ok();
         stream
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -236,7 +297,7 @@ impl NxusClient {
     }
 
     fn next_seq(&self) -> u32 {
-        let mut seq = self.seq.lock().unwrap();
+        let mut seq = lock(&self.seq);
         *seq = seq.wrapping_add(1);
         *seq
     }
@@ -248,7 +309,7 @@ impl NxusClient {
     pub fn request_timeout(&self, cmd: u16, payload: &[u8], timeout: Duration) -> Result<(u16, Vec<u8>)> {
         let seq = self.next_seq();
         let (tx, rx) = mpsc::channel::<Response>();
-        self.pending.lock().unwrap().insert(seq, tx);
+        lock(&self.pending).insert(seq, tx);
 
         let mut header = Vec::with_capacity(HEADER_SIZE);
         put_u32(&mut header, MAGIC);
@@ -261,14 +322,14 @@ impl NxusClient {
         // unregister the request itself: the reader thread never will, and the
         // map would grow by one dead entry per failed request on a dying link.
         let sent = {
-            let mut stream = self.stream.lock().unwrap();
+            let mut stream = lock(&self.stream);
             stream
                 .write_all(&header)
                 .and_then(|_| stream.write_all(payload))
                 .and_then(|_| stream.flush())
         };
         if let Err(e) = sent {
-            self.pending.lock().unwrap().remove(&seq);
+            lock(&self.pending).remove(&seq);
             return Err(NxusError { message: format!("send failed: {}", e), result: None });
         }
 
@@ -282,7 +343,7 @@ impl NxusClient {
             }
             Ok(None) => Err(NxusError { message: "connection closed".into(), result: None }),
             Err(RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&seq);
+                lock(&self.pending).remove(&seq);
                 Err(NxusError { message: format!("no reply for command 0x{:04X}", cmd), result: None })
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -293,7 +354,7 @@ impl NxusClient {
 
     /// Wait for the next asynchronous event (Switch-initiated).
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
-        self.events.lock().unwrap().recv_timeout(timeout).ok()
+        lock(&self.events).recv_timeout(timeout).ok()
     }
 
     // ---- session ----
@@ -301,6 +362,20 @@ impl NxusClient {
     pub fn status(&self) -> Result<Status> {
         let (_, body) = self.request(cmd::GET_STATUS, &[])?;
         let status = Status::parse(&body);
+        if status.proto_version != PROTO_VERSION {
+            // A console that speaks another version still answers the fields we
+            // know, so this is a warning, not a disconnect.  `swap` makes it fire
+            // once per process even though the GUI polls status constantly.
+            static PROTO_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !PROTO_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "warning: console protocol version {} (this client expects {}); \
+                     continuing, replies may decode incorrectly",
+                    status.proto_version, PROTO_VERSION
+                );
+            }
+        }
         if status.max_read > 0 {
             self.max_read.store(status.max_read, Ordering::Relaxed);
         }
@@ -349,6 +424,9 @@ impl NxusClient {
 
     pub fn mapping_count(&self) -> Result<u64> {
         let (_, body) = self.request(cmd::GET_MAPPING_COUNT, &[])?;
+        if body.len() < 8 {
+            return Err(NxusError { message: "short mapping count reply".into(), result: None });
+        }
         Ok(rd_u64(&body, 0))
     }
 
@@ -410,6 +488,9 @@ impl NxusClient {
 
     pub fn read_u32(&self, address: u64) -> Result<u32> {
         let data = self.read(address, 4)?;
+        if data.len() < 4 {
+            return Err(NxusError { message: "short read reply".into(), result: None });
+        }
         Ok(rd_u32(&data, 0))
     }
 
@@ -453,17 +534,29 @@ impl NxusClient {
     pub fn scan_begin_spec(&self, spec: &ScanSpec) -> Result<Status> {
         let payload = buildScanPayload(spec, 0);
         let (_, body) = self.request_timeout(cmd::SCAN_BEGIN, &payload, Duration::from_secs(600))?;
+        if body.len() < Status::SIZE {
+            return Err(NxusError { message: "short status reply".into(), result: None });
+        }
         Ok(Status::parse(&body))
     }
 
     pub fn scan_next_spec(&self, spec: &ScanSpec) -> Result<Status> {
         let payload = buildScanPayload(spec, 1);
         let (_, body) = self.request_timeout(cmd::SCAN_NEXT, &payload, Duration::from_secs(600))?;
+        if body.len() < Status::SIZE {
+            return Err(NxusError { message: "short status reply".into(), result: None });
+        }
         Ok(Status::parse(&body))
     }
 
     pub fn scan_status(&self) -> Result<Status> {
         let (_, body) = self.request(cmd::SCAN_STATUS, &[])?;
+        // A truncated reply would otherwise decode as scan_state 0 (idle) and
+        // make `scan_wait` spin until its own timeout instead of reporting
+        // "the console sent something broken".
+        if body.len() < Status::SIZE {
+            return Err(NxusError { message: "short status reply".into(), result: None });
+        }
         Ok(Status::parse(&body))
     }
 
@@ -526,34 +619,10 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::SCAN_GET_HITS, &payload)?;
-        if body.len() < 24 {
+        if body.len() < HitBatch::HEADER_SIZE {
             return Err(NxusError { message: "short hit batch".into(), result: None });
         }
-        let session_id = rd_u32(&body, 0);
-        let n = rd_u32(&body, 4) as usize;
-        let total = rd_u32(&body, 8);
-        let value_size = rd_u32(&body, 12);
-        let mapping_count = rd_u32(&body, 16) as usize;
-        let mut pos = 24;
-        let mut bases = Vec::with_capacity(mapping_count);
-        for _ in 0..mapping_count {
-            bases.push(rd_u64(&body, pos));
-            pos += 8;
-        }
-        let mut hits = Vec::with_capacity(n);
-        for _ in 0..n {
-            if pos + 16 > body.len() {
-                break;
-            }
-            let off = rd_u32(&body, pos);
-            let map_idx = rd_u16(&body, pos + 4);
-            let value_type = rd_u16(&body, pos + 6);
-            let value = rd_u64(&body, pos + 8);
-            pos += 16;
-            let base = bases.get(map_idx as usize).copied().unwrap_or(0);
-            hits.push(Hit { address: base + off as u64, mapping_idx: map_idx, value_type, value });
-        }
-        Ok(HitBatch { session_id, total, value_size, hits })
+        Ok(HitBatch::parse(&body))
     }
 
     /// Upper bound on the pre-allocation [`NxusClient::scan_all_hits`] derives from
@@ -688,6 +757,9 @@ impl NxusClient {
         put_u32(&mut payload, width);
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::FROZEN_ENABLE, &payload)?;
+        if body.len() < 8 {
+            return Err(NxusError { message: "short frozen handle reply".into(), result: None });
+        }
         Ok(rd_u64(&body, 0))
     }
 
@@ -794,6 +866,12 @@ impl NxusClient {
         let mut payload = Vec::new();
         put_u64(&mut payload, thread_id);
         let (_, body) = self.request(cmd::REGS_GET, &payload)?;
+        // 96 bytes is the minimum that fills the whole `r` array (the ARM32 half
+        // of the legacy 100-byte layout); `ThreadContext::parse` zero-fills the
+        // rest, so anything shorter would silently show made-up registers.
+        if body.len() < 96 {
+            return Err(NxusError { message: "short thread context reply".into(), result: None });
+        }
         Ok(ThreadContext::parse(&body))
     }
 
@@ -852,10 +930,10 @@ impl Drop for NxusClient {
         // A graceful shutdown sends the FIN immediately, so the console drops the
         // session and the reader thread's blocking read wakes up in milliseconds
         // instead of after the next read timeout.  This is what lets the GUI open
-        // a fresh connection right after dropping the old one.
-        if let Ok(s) = self.stream.lock() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
+        // a fresh connection right after dropping the old one.  `lock` (not
+        // `unwrap`) so a panicking worker cannot make `drop` itself panic.
+        let s = lock(&self.stream);
+        let _ = s.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -865,8 +943,10 @@ fn parse_chains(body: &[u8]) -> (Vec<PtrChain>, bool) {
     if body.len() < 16 {
         return (Vec::new(), false);
     }
-    let count = rd_u32(body, 0) as usize;
     let truncated = rd_u32(body, 8) != 0;
+    // A corrupt count must not become a multi-gigabyte allocation: only as many
+    // chains as the body can actually hold are ever decoded.
+    let count = (rd_u32(body, 0) as usize).min((body.len() - 16) / 48);
     let mut chains = Vec::with_capacity(count);
     let mut pos = 16;
     for _ in 0..count {
@@ -920,14 +1000,14 @@ fn reader_loop(mut stream: TcpStream, pending: Arc<Mutex<HashMap<u32, Sender<Res
         if flags & FLAG_ASYNC != 0 || kind >= 0x8000 {
             let _ = events.send(Event { kind, payload });
         } else {
-            let sender = pending.lock().unwrap().remove(&seq);
+            let sender = lock(&pending).remove(&seq);
             if let Some(tx) = sender {
                 let _ = tx.send(Some((kind, flags, payload)));
             }
         }
     }
     // Wake anyone still waiting.
-    let mut map = pending.lock().unwrap();
+    let mut map = lock(&pending);
     for (_, tx) in map.drain() {
         let _ = tx.send(None);
     }
