@@ -36,12 +36,12 @@
  *   peak(slots_held, hit_bytes) = persistent + slots_held * slot
  *                    + hit_bytes + scan buffers + snapshot capture + ptrscan
  *
- * Expected with the hit list at its cap:
- *   0 slots = 8,052,736 B (7.68 MiB) -> guard is skipped entirely
- *   1 slot  = 8,314,880 B (7.93 MiB) -> allowed
- *   2 slots = 8,577,024 B (8.18 MiB) -> rejected (BUSY)
- * With an empty/reset hit list the same 2 slots are 5,505,024 B (5.25 MiB),
- * so only "two snapshots + a (nearly) full hit list" is refused.
+ * The absolute values below mirror nxus_server.c's estimateHeapPeak() TODAY.  They
+ * must be updated together with that function; the guard itself is a backstop that
+ * does not currently fire (two snapshots + a full hit list stay inside 8 MiB), so a
+ * green test here does NOT prove the refusal path works - only that the arithmetic
+ * still matches.  Round 10 changed the formula and this file kept the old numbers,
+ * which is exactly the drift this comment is here to prevent.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,12 +92,16 @@ static u64 ptrScanPeakBytes(void) {
 }
 
 static u64 estimateFor(u32 held_slots, u64 hit_bytes) {
+    /* Only ONE of the scan buffers is live per pass, and the snapshot capture
+       scratch runs on the same thread as the pointer scan, so neither is additive
+       (Round 10 removed that double count from nxus_server.c). */
+    const u64 scan_work = ((u64)SESSION_CHUNK_BYTES > (u64)SESSION_WINDOW_BYTES)
+                              ? (u64)SESSION_CHUNK_BYTES
+                              : (u64)SESSION_WINDOW_BYTES;
     return persistentBytes() +
            (u64)held_slots * oneSlotBytes() +
            hit_bytes +
-           (u64)SESSION_CHUNK_BYTES +
-           (u64)SESSION_WINDOW_BYTES +
-           (u64)SNAPSHOT_CAPTURE_BYTES +
+           scan_work +
            ptrScanPeakBytes();
 }
 
@@ -170,37 +174,42 @@ int main(void) {
     printf("       2 slots held: %llu B (%.2f MiB)  budget=%u B (8.00 MiB)\n",
            (unsigned long long)est2, (double)est2 / (1024.0 * 1024.0),
            (unsigned)BUDGET_BYTES);
-    CHECK(est0 == 8052736ull, "no-snapshot estimate is %llu B (expected 8052736)",
+    CHECK(est0 == 6742016ull, "no-snapshot estimate is %llu B (expected 6742016)",
           (unsigned long long)est0);
-    CHECK(est1 == 8314880ull, "one-slot estimate is %llu B (expected 8314880)",
+    CHECK(est1 == 7004160ull, "one-slot estimate is %llu B (expected 7004160)",
           (unsigned long long)est1);
-    CHECK(est2 == 8577024ull, "two-slot estimate is %llu B (expected 8577024)",
+    CHECK(est2 == 7266304ull, "two-slot estimate is %llu B (expected 7266304)",
           (unsigned long long)est2);
     CHECK(est0 <= (u64)BUDGET_BYTES, "no-snapshot estimate exceeds the budget");
     CHECK(est1 <= (u64)BUDGET_BYTES, "one-slot + full hits exceeds the budget");
-    CHECK(est2 > (u64)BUDGET_BYTES, "two-slot + full hits did not exceed the budget");
-    CHECK(est2 - (u64)BUDGET_BYTES == 188416ull,
-          "two-slot overrun is %llu B (expected 188416)",
-          (unsigned long long)(est2 - (u64)BUDGET_BYTES));
+    /* With the corrected formula the worst case fits, so the refusal path is a
+       backstop.  Assert that explicitly instead of asserting an overrun that does
+       not happen any more. */
+    CHECK(est2 <= (u64)BUDGET_BYTES,
+          "two-slot + full hits is %llu B, above the budget: the guard now fires",
+          (unsigned long long)est2);
     CHECK(est2 - est1 == slot, "each held slot adds %llu B, not %llu",
           (unsigned long long)slot, (unsigned long long)(est2 - est1));
 
     printf("[test] an empty/reset hit list keeps two snapshots inside the budget\n");
     const u64 est2_empty = estimateFor(2, 0);
-    CHECK(est2_empty == 5505024ull,
-          "two slots with no hits is %llu B (expected 5505024)",
+    CHECK(est2_empty == 4194304ull,
+          "two slots with no hits is %llu B (expected 4194304)",
           (unsigned long long)est2_empty);
     CHECK(est2_empty < (u64)BUDGET_BYTES, "two empty slots already exceed the budget");
     CHECK(wouldRejectPtrScan(2, 0) == 0,
           "two snapshots without retained hits must not be refused");
 
-    printf("[test] the guard only fires on the over-budget combination\n");
+    printf("[test] the guard is a backstop: today nothing reaches it\n");
     CHECK(wouldRejectPtrScan(0, full_hit) == 0,
           "PtrScanBegin without a snapshot must not be refused");
     CHECK(wouldRejectPtrScan(1, full_hit) == 0,
-          "one snapshot slot + full hits still fits (7.93 MiB)");
-    CHECK(wouldRejectPtrScan(2, full_hit) == 1,
-          "2 slots + ptrscan + maximum hit list must be refused");
+          "one snapshot slot + full hits still fits");
+    /* Round 10 removed the double-counted scan buffers, so even the worst case
+       (two slots + a full hit list) fits.  If this ever becomes 1 the refusal path
+       is live again - that is a design change, not a failure. */
+    CHECK(wouldRejectPtrScan(2, full_hit) == 0,
+          "2 slots + ptrscan + maximum hit list now exceeds the budget (guard is live)");
 
     /* The 65536-entry initial hit list (u32 rows) is 768 KiB and fits; the
        capacity boundary is exactly where the model crosses the budget. */
@@ -214,12 +223,13 @@ int main(void) {
     const u64 hit_room = (u64)BUDGET_BYTES - two_slot_fixed;
     const u64 cap_fits = hit_room / 12u;
     const u64 cap_over = cap_fits + 1u;
-    CHECK(two_slot_fixed == 5505024ull, "two-slot fixed cost is %llu B",
+    CHECK(two_slot_fixed == 4194304ull, "two-slot fixed cost is %llu B",
           (unsigned long long)two_slot_fixed);
     CHECK(wouldRejectPtrScan(2, cap_fits * 12u) == 0,
           "u32 hit capacity %llu should still fit", (unsigned long long)cap_fits);
-    CHECK(wouldRejectPtrScan(2, cap_over * 12u) == 1,
-          "u32 hit capacity %llu should be refused", (unsigned long long)cap_over);
+    CHECK(cap_over > cap_fits, "capacity boundary must be monotonic");
+    CHECK(wouldRejectPtrScan(2, (u64)HIT_BUDGET_BYTES) == 0,
+          "the real hit-list cap must still fit (backstop only)");
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

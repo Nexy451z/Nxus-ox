@@ -406,6 +406,35 @@ class NxusClient:
         self._released_frozen = [a for a in self._released_frozen if a != address]
         self._last_frozen = [a for a in self._last_frozen if a != address]
 
+    def frozen_released(self, event: dict) -> list[int]:
+        """Handle an NxusEvent_FrozenReleased event; returns the released addresses.
+
+        The console now reports the release on the wire (`NxusFrozenReleased`), so
+        the addresses it names are dropped from the frozen baseline: the
+        "list shrank" difference in frozen_list_diff() is only a fallback for a
+        console that could not tell us, and must not report them a second time.
+        Any other event type returns an empty list.
+        """
+        if event.get('type') != P.EVT['FrozenReleased']:
+            return []
+        _count, addresses = P.parse_frozen_released(event.get('payload') or b'')
+        for address in addresses:
+            self._released_frozen = [a for a in self._released_frozen if a != address]
+            self._last_frozen = [a for a in self._last_frozen if a != address]
+        return addresses
+
+    def frozen_released_count(self, event: dict) -> int:
+        """Total number of addresses an NxusEvent_FrozenReleased names.
+
+        The console's count can exceed the addresses that fit in the frame
+        (``FROZEN_RELEASE_ADDR_MAX``), so callers log this number, not
+        ``len(frozen_released(event))``.
+        """
+        if event.get('type') != P.EVT['FrozenReleased']:
+            return 0
+        count, _addresses = P.parse_frozen_released(event.get('payload') or b'')
+        return count
+
     def frozen_enable(self, address: int, width: int) -> int:
         _, _, body = self.request(P.CMD['FrozenEnable'], P.FROZEN_REQUEST.pack(address, width, 0))
         self._note_frozen_enabled(address)

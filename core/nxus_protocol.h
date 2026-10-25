@@ -140,6 +140,10 @@ typedef enum {
     NxusEvent_DebugEvent     = 0x8007,
     /* A GDB-style stop was published: payload is NxusDebugStop. */
     NxusEvent_DebugStopped   = 0x8008,
+    /* The switch released frozen addresses on its own because the client had
+       been gone for a while: payload is NxusFrozenReleased.  A reconnecting
+       client uses it to drop its stale "frozen" markers. */
+    NxusEvent_FrozenReleased = 0x8009,
 } NxusEvent;
 
 /* ---- status flags ---- */
@@ -533,6 +537,23 @@ typedef struct NXUS_PACKED {
     u32 slot;         /* hardware slot, 0xFFFFFFFF when unknown */
 } NxusDebugStop;
 NXUS_STATIC_ASSERT(sizeof(NxusDebugStop) == 32, "NxusDebugStop must be 32 bytes");
+
+/* Payload of NxusEvent_FrozenReleased: the frozen addresses Nxus disabled by
+   itself after the PC stayed away long enough for releaseOwnedFrozen() to fire.
+   A reconnecting client uses it to drop its stale "frozen" markers.
+
+   Layout: { u32 count; u32 reserved; u64 addresses[n]; }.  count is the number
+   of addresses released - the full total, even when more were released than fit
+   in the event: the switch transmits at most NXUS_FROZEN_RELEASE_ADDR_MAX (32)
+   addresses, so the frame is 8 + 8 * min(count, 32) bytes and the excess is
+   reported by count alone.  A reader must clamp addresses[] to the received
+   frame length, never to count, when count > 32. */
+#define NXUS_FROZEN_RELEASE_ADDR_MAX 32
+typedef struct NXUS_PACKED {
+    u32 count;        /* total addresses released (may exceed the array) */
+    u32 reserved;     /* 0 */
+    u64 addresses[];  /* min(count, NXUS_FROZEN_RELEASE_ADDR_MAX) entries */
+} NxusFrozenReleased;
 
 typedef struct NXUS_PACKED {
     u64 thread_id;

@@ -3,7 +3,14 @@
 
 Checks, in order:
   * the PFS0 holds `main` (an NSO) and `main.npdm`,
-  * the NSO's segment table is self-consistent (sizes/offsets inside the file),
+  * the NSO's segment table is self-consistent (sizes/offsets inside the file)
+    and its memory footprint is estimated from the header: the text/rodata/data
+    segment sizes @0x18/0x28/0x38 and the `.bss` size @0x3C (0x40 is the
+    module-id area, NOT `.bss`).  `.bss` + META stack is the resident request of
+    the process.  A `.bss` above 16 MiB is a FAIL (runaway heap in CI); a
+    zero `system_resource_size` combined with more than 8 MiB of `.bss`+stack
+    is a WARN: the module then depends on the loader granting the System pool,
+    and when that grant is refused nothing gets written to the SD card,
   * the NPDM META header is decoded field by field (u8 Flags0 @0x0C, u8 Flags1
     @0x0D, MainThreadPriority @0x0E, MainThreadCoreNumber @0x0F, stack @0x1C,
     name @0x20) and only the "obviously wrong" values are asserted: the 64-bit
@@ -31,6 +38,10 @@ import pfs0_tool
 
 TID = '4200000000004E58'
 PROBE_TID = '4200000000004E59'
+
+NSO_BSS_OFFSET = 0x3C          # memory-only .bss size, the last field before 0x40
+BSS_WARN_BYTES = 8 * 1024 * 1024
+BSS_FAIL_BYTES = 16 * 1024 * 1024
 
 META_SIZE = 0x80
 META_SECTION_TABLE = 0x70      # AciOffset, AciSize, AcidOffset, AcidSize
@@ -68,6 +79,25 @@ def nso_header_sane(main):
     if text_file_off == 0 or text_file_off >= len(main):
         return False, f"text file offset 0x{text_file_off:X} outside the blob"
     return True, f"NSO header consistent (text at 0x{text_file_off:X})"
+
+
+def read_nso_memory(main):
+    """Read the memory-only footprint from the NSO0 header.
+
+    The NSO0 header stores the decompressed segment sizes - they are also the
+    sizes those segments occupy in memory - at 0x18 (text), 0x28 (rodata) and
+    0x38 (data), and the separate `.bss` size at 0x3C.  0x40 is already the
+    module-id/reserved area, so `.bss` is the last u32 before it.  Returns None
+    when the blob is not an NSO0 or too short to hold the header field.
+    """
+    if main[0:4] != b'NSO0' or len(main) < NSO_BSS_OFFSET + 4:
+        return None
+    return {
+        'text_size': struct.unpack_from('<I', main, 0x18)[0],
+        'rodata_size': struct.unpack_from('<I', main, 0x28)[0],
+        'data_size': struct.unpack_from('<I', main, 0x38)[0],
+        'bss_size': struct.unpack_from('<I', main, NSO_BSS_OFFSET)[0],
+    }
 
 
 def note(msg, warn=False):
@@ -212,9 +242,11 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
 
     main = files.get('main', b'')
     report(main[0:4] == b'NSO0', f"main is an NSO (magic {main[0:4]!r})")
+    mem = None
     if main[0:4] == b'NSO0':
         good, msg = nso_header_sane(main)
         report(good, msg)
+        mem = read_nso_memory(main)
 
     npdm = files.get('main.npdm', b'')
     report(npdm[0:4] == b'META', f"npdm magic {npdm[0:4]!r}")
@@ -243,6 +275,33 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
             report(meta['stack_size'] >= 0x4000,
                    f"META stack size 0x{meta['stack_size']:X} (>= 0x4000 for a sysmodule)")
             report(len(meta['name']) > 0, f"META process name {meta['name']!r}")
+
+            # Resident memory: the NSO header's .bss plus the META stack.  A
+            # sysmodule with system_resource_size=0 asks the loader for nothing
+            # beyond its own static segments, so this sum is what the process
+            # needs from the System pool; a heap runaway must fail in CI, while
+            # "large but legitimate" only warns (README recovery path).
+            stack_size = meta['stack_size']
+            sysres = meta['system_resource_size']
+            if mem is not None:
+                bss = mem['bss_size']
+                request = bss + stack_size
+                note(f"NSO segments text 0x{mem['text_size']:X} + rodata "
+                     f"0x{mem['rodata_size']:X} + data 0x{mem['data_size']:X} "
+                     f"(decompressed, @0x18/0x28/0x38), .bss 0x{bss:X} "
+                     f"({bss / 1024 / 1024:.2f} MiB) @0x{NSO_BSS_OFFSET:X}")
+                note(f"process memory request: .bss 0x{bss:X} + META stack "
+                     f"0x{stack_size:X} @0x1C = 0x{request:X} "
+                     f"({request / 1024 / 1024:.2f} MiB), "
+                     f"SystemResourceSize 0x{sysres:X} @0x14")
+                report(bss <= BSS_FAIL_BYTES,
+                       f"NSO .bss {bss / 1024 / 1024:.2f} MiB vs the "
+                       f"{BSS_FAIL_BYTES // (1024 * 1024)} MiB budget")
+                if sysres == 0 and request > BSS_WARN_BYTES:
+                    note(f".bss {bss / 1024 / 1024:.2f} MiB + stack 0x{stack_size:X} "
+                         f"with system_resource_size=0: the module relies on the "
+                         f"System pool; if the loader refuses it, nothing is "
+                         f"written to the SD card (see README recovery)", warn=True)
 
             sections, source, fallback_reason = locate_sections(npdm)
             if source == 'META table @0x70':

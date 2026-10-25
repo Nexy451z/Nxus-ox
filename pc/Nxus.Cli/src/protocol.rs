@@ -91,6 +91,9 @@ pub mod event {
     pub const DEBUG_EVENT: u16 = 0x8007;
     /// The target stopped on a breakpoint and is held (auto_continue == 0).
     pub const DEBUG_STOPPED: u16 = 0x8008;
+    /// The console released frozen addresses by itself (`releaseOwnedFrozen()`).
+    /// Payload: C `NxusFrozenReleased` (see [`crate::protocol::FrozenReleased`]).
+    pub const FROZEN_RELEASED: u16 = 0x8009;
 }
 
 // ---- status flags (NXUS_ST_*) ----
@@ -660,6 +663,49 @@ impl FrozenEntry {
 /// of a half-decoded last one.
 pub fn parse_frozen_list(data: &[u8]) -> Vec<FrozenEntry> {
     data.chunks_exact(FrozenEntry::SIZE).map(FrozenEntry::parse).collect()
+}
+
+/// C: `NXUS_FROZEN_RELEASE_ADDR_MAX` - the most addresses one
+/// `NxusEvent_FrozenReleased` frame can carry, even when more were released.
+pub const FROZEN_RELEASE_ADDRESSES_MAX: usize = 32;
+
+/// NxusEvent_FrozenReleased payload (C: `NxusFrozenReleased`).
+///
+/// Layout: `{ u32 count; u32 reserved; u64 addresses[]; }`.  `count` is the
+/// TOTAL number of addresses the console released and may be larger than the
+/// array: the frame only carries up to [`FROZEN_RELEASE_ADDRESSES_MAX`] of them,
+/// so the excess is reported by `count` alone.  [`FrozenReleased::parse`] clamps
+/// the address list to the bytes actually present, never to `count`, so a
+/// truncated or hostile payload cannot index past the end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrozenReleased {
+    /// How many addresses the console released in total (may exceed
+    /// `addresses.len()`).
+    pub count: u32,
+    /// The addresses that fitted in the frame (at most 32).
+    pub addresses: Vec<u64>,
+}
+
+impl FrozenReleased {
+    /// `count` + `reserved`.
+    pub const HEADER_SIZE: usize = 8;
+    /// Wire size of one address in the variable-length tail.
+    pub const ADDRESS_SIZE: usize = 8;
+
+    pub fn parse(data: &[u8]) -> FrozenReleased {
+        if data.len() < Self::HEADER_SIZE {
+            return FrozenReleased::default();
+        }
+        let count = rd_u32(data, 0);
+        // data[4..8] is the reserved word: skipped on purpose.
+        let available = (data.len() - Self::HEADER_SIZE) / Self::ADDRESS_SIZE;
+        let n = (count as usize).min(available).min(FROZEN_RELEASE_ADDRESSES_MAX);
+        let mut addresses = Vec::with_capacity(n);
+        for i in 0..n {
+            addresses.push(rd_u64(data, Self::HEADER_SIZE + i * Self::ADDRESS_SIZE));
+        }
+        FrozenReleased { count, addresses }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2459,6 +2505,15 @@ mod tests {
                    Some(cmd::DEBUG_STEP as u32));
         assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_DebugStopped"),
                    Some(event::DEBUG_STOPPED as u32));
+        // The release event the console sends after `releaseOwnedFrozen()`:
+        // payload is NxusFrozenReleased (parsed by FrozenReleased::parse), and
+        // the cap on the addresses that fit in one frame is 32.
+        assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_FrozenReleased"),
+                   Some(event::FROZEN_RELEASED as u32));
+        // header_define() only reads hex values and this macro is decimal, so
+        // match the #define line itself: either side drifting fails here.
+        assert!(HEADER.contains(&format!("#define NXUS_FROZEN_RELEASE_ADDR_MAX {}",
+                                         FROZEN_RELEASE_ADDRESSES_MAX)));
         assert_eq!(header_define(HEADER, "NXUS_ST_DEBUG_STOPPED"), Some(ST_DEBUG_STOPPED));
         // reserved-flag on the hit batch (added in Round 4/5): a drift here would
         // silently turn a truncated result back into a "complete" one.
@@ -2728,5 +2783,63 @@ mod tests {
         // Unknown reserved bits are ignored rather than misread.
         clean[20..24].copy_from_slice(&0x8000_0000u32.to_le_bytes());
         assert!(!HitBatch::parse(&clean).truncated);
+    }
+
+    // ---- NxusEvent_FrozenReleased -------------------------------------
+
+    fn frozen_released_payload(count: u32, addresses: &[u64]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&count.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());      // reserved
+        for address in addresses {
+            data.extend_from_slice(&address.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn frozen_released_decodes_every_address() {
+        let data = frozen_released_payload(2, &[0x1FA_1234, 0x2BC_5678]);
+        let event = FrozenReleased::parse(&data);
+        assert_eq!(event.count, 2);
+        assert_eq!(event.addresses, vec![0x1FA_1234, 0x2BC_5678]);
+    }
+
+    #[test]
+    fn frozen_released_clamps_the_addresses_to_the_frame_length() {
+        // count says 3 but only two addresses arrived (a cut-off frame): the
+        // missing tail must not be invented, and the total stays as reported.
+        let data = frozen_released_payload(3, &[0x1000, 0x2000]);
+        let event = FrozenReleased::parse(&data);
+        assert_eq!(event.count, 3);
+        assert_eq!(event.addresses, vec![0x1000, 0x2000]);
+        // A header-only frame is valid: count with nothing to drop.
+        let empty = FrozenReleased::parse(&frozen_released_payload(5, &[]));
+        assert_eq!(empty.count, 5);
+        assert!(empty.addresses.is_empty());
+    }
+
+    #[test]
+    fn frozen_released_reports_count_above_the_array_cap() {
+        // NXUS_FROZEN_RELEASE_ADDR_MAX: 40 released, only 32 addresses ride
+        // along.  count must stay 40 so the UI can say "40" instead of "32".
+        let all: Vec<u64> = (0..40u64).map(|i| 0x3000 + i * 8).collect();
+        let event = FrozenReleased::parse(&frozen_released_payload(40, &all[..32]));
+        assert_eq!(event.count, 40);
+        assert_eq!(event.addresses.len(), FROZEN_RELEASE_ADDRESSES_MAX);
+        // Even a frame that (against the wire format) carried more is capped.
+        let too_many = FrozenReleased::parse(&frozen_released_payload(40, &all));
+        assert_eq!(too_many.count, 40);
+        assert_eq!(too_many.addresses.len(), FROZEN_RELEASE_ADDRESSES_MAX);
+    }
+
+    #[test]
+    fn frozen_released_tolerates_short_and_garbage_payloads() {
+        assert_eq!(FrozenReleased::parse(&[]), FrozenReleased::default());
+        assert_eq!(FrozenReleased::parse(&[1, 0, 0]), FrozenReleased::default());
+        // A count of 0 is the empty release: no addresses, no panic.
+        let zero = FrozenReleased::parse(&frozen_released_payload(0, &[0xDEAD]));
+        assert_eq!(zero.count, 0);
+        assert!(zero.addresses.is_empty());
     }
 }

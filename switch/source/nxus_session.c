@@ -3,10 +3,12 @@
 #include "nxus_dmntcht.h"
 #include "nxus_log.h"
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 
 typedef struct {
     /* Scan state.  Atomic on purpose: the server thread stores Running while the
@@ -30,6 +32,14 @@ typedef struct {
        without materialising every candidate.  active == 0 for every other mode,
        where 'hits' is the only state. */
     NxusBaseline baseline;
+    /* Baseline store health.  The store lives in this file, not in the engine, so
+       the write callback is the only place that sees a failing card; the counters
+       are published through nxusSessionBaselineWriteFailed() /
+       nxusSessionBaselineDegraded() and folded into stats.write_failed by the
+       worker.  Reset whenever a baseline is (re)armed or dropped. */
+    u32  baseline_write_failed;
+    bool baseline_write_logged;   /* the first failure has already been logged */
+    bool baseline_degraded;       /* RAM fallback or a failed store write      */
     NxusMappingEntry *map_entries;
     NxusMappingTable maps;
     NxusScanRegion *regions;
@@ -511,12 +521,18 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
  *     stdio buffer (no per-block malloc, writes coalesce into the card's
  *     cluster size),
  *   - RAM: a single malloc of the scoped byte count, used when the card cannot
- *     be opened (no SD inserted, read-only card, ...) or when the scoped range is
+ *     be opened (no SD inserted, read-only card, ...), when the scoped range is
  *     small enough that writing a file would cost more than the memory
- *     (<= 512 KB).
+ *     (<= 512 KB), or when statvfs proves the card cannot hold the stream with
+ *     1.5x headroom (a store that fills up mid-scan loses blocks silently).
  *
  * Offsets are absolute positions in the store; the engine hands each block the
  * offset it was assigned, so a plain fseek covers the sparse layout.
+ *
+ * Health: a failed write is counted in g_Session.baseline_write_failed, logged
+ * once, folded into stats.write_failed and published through
+ * nxusSessionBaselineWriteFailed() / nxusSessionBaselineDegraded(), so a short
+ * candidate list caused by the store is distinguishable from an empty target.
  */
 #define NXUS_BASELINE_RAM_MAX   (512u * 1024u)
 #define NXUS_BASELINE_FILE_BUF  (64u * 1024u)
@@ -527,17 +543,48 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
 static FILE *g_BaseFile = NULL;
 static u8   *g_BaseRam = NULL;
 static u64   g_BaseRamSize = 0;
+/* Ordinal of the next store write.  The engine writes exactly one block per
+   non-zero, storable block, so this is the block number the failure line names. */
+static u32   g_BaseWriteSeq = 0;
 static u8    g_BaseFileBuf[NXUS_BASELINE_FILE_BUF] __attribute__((aligned(0x10)));
+
+/* Record one failing store write.  The engine turns that block into
+   NXUS_BBLOCK_UNREADABLE and bumps stats->dropped like any unreadable block, so
+   without this counter a card that is full / unplugged mid-scan looks exactly
+   like "the target had few candidates".  The FIRST failure is logged (a failing
+   card would otherwise emit one line per block); every failure is counted. */
+static void baselineWriteFailure(u32 block, int err) {
+    g_Session.baseline_write_failed++;
+    g_Session.baseline_degraded = true;
+    if (!g_Session.baseline_write_logged) {
+        g_Session.baseline_write_logged = true;
+        NXUS_LOG("baseline: write failed at block %u (errno=%d) - SD streaming degraded to RAM/skip",
+                 (unsigned)block, err);
+    }
+}
 
 static int baselineStoreWrite(void *ctx, u64 offset, const void *buf, u32 len) {
     (void)ctx;
     if (len == 0) return 0;
+    const u32 block = g_BaseWriteSeq++;
+    errno = 0;
+    int failed;
     if (g_BaseFile != NULL) {
-        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) return -1;
-        return fwrite(buf, 1, len, g_BaseFile) == len ? 0 : -1;
+        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) {
+            failed = 1;
+        } else {
+            failed = (fwrite(buf, 1, len, g_BaseFile) == len) ? 0 : 1;
+        }
+    } else if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) {
+        failed = 1;
+    } else {
+        memcpy(g_BaseRam + offset, buf, len);
+        failed = 0;
     }
-    if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) return -1;
-    memcpy(g_BaseRam + offset, buf, len);
+    if (failed) {
+        baselineWriteFailure(block, errno ? errno : EIO);
+        return -1;
+    }
     return 0;
 }
 
@@ -569,33 +616,88 @@ static u64 baselineRegionBytes(void) {
 
 static void baselineStoreClose(void) {
     if (g_BaseFile != NULL) {
-        fclose(g_BaseFile);       /* also flushes the setvbuf() buffer */
+        /* A buffered stream can surface a card error only at flush time: the last
+           (< 64 KB) writes still sit in the stdio buffer when the stream closes,
+           so a card that filled up near the end of the scan would otherwise look
+           like a clean run.  Only the FLUSH result is checked, never ferror():
+           ferror() also reflects a failed READ from the refine pass, which is not
+           a write failure and is reported as dropped_reads instead. */
+        errno = 0;
+        int flush_err = (fflush(g_BaseFile) != 0) ? (errno ? errno : EIO) : 0;
+        if (fclose(g_BaseFile) != 0 && flush_err == 0) {   /* also flushes */
+            flush_err = errno ? errno : EIO;
+        }
         g_BaseFile = NULL;
+        if (flush_err != 0) baselineWriteFailure(g_BaseWriteSeq, flush_err);
     }
     free(g_BaseRam);
     g_BaseRam = NULL;
     g_BaseRamSize = 0;
 }
 
+/* Does the card hold the whole stream with room to spare?  `needed` is the upper
+   bound of the dump (see baselineStoreOpen).  A failing probe must NOT disable SD
+   streaming on its own - only a PROVEN shortage falls back to the RAM buffer.
+   Returns false only when statvfs succeeded and reported less than 1.5x `needed`
+   free, in which case the caller takes the RAM branch (and its own failure path,
+   which ends in the classic first pass when the range does not fit in RAM). */
+static bool baselineSdHasRoom(u64 needed) {
+    struct statvfs vfs;
+    if (statvfs(NXUS_SESSION_BASELINE_DIR, &vfs) != 0) {
+        NXUS_LOG("baseline: free-space probe on %s failed (errno=%d) - trying the SD store",
+                 NXUS_SESSION_BASELINE_DIR, errno);
+        return true;
+    }
+    const u64 unit  = vfs.f_frsize ? (u64)vfs.f_frsize : (u64)vfs.f_bsize;
+    const u64 avail = (u64)vfs.f_bavail * unit;
+
+    /* 1.5x leaves the card usable while the scan runs (log file, snapshots) and
+       keeps the stream from failing near the end, where every lost block is a
+       silently missing candidate. */
+    u64 required = needed + needed / 2u;
+    if (required < needed) required = 0xFFFFFFFFFFFFFFFFull;   /* overflow clamp */
+
+    if (avail < required) {
+        NXUS_LOG("baseline: only %llu MiB free of %llu MiB needed - using the RAM buffer",
+                 (unsigned long long)(avail / (1024ull * 1024ull)),
+                 (unsigned long long)(required / (1024ull * 1024ull)));
+        return false;
+    }
+    return true;
+}
+
 /* Open a store able to hold every non-zero block of the current region list. */
 static bool baselineStoreOpen(void) {
     baselineStoreClose();
     remove(NXUS_SESSION_BASELINE_PATH);
+    g_BaseWriteSeq = 0;
 
     const u64 region_bytes = baselineRegionBytes();
     if (region_bytes == 0) return false;
 
     if (region_bytes > NXUS_BASELINE_RAM_MAX) {
-        FILE *f = fopen(NXUS_SESSION_BASELINE_PATH, "wb+");
-        if (f != NULL) {
-            /* A full buffered stream keeps the write path off the heap and turns
-               the engine's per-block writes into card-sized bursts. */
-            setvbuf(f, (char *)g_BaseFileBuf, _IOFBF, sizeof(g_BaseFileBuf));
-            g_BaseFile = f;
-            NXUS_LOG("baseline: SD store open (%llu region bytes)", (unsigned long long)region_bytes);
-            return true;
+        /* The dump can only grow to the last byte the u32 store offset can name,
+           so a range beyond 4 GiB does not need 1.5x of its full size: the stream
+           is capped there (blocks past it are dropped by the engine). */
+        u64 needed = region_bytes;
+        if (needed > 0xFFFFFFFFull) needed = 0xFFFFFFFFull;
+        if (!baselineSdHasRoom(needed)) {
+            /* Proven shortage: skip the SD stream entirely instead of filling the
+               card / failing write by write.  Mark it so the client can tell this
+               scan is running on the reduced (RAM or classic) baseline. */
+            g_Session.baseline_degraded = true;
+        } else {
+            FILE *f = fopen(NXUS_SESSION_BASELINE_PATH, "wb+");
+            if (f != NULL) {
+                /* A full buffered stream keeps the write path off the heap and turns
+                   the engine's per-block writes into card-sized bursts. */
+                setvbuf(f, (char *)g_BaseFileBuf, _IOFBF, sizeof(g_BaseFileBuf));
+                g_BaseFile = f;
+                NXUS_LOG("baseline: SD store open (%llu region bytes)", (unsigned long long)region_bytes);
+                return true;
+            }
+            NXUS_LOG("baseline: SD store unavailable, using RAM");
         }
-        NXUS_LOG("baseline: SD store unavailable, using RAM");
     }
 
     /* The whole scoped range is the worst case: only blocks that are not all-zero
@@ -617,6 +719,14 @@ static void baselineDiscard(void) {
     nxusBaselineFree(&g_Session.baseline);
     baselineStoreClose();
     remove(NXUS_SESSION_BASELINE_PATH);
+    /* The health counters describe the baseline that just went away: clearing
+       them here keeps a later classic hit-list scan from inheriting an earlier
+       Unknown scan's degraded state.  A refine pass that just consumed the
+       baseline does NOT go through here, so its report stays readable. */
+    g_Session.baseline_write_failed = 0;
+    g_Session.baseline_write_logged = false;
+    g_Session.baseline_degraded = false;
+    g_BaseWriteSeq = 0;
 }
 
 /* ---- target memory access --------------------------------------------- */
@@ -720,6 +830,10 @@ u32  nxusSessionId(void)            { return g_Session.session_id; }
 u32  nxusSessionScanState(void)     { return (u32)sessionStateLoad(); }
 u32  nxusSessionProgress(void)      { return g_Session.progress; }
 s32  nxusSessionLastResult(void)    { return g_Session.last_result; }
+/* Baseline store health (see nxus_session.h): a failing card and a RAM fallback
+   are reported here because both only ever showed up as "few candidates". */
+u32  nxusSessionBaselineWriteFailed(void) { return g_Session.baseline_write_failed; }
+bool nxusSessionBaselineDegraded(void)    { return g_Session.baseline_degraded; }
 /* While a baseline is live the hit list is intentionally empty (the first pass
    only fingerprints), so report the candidate count the baseline covered: the
    status then reads "N candidates" instead of "0 hits". */
@@ -1253,6 +1367,10 @@ static void scanThread(void *arg) {
                             (int *)&g_Session.cancel);
     }
 
+    /* The store belongs to the session, so the engine could only report a failed
+       store write as one more generic drop.  Publish the real count alongside the
+       pass that produced it (0 for every scan without a baseline). */
+    stats.write_failed = g_Session.baseline_write_failed;
     g_Session.progress = stats.permille;
 
     NxusScanState final_state;
@@ -1280,11 +1398,12 @@ static void scanThread(void *arg) {
        any reader that now sees "not Running" also sees the final results. */
     sessionStateStore(final_state);
 
-    NXUS_LOG("scan done: state=%u hits=%u candidates=%llu reads=%llu bytes=%llu dropped=%u",
+    NXUS_LOG("scan done: state=%u hits=%u candidates=%llu reads=%llu bytes=%llu dropped=%u write_failed=%u degraded=%u",
              (unsigned)final_state, (unsigned)g_Session.hits.count,
              (unsigned long long)candidates,
              (unsigned long long)stats.reads, (unsigned long long)stats.bytes_read,
-             (unsigned)stats.dropped);
+             (unsigned)stats.dropped, (unsigned)stats.write_failed,
+             (unsigned)(g_Session.baseline_degraded ? 1u : 0u));
 
     free(chunk);
     free(window);

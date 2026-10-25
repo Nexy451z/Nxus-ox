@@ -1607,6 +1607,24 @@ pub fn settings_window(app: &mut App, ctx: &egui::Context) {
             ui.label(RichText::new("(0=plain, 1=linked via slot5, 2=linked via slot4)").color(DIM));
         });
         ui.separator();
+        ui.label(RichText::new("Logging").strong());
+        ui.horizontal(|ui| {
+            ui.label("console log level");
+            egui::ComboBox::from_id_salt("log-level")
+                .selected_text(match app.prefs.log_level {
+                    0 => "0 - errors only",
+                    2 => "2 - debug",
+                    _ => "1 - info",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.prefs.log_level, 0, "0 - errors only");
+                    ui.selectable_value(&mut app.prefs.log_level, 1, "1 - info");
+                    ui.selectable_value(&mut app.prefs.log_level, 2, "2 - debug");
+                });
+        });
+        ui.label(RichText::new("Verbosity of the console's own log ring / SD log \
+                                (applied with the rest of these settings).").color(DIM));
+        ui.separator();
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new(RichText::new("Apply to console").strong())).clicked() {
                 let enabled = app.prefs.hotkey_enabled as u32;
@@ -1621,6 +1639,7 @@ pub fn settings_window(app: &mut App, ctx: &egui::Context) {
                     // the current policy travels along: sending a constant 1 here
                     // released a target held at a stop (and disarmed the next one).
                     auto_continue: auto_continue_for(app.prefs.watch_stop_on_hit),
+                    log_level: app.prefs.log_level,
                 }, "applying settings");
             }
             ui.label(RichText::new("settings are remembered between runs").color(DIM));

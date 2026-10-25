@@ -106,6 +106,11 @@ typedef struct {
     u32 dropped;
     u32 retries;      /* reads that had to be retried smaller */
     u32 dropped_reads;/* refine windows that could not be read at all */
+    u32 write_failed; /* baseline store writes that failed (the block behind each
+                         one is dropped as well; kept separate so a failing store
+                         is distinguishable from unreadable target memory).
+                         Filled in by the owner of the store (nxus_session), which
+                         is why the engine itself never writes it. */
 } NxusScanStats;
 
 int  nxusHitListInit(NxusHitList *list, u32 capacity, u32 max_capacity, u32 value_size);

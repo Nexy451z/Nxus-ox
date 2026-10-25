@@ -74,40 +74,127 @@ static void pauseLeave(void);
 static u64 g_FrozenOwned[NXUS_FROZEN_OWNED_MAX];
 static u32 g_FrozenOwnedCount;
 
+/* g_FrozenOwned is written by the connection thread (FrozenEnable/Disable) and by
+   the tick (releaseOwnedFrozen), so it needs a lock: without one, a release that
+   runs concurrently with an enable can drop the just-added address from the table
+   and leave it frozen forever - exactly the symptom this bookkeeping exists to fix. */
+static Mutex g_FrozenLock;
+static bool  g_FrozenLockReady;
+static void frozenLock(void)   { if (g_FrozenLockReady) mutexLock(&g_FrozenLock); }
+static void frozenUnlock(void) { if (g_FrozenLockReady) mutexUnlock(&g_FrozenLock); }
+
+/* Releases that happened while nobody was connected.  The event can only be sent to
+   a live client, and the release itself is triggered by the client being gone, so
+   the notification waits for the next connection instead of being dropped. */
+static u64 g_FrozenReleasedPending[NXUS_FROZEN_RELEASE_ADDR_MAX];
+static u32 g_FrozenReleasedPendingCount;
+static u32 g_FrozenReleasedTotal;
+
 static void frozenOwnedAdd(u64 address) {
+    frozenLock();
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
-        if (g_FrozenOwned[i] == address) return;
+        if (g_FrozenOwned[i] == address) { frozenUnlock(); return; }
     }
     if (g_FrozenOwnedCount >= NXUS_FROZEN_OWNED_MAX) {
         NXUS_LOG("frozen: ownership table full - cannot track %016llX for cleanup",
                  (unsigned long long)address);
+        frozenUnlock();
         return;
     }
     g_FrozenOwned[g_FrozenOwnedCount++] = address;
+    frozenUnlock();
 }
 
 static void frozenOwnedRemove(u64 address) {
+    frozenLock();
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
         if (g_FrozenOwned[i] == address) {
             g_FrozenOwned[i] = g_FrozenOwned[--g_FrozenOwnedCount];
+            frozenUnlock();
             return;
         }
+    }
+    frozenUnlock();
+}
+
+/* Frozen addresses released by the switch itself are reported with
+   NxusEvent_FrozenReleased, so a client that reconnects does not keep showing
+   them as frozen.  The payload only carries the first
+   NXUS_FROZEN_RELEASE_ADDR_MAX addresses; anything beyond that is summarised by
+   count alone (see NxusFrozenReleased in nxus_protocol.h).  A failed send must
+   never turn the release itself into a failure - it is only logged. */
+static void sendFrozenReleasedEvent(u32 total, const u64 *addresses) {
+    if (nxusNetClientFd() < 0) return;   /* nobody connected: no one to tell */
+    const u32 sent = (total < NXUS_FROZEN_RELEASE_ADDR_MAX)
+                         ? total : (u32)NXUS_FROZEN_RELEASE_ADDR_MAX;
+    u8 payload[sizeof(NxusFrozenReleased) + NXUS_FROZEN_RELEASE_ADDR_MAX * sizeof(u64)];
+    NxusFrozenReleased head;
+    memset(&head, 0, sizeof(head));
+    head.count = total;      /* the full total; the array may be shorter */
+    head.reserved = 0;
+    memcpy(payload, &head, sizeof(head));
+    for (u32 i = 0; i < sent; i++) {
+        const u64 address = addresses[i];
+        memcpy(payload + sizeof(head) + (size_t)i * sizeof(u64), &address, sizeof(address));
+    }
+    const u32 length = (u32)(sizeof(head) + (size_t)sent * sizeof(u64));
+    Result rc = nxusNetSendEvent(NxusEvent_FrozenReleased, payload, length);
+    if (R_FAILED(rc)) {
+        NXUS_LOG("frozen: FrozenReleased event (count=%u) failed rc=0x%08X - "
+                 "the release itself stands",
+                 (unsigned)total, (unsigned)rc);
     }
 }
 
 static void releaseOwnedFrozen(void) {
-    if (g_FrozenOwnedCount == 0) return;
-    if (nxusDebugIsAttached()) return;   /* dmnt is closed: nothing to disable */
-    NXUS_LOG("frozen: releasing %u address(es) - the client is gone",
-             (unsigned)g_FrozenOwnedCount);
-    for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
-        Result rc = nxusDmntDisableFrozen(g_FrozenOwned[i]);
+    u64 released_addresses[NXUS_FROZEN_RELEASE_ADDR_MAX];
+    u32 released = 0;
+    u32 snapshot = 0;
+
+    frozenLock();
+    if (g_FrozenOwnedCount == 0) { frozenUnlock(); return; }
+    if (nxusDebugIsAttached()) { frozenUnlock(); return; }
+    released = g_FrozenOwnedCount;
+    snapshot = (released < NXUS_FROZEN_RELEASE_ADDR_MAX)
+                   ? released : (u32)NXUS_FROZEN_RELEASE_ADDR_MAX;
+    for (u32 i = 0; i < snapshot; i++) released_addresses[i] = g_FrozenOwned[i];
+    g_FrozenOwnedCount = 0;
+    frozenUnlock();
+
+    NXUS_LOG("frozen: releasing %u address(es) - the client is gone", (unsigned)released);
+    for (u32 i = 0; i < snapshot; i++) {
+        Result rc = nxusDmntDisableFrozen(released_addresses[i]);
         if (R_FAILED(rc)) {
             NXUS_LOG("frozen: release of %016llX failed rc=0x%08X",
-                     (unsigned long long)g_FrozenOwned[i], (unsigned)rc);
+                     (unsigned long long)released_addresses[i], (unsigned)rc);
         }
     }
-    g_FrozenOwnedCount = 0;
+
+    /* Nobody is connected (that is why this ran): queue the notification for the
+       next client instead of calling nxusNetSendEvent with no peer. */
+    frozenLock();
+    g_FrozenReleasedTotal += released;
+    for (u32 i = 0; i < snapshot && g_FrozenReleasedPendingCount < NXUS_FROZEN_RELEASE_ADDR_MAX; i++) {
+        g_FrozenReleasedPending[g_FrozenReleasedPendingCount++] = released_addresses[i];
+    }
+    frozenUnlock();
+}
+
+/* Deliver a queued FrozenReleased notification now that a client is connected. */
+static void flushFrozenReleased(void) {
+    u64 addresses[NXUS_FROZEN_RELEASE_ADDR_MAX];
+    u32 count = 0;
+    u32 total = 0;
+
+    frozenLock();
+    total = g_FrozenReleasedTotal;
+    count = g_FrozenReleasedPendingCount;
+    for (u32 i = 0; i < count; i++) addresses[i] = g_FrozenReleasedPending[i];
+    g_FrozenReleasedTotal = 0;
+    g_FrozenReleasedPendingCount = 0;
+    frozenUnlock();
+
+    if (total != 0) sendFrozenReleasedEvent(total, addresses);
 }
 
 /* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
@@ -117,6 +204,44 @@ static u32              g_ChainCount;
 static NxusPtrScanStats g_PtrStats;
 static u64              g_PtrTarget;
 static u64              g_PtrModuleBase;
+
+/* A PtrScanBegin may not run longer than this.  The PC gives up on the reply
+   after 120 s, but the console used to keep walking roots, so a scan the client
+   had already abandoned could hold the session and its heap for minutes and the
+   client never saw the result.  90 s leaves 30 s of headroom: the reply is
+   produced before the client's timeout, and what the scan found by then is
+   returned as a partial list.  The clock starts at the top of the handler, so
+   the mapping refresh counts against the budget too. */
+#define NXUS_PTRSCAN_TIME_BUDGET_MS 90000ull
+
+/* Budget state the engine sees through the cancel flag it polls.  nxusPtrScan()
+   takes `int *cancel` and only looks at it between roots and inside the walk,
+   so the flag is refreshed from the read callback - the one hook that runs
+   throughout the scan - rather than from a timer thread. */
+typedef struct {
+    u64 start_ms;
+    int cancel;      /* the flag nxusPtrScan() reads: 1 = stop the walk */
+    int budget_hit;  /* set once the time budget produced that stop */
+} PtrScanBudget;
+
+/* Reads the one clock the handler owns; 1 once the budget is gone. */
+static int ptrScanOverBudget(const PtrScanBudget *budget) {
+    const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    return (now_ms - budget->start_ms) >= NXUS_PTRSCAN_TIME_BUDGET_MS;
+}
+
+/* Read callback handed to nxusPtrScan(): re-arms the cancel flag before the
+   memory read, so a scan that is burning its budget stops within one read of
+   the deadline instead of at the next command.  The context is the budget, not
+   the session: nxusSessionReadCallback() ignores it. */
+static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
+    PtrScanBudget *budget = (PtrScanBudget *)ctx;
+    if (!budget->cancel && ptrScanOverBudget(budget)) {
+        budget->cancel = 1;
+        budget->budget_hit = 1;
+    }
+    return nxusSessionReadCallback(NULL, address, buffer, size);
+}
 
 /* ---- 8 MB heap budget -------------------------------------------------- */
 
@@ -263,6 +388,11 @@ void nxusServerInit(void) {
         mutexInit(&g_PauseLock);
         atomic_init(&g_PauseBusy, false);
         g_PauseLockReady = true;
+    }
+
+    if (!g_FrozenLockReady) {
+        mutexInit(&g_FrozenLock);
+        g_FrozenLockReady = true;
     }
 
     nxusHidInit();
@@ -630,7 +760,10 @@ static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
 
     u32 found = 0;
     u8 page[0x200];
-    for (u32 i = 0; i < maps->count && found < max_modules; i++) {
+    /* Copy the pair once: nxus_session.h asks callers to read entries+count
+       immediately, because a publish can replace the block while we walk it. */
+    const u32 map_total = maps->count;
+    for (u32 i = 0; i < map_total && found < max_modules; i++) {
         const NxusMappingEntry *m = &maps->entries[i];
         if (!(m->reserved & NXUS_PERM_R) || m->size < sizeof(page)) continue;
         if (nxusSessionReadMemory(m->base, page, sizeof(page)) != 0) continue;
@@ -676,7 +809,8 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
     *out_module_base = module_base;
 
     u32 n = 0;
-    for (u32 i = 0; i < maps->count && n < max_regions; i++) {
+    const u32 map_total = maps->count;   /* copied once, see nxus_session.h */
+    for (u32 i = 0; i < map_total && n < max_regions; i++) {
         const NxusMappingEntry *m = &maps->entries[i];
         if (!(m->reserved & NXUS_PERM_R) || m->size == 0) continue;
 
@@ -744,6 +878,14 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     }
     NxusPtrScanRequest req;
     memcpy(&req, payload, sizeof(req));
+
+    /* Start the clock before the mapping refresh and before the heap check: the
+       client times the whole command from its own request, so everything this
+       handler does has to fit inside the budget. */
+    PtrScanBudget budget;
+    budget.start_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    budget.cancel = 0;
+    budget.budget_hit = 0;
 
     /* Refuse before the mapping refresh and before allocating anything: the
        pointer scan needs its scratch (256 KiB), region array (~96 KiB) and a
@@ -836,16 +978,31 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     /* Honour the client's --max: the engine stops at max_results and reports
        truncated, which is exactly the advice the CLI gives when it fires. */
     const u32 out_cap = opts.max_results ? opts.max_results : NXUS_PTRSCAN_MAX_RESULTS;
+    /* The last argument is the cancel flag the engine polls; ptrScanReadBudgeted
+       raises it once the time budget is spent, so the walk always returns. */
     int src = nxusPtrScan(regions, region_count, req.target_address, module_base, &opts,
                           g_Chains, out_cap, &count,
-                          nxusSessionReadCallback, NULL, scratch, 256 * 1024, &g_PtrStats, NULL);
+                          ptrScanReadBudgeted, &budget, scratch, 256 * 1024, &g_PtrStats,
+                          &budget.cancel);
 
-    g_ChainCount = (src == NXUS_SCAN_OK) ? count : 0;
+    const u64 elapsed_ms = (armTicksToNs(armGetSystemTick()) / 1000000ull)
+                           - budget.start_ms;
+
+    /* A cancelled walk is a partial result, not a failure: the chains already
+       stored are real, so they are published, flagged as incomplete.  Anything
+       else keeps the old all-or-nothing rule. */
+    if (budget.budget_hit || src == NXUS_SCAN_ERR_CANCELLED) g_PtrStats.truncated = 1;
+    g_ChainCount = (src == NXUS_SCAN_OK || src == NXUS_SCAN_ERR_CANCELLED) ? count : 0;
     g_PtrTarget = req.target_address;
     g_PtrModuleBase = module_base;
 
-    NXUS_LOG("ptrscan: chains=%u roots=%llu reads=%llu",
-             (unsigned)g_ChainCount, (unsigned long long)g_PtrStats.roots_examined,
+    if (budget.budget_hit) {
+        NXUS_LOG("ptrscan: time budget reached after %llu ms (chains=%u) - "
+                 "returning partial results",
+                 (unsigned long long)elapsed_ms, (unsigned)g_ChainCount);
+    }
+    NXUS_LOG("ptrscan: done in %llu ms, chains=%u, reads=%llu",
+             (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
              (unsigned long long)g_PtrStats.reads);
 
     free(regions);
@@ -1128,7 +1285,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                        instead: i is a u32 index, so i < start simply yields nothing
                        when the offset is past the table. */
                     const u64 start = req.offset;
-                    for (u32 i = 0; i < table->count && got < max_count; i++) {
+                    const u32 table_count = table->count;   /* copied once */
+                    for (u32 i = 0; i < table_count && got < max_count; i++) {
                         if ((u64)i < start) continue;
                         const NxusMappingEntry *m = &table->entries[i];
                         memset(&buffer[got], 0, sizeof(NxusMemoryInfo));
@@ -1539,12 +1697,12 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (length >= sizeof(NxusMappingsRequest)) {
                 NxusMappingsRequest req;
                 memcpy(&req, payload, sizeof(req));
-                /* Only max_count is meaningful here.  NxusFrozenRequest is
-                   {address, width} and is byte-compatible with
-                   NxusMappingsRequest {offset, max_count}, so honouring req.offset
-                   would read an *address* as a page offset; dmnt's frozen table is
-                   capped at 0x80 entries anyway and callers never page it. */
-                if (req.max_count > 0 && req.max_count <= 512) max_count = req.max_count;
+                /* Only max_count is meaningful here, and the payload is ambiguous:
+                   NxusFrozenRequest {address,width} is byte-compatible with
+                   NxusMappingsRequest {offset,max_count}.  Honouring a width (1..8) as
+                   a page size truncated the reply to a couple of rows, so a value that
+                   small is treated as the frozen-request shape and ignored. */
+                if (req.max_count >= 16 && req.max_count <= 512) max_count = req.max_count;
             }
             NxusFrozenAddressEntry *entries = (NxusFrozenAddressEntry *)calloc(max_count, sizeof(NxusFrozenAddressEntry));
             NxusFrozenEntry *wire = (NxusFrozenEntry *)calloc(max_count, sizeof(NxusFrozenEntry));
@@ -1647,6 +1805,9 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
             if (!debug_only && length >= sizeof(NxusConfig)) {
                 memcpy(&g_Config, payload, sizeof(g_Config));
+            /* Apply the new console log level immediately; it is the only consumer of
+               NxusConfig.log_level and nothing else can reach it from outside. */
+            nxusLogSetLevel(g_Config.log_level);
                 nxusSessionSetWatchdogTimeout(g_Config.watchdog_timeout_ms);
                 nxusSessionSetChunkSize(g_Config.chunk_size);
                 nxusHidConfigure(g_Config.hotkey_mask, g_Config.hotkey_hold_ms, g_Config.hotkey_enabled);
@@ -2025,6 +2186,7 @@ void nxusServerTick(void) {
         const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
         if (nxusNetClientFd() >= 0) {
             last_client_ms = now_ms;
+            flushFrozenReleased();
         } else if (g_FrozenOwnedCount > 0) {
             /* No client: a fresh boot has no timestamp yet, so start the grace
                window on the first tick without one. */

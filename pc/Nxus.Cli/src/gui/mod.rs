@@ -71,7 +71,7 @@ pub enum Cmd {
     /// console rewrites every field from it and a stale auto_continue would thaw
     /// a target the user expects to be held.
     Config { mask: u64, hold: u32, enabled: u32, watchdog: u32, style: u32,
-             auto_continue: u32 },
+             auto_continue: u32, log_level: u32 },
     Pause,
     Resume,
     /// Push ONLY the debug block before arming (a 16-byte `NxusDebugConfig`):
@@ -112,6 +112,10 @@ pub enum Ev {
     Wrote { address: u64, data: Vec<u8> },
     Frozen { address: u64, value: u64 },
     Unfrozen { address: u64 },
+    /// The console released frozen addresses by itself (NxusEvent_FrozenReleased).
+    /// `count` is the console's total and can exceed `addresses.len()` when more
+    /// were released than fit in one frame (at most 32 addresses ride along).
+    FrozenReleased { count: u32, addresses: Vec<u64> },
     WatchlistValues(Vec<(u64, u64)>),
     Chains(Vec<PtrChain>, bool),          // chains, truncated-by-console
     Cheat(String),
@@ -189,6 +193,17 @@ fn drain_events(c: &NxusClient, tx: &Sender<Ev>) {
             let _ = tx.send(Ev::DebugStopped {
                 thread_id: stop.thread_id, pc: stop.pc, address: stop.address,
                 kind: stop.kind, slot: stop.slot,
+            });
+            continue;
+        }
+        if ev.kind == event::FROZEN_RELEASED {
+            let released = P::FrozenReleased::parse(&ev.payload);
+            // The event is authoritative: drop the addresses from the client's
+            // frozen baseline too, so the "list shrank" fallback (frozen_list_diff)
+            // cannot report the same release a second time.
+            c.note_frozen_released(&released.addresses);
+            let _ = tx.send(Ev::FrozenReleased {
+                count: released.count, addresses: released.addresses,
             });
             continue;
         }
@@ -709,17 +724,17 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let _ = tx.send(Ev::Message(format!("diff: {} changed block(s)", summary.changed_count)));
                             let _ = tx.send(Ev::Snapshot { summary, changed });
                         }
-                        Cmd::Config { mask, hold, enabled, watchdog, style, auto_continue } => {
+                        Cmd::Config { mask, hold, enabled, watchdog, style, auto_continue, log_level } => {
                             // "Apply" is the full request on purpose: the user is
                             // applying EVERY setting.  auto_continue is the current
                             // stop-on-hit choice - hardcoding 1 here used to
                             // silently release a held target / break a --stop watch.
-                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, 1,
+                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, log_level,
                                          Some((style, auto_continue)))
                                 .map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message(format!(
-                                "settings applied (hotkey 0x{:X}, watchdog {} ms, {} on hit)",
-                                mask, watchdog,
+                                "settings applied (hotkey 0x{:X}, watchdog {} ms, log level {}, {} on hit)",
+                                mask, watchdog, log_level,
                                 if auto_continue == 0 { "stop" } else { "auto-resume" })));
                         }
                         Cmd::Pause => {
@@ -858,6 +873,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Console log verbosity used until the user changes it: NXUS_LOG_LEVEL_INFO.
+/// The console's own default (`g_Config.log_level = 1`) and the sysmodule's boot
+/// level (main.c pins INFO) agree, so a settings file from an older build keeps
+/// the same behaviour instead of silently going quiet (0) or verbose (2).
+fn default_log_level() -> u32 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Prefs {
     pub host: String,
@@ -880,6 +903,10 @@ pub struct Prefs {
     pub hotkey_hold: u32,
     pub watchdog_ms: u32,
     pub watch_style: u32,
+    /// Console log verbosity (NXUS_LOG_LEVEL_*: 0 = errors only, 1 = info,
+    /// 2 = debug), applied with the rest of the Settings window.
+    #[serde(default = "default_log_level")]
+    pub log_level: u32,
     pub watch_kind: usize,
     pub watch_size: u32,
     /// GDB style: hold the target at a watchpoint hit instead of resuming it.
@@ -922,6 +949,7 @@ impl Default for Prefs {
             hotkey_hold: 300,
             watchdog_ms: 15000,
             watch_style: 1,
+            log_level: default_log_level(),
             watch_kind: 0,
             watch_size: 4,
             // GDB behaviour by default: a hit is a stop, not a log line.
@@ -1481,6 +1509,31 @@ impl App {
             Ev::Unfrozen { address } => {
                 self.st.frozen.retain(|a| *a != address);
                 self.st.busy = false;
+            }
+            Ev::FrozenReleased { count, addresses } => {
+                // The console told us which addresses it released: drop exactly
+                // those from the list the UI shows.  `count` (total) is what the
+                // user is told about; `addresses` is the part that fitted in the
+                // frame, so a release larger than 32 names the rest by number.
+                for address in &addresses {
+                    self.st.frozen.retain(|frozen| frozen != address);
+                }
+                // No difference warning here: this event IS the release report,
+                // and the "the list shrank" comparison only exists for a console
+                // that cannot send it - warning twice would look like two events.
+                let total = count.max(addresses.len() as u32);
+                let mut line = format!("the console released {} frozen address(es)", total);
+                if !addresses.is_empty() {
+                    line.push_str(": ");
+                    line.push_str(&addresses.iter().map(|a| format!("{:08X}", a))
+                        .collect::<Vec<_>>().join(", "));
+                }
+                if total > addresses.len() as u32 {
+                    // The frame carries at most 32 addresses; the rest are only
+                    // counted, so a marker for one of them may stay behind.
+                    line.push_str(&format!(" (only {} fit in the event)", addresses.len()));
+                }
+                self.st.log(line);
             }
             Ev::WatchlistValues(values) => {
                 for (addr, val) in values {

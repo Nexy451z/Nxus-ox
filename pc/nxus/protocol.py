@@ -198,7 +198,33 @@ EVT = {
     'Log': 0x8006,
     'DebugEvent': 0x8007,
     'DebugStopped': 0x8008,
+    'FrozenReleased': 0x8009,
 }
+
+# NxusEvent_FrozenReleased payload: { u32 count; u32 reserved; u64 addresses[n]; }
+# count is the TOTAL number of addresses the console released and may be larger
+# than the array: only NXUS_FROZEN_RELEASE_ADDR_MAX of them fit in one frame.
+FROZEN_RELEASED_HEADER = struct.Struct('<II')
+FROZEN_RELEASE_ADDR_MAX = 32
+
+
+def parse_frozen_released(payload: bytes):
+    """Decode an NxusEvent_FrozenReleased payload into ``(count, addresses)``.
+
+    ``count`` is the console's own total and can exceed ``len(addresses)``: a
+    frame carries at most ``FROZEN_RELEASE_ADDR_MAX`` addresses.  The list is
+    clamped to the bytes actually present (and to that cap), never to ``count``,
+    so a cut-off or hostile frame cannot be read past its end.
+    """
+    if len(payload) < FROZEN_RELEASED_HEADER.size:
+        return 0, []
+    count, _reserved = FROZEN_RELEASED_HEADER.unpack_from(payload, 0)
+    available = (len(payload) - FROZEN_RELEASED_HEADER.size) // 8
+    n = min(count, available, FROZEN_RELEASE_ADDR_MAX)
+    base = FROZEN_RELEASED_HEADER.size
+    addresses = [struct.unpack_from('<Q', payload, base + i * 8)[0] for i in range(n)]
+    return count, addresses
+
 
 ST = {
     'NXUS_ST_PAUSED': 0x0001,

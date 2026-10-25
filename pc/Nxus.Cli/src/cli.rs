@@ -23,10 +23,11 @@ session
   log                             dump the sysmodule log ring
   pause | resume                  freeze / unfreeze the target
   config [--hotkey COMBO] [--hold MS] [--watchdog MS] [--chunk N]
-         [--watch-style N] [--auto-continue 0|1]
-                                  set the controller hotkey (COMBO: plus, L+PLUS, off) and
-                                  the debug policy (auto-continue 0 = a breakpoint hit
-                                  holds the target)
+         [--log-level 0|1|2] [--watch-style N] [--auto-continue 0|1]
+                                  set the controller hotkey (COMBO: plus, L+PLUS, off),
+                                  the console's log verbosity (0=errors, 1=info,
+                                  2=debug) and the debug policy (auto-continue 0 = a
+                                  breakpoint hit holds the target)
   events [--seconds N] [--count N] listen for Switch-initiated events
   pids | processes                list running process IDs on the console
   attach [--pid PID]              attach kernel debugger (default: current game)
@@ -750,6 +751,17 @@ fn execute(opts: &Opts) -> Result<()> {
             let hold = opts.num("hold").unwrap_or(500) as u32;
             let watchdog = opts.num("watchdog").unwrap_or(15000) as u32;
             let chunk = opts.num("chunk").unwrap_or(0) as u32;
+            // NXUS_LOG_LEVEL_*: 0 = errors only, 1 = info, 2 = debug.  The full
+            // NxusConfig request rewrites every field, so leaving the option out
+            // keeps the value this command always sent (INFO) instead of silently
+            // changing what other settings runs have configured.
+            let log_level = match opts.num("log-level") {
+                Some(level) if level <= 2 => level as u32,
+                Some(_) => {
+                    return Err(usage("config --log-level 0|1|2  (0=errors, 1=info, 2=debug)"))
+                }
+                None => 1,
+            };
             let debug = match (opts.num("watch-style"), opts.num("auto-continue")) {
                 (None, None) => None,
                 (style, auto_continue) => Some((
@@ -758,13 +770,21 @@ fn execute(opts: &Opts) -> Result<()> {
                 )),
             };
 
-            let body = client.set_config(mask, hold, enabled, chunk, watchdog, 5000, 1, debug)?;
+            let body = client.set_config(mask, hold, enabled, chunk, watchdog, 5000, log_level, debug)?;
             if body.len() >= 32 {
                 println!("hotkey mask  : 0x{:X}{}", rd_u64(&body, 0),
                          if enabled == 0 { " (disabled)" } else { "" });
                 println!("hotkey hold  : {} ms", rd_u32(&body, 8));
                 println!("chunk size   : {} bytes", rd_u32(&body, 16));
                 println!("watchdog     : {} ms", rd_u32(&body, 20));
+                // Field order of NxusConfig: mask, hold, enabled, chunk, watchdog,
+                // heartbeat, log_level - so the reply's log level is at offset 28.
+                println!("log level    : {} ({})", rd_u32(&body, 28),
+                         match rd_u32(&body, 28) {
+                             0 => "errors only",
+                             2 => "debug",
+                             _ => "info",
+                         });
             }
             if let Some(dbg) = debug {
                 println!("debug config : watch style {} / auto-continue {}", dbg.0, dbg.1);
@@ -792,6 +812,39 @@ fn execute(opts: &Opts) -> Result<()> {
                         }
                         event::HOTKEY_PAUSED => println!("[{:6.2}s] hotkey: target paused", at),
                         event::AUTO_RESUME => println!("[{:6.2}s] watchdog: target auto-resumed", at),
+                        event::FROZEN_RELEASED => {
+                            let released = FrozenReleased::parse(&ev.payload);
+                            // count is the total the console released; the frame
+                            // carries at most FROZEN_RELEASE_ADDRESSES_MAX of them.
+                            let total = released.count.max(released.addresses.len() as u32);
+                            let named = if released.addresses.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", format_address_list(&released.addresses))
+                            };
+                            let extra = if total > released.addresses.len() as u32 {
+                                // At most 32 addresses fit in one event; the rest
+                                // are only counted, so name that limit.
+                                format!(" (only {} fit in the event)", released.addresses.len())
+                            } else {
+                                String::new()
+                            };
+                            println!("[{:6.2}s] the console released {} frozen address(es){}{}",
+                                     at, total, named, extra);
+                            // The event is the authoritative report: drop the
+                            // addresses from the client baseline and the on-disk
+                            // one, so a later `frozen list` cannot claim the same
+                            // release again through its own list difference.
+                            client.note_frozen_released(&released.addresses);
+                            if let Some(status) = &initial_status {
+                                if let Some(mut baseline) = load_frozen_baseline(&opts.host, opts.port)
+                                    .filter(|baseline| baseline.title == status.program_id) {
+                                    baseline.addresses
+                                        .retain(|frozen| !released.addresses.contains(frozen));
+                                    save_frozen_baseline(&opts.host, opts.port, &baseline);
+                                }
+                            }
+                        }
                         event::DEBUG_STOPPED if ev.payload.len() >= DebugStop::SIZE => {
                             let stop = DebugStop::parse(&ev.payload);
                             println!("[{:6.2}s] stopped: thread=0x{:X} pc={:08X} ({} to {:08X})",

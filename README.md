@@ -84,9 +84,12 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   |---|---|
   | PC closes the CLI mid-debug (stop banner, GUI) | The debug session is released when the connection drops; the target resumes. |
   | PC disappears while paused | The pause watchdog resumes the target (~15 s). |
-  | PC disappears while addresses are frozen | Nxus remembers what it froze and **releases them 30 s after the client is gone** (otherwise only a reboot would stop `dmnt` writing them). |
+  | PC disappears while addresses are frozen | Nxus remembers what it froze and **releases them 30 s after the client is gone** (otherwise only a reboot would stop `dmnt` writing them). The release is reported with `NxusEvent_FrozenReleased`, so a reconnecting client drops them from its list instead of showing stale values. |
+  | PC disappears in the middle of a scan | The scan keeps running for a minute so a quick reconnect can still read it, then it is **cancelled automatically** (previously it held the worker and the SCANNING flag until the process restarted). |
   | Wi-Fi drops / console sleeps | The listener is rebuilt automatically, and a boot-time network failure is retried every 3 s instead of parking the module. |
   | Hit list fills up | The reply is flagged `NXUS_HITBATCH_TRUNCATED`; refine further or raise the limit. |
+  | Pointer scan is huge | The console stops it after 90 s and returns the partial chains flagged as truncated, so the PC never waits past its own timeout. |
+  | SD card missing or full | The module still starts and serves over TCP (RAM only); the log lives in the RAM ring, readable with `nxus log`. A stale `scan_base.bin` from a previous boot is deleted at startup. |
   | Something is genuinely stuck | Hold `POWER` to force-off, then boot hekate and remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` to stop the module from starting. |
  `nxus status` also refreshes `pid` / `title id` / `main NSO base` once per second (and right after `forceopen`), so the reported target identity no longer stays at zero after the game is (re)started.
 
@@ -207,7 +210,7 @@ Nxus-ox/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
     tests/    Cross-language protocol parity & end-to-end test suite (75 tests)
-  tests/      Host C unit test suite (1,336 checks across 7 test binaries)
+  tests/      Host C unit test suite (1,394 checks across 7 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
 
@@ -230,7 +233,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,336 checks: scanner, dense baseline, fast paths, chunk boundaries, ptrscan memoization, snapshot, session views, heap budget, hotkey)
+# 1. Host C Core Tests (1,394 checks: scanner, dense baseline, fast paths, chunk boundaries, ptrscan memoization, snapshot, session views, heap budget, hotkey)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (42 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)

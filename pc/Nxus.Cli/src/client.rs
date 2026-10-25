@@ -872,7 +872,13 @@ impl NxusClient {
         put_u32(&mut payload, max_offset);
         put_u32(&mut payload, max_results);
         put_u32(&mut payload, value_width);
-        let (_, body) = self.request_timeout(cmd::PTRSCAN_BEGIN, &payload, Duration::from_secs(120))?;
+        // The console aborts its own pointer scan after 90 s and answers with
+        // whatever it has (NXUS_PTRSCAN_TIME_BUDGET_MS in nxus_server.c), so the
+        // deadline has to sit clearly above that: 150 s leaves room for the
+        // reply to travel and for a slow tick on the console side.  The old
+        // 120 s was already above 90 s, but a scan that only just missed the
+        // budget could lose the reply to a stalled Wi-Fi link.
+        let (_, body) = self.request_timeout(cmd::PTRSCAN_BEGIN, &payload, Duration::from_secs(150))?;
         Ok(parse_chains(&body))
     }
 
@@ -980,6 +986,21 @@ impl NxusClient {
         lock(&self.released_frozen).retain(|frozen| *frozen != address);
         lock(&self.last_frozen).retain(|frozen| *frozen != address);
         Ok(())
+    }
+
+    /// Record addresses the console said it released
+    /// (`NxusEvent_FrozenReleased`, see [`FrozenReleased`]).
+    ///
+    /// Once the console reports the release on the wire, the PC's own
+    /// "list shrank" difference (see [`NxusClient::frozen_list_diff`]) must not
+    /// report the same addresses a second time: they are dropped from the
+    /// baseline so the next `FROZEN_LIST` reply looks consistent.
+    pub fn note_frozen_released(&self, addresses: &[u64]) {
+        if addresses.is_empty() {
+            return;
+        }
+        lock(&self.released_frozen).retain(|frozen| !addresses.contains(frozen));
+        lock(&self.last_frozen).retain(|frozen| !addresses.contains(frozen));
     }
 
     // ---- debug mode ----

@@ -62,6 +62,24 @@ static inline bool nxusSessionIsRunning(void) {
 }
 u32  nxusSessionProgress(void);
 s32  nxusSessionLastResult(void);
+/* ---- baseline store health (Unknown scan) -------------------------------
+ * The dense baseline streams its fingerprint store to the SD card and used to
+ * degrade invisibly: a failed write only turned a block unreadable (one more
+ * "dropped" block), which every client shows as "few candidates".  These two
+ * accessors are the missing signal; neither changes an existing signature.
+ *
+ *   nxusSessionBaselineWriteFailed() - blocks the store could not persist for
+ *       the current (or last) baseline.  Each one can never yield a hit.
+ *   nxusSessionBaselineDegraded()    - true when the scan is running with a
+ *       reduced baseline at all: the SD stream was refused up front because the
+ *       card had less than 1.5x the estimated need free (RAM buffer fallback),
+ *       or at least one store write failed.
+ *
+ * Both are cleared when a new scan arms or drops a baseline, so a classic
+ * hit-list scan reports 0/false.  Read them while not Running: the worker only
+ * publishes the counters when its pass returns. */
+u32  nxusSessionBaselineWriteFailed(void);
+bool nxusSessionBaselineDegraded(void);
 u32  nxusSessionHitCount(void);
 u32  nxusSessionMappingCount(void);
 u64  nxusSessionProcessId(void);
