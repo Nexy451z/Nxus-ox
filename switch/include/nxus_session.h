@@ -261,11 +261,14 @@ const NxusHitList      *nxusSessionHits(void);
  *     would break scan-then-attach); with no pid at all the scan generation is the
  *     token, exactly like the chain list,
  *   - a generation change is NOT automatically a mismatch any more: it means the
- *     table was rebuilt, and the rebuild may only have moved UNRELATED mappings.
- *     nxusSessionHitsRevalidate() then checks whether the new table still resolves
- *     every hit to the absolute address stored with it; if so the hit list stays
- *     servable (its stamp is re-pointed at the new generation) and a refine keeps
- *     working.  A single mismatch - or a different target - still discards,
+ *     table was rebuilt, and the rebuild may only have moved UNRELATED mappings -
+ *     or shifted every recorded index by inserting/removing a mapping before them.
+ *     nxusSessionHitsRevalidate() then re-resolves each hit by the ABSOLUTE ADDRESS
+ *     stored with it, REPAIRS mapping_idx/offset against the current table, drops
+ *     only the hits whose address is no longer mapped and keeps the list servable
+ *     (re-pointing its stamp at the new generation), so a refine keeps working.  A
+ *     different target still discards, and so does a rebuild after which no single
+ *     hit survives,
  *   - nxusSessionInvalidateHits() discards hits + mapping snapshot.
  *
  * Detection is the server's job: fillStatus() and sendHits(), plus ScanNext() inside
@@ -276,29 +279,46 @@ const NxusHitList      *nxusSessionHits(void);
 /* True while the stored hit list may be served to the current target.  Also false
    after nxusSessionInvalidateHits() until a new scan stamps a list.  A rebuilt
    mapping table is not refused on sight: it is first offered to
-   nxusSessionHitsRevalidate() (see below), and the list is served again when every
-   hit still resolves to its recorded address.  An empty session (no list ever
-   built) matches: there is nothing that could be stale. */
+   nxusSessionHitsRevalidate() (see below), which repairs the stored indices from the
+   recorded addresses and drops only the hits that can no longer be resolved.  An
+   empty session (no list ever built) matches: there is nothing that could be stale. */
 bool nxusSessionHitsMatchTarget(void);
 
 /* Rescue a stamped list across a mapping-table REBUILD (same target, new table
    generation).  Every hit stores the absolute address it was found at next to its
-   mapping_idx/offset, so the list is still trustworthy exactly when the currently
-   published table resolves each of them back to that address:
-       mapping_base[mapping_idx] + offset == hit.address   (for EVERY hit)
+   mapping_idx/offset, and the ADDRESS is what the rescue works from - the stored
+   index is only an ordinal into a table that no longer exists:
  *
- *   - all hits match       -> true, and the owner stamp is re-pointed at the
- *                             current generation (so later readers/refines do not
- *                             refuse the list again).  Logs
- *                             "hits: revalidated %u hit(s) across a mapping rebuild",
- *   - one mismatch         -> false (the caller discards as before),
- *   - mapping_idx out of range, or no published table -> false,
- *   - a pass is Running, or the list was never stamped / is already discarded ->
- *     false (there is no consistent list to walk).
+ *   1. the base array of the table is stamped with the hit list (32 KB, taken when
+ *      the list is armed).  If the current table still has the same bases in the
+ *      same order, no index can have shifted and the stored mapping_idx values are
+ *      verified arithmetically per hit - nothing is searched,
+ *   2. otherwise each hit is re-resolved by ADDRESS against the CURRENT table (one
+ *      sorted base index per rebuild, then one binary search per hit) and its
+ *      mapping_idx/offset are REWRITTEN to the mapping that contains the address.
+ *      This is what rescues a rebuild in which a mapping was inserted or removed
+ *      before the recorded ones: the addresses survive, the indices are repaired,
+ *   3. a hit is resolvable only inside a mapping with read permission, a non-zero
+ *      size and base <= address < base + size.  A reused base whose size shrank, a
+ *      mapping turned read-only and a vanished mapping are all unresolvable,
+ *   4. unresolvable hits are DROPPED (the list is compacted in place); the log line
+ *      is "hits: %u hit(s) can no longer be resolved - dropped".
+ *
+ * Returns:
+ *   - true  -> at least one hit survives.  The owner stamp is re-pointed at the
+ *              current generation and the base stamp is re-recorded from the verified
+ *              table, so later readers/refines do not repeat the check.  Logs
+ *              "hits: revalidated %u hit(s) across a mapping rebuild",
+ *   - false -> NOT ONE hit survives (all dropped: the table is gone, or none of the
+ *              recorded addresses is mapped any more).  The caller discards the list,
+ *              so refine/undo answer BAD_STATE.  Also false when a pass is Running, or
+ *              the list was never stamped / is already discarded - there is no
+ *              consistent list to walk.
  *
  * Callers: nxusSessionHitsMatchTarget() on a generation mismatch (and through it
  * scan refine, undo and the hit readers).  Runs on the connection thread, which is
- * serialized with the table publications. */
+ * serialized with the table publications; that thread also owns the base stamp it
+ * rewrites. */
 bool nxusSessionHitsRevalidate(void);
 
 /* Identity half of the check above: the same pid / program id / scan-generation

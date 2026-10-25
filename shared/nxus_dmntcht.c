@@ -91,8 +91,9 @@ bool nxusDmntIsActive(void) {
    one earlier IPC failure made dmnt drop the session.  Without a repair path every
    later command keeps returning that Result - which is exactly how a Pause could
    leave the console permanently unable to Read/GetMappings (snapshot capture then
-   failed with 0x0032C80D).  ForceOpen once and repeat the failed command once. */
-#define NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED 0x0032C80Du
+   failed with 0x0032C80D).  ForceOpen once and repeat the failed command once.
+   (NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED is declared in the header: callers need the
+   value to recognise "dmnt holds no process" without opening one.) */
 /* Upper bound for a mapping count accepted from dmnt (sanity, not protocol). */
 #define NXUS_DMNT_MAX_MAPPINGS 8192ull
 
@@ -254,6 +255,34 @@ Result nxusDmntGetMetadata(NxusProcessMetadata *out) {
        though the target is alive.  Reopening once and retrying keeps the caller
        from surfacing 0x8003C806 (BAD_STATE) / 0x0032C80D to the PC. */
     return dmntRunCommand(opGetMetadata, out, true, "GetMetadata");
+}
+
+/* Read-only metadata: no ForceOpen, no repair retry.
+ *
+ * nxusDmntGetMetadata() above repairs a failed metadata command by calling
+ * ForceOpen() - a takeover, because dmnt:cht holds one process at a time.  That is
+ * right for the paths that are *about* to use the process (attaching, scanning),
+ * but Status only wants to describe it: a status poll must not be able to steal the
+ * process from Atmosphère's cheat manager or another debugger, and it must not
+ * re-open dmnt on a console that deliberately has none (the boot-time ForceOpen is
+ * a one-shot; everything else is gated on HasCheatProcess).
+ *
+ * Command 65000 is a pure query - it writes its bool and never opens anything - so
+ * asking it first turns the repair into a plain "not attached" answer.  Both calls
+ * are raw dispatches: neither goes through dmntRunCommand(), which is the only
+ * place that can ForceOpen().  A process that vanishes between the two IPCs is
+ * reported with dmnt's own Result; there is nothing to repair in that case either.
+ */
+Result nxusDmntPeekMetadata(NxusProcessMetadata *out) {
+    if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    if (out == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    bool attached = false;
+    Result rc = opHasCheatProcess(&attached);
+    if (R_FAILED(rc)) return rc;
+    if (!attached) return (Result)NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED;
+
+    return opGetMetadata(out);
 }
 
 Result nxusDmntForceOpen(void) {

@@ -41,6 +41,11 @@ Result nxusDmntInitialize(void);
 void   nxusDmntExit(void);
 bool   nxusDmntIsActive(void);
 
+/* dmnt:cht's ResultCheatNotAttached (0x0032C80D): the service holds no cheat
+   process to answer for.  nxusDmntPeekMetadata() returns exactly this instead of
+   opening one. */
+#define NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED 0x0032C80Du
+
 /* Read/Write/Metadata and the other commands reopen dmnt automatically once after
    a failed dispatch (0x0032C80D ResultCheatNotAttached, plus any failure for the
    three legacy ones).  Disable that while the Nxus debug session owns the process:
@@ -51,6 +56,22 @@ void   nxusDmntSetAutoReopen(bool enabled);
 Result nxusDmntHasCheatProcess(bool *out);
 Result nxusDmntGetCheatProcessEvent(Handle *out_handle);
 Result nxusDmntGetMetadata(NxusProcessMetadata *out);
+/* Read-only metadata query - the one to use when the caller only wants to LOOK.
+ *
+ * It asks dmnt whether it holds a cheat process at all (65000, a pure query) and
+ * answers NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED when it does not.  Unlike
+ * nxusDmntGetMetadata() it never calls ForceOpen() and never runs the repair
+ * retry, so it cannot take the process over from Atmosphère's cheat manager, from
+ * another debugger or from Nxus's own debug session, and it cannot re-open dmnt
+ * behind a failed HasCheatProcess probe.  That distinction matters for Status,
+ * which is polled far more often than anything else and must stay observational:
+ * the boot-time ForceOpen is a one-shot, and a status poll must not be able to
+ * re-create the state the rest of the server gates on HasCheatProcess.
+ *
+ * Fills *out only on success.  Returns ResultCheatNotAttached when dmnt holds no
+ * process, plus whatever the metadata command itself answers (a process that
+ * disappeared between the two IPCs). */
+Result nxusDmntPeekMetadata(NxusProcessMetadata *out);
 Result nxusDmntForceOpen(void);
 Result nxusDmntForceClose(void);
 /* Pause/Resume the cheat process through dmnt itself.  These are the real

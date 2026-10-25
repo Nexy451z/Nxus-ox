@@ -83,6 +83,24 @@ static void fakeMappings(u32 gen, u32 count) {
     g_FakeMapCount = count;
 }
 
+/* An arbitrary table: the hit-rescue tests need layouts fakeMappings() cannot express
+   (a mapping inserted in the middle, a reused base with a smaller size, a mapping
+   turned read-only).  Entries are appended in the order the caller gives them, which
+   is how dmnt hands them back: ascending by base. */
+static void fakeClearMappings(void) {
+    g_FakeMapCount = 0;
+}
+
+static void fakeAddMapping(u64 base, u64 size, u32 perm) {
+    if (g_FakeMapCount >= FAKE_MAP_CAP) return;
+    NxusMemoryInfo *m = &g_FakeMaps[g_FakeMapCount++];
+    memset(m, 0, sizeof(*m));
+    m->base_addr = base;
+    m->size = size;
+    m->memory_type = 3;
+    m->perm = perm;
+}
+
 /* Outstanding view pins, exactly as the session reports them (identified tokens
    plus the compat pins).  This is the "did somebody forget to unpin?" signal. */
 static u32 readers(void) {
@@ -469,6 +487,283 @@ static void testRegionsHoldAcrossRebuild(void) {
     CHECK(readers() == 0u, "unpin clears the region pin (%u)", readers());
     CHECK(g_ViewRetiredCount == 0u, "the last unpin drains mappings and regions (%u)",
           (unsigned)g_ViewRetiredCount);
+}
+
+/* ---- hit rescue across a mapping rebuild --------------------------------
+ *
+ * nxusSessionHitsRevalidate() used to verify "mapping_base[same idx] + offset ==
+ * address", which cannot rescue the case the rescue exists for: a mapping inserted or
+ * removed BEFORE the recorded ones shifts every later ordinal, so the stored index
+ * names another (readable, plausible) region and the check fails.  The list is now
+ * repaired from the ABSOLUTE ADDRESS recorded with each hit, and only hits whose
+ * address is no longer inside a readable mapping are dropped.
+ *
+ * The list is filled the way the engine fills it (absolute address next to the
+ * ordinal + offset) but without running a scan, so the rebuild is the only variable. */
+
+#define HIT_VALUE_SIZE 4u
+
+/* Append one hit as the engine would: (mapping_idx, offset) plus the ABSOLUTE address
+   it was found at, and its value in the SoA value array. */
+static void hitAppend(u32 mapping_idx, u32 offset, u64 address, u8 value) {
+    CHECK(g_Session.hits.count < g_Session.hits.capacity, "the test hit list has room");
+    if (g_Session.hits.count >= g_Session.hits.capacity) return;
+    const u32 i = g_Session.hits.count++;
+    NxusHitAddress *hit = &g_Session.hits.addresses[i];
+    hit->offset = offset;
+    hit->mapping_idx = (u16)mapping_idx;
+    hit->reserved = 0;
+    hit->address = address;
+    memset(g_Session.hits.values + (size_t)i * g_Session.hits.value_size, 0,
+           g_Session.hits.value_size);
+    g_Session.hits.values[(size_t)i * g_Session.hits.value_size] = value;
+}
+
+static u8 hitValue(u32 index) {
+    return g_Session.hits.values[(size_t)index * g_Session.hits.value_size];
+}
+
+/* Arm a hit list exactly like ScanBegin(): the owner stamp (which also records the
+   mapping bases) followed by the list itself.  The caller published its table first. */
+static bool armHitList(u32 capacity) {
+    hitsOwnerStamp();
+    atomic_store_explicit(&g_HitsStale, 0, memory_order_release);
+    sessionStateStore(NxusScanState_Done);
+    return nxusHitListInit(&g_Session.hits, capacity, capacity, HIT_VALUE_SIZE) ==
+           NXUS_SCAN_OK;
+}
+
+/* Three readable mappings: 0x30000000 / 0x30010000 / 0x30020000. */
+#define RESCUE_B0 0x30000000ull
+#define RESCUE_B1 0x30010000ull
+#define RESCUE_B2 0x30020000ull
+#define RESCUE_RW (NXUS_PERM_R | NXUS_PERM_W)
+
+static void rescuePublishThree(void) {
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "rescue base table published");
+}
+
+/* The regression: a rebuild that INSERTS a mapping in front of the recorded ones. */
+static void testHitsRescueShiftedRebuild(void) {
+    printf("- a rebuilt table that shifted the indices keeps its hits\n");
+    freshSession();
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed against the first table");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x11);
+    hitAppend(2, 0x80, RESCUE_B2 + 0x80, 0x22);
+    CHECK(nxusSessionHitsMatchTarget(), "a fresh list matches its own table");
+    const u32 gen_before = nxusSessionMappingGeneration();
+
+    /* The newcomer is not related to either hit, but it shifts both ordinals by one. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(0x30008000ull, 0x1000, RESCUE_RW);        /* inserted */
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "shifted table published");
+    CHECK(nxusSessionMappingGeneration() != gen_before,
+          "the rebuild is a new generation (%u/%u)", gen_before,
+          nxusSessionMappingGeneration());
+
+    g_LastLog[0] = '\0';
+    CHECK(nxusSessionHitsMatchTarget(), "the list is rescued, not discarded (log: \"%s\")",
+          g_LastLog);
+    CHECK(strstr(g_LastLog, "revalidated 2 hit(s)") != NULL,
+          "the rescue is logged: \"%s\"", g_LastLog);
+    CHECK(g_Session.hits.count == 2u, "both hits survive (%u)", (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.addresses[0].mapping_idx == 2u &&
+          g_Session.hits.addresses[0].offset == 0x40u,
+          "hit 0 was re-pointed at the shifted mapping (%u/%u)",
+          (unsigned)g_Session.hits.addresses[0].mapping_idx,
+          (unsigned)g_Session.hits.addresses[0].offset);
+    CHECK(g_Session.hits.addresses[1].mapping_idx == 3u &&
+          g_Session.hits.addresses[1].offset == 0x80u,
+          "hit 1 was re-pointed at the shifted mapping (%u/%u)",
+          (unsigned)g_Session.hits.addresses[1].mapping_idx,
+          (unsigned)g_Session.hits.addresses[1].offset);
+    CHECK(g_Session.hits.addresses[0].address == RESCUE_B1 + 0x40 &&
+          g_Session.hits.addresses[1].address == RESCUE_B2 + 0x80,
+          "the recorded addresses are unchanged");
+    CHECK(hitValue(0) == 0x11 && hitValue(1) == 0x22,
+          "the recorded values travelled with their hits (%u/%u)",
+          (unsigned)hitValue(0), (unsigned)hitValue(1));
+
+    /* The rewritten indices must resolve through the CURRENT table to the very same
+       addresses - that is what sendHits()/the PC do with mapping_idx + offset. */
+    const NxusMappingTable *table = nxusSessionMappings();
+    CHECK(table != NULL, "rescue table readable");
+    if (table != NULL) {
+        u64 a0 = 0;
+        u64 a1 = 0;
+        CHECK(nxusHitResolve(&g_Session.hits, table, 0, &a0) && a0 == RESCUE_B1 + 0x40,
+              "hit 0 resolves to its recorded address (0x%llX)",
+              (unsigned long long)a0);
+        CHECK(nxusHitResolve(&g_Session.hits, table, 1, &a1) && a1 == RESCUE_B2 + 0x80,
+              "hit 1 resolves to its recorded address (0x%llX)",
+              (unsigned long long)a1);
+        nxusSessionViewRelease();
+    }
+}
+
+/* Only the hits the current table can no longer resolve are dropped; when none is
+   left the list is refused as a whole (the caller answers BAD_STATE). */
+static void testHitsRescueDropsOnlyUnresolvable(void) {
+    printf("- a shift costs only the hits that really vanished\n");
+    freshSession();
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x11);
+    hitAppend(2, 0x80, RESCUE_B2 + 0x80, 0x22);
+    /* A previous refine pass would have left its count here; Undo rewinds to it, so a
+       rescue that drops entries must clamp it or Undo would resurrect empty slots. */
+    g_Session.hits.prev_count = 2;
+
+    /* B1 is gone: the hit recorded inside it can never resolve again, the other one
+       moved to index 1. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "table without B1 published");
+
+    g_LastLog[0] = '\0';
+    CHECK(nxusSessionHitsMatchTarget(), "one hit is enough to keep the list");
+    CHECK(g_Session.hits.count == 1u, "only the resolvable hit survives (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.addresses[0].address == RESCUE_B2 + 0x80 &&
+          g_Session.hits.addresses[0].mapping_idx == 1u &&
+          g_Session.hits.addresses[0].offset == 0x80u,
+          "the surviving hit was compacted and re-pointed (%u/%u)",
+          (unsigned)g_Session.hits.addresses[0].mapping_idx,
+          (unsigned)g_Session.hits.addresses[0].offset);
+    CHECK(hitValue(0) == 0x22, "its value moved with it (%u)", (unsigned)hitValue(0));
+    CHECK(strstr(g_LastLog, "1 hit(s) can no longer be resolved - dropped") != NULL,
+          "the dropped hit is named: \"%s\"", g_LastLog);
+    CHECK(g_Session.hits.prev_count == 1u,
+          "Undo cannot resurrect the dropped slot (prev_count=%u)",
+          (unsigned)g_Session.hits.prev_count);
+
+    /* Now the recorded mapping is gone too: nothing is left to refine. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "table without B2 published");
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsMatchTarget(), "no resolvable hit -> the list is refused");
+    CHECK(g_Session.hits.count == 0u, "and the list is emptied (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.prev_count == 0u, "and Undo has nothing to rewind to (%u)",
+          (unsigned)g_Session.hits.prev_count);
+    CHECK(strstr(g_LastLog, "can no longer be resolved") != NULL,
+          "the refusal names the cause: \"%s\"", g_LastLog);
+}
+
+/* A reused base is not a valid hit address: the check is base <= address < base+size
+   WITH read permission, not "the base matches".  The base array being unchanged also
+   exercises the stamp fast path (no search, per-hit arithmetic only). */
+static void testHitsRescueSameBaseReuse(void) {
+    printf("- same base, smaller size / lost read perm: the hit is unresolvable\n");
+    freshSession();
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x33);
+
+    /* Unrelated mapping grew: the base ORDER is unchanged (fast path), the fingerprint
+       (base/size) changed, so the generation - and thus the rescue - runs. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x2000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "grown table published");
+    CHECK(nxusSessionHitsMatchTarget(), "an unchanged base order keeps the list");
+    CHECK(g_Session.hits.count == 1u && g_Session.hits.addresses[0].mapping_idx == 1u &&
+          g_Session.hits.addresses[0].offset == 0x40u,
+          "the hit keeps its index and offset (%u/%u)",
+          (unsigned)g_Session.hits.addresses[0].mapping_idx,
+          (unsigned)g_Session.hits.addresses[0].offset);
+
+    /* The SAME base is reused with a size that no longer covers the offset. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x2000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0x20, RESCUE_RW);
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "shrunken table published");
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsMatchTarget(), "a shrunken mapping drops the hit");
+    CHECK(g_Session.hits.count == 0u, "the list is emptied (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(strstr(g_LastLog, "can no longer be resolved") != NULL,
+          "the drop is logged: \"%s\"", g_LastLog);
+
+    /* Read permission is required as well: the mapping is there, at the right place,
+       but a hit cannot be refined through a write-only mapping. */
+    freshSession();
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed (perm case)");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x33);
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B0, 0x2000, RESCUE_RW);            /* forces a new generation */
+    fakeAddMapping(RESCUE_B1, 0x1000, NXUS_PERM_W);          /* read access lost */
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "read-only table published");
+    g_LastLog[0] = '\0';
+    CHECK(!nxusSessionHitsMatchTarget(), "a mapping without read permission drops the hit");
+    CHECK(g_Session.hits.count == 0u, "the list is emptied (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(strstr(g_LastLog, "can no longer be resolved") != NULL,
+          "the drop is logged: \"%s\"", g_LastLog);
+}
+
+/* A table that does not come back in base order must still be searched correctly: the
+   resolver builds and sorts its own base index instead of binary-searching a table it
+   wrongly assumes is ordered. */
+static void testHitsRescueUnsortedTable(void) {
+    printf("- a table that is not base-ascending is indexed, not assumed sorted\n");
+    freshSession();
+    rescuePublishThree();
+    CHECK(armHitList(8), "hit list armed");
+    hitAppend(1, 0x40, RESCUE_B1 + 0x40, 0x44);
+    hitAppend(2, 0x80, RESCUE_B2 + 0x80, 0x55);
+
+    /* Same mappings, reversed order: B2 -> index 0, B0 -> 1, B1 -> 2. */
+    fakeClearMappings();
+    fakeAddMapping(RESCUE_B2, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B0, 0x1000, RESCUE_RW);
+    fakeAddMapping(RESCUE_B1, 0x1000, RESCUE_RW);
+    CHECK(R_SUCCEEDED(nxusSessionRefreshMappings()), "reversed table published");
+
+    g_LastLog[0] = '\0';
+    CHECK(nxusSessionHitsMatchTarget(), "the list is rescued through the sorted index");
+    CHECK(g_Session.hits.count == 2u, "both hits survive (%u)",
+          (unsigned)g_Session.hits.count);
+    CHECK(g_Session.hits.addresses[0].mapping_idx == 2u &&
+          g_Session.hits.addresses[0].offset == 0x40u,
+          "hit 0 found its mapping at the new ordinal (%u/%u)",
+          (unsigned)g_Session.hits.addresses[0].mapping_idx,
+          (unsigned)g_Session.hits.addresses[0].offset);
+    CHECK(g_Session.hits.addresses[1].mapping_idx == 0u &&
+          g_Session.hits.addresses[1].offset == 0x80u,
+          "hit 1 found its mapping at the new ordinal (%u/%u)",
+          (unsigned)g_Session.hits.addresses[1].mapping_idx,
+          (unsigned)g_Session.hits.addresses[1].offset);
+    CHECK(strstr(g_LastLog, "revalidated 2 hit(s)") != NULL,
+          "the rescue is logged: \"%s\"", g_LastLog);
+
+    const NxusMappingTable *table = nxusSessionMappings();
+    CHECK(table != NULL, "reversed table readable");
+    if (table != NULL) {
+        u64 a0 = 0;
+        u64 a1 = 0;
+        CHECK(nxusHitResolve(&g_Session.hits, table, 0, &a0) && a0 == RESCUE_B1 + 0x40,
+              "hit 0 resolves to its recorded address (0x%llX)",
+              (unsigned long long)a0);
+        CHECK(nxusHitResolve(&g_Session.hits, table, 1, &a1) && a1 == RESCUE_B2 + 0x80,
+              "hit 1 resolves to its recorded address (0x%llX)",
+              (unsigned long long)a1);
+        nxusSessionViewRelease();
+    }
 }
 
 /* Exit() is terminal for views: it frees the ring even with an outstanding pin,
@@ -862,6 +1157,10 @@ int main(void) {
     testUnpinnedPublishDrains();
     testLegacyCallerNeverReleases();
     testRegionsHoldAcrossRebuild();
+    testHitsRescueShiftedRebuild();
+    testHitsRescueDropsOnlyUnresolvable();
+    testHitsRescueSameBaseReuse();
+    testHitsRescueUnsortedTable();
     testExitIsTerminal();
     testConcurrentReaders();
     testTargetIdentitySnapshot();

@@ -10,6 +10,14 @@
 #include <string.h>
 #include <sys/statvfs.h>
 
+/* Ceiling of the mapping table the hit-rescue path can index.  The snapshot itself
+   is capped at 4096 mappings (snapshotMappings), so this only guards a future
+   growth: a larger table cannot be indexed and every hit is then dropped as
+   "unresolvable" instead of being resolved against a wrong ordinal.  The two arrays
+   it sizes are 32 KB (bases) + 8 KB (mapping_idx), which is the whole memory cost
+   of the rescue path. */
+#define NXUS_SESSION_MAP_INDEX_CAP 4096u
+
 typedef struct {
     /* Scan state.  Atomic on purpose: the server thread stores Running while the
        worker stores Done/Error/Cancelled, and status pollers plus the server's
@@ -83,6 +91,16 @@ typedef struct {
        absolute address recorded with it (nxusSessionHitsRevalidate()). */
     u32 hits_owner_mapping_generation;
     bool hits_owner_valid;
+
+    /* Base array of the table the stored hits were recorded against, IN TABLE ORDER
+       (see the hit-rescue block below).  A hit only stores mapping_idx - an ORDINAL -
+       so the only way to tell "the same table" from "a rebuilt table that shifted
+       every later index" is to compare this array with the current one; when they
+       differ, each hit is re-resolved by its ABSOLUTE address instead of its index.
+       4096 x 8 B = 32 KB, which is the entire memory cost of the rescue path. */
+    u64 hit_stamp_bases[NXUS_SESSION_MAP_INDEX_CAP];
+    u32 hit_stamp_count;
+    bool hit_stamp_valid;
 } Session;
 
 static Session g_Session;
@@ -292,6 +310,53 @@ u32 nxusSessionMappingGeneration(void) {
     return mappingGenerationLoad();
 }
 
+/* ---- hit rescue (absolute address -> CURRENT mapping) -------------------
+ *
+ * A hit stores mapping_idx - an ORDINAL into the mapping snapshot - plus an offset,
+ * and the PC resolves it as mapping_base[mapping_idx] + offset.  It ALSO stores the
+ * absolute address it was found at (NxusHitAddress.address).
+ *
+ * The generation check (above) can only say "the table was replaced".  It cannot say
+ * WHERE the recorded mappings went: a mapping inserted or removed before them shifts
+ * every later index, so the stored index keeps "resolving" - to a different, wrong
+ * region - while the address recorded with the hit is still perfectly good.  The old
+ * verifier compared base+offset of the SAME index and therefore threw the whole list
+ * away; on hardware that made `scan refine` answer BAD_STATE whenever an unrelated
+ * heap mapping appeared between the scan and the refine.
+ *
+ * The rescue therefore works with the ADDRESS as the ground truth:
+ *
+ *   1. the base array of the table is stamped next to the hit list when the list is
+ *      armed (hitsOwnerStamp -> hitsStampMapBases).  Same bases in the same order
+ *      means no index can have shifted, so the stored indices are verified
+ *      arithmetically and nothing else is touched (the common case: a rebuild that
+ *      only changed unrelated sizes/perms).  No search at all,
+ *   2. otherwise every hit is re-resolved by its ADDRESS against the CURRENT table
+ *      (binary search over a sorted base index built once per rebuild, see the
+ *      resolver below), and its mapping_idx/offset are REWRITTEN to the mapping that
+ *      contains the address now.  A hit whose address no longer falls inside a
+ *      readable mapping is dropped; the others survive, so a shifted rebuild costs
+ *      the hits that really vanished - not the whole list,
+ *   3. a hit is "resolvable" only inside a mapping with READ permission, a non-zero
+ *      size and (base <= address < base + size).  Same-base reuse, a mapping turned
+ *      read-only and a mapping that went away all count as unresolvable.
+ *
+ * The 32 KB base stamp doubles as the sort scratch of step 2: it is rewritten there
+ * with the current bases (plus the 8 KB mapping_idx array below), so the whole
+ * feature costs 40 KB and no allocation.  Only the connection thread writes either
+ * buffer (hitsOwnerStamp / nxusSessionHitsRevalidate both run there), exactly like
+ * the mapping table they describe.
+ *
+ * g_MapSortIds is only meaningful for an index that had to be SORTED: when the table
+ * is already ascending by base (every producer walks the address space upwards:
+ * dmnt's mapping list and the debug walk both do), the resolver binary-searches the
+ * table in place and leaves both arrays alone.
+ */
+static u16 g_MapSortIds[NXUS_SESSION_MAP_INDEX_CAP];
+
+/* Defined with the hit-rescue helpers below; the owner stamp (which arms a list) and
+   the revalidator (which re-points it) are the only callers. */
+static void hitsStampMapBases(void);
 /* Remember the identity a freshly armed hit list belongs to.  Callers pass the
    session's own cached identity: ScanBegin refreshes it (cacheProcessInfo) and takes
    the mapping snapshot immediately before stamping, so all three describe the same
@@ -299,7 +364,9 @@ u32 nxusSessionMappingGeneration(void) {
    snapshotMappings() published the table the worker will scan with and before
    startJob() runs it - i.e. it names that table, not one published mid-scan.
    pid and program_id are taken from ONE identity snapshot: two separate accessor
-   calls could stamp the pid of one write with the title of the next. */
+   calls could stamp the pid of one write with the title of the next.
+   The base stamp is taken here too, so a later rebuild can prove (or repair) the
+   mapping_idx values this list is about to be filled with. */
 static void hitsOwnerStamp(void) {
     const NxusTargetIdentity id = identitySample();
     g_Session.hits_owner_pid = id.pid;
@@ -307,12 +374,17 @@ static void hitsOwnerStamp(void) {
     g_Session.hits_owner_session_id = g_Session.session_id;
     g_Session.hits_owner_mapping_generation = mappingGenerationLoad();
     g_Session.hits_owner_valid = true;
+    hitsStampMapBases();
 }
 
 /* No list is tied to a target any more (Reset): nothing to compare, nothing to
    refuse. */
 static void hitsOwnerClear(void) {
     g_Session.hits_owner_valid = false;
+    /* The stamp described that list's table: without a list it must not be consulted
+       by a later rescue. */
+    g_Session.hit_stamp_valid = false;
+    g_Session.hit_stamp_count = 0;
 }
 
 /* Guards double initialisation.  A second nxusSessionInit() must not memset a
@@ -326,6 +398,66 @@ static void buildRegions(const NxusScanRequest *req);
 /* Defined with the mapping views further down; nxusSessionHitsRevalidate() needs the
    consistent sample before that point. */
 static const NxusMappingTable *mappingsSample(void);
+
+/* ---- hit-rescue helpers (see the block above) -------------------------- */
+
+/* Record the base array of `maps` (in table order) next to the hit list. */
+static void hitsStampMapBasesFrom(const NxusMappingTable *maps) {
+    if (maps == NULL || maps->entries == NULL || maps->count == 0 ||
+        maps->count > NXUS_SESSION_MAP_INDEX_CAP) {
+        g_Session.hit_stamp_count = 0;
+        g_Session.hit_stamp_valid = false;
+        return;
+    }
+    for (u32 i = 0; i < maps->count; i++) {
+        g_Session.hit_stamp_bases[i] = maps->entries[i].base;
+    }
+    g_Session.hit_stamp_count = maps->count;
+    g_Session.hit_stamp_valid = true;
+}
+
+/* Record the CURRENT table's base array (in table order) next to the hit list.
+   Called when a list is armed and after a rescue re-pointed its indices at a rebuilt
+   table.  A missing/empty table or one too large to index clears the stamp: the
+   rescue then falls straight through to the address resolution, which is the correct
+   answer anyway (it just cannot take the "no index shifted" shortcut). */
+static void hitsStampMapBases(void) {
+    hitsStampMapBasesFrom(mappingsSample());
+}
+
+/* Is the table strictly ascending by base?  Only then may the resolver binary-search
+   it in place; every snapshot producer walks the address space upwards, so this is
+   the normal answer and the sorted-index path below is a safety net. */
+static bool mapBasesAscending(const NxusMappingEntry *entries, u32 count) {
+    for (u32 i = 1; i < count; i++) {
+        if (!(entries[i - 1].base < entries[i].base)) return false;
+    }
+    return true;
+}
+
+/* Shellsort the (bases, mapping_idx) parallel arrays IN PLACE - no heap, no
+   recursion, bounded by 4096 entries.  Used only for a table that came back
+   unsorted, so the O(n^1.5) bound costs nothing in practice but keeps the sort
+   independent of the C library's qsort (the sysmodule does not want the extra
+   comparator machinery for a 4096-element array). */
+static void mapSortIndex(u32 count) {
+    u32 gap = 1;
+    while (gap < count / 3) gap = gap * 3 + 1;
+    for (; gap >= 1; gap /= 3) {
+        for (u32 i = gap; i < count; i++) {
+            const u64 key_base = g_Session.hit_stamp_bases[i];
+            const u16 key_id = g_MapSortIds[i];
+            u32 j = i;
+            while (j >= gap && g_Session.hit_stamp_bases[j - gap] > key_base) {
+                g_Session.hit_stamp_bases[j] = g_Session.hit_stamp_bases[j - gap];
+                g_MapSortIds[j] = g_MapSortIds[j - gap];
+                j -= gap;
+            }
+            g_Session.hit_stamp_bases[j] = key_base;
+            g_MapSortIds[j] = key_id;
+        }
+    }
+}
 
 static u64 nowMs(void) { return armTicksToNs(armGetSystemTick()) / 1000000ull; }
 
@@ -1309,30 +1441,113 @@ static bool hitsOwnerIdentityMatches(void) {
 
 /* Can the stamped list be rescued across a mapping-table rebuild?
  *
- * A hit stores mapping_idx - an ORDINAL into the published snapshot - plus an
- * offset, and the PC (and the refine pass) resolve it as mapping_base[idx] + offset.
- * A re-snapshot of the SAME target can still reorder the table: a mapping split,
- * merged or an unrelated heap block appearing before the recorded ones shifts every
- * later index, so the stored index keeps "resolving" - to another region.  A
- * generation mismatch therefore used to throw the whole list away, and on hardware
- * that made `scan refine` impossible whenever an UNRELATED heap mapping came or went
- * between the scan and the refine: one hit was reported, then the refine answered
- * BAD_STATE ("the mapping table was rebuilt") although the address was still valid.
+ * A hit stores mapping_idx - an ORDINAL into the published snapshot - plus an offset,
+ * and the PC (and the refine pass) resolve it as mapping_base[idx] + offset.  A
+ * re-snapshot of the SAME target can still move every index: an unrelated mapping
+ * inserted or removed before the recorded ones shifts all later indices, and the
+ * stored index keeps "resolving" - to another region.  Comparing base+offset of the
+ * SAME index (what this function used to do) therefore cannot rescue such a rebuild:
+ * it fails the arithmetic and threw the whole list away, although every recorded
+ * ADDRESS was still valid.  On hardware that made `scan refine` answer BAD_STATE
+ * whenever a heap mapping came or went between the scan and the refine.
  *
- * Every hit now also carries the absolute address it was found at
- * (NxusHitAddress.address), so the list IS still trustworthy when the currently
- * published table resolves each stored pair back to that exact address - i.e.
- * mapping_base[idx] + offset == address for every hit.  One mismatch (or an index
- * the table no longer has) is enough to make the list wrong, so a single bad entry
- * rejects it as a whole and the caller discards it exactly as before.
+ * The rescue uses the absolute address (NxusHitAddress.address) as the ground truth:
  *
- * On success the owner stamp is re-pointed at the generation published now, so the
- * pair matches again and no later reader repeats the check for this rebuild.
+ *   - the base array of the table is stamped next to the hit list when it is armed
+ *     (hitsOwnerStamp).  If the CURRENT table still has the same bases in the same
+ *     order, no index can have shifted: the stored mapping_idx is verified
+ *     arithmetically per hit and nothing is searched,
+ *   - otherwise every hit is re-resolved by its address against the current table
+ *     (ONE sorted base index per rebuild, then one binary search per hit) and its
+ *     mapping_idx / offset are REWRITTEN to the mapping that contains the address
+ *     now.  Hits whose address no longer falls inside a readable mapping are DROPPED;
+ *     the rest survive, so a shifted rebuild costs the hits that really vanished -
+ *     instead of the whole list,
+ *   - "resolvable" means: inside the current table, read permission, size != 0 and
+ *     base <= address < base + size.  A reused base with a smaller size, a mapping
+ *     turned read-only and a vanished mapping all count as unresolvable.
  *
- * False while a pass is Running (the worker grows / compacts the arrays, so there is
- * no consistent list to walk), and for a list that was never stamped or is already
- * discarded - those keep being refused by the caller.
+ * On success the owner stamp is re-pointed at the generation published now and the
+ * base stamp is re-recorded from the very table that was verified, so no later reader
+ * repeats the check for this rebuild.
+ *
+ * False when NOT ONE hit survives (nothing left to refine -> the caller answers
+ * BAD_STATE and discards), while a pass is Running (the worker grows / compacts the
+ * arrays, so there is no consistent list to walk), and for a list that was never
+ * stamped or is already discarded - those keep being refused by the caller.
  */
+
+/* Address -> CURRENT mapping.  The table is searched once per REBUILD, not once per
+   hit: a sorted base index is built once (or the already-ascending table is searched
+   in place) and every hit is then one binary search. */
+typedef struct {
+    const NxusMappingEntry *entries;
+    u32 count;
+    const u64 *sorted_bases;   /* non-NULL: index built into the session stamp array */
+    const u16 *sorted_ids;     /* parallel mapping_idx of sorted_bases[]              */
+} NxusMapResolver;
+
+/* Prepare a resolver for `entries`.  Returns false when the table can neither be
+   searched in place (not ascending by base) nor indexed (more than
+   NXUS_SESSION_MAP_INDEX_CAP entries): no hit is resolvable then, which is the
+   honest answer. */
+static bool mapResolverInit(NxusMapResolver *r, const NxusMappingEntry *entries,
+                            u32 count) {
+    r->entries = entries;
+    r->count = count;
+    r->sorted_bases = NULL;
+    r->sorted_ids = NULL;
+    if (mapBasesAscending(entries, count)) return true;      /* the normal case */
+    if (count > NXUS_SESSION_MAP_INDEX_CAP) return false;
+
+    /* The 32 KB stamp array doubles as the sort scratch: the recorded bases were
+       already consumed by the "did the order change?" comparison above, and a later
+       success re-records them from the verified table. */
+    for (u32 i = 0; i < count; i++) {
+        g_Session.hit_stamp_bases[i] = entries[i].base;
+        g_MapSortIds[i] = (u16)i;
+    }
+    mapSortIndex(count);
+    r->sorted_bases = g_Session.hit_stamp_bases;
+    r->sorted_ids = g_MapSortIds;
+    return true;
+}
+
+/* Index (into `entries`) of the mapping that CONTAINS `address`, or false.  A mapping
+   qualifies only with read permission, a non-zero size and base <= address <
+   base + size - a same-base reuse whose size shrank, a mapping turned read-only and a
+   hole between mappings are all "cannot be resolved", never "close enough". */
+static bool mapResolverFind(const NxusMapResolver *r, u64 address, u32 *out_index) {
+    u32 lo = 0;
+    u32 hi = r->count;
+    u32 found = 0;
+    bool any = false;
+
+    while (lo < hi) {
+        const u32 mid = lo + (hi - lo) / 2;
+        const u64 base = (r->sorted_bases != NULL) ? r->sorted_bases[mid]
+                                                   : r->entries[mid].base;
+        if (base <= address) {
+            found = mid;
+            any = true;
+            lo = mid + 1;                 /* last base at or below the address */
+        } else {
+            hi = mid;
+        }
+    }
+    if (!any) return false;
+
+    const u32 idx = (r->sorted_ids != NULL) ? (u32)r->sorted_ids[found] : found;
+    const NxusMappingEntry *m = &r->entries[idx];
+    if (m->size == 0) return false;
+    if ((m->reserved & NXUS_PERM_R) == 0) return false;
+    if (!m->valid) return false;
+    if (address < m->base) return false;
+    if (address - m->base >= m->size) return false;
+    *out_index = idx;
+    return true;
+}
+
 bool nxusSessionHitsRevalidate(void) {
     if (hitsStale()) return false;
     if (!g_Session.hits_owner_valid) return false;
@@ -1342,30 +1557,115 @@ bool nxusSessionHitsRevalidate(void) {
        table was verified.  If a rebuild slips in between, the stamp is the older of
        the two and the next MatchTarget() simply re-runs this check. */
     const u32 generation = mappingGenerationLoad();
-    const NxusHitList *hits = &g_Session.hits;
+    NxusHitList *hits = &g_Session.hits;
     const u32 count = hits->count;
 
     if (count == 0) {
         /* Nothing to verify: an empty list is valid against any table, and only the
            stamp update makes it servable again. */
         g_Session.hits_owner_mapping_generation = generation;
+        hitsStampMapBases();
         NXUS_LOG("hits: revalidated %u hit(s) across a mapping rebuild", 0u);
         return true;
     }
 
     const NxusMappingTable *maps = mappingsSample();
-    if (maps == NULL || maps->entries == NULL) return false;
-
-    for (u32 i = 0; i < count; i++) {
-        const NxusHitAddress *hit = &hits->addresses[i];
-        if ((u32)hit->mapping_idx >= maps->count) return false;
-        if (maps->entries[hit->mapping_idx].base + (u64)hit->offset != hit->address) {
-            return false;
-        }
+    if (maps == NULL || maps->entries == NULL || maps->count == 0) {
+        /* No table at all: not one recorded address can be resolved against it. */
+        NXUS_LOG("hits: %u hit(s) can no longer be resolved - dropped", (unsigned)count);
+        return false;
     }
 
+    /* Step 1: did the recorded base array survive unchanged?  Then no index shifted
+       and the stored mapping_idx values still name the regions the hits were recorded
+       in - no search at all, only the per-hit arithmetic below decides.  (The stamp
+       and the table describe the same walk; a rebuilt table with identical bases in
+       identical order has identical indices.) */
+    bool same_order = g_Session.hit_stamp_valid &&
+                      g_Session.hit_stamp_count == maps->count;
+    for (u32 i = 0; same_order && i < maps->count; i++) {
+        if (maps->entries[i].base != g_Session.hit_stamp_bases[i]) same_order = false;
+    }
+
+    /* Step 2: otherwise resolve by ADDRESS against the CURRENT table.  The index is
+       built once for the whole rebuild, not per hit. */
+    NxusMapResolver resolver;
+    bool have_resolver = false;
+    if (!same_order) {
+        have_resolver = mapResolverInit(&resolver, maps->entries, maps->count);
+    }
+
+    const u32 value_size = hits->value_size;
+    u32 keep = 0;
+    u32 dropped = 0;
+
+    for (u32 i = 0; i < count; i++) {
+        /* Compaction only ever writes slots BEFORE `i`, so this entry is intact. */
+        const NxusHitAddress cur = hits->addresses[i];
+        u32 idx = 0;
+        u64 offset = 0;
+        bool ok = false;
+
+        if (same_order) {
+            idx = (u32)cur.mapping_idx;
+            if (idx < maps->count) {
+                const NxusMappingEntry *m = &maps->entries[idx];
+                offset = (u64)cur.offset;
+                ok = m->size != 0 && offset < m->size &&
+                     (m->reserved & NXUS_PERM_R) != 0 && m->valid != 0 &&
+                     m->base + offset == cur.address;
+            }
+        } else if (have_resolver && mapResolverFind(&resolver, cur.address, &idx)) {
+            /* The recorded address is the ground truth; the offset is measured from
+               the mapping base, never from a clipped region start (addr_base). */
+            offset = cur.address - maps->entries[idx].base;
+            ok = offset <= 0xFFFFFFFFull;      /* the wire field is 32 bits */
+        }
+
+        if (!ok) { dropped++; continue; }
+
+        NxusHitAddress fixed = cur;
+        fixed.mapping_idx = (u16)idx;
+        fixed.offset = (u32)offset;
+        if (keep != i) {
+            /* Compact the hit list in place: a dropped entry must not leave a hole
+               that a later refine / sendHits walk would read as a valid hit. */
+            hits->addresses[keep] = fixed;
+            if (value_size != 0) {
+                memcpy(hits->values + (size_t)keep * value_size,
+                       hits->values + (size_t)i * value_size, value_size);
+            }
+        } else if (fixed.mapping_idx != cur.mapping_idx || fixed.offset != cur.offset) {
+            hits->addresses[i] = fixed;
+        }
+        keep++;
+    }
+
+    if (dropped != 0) {
+        hits->count = keep;
+        /* Undo rewinds to prev_count: it must not resurrect the dropped slots (their
+           values were overwritten by the compaction above). */
+        if (hits->prev_count > keep) hits->prev_count = keep;
+    }
+
+    if (keep == 0) {
+        /* Not one address survives: nothing is left to refine or serve, so report the
+           list as unservable and let the caller discard it (BAD_STATE). */
+        NXUS_LOG("hits: %u hit(s) can no longer be resolved - dropped", (unsigned)dropped);
+        return false;
+    }
+
+    /* Re-point the owner stamp and re-record the bases from the table that was just
+       verified, so the pair matches again and a later rebuild is compared with this
+       one. */
     g_Session.hits_owner_mapping_generation = generation;
-    NXUS_LOG("hits: revalidated %u hit(s) across a mapping rebuild", (unsigned)count);
+    hitsStampMapBasesFrom(maps);
+    NXUS_LOG("hits: revalidated %u hit(s) across a mapping rebuild", (unsigned)keep);
+    /* Last, so the loss (the actionable line) ends the block instead of being buried
+       above the summary. */
+    if (dropped != 0) {
+        NXUS_LOG("hits: %u hit(s) can no longer be resolved - dropped", (unsigned)dropped);
+    }
     return true;
 }
 
@@ -1387,11 +1687,12 @@ bool nxusSessionHitsMatchTarget(void) {
     if (!hitsOwnerIdentityMatches()) return false;
 
     /* The mapping snapshot was replaced after this list was stamped.  mapping_idx is
-       an ordinal into that table, so the list is servable only if the new table
-       still resolves every hit to the address that was recorded with it:
-       nxusSessionHitsRevalidate() proves that and re-points the stamp at the new
-       generation.  Otherwise this is the old "discard" answer (the server logs the
-       rebuild and answers BAD_STATE). */
+       an ordinal into that table, so the list is offered to
+       nxusSessionHitsRevalidate(), which re-resolves every hit by its recorded
+       ADDRESS, rewrites the indices, drops only what the current table cannot map any
+       more and re-points the stamp at the new generation.  False when nothing
+       survives: that is the old "discard" answer (the server logs the rebuild and
+       answers BAD_STATE). */
     if (g_Session.hits_owner_mapping_generation != mappingGenerationLoad()) {
         return nxusSessionHitsRevalidate();
     }

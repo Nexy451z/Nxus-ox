@@ -428,23 +428,23 @@ static bool g_ChainsStale;
    the mapping refresh counts against the budget too. */
 #define NXUS_PTRSCAN_TIME_BUDGET_MS 90000ull
 
-/* Read budget: a runaway guard, not the schedule.  The schedule is
-   NXUS_PTRSCAN_TIME_BUDGET_MS above - the wall clock is what the client's 120 s
-   timeout is measured against, so the walk is meant to end on time, and this
-   counter only has to be large enough that the clock gets there first in the
-   normal case while still bounding a walk whose reads are cheap enough to
-   outrun it.  The old 20000 was far below that: on hardware (MHXX) it tripped
-   after 2.3 s with ~8700 reads/s, so the scan never used the 90 s it was
-   allowed and returned a list truncated by an internal counter.
-   500000 is 25x that, and cheap to reach: the engine only counts a read that
-   actually happened (a budget-starved dereference is skipped, not counted), so
-   hitting it means the walk really did 500k memory reads.
-   Arithmetic for the reported rate: 500000 / 8700 reads/s ~= 57 s, i.e. at that
-   throughput the read budget still fires before the 90 s clock (~783k reads
-   would fit).  Raise this to 1000000 if the clock should always be the stop
-   reason; the wall clock is enforced by ptrScanReadBudgeted() either way, so
-   the only effect of the number is which of the two limits is reported. */
-#define NXUS_PTRSCAN_MAX_READS 1000000u
+/* Read budget: 0 = UNLIMITED, i.e. the walk is bounded by the wall clock
+   (NXUS_PTRSCAN_TIME_BUDGET_MS) alone.
+ *
+ * It used to be a large but finite runaway guard, and that number could only ever
+ * mis-report the stop reason: on hardware (MHXX) the walk ran at ~8.6k reads/s and
+ * the old 20000 tripped after 2.3 s, truncating a scan that was allowed 90 s.  The
+ * 4 KB page cache (ptrScanReadBudgeted) then cuts the dmnt round trips by roughly
+ * the number of windows per page, so a call-count cap would say even less about the
+ * cost of a walk.  The clock is the schedule - the reply has to be produced before
+ * the client's 120 s timeout - and everything else is a partial result.
+ *
+ * A non-zero value still works if a hard cap is ever needed again: core/
+ * nxus_ptrscan.c's readTarget() then refuses further reads once the walk has ASKED
+ * for that many (page-cache hits included, since the engine cannot see the cache),
+ * and ptrScanPublish() reports it as the stop reason instead of the clock.  Nothing
+ * in the default path sets one. */
+#define NXUS_PTRSCAN_MAX_READS 0u
 
 /* Budget state the engine sees through the cancel flag it polls.  nxusPtrScan()
    takes `int *cancel` and only looks at it between roots and inside the walk,
@@ -470,10 +470,233 @@ static int ptrScanOverBudget(const PtrScanBudget *budget) {
     return (now_ms - budget->start_ms) >= NXUS_PTRSCAN_TIME_BUDGET_MS;
 }
 
+/* ---- 4 KB page cache for the walk's reads ------------------------------ */
+
+/* One dereference by the engine is a 1 KiB window (opts.window_size below), and the
+ * windows of one node are usually adjacent: the same 4 KiB page is asked for up to
+ * four times in a row.  Every request used to be its own dmnt:cht IPC (65102),
+ * which capped the walk at ~8.6k reads/s on hardware.  Reading the page once and
+ * serving the following windows from RAM turns those four IPCs into one, and the
+ * engine's own 1 KiB window cache then only has to handle revisits.
+ *
+ * .bss only - 8 slots * (4 KiB + tag), nothing is allocated or freed.  The walk's
+ * worker thread is the only user; ptrScanPageCacheArm() clears every tag right
+ * before nxusPtrScan(), so bytes cached for a previous title can never be served
+ * against a new process.  Round-robin replacement: the access pattern is mostly
+ * sequential within a page and across pages, where LRU keeps nothing extra, and a
+ * re-fetched page costs exactly the IPC it would have cost before the cache
+ * existed. */
+#define NXUS_PTRSCAN_PAGE_SHIFT 12u
+#define NXUS_PTRSCAN_PAGE_SIZE  (1u << NXUS_PTRSCAN_PAGE_SHIFT)   /* 4 KiB */
+#define NXUS_PTRSCAN_PAGE_MASK  ((u64)NXUS_PTRSCAN_PAGE_SIZE - 1u)
+#define NXUS_PTRSCAN_PAGE_SLOTS 8u
+
+typedef struct {
+    u64 tag;      /* page base, meaningful while valid != 0 */
+    u32 valid;    /* bytes of data[] dmnt actually returned (<= PAGE_SIZE) */
+    u32 reserved;
+    u8  data[NXUS_PTRSCAN_PAGE_SIZE];
+} NxusPtrScanPage;
+
+static NxusPtrScanPage    g_PtrScanPages[NXUS_PTRSCAN_PAGE_SLOTS];
+static u32                g_PtrScanPageNext;          /* round-robin victim */
+/* The region list of the walk in flight: the NXUS_PERM_R mappings, i.e. exactly
+   the ranges dmnt will accept a read for.  ptrScanReadPaged() clamps every page read
+   to the end of the mapping it belongs to, and a window that runs past that end is
+   served for its mapped bytes (the rest reads as zero - no pointer).  Without that,
+   a 4 KiB page read - and every window in the last kilobyte of a mapping - failed as
+   a whole, and the engine memoizes a failed window as a dead end: every pointer in
+   that part of the mapping stayed unfindable for the rest of the scan (a permanent
+   false negative, not a retry). */
+static const NxusPtrRegion *g_PtrScanPageRegions;
+static u32                 g_PtrScanPageRegionCount;
+static u32                 g_PtrScanPageRegionHint;  /* last hit, tried first */
+/* IPC accounting: the engine counts read CALLS, while stats.reads is documented as
+   the reads of the TARGET.  ptrScanJobRun() publishes these after the walk, so a
+   cache hit (which answers without dmnt) does not show up as a read.  The engine's
+   own call count is kept aside in g_PtrScanEngineReads: it is what a non-zero
+   max_reads caps, and therefore what the "read budget" stop reason must test. */
+static u64 g_PtrScanReadIpcs;
+static u64 g_PtrScanReadIpcBytes;
+static u64 g_PtrScanEngineReads;
+
+/* Start a walk with an empty cache and its own region list.  Called on the worker
+   thread, before nxusPtrScan(); nothing else touches the cache while a walk runs. */
+static void ptrScanPageCacheArm(const NxusPtrRegion *regions, u32 region_count) {
+    for (u32 i = 0; i < NXUS_PTRSCAN_PAGE_SLOTS; i++) {
+        g_PtrScanPages[i].valid = 0;
+        g_PtrScanPages[i].tag = 0;
+    }
+    g_PtrScanPageNext = 0;
+    g_PtrScanPageRegions = regions;
+    g_PtrScanPageRegionCount = (regions != NULL) ? region_count : 0;
+    g_PtrScanPageRegionHint = 0;
+    g_PtrScanReadIpcs = 0;
+    g_PtrScanReadIpcBytes = 0;
+    g_PtrScanEngineReads = 0;
+}
+
+/* Does [r->base, r->base + r->size) contain address?  A region whose end wraps the
+   address space is treated as "does not contain anything": no real mapping does,
+   and a wrapped end would otherwise make every address look mapped. */
+static bool ptrScanRegionHolds(const NxusPtrRegion *r, u64 address) {
+    if (r->size == 0) return false;
+    if (r->base > UINT64_MAX - (u64)r->size) return false;
+    if (address < r->base) return false;
+    return address - r->base < (u64)r->size;
+}
+
+/* Mapping that contains `address`, from the walk's own region list.  The previous
+   page's region is tried first: page fills walk one mapping for many pages in a
+   row, so the common case is a single comparison.  The fallback is a linear scan
+   (the list mirrors dmnt's mapping order, which is ascending, but nothing here
+   relies on that).  Returns false when the address is not inside any mapping. */
+static bool ptrScanMappingFor(u64 address, u64 *out_start, u64 *out_end) {
+    const NxusPtrRegion *regions = g_PtrScanPageRegions;
+    const u32 count = g_PtrScanPageRegionCount;
+    if (regions == NULL || count == 0) return false;
+
+    u32 hint = g_PtrScanPageRegionHint;
+    if (hint >= count) hint = 0;
+    if (ptrScanRegionHolds(&regions[hint], address)) {
+        *out_start = regions[hint].base;
+        *out_end = regions[hint].base + (u64)regions[hint].size;
+        return true;
+    }
+    for (u32 i = 0; i < count; i++) {
+        if (!ptrScanRegionHolds(&regions[i], address)) continue;
+        g_PtrScanPageRegionHint = i;
+        *out_start = regions[i].base;
+        *out_end = regions[i].base + (u64)regions[i].size;
+        return true;
+    }
+    return false;
+}
+
+/* One dmnt round trip, and the only place the walk's reads reach the target.
+   Counted for stats.reads (see g_PtrScanReadIpcs). */
+static int ptrScanReadIpc(u64 address, void *buffer, u32 size) {
+    g_PtrScanReadIpcs++;
+    g_PtrScanReadIpcBytes += size;
+    return nxusSessionReadCallback(NULL, address, buffer, size);
+}
+
+/* Serve [address, address + size) through the page cache.
+ *
+ * Returns 0 on success and -1 when the FIRST byte is not inside a mapping (or when
+ * dmnt refuses the read), which the engine treats as a permanent fault of that
+ * window.  `size` is at most one page here; larger requests take the chunk path in
+ * ptrScanReadTarget().
+ *
+ * A request that starts in a mapping but runs past its end is served for the mapped
+ * bytes and zero-filled for the rest: an unmapped byte can only hold "no pointer",
+ * so zero is the honest answer, while failing the read is what poisoned the walk
+ * (the engine memoizes a failed window as a dead end, so every pointer in the last
+ * kilobyte of a mapping stayed unfindable for the rest of the scan).  The next
+ * mapping is used when one starts there - only the tail past the last mapped byte
+ * of the request is zeroed. */
+static int ptrScanReadPaged(u64 address, void *buffer, u32 size) {
+    u8 *out = (u8 *)buffer;
+    u32 done = 0;
+    if (address > UINT64_MAX - (u64)size) return -1;   /* wraps: never mapped */
+
+    while (done < size) {
+        const u64 addr = address + (u64)done;
+        const u64 page = addr & ~NXUS_PTRSCAN_PAGE_MASK;
+        const u32 in_page = (u32)(addr - page);
+        u32 chunk = NXUS_PTRSCAN_PAGE_SIZE - in_page;   /* bytes left in the page */
+        if (chunk > size - done) chunk = size - done;   /* the request may be shorter */
+
+        u64 map_start = 0;
+        u64 map_end = 0;
+        if (!ptrScanMappingFor(addr, &map_start, &map_end)) {
+            /* Not mapped here.  The first byte decides: a read that begins outside
+               every mapping is a fault, a tail that ran off the end of a mapping is
+               just "nothing there" and reads as zero. */
+            if (done == 0) return -1;
+            memset(out + done, 0, size - (size_t)done);
+            return 0;
+        }
+
+        /* How much of this chunk is inside the mapping.  A window read at a pointer
+           in the mapping's last kilobyte is the normal case for this: the rest of
+           the window is handled by the next loop iteration (which may find another
+           mapping) or by the zero fill above. */
+        u32 mapped = chunk;
+        if ((u64)chunk > map_end - addr) mapped = (u32)(map_end - addr);
+
+        NxusPtrScanPage *slot = NULL;
+        for (u32 i = 0; i < NXUS_PTRSCAN_PAGE_SLOTS; i++) {
+            if (g_PtrScanPages[i].valid != 0 && g_PtrScanPages[i].tag == page) {
+                slot = &g_PtrScanPages[i];
+                break;
+            }
+        }
+        if (slot != NULL && in_page + mapped <= slot->valid) {
+            memcpy(out + done, slot->data + in_page, mapped);
+            done += mapped;
+            continue;
+        }
+
+        /* A mapping whose base is not page aligned would make a page-sized read
+           start outside the mapping.  dmnt's mappings are page aligned, so this is
+           only a safety net: read just the request, do not cache the page. */
+        if (page < map_start) {
+            if (ptrScanReadIpc(addr, out + done, mapped) != 0) return -1;
+            done += mapped;
+            continue;
+        }
+
+        /* Read only the mapped part of the page: min(4 KiB, map_end - page).  A
+           full-page read here is what used to fail at the end of a mapping; the
+           clamp is what makes the last page of every mapping cacheable at all. */
+        u64 want64 = map_end - page;
+        u32 want = NXUS_PTRSCAN_PAGE_SIZE;
+        if (want64 < (u64)want) want = (u32)want64;
+
+        const u32 victim = g_PtrScanPageNext;
+        g_PtrScanPageNext = (g_PtrScanPageNext + 1u) % NXUS_PTRSCAN_PAGE_SLOTS;
+        NxusPtrScanPage *fill = &g_PtrScanPages[victim];
+        /* Drop the old tag first: a failed fill must leave the slot dead, never
+           serve the previous page's bytes under this tag. */
+        fill->valid = 0;
+        fill->tag = 0;
+        if (ptrScanReadIpc(page, fill->data, want) != 0) return -1;
+        fill->tag = page;
+        fill->valid = want;
+
+        /* in_page + mapped <= want: page + in_page + mapped == addr + mapped <=
+           map_end, and want == min(PAGE_SIZE, map_end - page). */
+        memcpy(out + done, fill->data + in_page, mapped);
+        done += mapped;
+    }
+    return 0;
+}
+
+/* Serve one read for the walk.
+ *
+ * size > 4 KiB is the static-region root chunk (core/nxus_ptrscan.c reads a region
+ * in chunk_size pieces, 128 KiB on the console): one IPC for the whole chunk is
+ * strictly better than splitting it into per-page IPCs, and the chunk is always
+ * inside a single mapping, so the cache stays out of it.  Everything smaller - the
+ * per-dereference windows - goes through the page cache. */
+static int ptrScanReadTarget(u64 address, void *buffer, u32 size) {
+    if (size > NXUS_PTRSCAN_PAGE_SIZE) {
+        u64 map_start = 0;
+        u64 map_end = 0;
+        if (ptrScanMappingFor(address, &map_start, &map_end) &&
+            address < map_end && size <= map_end - address) {
+            return ptrScanReadIpc(address, buffer, size);
+        }
+    }
+    return ptrScanReadPaged(address, buffer, size);
+}
+
 /* Read callback handed to nxusPtrScan(): re-arms the cancel flag before the
    memory read, so a scan that is burning its budget stops within one read of
    the deadline instead of at the next command.  The context is the budget, not
-   the session: nxusSessionReadCallback() ignores it.
+   the session: the page cache and nxusSessionReadCallback() are reached through
+   ptrScanReadTarget().
 
    The engine polls the plain `cancel` it was given, so the copy at the end is
    what carries BOTH sources of a stop to it: the budget decided here and the
@@ -487,7 +710,7 @@ static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
         budget->budget_hit = 1;
     }
     budget->cancel = atomic_load_explicit(&budget->cancel_flag, memory_order_acquire);
-    return nxusSessionReadCallback(NULL, address, buffer, size);
+    return ptrScanReadTarget(address, buffer, size);
 }
 
 /* ---- 8 MB heap budget -------------------------------------------------- */
@@ -835,9 +1058,19 @@ static void refreshMappingsAfterTargetChange(void) {
  * still reported a zeroed target - "status: target 0000... (pid 0)" while the
  * metadata command answered "pid 140" - because the tick's refresh is gated on
  * nxusDmntHasCheatProcess(): while that probe fails, or if no tick has succeeded
- * yet, the cache stays empty even though GetMetadata() (which re-opens the cheat
- * process once and retries) has the answer.  Status is the client's only view of
- * the target, so it must not report 0 while dmnt can name the process.
+ * yet, the cache stays empty even though dmnt already knows the process.  Status
+ * is the client's only view of the target, so it must not report 0 while dmnt can
+ * name the process.
+ *
+ * The query uses nxusDmntPeekMetadata(), NOT nxusDmntGetMetadata(): the latter is
+ * documented to repair a failed metadata command with a ForceOpen(), i.e. a
+ * takeover of dmnt's cheat process.  A read-only status poll must never change the
+ * state it reports - it used to open dmnt on a console where nothing else had it
+ * open (the boot-time ForceOpen is a one-shot and the tick is gated on
+ * HasCheatProcess, so only this path could re-open it), stealing the process from
+ * Atmosphère's cheat manager or another debugger in the middle of a status poll.
+ * The peek asks HasCheatProcess first and answers "not attached" without touching
+ * anything, so a closed dmnt stays closed.
  *
  * Fills the four fields from one dmnt metadata reply and PUBLISHES them into the
  * session cache with nxusSessionSetProcessIdentityEx() - the same single seqlock
@@ -849,11 +1082,10 @@ static void refreshMappingsAfterTargetChange(void) {
  * and therefore serialises behind the scan/reader thread - which is why it is
  * throttled: Status is polled every ~20 ms, and the broken-cache case must not turn
  * into 50 IPCs/s.  A failed attempt backs off to one try per 5 s: with no title
- * open GetMetadata() fails and its documented auto-reopen retries, and that must
- * not become a once-per-second dmnt ForceOpen (plus a log line each) on the HOME
- * menu.  Skipped while a debug session owns the process (dmnt is closed then, and
- * GetMetadata's auto-reopen would fight with that handle); the attach hand-off has
- * already published the identity in that case.
+ * open the peek answers "not attached" every time, and that probe must not become a
+ * dmnt dispatch on every status poll while the client sits on the HOME menu.
+ * Skipped while a debug session owns the process (dmnt is closed then, and the
+ * attach hand-off has already published the identity).
  *
  * Returns false when dmnt has nothing to say - the caller reports 0, which then is
  * the honest answer (no target open).
@@ -869,12 +1101,12 @@ static bool statusFillIdentityFromDmnt(void) {
 
     NxusProcessMetadata md;
     memset(&md, 0, sizeof(md));
-    const Result rc = nxusDmntGetMetadata(&md);
+    const Result rc = nxusDmntPeekMetadata(&md);
     /* A zero pid is dmnt's "no cheat process" answer, not an identity. */
     if (R_FAILED(rc) || md.process_id == 0) {
         interval_ms = 5000ull;
         NXUS_LOG_DEBUG("status: dmnt has no target (rc=0x%08X, pid=%llu) - "
-                       "reporting no target",
+                       "reporting no target (dmnt left closed)",
                        (unsigned)rc, (unsigned long long)md.process_id);
         return false;
     }
@@ -933,10 +1165,11 @@ static void fillStatus(NxusStatus *st) {
         st->main_size = nxusSessionMainSize();
     }
     /* Still no pid: the cache was never stamped (see statusFillIdentityFromDmnt -
-       the 1 Hz refresh above is gated on HasCheatProcess, which can fail while
-       GetMetadata still answers).  Ask dmnt once per second and publish what it
-       says, so the reply and every later command carry the real target.  Only when
-       that fails too does Status report 0. */
+       the 1 Hz refresh above is gated on HasCheatProcess, which can fail while the
+       read-only metadata peek still answers).  Ask dmnt once per second - without
+       opening anything - and publish what it says, so the reply and every later
+       command carry the real target.  Only when that fails too does Status report
+       0. */
     if (st->process_id == 0 && statusFillIdentityFromDmnt() &&
         nxusSessionTargetIdentity(&identity)) {
         st->process_id = identity.pid;
@@ -1702,19 +1935,22 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
      * All three cases reach the client as the same flag
      * (NxusPtrChainListHeader.truncated), so a hardware log is the only way to
      * tell "the 90 s clock ran out" (the normal, expected stop - the reply has to
-     * be produced before the client's 120 s timeout) from "the runaway guard
-     * fired" (NXUS_PTRSCAN_MAX_READS, which should be unreachable in a healthy
-     * walk) from "the result cap was reached" (a good walk with more chains than
-     * the client asked for).  Keep them three distinct strings.
+     * be produced before the client's 120 s timeout) from "a read budget fired"
+     * (NXUS_PTRSCAN_MAX_READS, which is 0 = unlimited in the default build, so this
+     * string should normally never appear) from "the result cap was reached" (a good
+     * walk with more chains than the client asked for).  Keep them three distinct
+     * strings.
      *
-     * reads >= max_reads is the engine's own test (see readTarget() in
-     * core/nxus_ptrscan.c): it counts only reads it actually performed, so
-     * equality means the budget really was spent and not merely approached.  A
-     * cancelled walk (client gone / shutdown) is neither of the three - it already
-     * logged its own reason in ptrScanRequestCancel(). */
+     * The read test uses the engine's own read CALL count, not g_PtrStats.reads:
+     * ptrScanJobRun() replaces that field with the number of IPC round trips (which
+     * the page cache made much smaller), while the engine's budget in
+     * core/nxus_ptrscan.c readTarget() counts the reads it asked for and could not
+     * see the cache.  Also see the max_reads comment above.  A cancelled walk
+     * (client gone / shutdown) is neither of the three - it already logged its own
+     * reason in ptrScanRequestCancel(). */
     const bool time_cut = g_PtrJob.budget.budget_hit != 0;
     const bool read_cut = !time_cut && g_PtrJob.opts.max_reads != 0 &&
-                          g_PtrStats.reads >= (u64)g_PtrJob.opts.max_reads;
+                          g_PtrScanEngineReads >= (u64)g_PtrJob.opts.max_reads;
     const bool results_cut = !time_cut && !read_cut && src == NXUS_SCAN_OK &&
                              g_PtrStats.truncated != 0;
     if (time_cut) {
@@ -1744,6 +1980,9 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
     free(g_PtrJob.scratch);
     g_PtrJob.regions = NULL;
     g_PtrJob.scratch = NULL;
+    /* Drop the cache's view of the region array that was just freed; the next walk
+       arms its own list (ptrScanJobRun) before the engine can read again. */
+    ptrScanPageCacheArm(NULL, 0);
 
     g_PtrJobResult = ok ? 0 : (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     atomic_store_explicit(&g_PtrJobState, ok ? NxusPtrJob_Done : NxusPtrJob_Failed,
@@ -1765,6 +2004,10 @@ static void ptrScanJobRun(void) {
     /* Start from a clean slate: a previous run's stats must not be published
        together with a failed/empty result (that reads as "0 chains, complete"). */
     memset(&g_PtrStats, 0, sizeof(g_PtrStats));
+    /* Empty the 4 KB page cache and give it THIS walk's region list.  Done here,
+       on the walk's own thread, so no other title's bytes can be served (the
+       region list is also what bounds every page read - see ptrScanReadPaged). */
+    ptrScanPageCacheArm(g_PtrJob.regions, g_PtrJob.region_count);
     /* Honour the client's --max: the engine stops at max_results and reports
        truncated, which is exactly the advice the CLI gives when it fires. */
     const u32 out_cap = g_PtrJob.opts.max_results ? g_PtrJob.opts.max_results
@@ -1779,6 +2022,16 @@ static void ptrScanJobRun(void) {
                                 ptrScanReadBudgeted, &g_PtrJob.budget,
                                 g_PtrJob.scratch, g_PtrJob.scratch_size,
                                 &g_PtrStats, &g_PtrJob.budget.cancel);
+
+    /* The engine increments stats.reads once per read it ASKS for; the page cache
+       answers most of those without a dmnt round trip.  Publish the number of
+       actual target reads (IPCs) instead, which is what the field means - and what
+       the log lines and the PC see.  Only the walk thread writes either value; the
+       engine's call count is kept for the read-budget stop reason (see
+       ptrScanPublish). */
+    g_PtrScanEngineReads = g_PtrStats.reads;
+    g_PtrStats.reads = g_PtrScanReadIpcs;
+    g_PtrStats.bytes_read = g_PtrScanReadIpcBytes;
 
     const u64 elapsed_ms = (armTicksToNs(armGetSystemTick()) / 1000000ull) - start_ms;
     ptrScanPublish(src, count, elapsed_ms);
@@ -2061,20 +2314,21 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
        stale mapping table). */
     const u32 walk_width = opts.value_width;
     opts.window_size = 0x400;
-    /* The clock (NXUS_PTRSCAN_TIME_BUDGET_MS) is what ends a scan; this counter
-       is only the runaway guard that bounds a walk whose reads are so cheap it
-       could outrun the clock.  See the NXUS_PTRSCAN_MAX_READS comment for the
-       arithmetic and why the old 20000 was wrong. */
+    /* The clock (NXUS_PTRSCAN_TIME_BUDGET_MS) is the only stop the walk is meant to
+       hit: NXUS_PTRSCAN_MAX_READS is 0 = unlimited.  A non-zero value would still be
+       honoured by the engine as a cap on the reads it asks for (see the
+       NXUS_PTRSCAN_MAX_READS comment) - nothing sets one. */
     opts.max_reads = NXUS_PTRSCAN_MAX_READS;
 
     /* Log the two limits with the request: without them a hardware log cannot
        tell what the walk was allowed to reach (and the closing "done" line only
-       reports what it used). */
+       reports what it used).  max_reads=0 means "no read cap, the clock decides". */
     NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u width=%u regions=%u "
-             "max_chains=%u max_reads=%u",
+             "max_chains=%u max_reads=%u%s",
              (unsigned long long)req.target_address, (unsigned long long)module_base,
              (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count,
-             (unsigned)opts.max_results, (unsigned)opts.max_reads);
+             (unsigned)opts.max_results, (unsigned)opts.max_reads,
+             (opts.max_reads == 0) ? " (unlimited, time budget only)" : "");
 
     /* Everything the walk needs is in place, so hand the job to the worker.  The
        start clock was taken at the top of the handler: the client times the whole
