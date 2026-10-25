@@ -44,6 +44,13 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits);
 /* Tear the session down: stop the worker, free every owned block and unpublish
    the mapping/region views.  Safe to call when not initialised (no-op).  Clears
    the initialised state, so Init() after Exit() starts a fresh session.
+   The worker Thread is joined and closed exactly once: the slot is claimed
+   atomically in nxus_session.c (the same pattern as the pointer-scan worker), so
+   a concurrent ScanBegin/ScanNext/Reset on the connection thread either starts
+   the next worker or hands the slot to Exit, never both - two callers could
+   otherwise threadWaitForExit()/threadClose() the same Thread and double-close
+   it.  A scan that loses the claim is refused (BUSY) or refused after the
+   shutdown gate (BAD_STATE) instead of creating a worker behind this teardown.
    Exit is TERMINAL for published views: it frees the blocks behind every pointer
    nxusSessionMappings()/nxusSessionRegions() ever returned, including ones whose
    pin was never released, so no view may be used across Exit.  It also invalidates
@@ -159,6 +166,10 @@ Result nxusSessionScanNext(const NxusScanRequest *req,
                            const u8 *pattern, u32 pattern_len, const u8 *mask);
 Result nxusSessionScanCancel(void);
 Result nxusSessionScanUndo(void);
+/* Drop the hit list / baseline and leave the session idle.  Takes the same worker
+   Thread-slot claim as ScanBegin()/Exit(), so it never joins a worker another
+   caller is already reaping; while Exit() owns the teardown the call is a logged
+   no-op (the connection thread's ScanReset handler can land during shutdown). */
 void   nxusSessionReset(void);
 
 /* (Re)snapshot the target's mappings without starting a scan; used by the

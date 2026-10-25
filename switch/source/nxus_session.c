@@ -87,6 +87,36 @@ typedef struct {
 static Session g_Session;
 static Mutex   g_SessionMutex;
 
+/* ---- scan worker Thread slot -------------------------------------------
+ *
+ * g_Session.thread / g_Session.thread_live are touched by three callers on two
+ * threads: startJob() (the connection thread) reaps the previous worker and
+ * creates the next one, nxusSessionExit() (shutdown) joins the worker, and
+ * nxusSessionReset() joins it.  The worker publishes Done/Error BEFORE its last
+ * frees, so a shutdown can land while the connection thread is between "the scan
+ * finished" and startJob()'s join - previously both sides called
+ * threadWaitForExit()/threadClose() on the same Thread: the second wait ran on
+ * freed thread state and the second close freed it again.
+ *
+ * The right to touch the slot is therefore claimed atomically, exactly like
+ * nxusServer's ptrScanClaimSlot()/ptrScanJoinSlotLocked():
+ *
+ *   - startJob() claims it for reap -> threadCreate() -> threadStart(),
+ *   - Exit() / Reset() claim it for cancel -> join -> close,
+ *   - the loser never touches the Thread (startJob() answers BUSY, Exit()/Reset()
+ *     log it and leave the slot to the claim holder),
+ *   - g_Session.thread_live is only read or written by the claim holder.
+ *
+ * g_SessionExited is the shutdown half of the protocol (same shape as
+ * g_ServerExited): it is set BEFORE Exit() claims the slot, and startJob()
+ * re-checks it UNDER the claim, so a ScanBegin that passed its Running check
+ * just before the shutdown cannot create a worker behind Exit()'s join.
+ *
+ * Init() resets both, because Exit() may be followed by a fresh Init().
+ */
+static atomic_bool g_ScanThreadClaim;
+static atomic_bool g_SessionExited;
+
 /* ---- target identity ---------------------------------------------------
  *
  * pid / program_id / main_base / main_size describe ONE process: every
@@ -993,6 +1023,37 @@ static int sessionRead(void *ctx, u64 address, void *buffer, u32 size) {
 /* (g_Inited is declared above: the view pin API has to know whether a session is
    live before it hands out a token.) */
 
+/* Join and close the worker Thread.  The caller must hold g_ScanThreadClaim (see
+   the slot block at the top of this file).  Returns true when a worker was
+   actually reaped. */
+static bool scanThreadJoinLocked(void) {
+    if (!g_Session.thread_live) return false;
+    threadWaitForExit(&g_Session.thread);
+    threadClose(&g_Session.thread);
+    g_Session.thread_live = false;
+    return true;
+}
+
+/* Take the worker Thread slot for one of the sequences listed in the slot block.
+   Bounded wait instead of an endless one: the holder only sits in a worker join
+   plus threadCreate()/threadStart(), never in an IPC, and a scan that has to wait
+   for a shutting-down session is better answered BUSY than blocked. */
+static bool scanThreadClaim(u32 spin_ms) {
+    for (u32 waited = 0; ; waited += 1u) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong_explicit(&g_ScanThreadClaim, &expected, true,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            return true;
+        }
+        if (waited >= spin_ms) return false;
+        svcSleepThread(1000000ull);
+    }
+}
+
+static void scanThreadRelease(void) {
+    atomic_store_explicit(&g_ScanThreadClaim, false, memory_order_release);
+}
+
 void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     if (g_Inited) return;      /* already initialised: keep the live session */
     mutexInit(&g_SessionMutex);
@@ -1000,6 +1061,10 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     /* Before any publish/drop can run (they are all behind a live session). */
     mutexInit(&g_ViewPublishMutex);
     memset(&g_Session, 0, sizeof(g_Session));
+    /* No worker exists at boot, and Init() after Exit() starts a new session:
+       both halves of the worker-slot protocol start free (see the slot block). */
+    atomic_init(&g_ScanThreadClaim, false);
+    atomic_init(&g_SessionExited, false);
     atomic_init(&g_Session.state, NxusScanState_Idle);
     atomic_init(&g_Session.cancel, 0);
     atomic_init(&g_ViewSeq, 0);   /* both published views start empty/stable */
@@ -1033,11 +1098,32 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits) {
 
 void nxusSessionExit(void) {
     if (!g_Inited) return;     /* nothing initialised (or already exited) */
+
+    /* Shutdown gate first: a startJob() that is about to take the slot re-checks
+       this under the claim instead of creating a worker behind the join below. */
+    atomic_store_explicit(&g_SessionExited, true, memory_order_release);
+
     nxusSessionScanCancel();
-    if (g_Session.thread_live) {
-        threadWaitForExit(&g_Session.thread);
-        threadClose(&g_Session.thread);
-        g_Session.thread_live = false;
+    /* The worker Thread is joined and closed ONLY by the slot claim holder, so a
+       concurrent startJob()/Reset() can never reap the same Thread (see the slot
+       block at the top of this file).  Bounded: the holder cannot be in an IPC. */
+    if (scanThreadClaim(2000)) {
+        /* A startJob() that took the slot just before g_SessionExited became
+           visible may have started a worker AFTER the cancel above was ignored
+           (startJob() clears the flag).  Re-issue it under the claim so the join
+           is bounded by the worker's own read loop, not by a whole scan. */
+        nxusSessionScanCancel();
+        if (scanThreadJoinLocked()) {
+            NXUS_LOG("scan: worker joined and closed (session exit)");
+        }
+        scanThreadRelease();
+    } else {
+        /* Reset() or a Begin() owns the claim.  A Begin() that owns it re-checks
+           g_SessionExited under the claim and cannot create a worker any more, and
+           Reset() reaps the worker itself: touching the Thread here is exactly the
+           double close this claim exists to prevent. */
+        NXUS_LOG("scan: worker slot still claimed at exit - not joining "
+                 "(the claim holder reaps it; no new worker can start)");
     }
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
@@ -1628,6 +1714,26 @@ static void buildRegions(const NxusScanRequest *req) {
 
 /* ---- worker ------------------------------------------------------------ */
 
+/* Release everything a worker pass allocated.  Every abort path goes through
+   this, and `discard_baseline` drops the armed baseline store along with it:
+   a pass that cannot run can never be refined, so leaving the store open and
+   the dump on the card is a leak that only the NEXT ScanBegin's baselineDiscard()
+   would hide - and if no scan follows, the FILE* and sdmc:/nxus/scan_base.bin
+   stay behind for the rest of the session.  The normal exit passes false because
+   a completed first pass keeps its fingerprints for the refine pass. */
+static void scanWorkerRelease(bool discard_baseline, u8 *chunk, u8 *window,
+                              u8 *cur_buf, u8 *prev_buf) {
+    if (discard_baseline && g_Session.baseline.active) {
+        /* Closes the FILE* (checking the final flush), frees the RAM store and
+           removes the dump - the same path the other error paths already used. */
+        baselineDiscard();
+    }
+    free(chunk);
+    free(window);
+    free(cur_buf);
+    free(prev_buf);
+}
+
 static void scanThread(void *arg) {
     (void)arg;
     const bool first_pass = g_Session.job_first_pass;
@@ -1647,11 +1753,14 @@ static void scanThread(void *arg) {
         const u32 chunk_size = g_Session.chunk_size;
         chunk = (u8 *)malloc(chunk_size);
         if (chunk == NULL) {
-            /* The worker cannot scan without its buffer.  Report a real OOM
-               (not BadInput) so the client can shrink the chunk or free memory
-               instead of blaming the request.  Result first, state last: a reader
-               that observes a settled state must also observe the error code
-               (release store). */
+            /* The worker cannot scan without its buffer.  Drop the baseline armed
+               by ScanBegin() FIRST (its store is closed and scan_base.bin removed)
+               so an aborted Unknown scan does not keep the FILE* open and the dump
+               on the card.  Report a real OOM (not BadInput) so the client can
+               shrink the chunk or free memory instead of blaming the request, and
+               publish the result before the state: a reader that observes a
+               settled state must also observe the error code (release store). */
+            scanWorkerRelease(true, chunk, NULL, NULL, NULL);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte chunk allocation failed (out of memory)",
@@ -1693,14 +1802,14 @@ static void scanThread(void *arg) {
         cur_buf = (u8 *)malloc(buf_size);
         prev_buf = (u8 *)malloc(buf_size);
         if (cur_buf == NULL || prev_buf == NULL) {
-            baselineDiscard();
+            /* Nothing can be refined without the block buffers: close the store
+               and remove the dump (scanWorkerRelease) before publishing the OOM,
+               then release whatever of the two buffers did get allocated. */
+            scanWorkerRelease(true, chunk, NULL, cur_buf, prev_buf);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte baseline buffers failed (out of memory)",
                      (unsigned)buf_size);
-            free(chunk);
-            free(cur_buf);
-            free(prev_buf);
             return;
         }
         rc = nxusScanNextFromBaseline(&g_Session.baseline,
@@ -1722,6 +1831,10 @@ static void scanThread(void *arg) {
     } else {
         window = (u8 *)malloc(g_Session.window_size);
         if (window == NULL) {
+            /* No baseline is armed on this path (an armed one makes ScanBegin take
+               the branch above), but release through the same helper so every abort
+               has exactly one cleanup route. */
+            scanWorkerRelease(true, chunk, window, NULL, NULL);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
             NXUS_LOG("scan abort: %u-byte window allocation failed (out of memory)",
@@ -1773,20 +1886,29 @@ static void scanThread(void *arg) {
              (unsigned)stats.dropped, (unsigned)stats.write_failed,
              (unsigned)(g_Session.baseline_degraded ? 1u : 0u));
 
-    free(chunk);
-    free(window);
-    free(cur_buf);
-    free(prev_buf);
+    /* Normal exit: the baseline (if this was a first pass) is deliberately kept,
+       so false keeps its fingerprints and dump for the next refine pass. */
+    scanWorkerRelease(false, chunk, window, cur_buf, prev_buf);
 }
 
 static Result startJob(bool first_pass) {
     if (sessionStateLoad() == NxusScanState_Running) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
 
-    if (g_Session.thread_live) {
-        threadWaitForExit(&g_Session.thread);
-        threadClose(&g_Session.thread);
-        g_Session.thread_live = false;
+    /* Reap the previous worker and create the next one under the slot claim (see
+       the slot block at the top of this file).  A begin that loses the claim to
+       Exit()/Reset() is answered BUSY instead of racing their join; one that wins
+       re-checks g_SessionExited so it cannot start a worker behind Exit()'s join,
+       where the session blocks it is about to read are being freed. */
+    if (!scanThreadClaim(200)) {
+        NXUS_LOG("scan: worker slot busy (exit/reset in progress) - not starting the scan");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
+    if (atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
+        scanThreadRelease();
+        NXUS_LOG("scan: session is exiting - not starting the worker");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+    (void)scanThreadJoinLocked();
 
     g_Session.job_first_pass = first_pass;
     g_Session.last_result = 0;
@@ -1798,7 +1920,10 @@ static Result startJob(bool first_pass) {
        per-block locals off the edge. */
     alignas(0x1000) static u8 scanStack[0x10000];
     Result rc = threadCreate(&g_Session.thread, scanThread, NULL, scanStack, sizeof(scanStack), 0x2C, -2);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        scanThreadRelease();
+        return rc;
+    }
 
     /* Publish Running only AFTER every worker input is in place (regions, mapping
        snapshot, hit list, job request, thread_live): the release store pairs with
@@ -1806,6 +1931,9 @@ static Result startJob(bool first_pass) {
     g_Session.thread_live = true;
     sessionStateStore(NxusScanState_Running);
     threadStart(&g_Session.thread);
+    /* Released only now: from here on Exit()/Reset() may claim and join the worker
+       this call just started. */
+    scanThreadRelease();
     return 0;
 }
 
@@ -1943,7 +2071,13 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     atomic_store_explicit(&g_HitsStale, 0, memory_order_release);
     sessionStateStore(NxusScanState_Idle);
     Result jr = startJob(true);
-    if (R_FAILED(jr)) baselineDiscard();   /* no worker: the dump is dead weight */
+    /* No worker: the dump is dead weight.  Unless Exit() owns the session by now:
+       it frees the baseline itself, and discarding it here would race that teardown
+       on the FILE* / RAM store (startJob() reports BAD_STATE once the exit gate is
+       up, the same case this check covers). */
+    if (R_FAILED(jr) && !atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
+        baselineDiscard();
+    }
     return jr;
 }
 
@@ -2019,11 +2153,24 @@ Result nxusSessionScanUndo(void) {
 
 void nxusSessionReset(void) {
     nxusSessionScanCancel();
-    if (g_Session.thread_live) {
-        threadWaitForExit(&g_Session.thread);
-        threadClose(&g_Session.thread);
-        g_Session.thread_live = false;
+    /* Reset is the third user of the worker Thread slot: it joins and closes it,
+       so it must take the same claim as startJob()/Exit() instead of racing their
+       join (see the slot block at the top of this file).  When the slot cannot be
+       claimed (Exit() is tearing the session down, or a Begin() is between reap
+       and start), the reset is a logged no-op: freeing the hit list/baseline under
+       a worker this call could not reap is the corruption the claim prevents. */
+    if (!scanThreadClaim(2000)) {
+        NXUS_LOG("scan: worker slot still claimed at reset - reset skipped");
+        return;
     }
+    if (atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
+        scanThreadRelease();
+        NXUS_LOG("scan: session is exiting - reset skipped (Exit owns the teardown)");
+        return;
+    }
+    (void)scanThreadJoinLocked();
+    scanThreadRelease();
+
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
     /* No list is left that could belong to a target: the next ScanBegin stamps a

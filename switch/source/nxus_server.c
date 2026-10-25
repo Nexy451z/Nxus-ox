@@ -1297,6 +1297,15 @@ static atomic_bool g_PtrThreadReaping;
    exists to close.  Atomic because handlePtrScanBegin() on the connection thread
    re-checks it under the slot claim. */
 static atomic_bool g_ServerExited;
+/* How long nxusServerExit() is willing to wait for the worker Thread slot, and the
+   granularity it re-issues the sticky cancel at.  The slot is only ever held across
+   a handful of kernel calls (threadCreate/threadStart in handlePtrScanBegin, one join
+   here) or across the inline walk that runs when threadCreate() failed, so 2 s is
+   generous; it is still SHORT on purpose, because the moment to free the mapping /
+   region views has to be decided inside nxusServerExit() - the process is on its way
+   out and nothing else would retry it. */
+#define NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS 2000u
+#define NXUS_PTRSCAN_EXIT_CLAIM_STEP_MS   100u
 
 static bool ptrScanBusy(void) {
     return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
@@ -1344,6 +1353,24 @@ static void ptrScanRequestCancel(const char *why) {
     if (!ptrScanBusy()) return;
     g_PtrJob.budget.cancel = 1;
     NXUS_LOG("ptrscan: cancel requested (%s) - the worker stops at its next read", why);
+}
+
+/* Unconditional variant for the shutdown.  ptrScanRequestCancel() above is a no-op
+   unless the published job state is Running, which is exactly the state a walk that
+   is still being prepared does not have yet:
+ *   - handlePtrScanBegin() copies g_PtrJob.budget (cancel = 0) and only THEN claims
+     the Thread slot and starts the worker, so a cancel that arrives in that window
+     would be overwritten and the worker would run its whole 90 s budget;
+ *   - the threadCreate()-failed path runs the walk inline on the connection thread
+     without ever publishing Running at all.
+   The engine only ever reads the flag (it never owns it), so writing it while no
+   walk exists is harmless: the next handlePtrScanBegin() overwrites the whole budget
+   struct with its own (cancel = 0) copy.  nxusServerExit() re-issues this under the
+   Thread-slot claim, which is what makes the last write stick - no Begin can start
+   after that point (g_ServerExited is already set and re-checked under the claim). */
+static void ptrScanCancelSticky(const char *why) {
+    ptrScanRequestCancel(why);
+    g_PtrJob.budget.cancel = 1;
 }
 
 /* The target's own architecture, as far as the console can tell - the highest
@@ -1829,11 +1856,24 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
 
     /* No thread available (kernel quota, low memory): walk here instead of failing
        a scan the console can still perform.  That is the old behaviour, so the
-       reply is the old one - the chain list (or the walk's own error). */
-    ptrScanReleaseSlot();
+       reply is the old one - the chain list (or the walk's own error).
+     *
+     * The Thread-slot claim is deliberately KEPT across this inline walk (it used to
+     * be released before ptrScanJobRun()).  The walk reads the same session views a
+     * worker thread does, and nxusServerExit() frees them only after it has claimed
+     * the slot and joined: releasing the claim first made the exit path believe
+     * there was no walk at all (ptrScanJoinSlotLocked() returns false when no worker
+     * exists) and free the mapping/region views under a running walk.  Holding it
+     * makes the claim mean "no walk of this handler is in flight, on either thread",
+     * which is what the exit path's "join, then release" order relies on.  The exit
+     * worst case is bounded: it re-issues the sticky cancel while it spins, so this
+     * walk stops at its next read instead of at its 90 s budget. */
     NXUS_RESULT("threadCreate(ptrscan)", trc);
     NXUS_LOG("ptrscan: no worker thread - walking on the connection thread");
     ptrScanJobRun();
+    /* Released as soon as the walk is over, BEFORE the reply: a blocking send must
+       not keep the exit path spinning on the claim. */
+    ptrScanReleaseSlot();
     const int state = atomic_load_explicit(&g_PtrJobState, memory_order_acquire);
     const Result walk_rc = g_PtrJobResult;
     /* Leave the state as Get() knew it (no pending result to report): the reply
@@ -3483,8 +3523,8 @@ void nxusServerTick(void) {
  * Stop every worker and the session this file owns, in the one order that keeps a
  * reader from outliving what it reads:
  *
- *   1. Pointer-scan worker.  It walks the target and the mapping/region views for
- *      up to the 90 s budget, so it is CANCELLED first (the engine polls
+ *   1. Pointer-scan walk.  It walks the target and the mapping/region views for up
+ *      to the 90 s budget, so it is CANCELLED first (the engine polls
  *      g_PtrJob.budget.cancel between roots and inside the walk - the same flag
  *      PtrScanGet's cancel path sets) and only then joined.  threadWaitForExit()
  *      without the cancel would block for the rest of that budget, and not joining
@@ -3495,12 +3535,34 @@ void nxusServerTick(void) {
  *      is touched: handlePtrScanBegin() holds the same claim across its
  *      reap/create/start sequence and re-checks g_ServerExited under it, so no worker
  *      can be created behind this join and no Thread is ever joined or closed twice.
+ *      The claim is ALSO held across the inline walk (threadCreate() failed), so
+ *      "claim held" means "no pointer walk is in flight, worker or connection
+ *      thread".
+ *
+ *      The claim can be taken by a Begin that is just starting a walk, so it is
+ *      retried for a short, bounded time (NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS) with the
+ *      sticky cancel re-issued on every attempt.  That combination is what makes the
+ *      release below safe:
+ *        - the cancel is sticky and is re-issued under the claim, so a walk that was
+ *          started (or whose budget was copied) after the first cancel still stops at
+ *          its next read;
+ *        - the join only returns once the worker thread has left the walk, i.e. once
+ *          it can no longer touch the views;
+ *        - if the claim still cannot be taken within the deadline - only possible if
+ *          the slot holder is wedged - the views are NOT released at all (see
+ *          below), because freeing them while a walk may still be running is exactly
+ *          the use-after-free this ordering exists to prevent.  Nothing is left to
+ *          retry the release afterwards (the process is exiting), so the safe choice
+ *          is to leak the views into the teardown instead of freeing memory a live
+ *          reader could still name.
  *
  *   2. The session.  nxusSessionScanCancel() sets the scan worker's flag and
  *      nxusSessionExit() then joins that worker and frees the hit list, the SD
  *      baseline, the mapping/region views and every view pin.  Exit() repeats the
  *      cancel internally; doing it here keeps the shutdown order readable and
- *      makes sure the flag is raised BEFORE the join rather than inside it.
+ *      makes sure the flag is raised BEFORE the join rather than inside it.  It is
+ *      only reached once step 1 proved that no pointer walk can be reading those
+ *      views any more.
  *
  * The debug session (nxusDebugExit), the network (nxusNetExit) and dmnt
  * (nxusDmntExit) are deliberately NOT stopped here: they belong to other modules
@@ -3516,31 +3578,65 @@ void nxusServerExit(void) {
         return;
     }
 
-    /* 1. pointer-scan worker: cancel, then join exactly once.  The cancel is what
-       makes a running walk return to ptrScanPublish() (the engine only polls the flag
-       between roots / inside the walk), so the join below is bounded by the walk's
-       own read loop instead of by its remaining time budget. */
-    ptrScanRequestCancel("server exit");
-    if (ptrScanClaimSlot(2000)) {
-        /* A Begin that took the slot just before g_ServerExited became visible may have
-           started a walk AFTER the cancel above was ignored (the job was not Running
-           yet).  Re-issue it under the claim, so the join cannot wait for the walk's
-           whole time budget. */
-        ptrScanRequestCancel("server exit (worker started late)");
+    /* 1. pointer-scan walk: cancel, take the slot with a short deadline, join
+       exactly once.  The cancel is what makes a running walk return to
+       ptrScanPublish() (the engine only polls the flag between roots / inside the
+       walk), so the join below is bounded by the walk's own read loop instead of by
+       its remaining time budget.  It is re-issued on every claim attempt, because a
+       Begin that is already past its budget copy may have written cancel = 0 after
+       this one. */
+    ptrScanCancelSticky("server exit");
+
+    const u64 claim_start_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    bool claimed = false;
+    for (;;) {
+        /* Sticky, not "only when Running": a walk that is still being prepared or
+           runs inline on the connection thread has no published Running state, and a
+           Begin that copied cancel = 0 after the first store above would otherwise
+           let its worker run the whole budget. */
+        g_PtrJob.budget.cancel = 1;
+        if (ptrScanClaimSlot(NXUS_PTRSCAN_EXIT_CLAIM_STEP_MS)) {
+            claimed = true;
+            break;
+        }
+        const u64 waited_ms = (armTicksToNs(armGetSystemTick()) / 1000000ull) - claim_start_ms;
+        if (waited_ms >= NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS) break;
+    }
+
+    if (claimed) {
+        /* Re-issued UNDER the claim, so it is the last write: a Begin that took the
+           slot just before g_ServerExited became visible may have started a walk
+           after the cancel above was written, with its own copy of the budget.  From
+           here on no Begin can create a worker (it re-checks g_ServerExited under the
+           claim), so this cancel cannot be overwritten again - and the join below
+           therefore cannot wait for the walk's whole time budget. */
+        ptrScanCancelSticky("server exit (worker started late)");
+        /* threadWaitForExit() returns only once the worker has left ptrScanJobRun(),
+           i.e. once it can no longer read the mapping/region views.  This is the
+           guarantee that licenses nxusSessionExit() below to free them. */
         if (ptrScanJoinSlotLocked()) {
             NXUS_LOG("ptrscan: worker joined and closed (server exit)");
         }
         ptrScanReleaseSlot();
     } else {
-        /* A Begin on the connection thread owns the slot.  It cannot create a new
-           worker any more (it re-checks g_ServerExited under the claim), and
-           nxusNetExit() joins that thread right after this, so the only cost is one
-           log line instead of a silent leak. */
-        NXUS_LOG_ERROR("ptrscan: worker slot still claimed by a Begin at exit - "
-                       "not joining (no new worker can be created)");
+        /* The slot holder did not let go within the deadline.  It cannot create a new
+           worker any more (it re-checks g_ServerExited under its claim), but a walk it
+           already started may still be reading the views and no join could prove
+           otherwise.  Therefore: cancel the scan worker (its flag frees nothing) and
+           DO NOT release the session.  Freeing the views here is exactly the
+           use-after-free this function's ordering exists to prevent; a leak that ends
+           with the process - nxusNetExit() and __appExit() follow immediately - is the
+           only safe outcome. */
+        (void)nxusSessionScanCancel();
+        NXUS_LOG_ERROR("ptrscan: worker slot still claimed at exit after %u ms - "
+                       "session views NOT released (a walk may still read them; the "
+                       "process is exiting)",
+                       (unsigned)NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS);
+        return;
     }
 
-    /* 2. a running scan, then the session itself. */
+    /* 2. a running scan, then the session itself.  Only reached once no pointer walk
+       can be in flight, so the views freed here have no reader left. */
     (void)nxusSessionScanCancel();
     nxusSessionExit();
     NXUS_LOG("server: scan cancelled and session released");

@@ -8,16 +8,27 @@
 
 static Thread   g_Thread;
 /* Lifecycle of g_Thread.  The worker is created lazily by nxusHidStart() and
-   joined+closed by nxusHidExit(); the worker itself never clears these flags (it
-   used to clear g_ThreadLive on return, which made the exit path skip
-   threadClose() and leak the thread object).
-     - g_ThreadLive    : g_Thread holds a created, started, not-yet-closed thread.
+   joined+closed by nxusHidExit(), or reaped by a later nxusHidStart() when it
+   died on its own; the worker itself never closes it (it used to clear
+   g_ThreadLive on return, which made the exit path skip threadClose() and leak
+   the thread object).
+     - g_ThreadOpen    : g_Thread holds a handle returned by threadCreate() that
+                         has not been closed yet.  This flag is the close token:
+                         only the caller that wins its compare-exchange true->false
+                         runs threadClose(), so a double close is impossible even
+                         though both a start and an exit may want to reap it.
+     - g_ThreadLive    : the thread is started and has not been declared dead yet.
+                         A worker whose openInput() fails clears it on return and
+                         leaves g_ThreadOpen set: the handle is still open, so the
+                         next nxusHidStart() (Config resend) or nxusHidExit() has
+                         to reap it instead of threadCreate() overwriting it.
      - g_ThreadStarting: a start owns threadCreate()/threadStart(); claimed by
                          compare-exchange so two starts cannot both create a thread.
-     - g_ThreadClosing : an exit owns threadWaitForExit()/threadClose(); it is both
-                         the start lock (a start that sees it refuses to run) and
-                         the flag that makes a double close impossible, because only
-                         the compare-exchange winner ever closes g_Thread. */
+     - g_ThreadClosing : an exit owns the join; it is both the start lock (a start
+                         that sees it refuses to run) and the exit lock, so only
+                         the compare-exchange winner ever waits for/close the
+                         thread of that generation. */
+static atomic_bool g_ThreadOpen;
 static atomic_bool g_ThreadLive;
 static atomic_bool g_ThreadStarting;
 static atomic_bool g_ThreadClosing;
@@ -38,6 +49,7 @@ static Mutex    g_Mutex;
 void nxusHidInit(void) {
     mutexInit(&g_Mutex);
     atomic_init(&g_Stop, false);
+    atomic_init(&g_ThreadOpen, false);
     atomic_init(&g_ThreadLive, false);
     atomic_init(&g_ThreadStarting, false);
     atomic_init(&g_ThreadClosing, false);
@@ -96,7 +108,12 @@ static void hidThread(void *arg) {
     if (R_FAILED(g_InitResult)) {
         NXUS_LOG("hotkey: input unavailable - the hotkey stays disabled");
         /* Clear the live flag on the way out: leaving it set made nxusHidStart()
-           refuse for the rest of the boot, so the hotkey could never come back. */
+           refuse for the rest of the boot, so the hotkey could never come back.
+           The handle from threadCreate() is deliberately NOT closed here - a
+           worker must not close the object it is still running on.  g_ThreadOpen
+           stays set, so the next nxusHidStart() (Config resend) or nxusHidExit()
+           waits for this return and then closes it; nxusHidStart() clears the
+           flag itself before it calls threadCreate() again. */
         g_Available = false;
         atomic_store_explicit(&g_ThreadLive, false, memory_order_release);
         return;
@@ -153,9 +170,12 @@ static void hidThread(void *arg) {
 
     if (g_Available) hidExit();
     g_Available = false;
-    /* g_ThreadLive stays true on purpose: only nxusHidExit() clears it, after it
-       has joined and closed g_Thread.  Clearing it here used to hide the live
-       thread from the exit path and leak the thread object. */
+    /* g_ThreadLive stays true on purpose on this path: only nxusHidExit() clears
+       it, after it has joined and closed g_Thread.  Clearing it here used to hide
+       the live thread from the exit path and leak the thread object.  The
+       failed-start path above is the one exception - there is no session to join,
+       so it clears the flag and leaves the handle to be reaped through
+       g_ThreadOpen. */
 }
 
 void nxusHidExit(void) {
@@ -180,10 +200,24 @@ void nxusHidExit(void) {
         svcSleepThread(1000000ull);
     }
 
-    if (atomic_load_explicit(&g_ThreadLive, memory_order_acquire)) {
+    /* Reap the handle whenever one is still open, not only while the worker is
+       live.  A worker whose openInput() failed cleared g_ThreadLive and returned,
+       but its Thread is still open: skipping it here leaked that handle for good,
+       and a later start would have closed it instead.  The join is safe in both
+       cases - a worker that already returned leaves its exit event signalled, so
+       threadWaitForExit() returns at once, while one that is still inside its
+       failed start is actually waited for.  threadClose() runs only for the
+       compare-exchange winner on g_ThreadOpen, because a nxusHidStart() that
+       reaped this same handle may have closed it concurrently. */
+    if (atomic_load_explicit(&g_ThreadLive, memory_order_acquire) ||
+        atomic_load_explicit(&g_ThreadOpen, memory_order_acquire)) {
         /* Paired join + close, executed only by the winner above. */
         threadWaitForExit(&g_Thread);
-        threadClose(&g_Thread);
+        bool open_expected = true;
+        if (atomic_compare_exchange_strong_explicit(&g_ThreadOpen, &open_expected, false,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            threadClose(&g_Thread);
+        }
         atomic_store_explicit(&g_ThreadLive, false, memory_order_release);
     }
 
@@ -221,6 +255,23 @@ void nxusHidStart(void) {
         return;
     }
 
+    /* g_ThreadLive is false but a handle may still be open: hidThread() clears the
+       live flag when openInput() fails and returns, so before this reap every
+       Config resend called threadCreate() over the previous handle and leaked it.
+       Reap it now.  The join cannot hold this caller up - the worker is already on
+       its way out - but it is still done so the object is never closed while its
+       worker is inside its last instructions.  Only the compare-exchange winner
+       on g_ThreadOpen closes (the same close token nxusHidExit() uses), and the
+       flag is dropped before threadClose() so the handle is never closed twice.
+       If threadCreate() below fails the handle is already gone and g_ThreadOpen
+       stays false, which keeps the next exit from touching the stale Thread. */
+    bool open_expected = true;
+    if (atomic_compare_exchange_strong_explicit(&g_ThreadOpen, &open_expected, false,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        threadWaitForExit(&g_Thread);
+        threadClose(&g_Thread);
+    }
+
     atomic_store_explicit(&g_Stop, false, memory_order_relaxed);
     alignas(0x1000) static u8 stack[0x4000];
     Result rc = threadCreate(&g_Thread, hidThread, NULL, stack, sizeof(stack), 0x2C, -2);
@@ -229,6 +280,9 @@ void nxusHidStart(void) {
         atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
         return;
     }
+    /* The handle exists from here on: publish it before g_ThreadLive, so nobody
+       can observe a started thread whose handle is not marked open yet. */
+    atomic_store_explicit(&g_ThreadOpen, true, memory_order_release);
     threadStart(&g_Thread);
     /* Publish the thread only after it was started: any exit that observes this
        flag then has a started Thread that threadWaitForExit() can really join.
