@@ -47,3 +47,7 @@ mhxx_ctrpf/build/
 .audit_*.md
 .cov.*
 .su.sh
+
+# build artifacts (the packed NSO/NPDM, not sources)
+switch/pack/
+probe/pack/
