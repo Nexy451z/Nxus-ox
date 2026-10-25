@@ -1241,10 +1241,14 @@ class MockSwitch:
                 walk(v, 1, [], m['base'] - module_base + off)
 
         self.chains = chains
+        # Mirrors NxusPtrChainListHeader.truncated: the walk stops at max_results,
+        # so a full list means "there may be more" rather than "that is all".
+        self.ptr_truncated = bool(max_results) and len(chains) >= max_results
         return self._chain_list()
 
     def _chain_list(self) -> bytes:
-        header = P.PTR_CHAIN_LIST_HEADER.pack(len(self.chains), len(self.chains), 0, 0)
+        truncated = 1 if getattr(self, 'ptr_truncated', False) else 0
+        header = P.PTR_CHAIN_LIST_HEADER.pack(len(self.chains), len(self.chains), truncated, 0)
         body = header
         for c in self.chains:
             steps = list(c['steps']) + [0] * (P.NXUS_PTRSCAN_MAX_DEPTH - len(c['steps']))

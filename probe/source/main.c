@@ -356,6 +356,13 @@ static void probePerCore(void) {
         threadWaitForExit(&t);
         threadClose(&t);
         rec("svcSetHardwareBreakPoint", g_CoreResults[core].rc, (u64)core, 0);
+        /* The write itself can fail even when the migration worked.  Counting it
+           keeps the verdict honest: "confirmed" must mean four successful writes,
+           not four attempted ones. */
+        if (R_FAILED(g_CoreResults[core].rc)) {
+            g_PerCoreFailures++;
+            g_LastCoreMigrateRc = g_CoreResults[core].rc;
+        }
     }
 }
 

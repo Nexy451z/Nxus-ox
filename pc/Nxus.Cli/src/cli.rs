@@ -2058,7 +2058,17 @@ fn break_kind_name(kind: u32) -> &'static str {
 
 fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, opts: &Opts) -> Result<()> {
     if chains.is_empty() {
-        println!("no pointer chain found (try --depth 4, a larger --max-offset, or --pc)");
+        /* An empty list is only "no chain exists" when the console also says it
+           finished.  It reports truncated=1 when it stopped on max_results or on
+           the read budget, and in that case nothing was proven - saying "not
+           found" would be a false negative. */
+        if truncated {
+            println!("no pointer chain found - but the console stopped EARLY ({})", source);
+            println!("  the read budget or max-results limit was hit before the search space was exhausted;");
+            println!("  this is not proof that no chain exists. Raise --max / --max-offset and retry.");
+        } else {
+            println!("no pointer chain found (try --depth 4, a larger --max-offset, or --pc)");
+        }
         return Ok(());
     }
     if truncated {

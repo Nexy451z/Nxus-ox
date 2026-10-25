@@ -733,8 +733,14 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
              (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count);
 
     u32 count = 0;
+    /* Start from a clean slate: a previous run's stats must not be published
+       together with a failed/empty result (that reads as "0 chains, complete"). */
+    memset(&g_PtrStats, 0, sizeof(g_PtrStats));
+    /* Honour the client's --max: the engine stops at max_results and reports
+       truncated, which is exactly the advice the CLI gives when it fires. */
+    const u32 out_cap = opts.max_results ? opts.max_results : NXUS_PTRSCAN_MAX_RESULTS;
     int src = nxusPtrScan(regions, region_count, req.target_address, module_base, &opts,
-                          g_Chains, NXUS_PTRSCAN_MAX_RESULTS, &count,
+                          g_Chains, out_cap, &count,
                           nxusSessionReadCallback, NULL, scratch, 256 * 1024, &g_PtrStats, NULL);
 
     g_ChainCount = (src == NXUS_SCAN_OK) ? count : 0;
