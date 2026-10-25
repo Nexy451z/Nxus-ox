@@ -78,11 +78,17 @@ static atomic_bool g_HandoffBusy;
 static atomic_int  g_DebugOpUsers;
 static atomic_bool g_DebugClosing;
 
-/* Upper bound, in 1 ms steps, for the in-flight drain nxusDebugDetach() runs
-   before it closes the handle.  Unchanged at 500 ms: widening the guard to more
-   commands must not make a detach wait longer, it only makes more commands
-   visible to the same single bounded wait. */
-#define NXUS_DEBUG_OP_DRAIN_MS 500
+/* In-flight drain budget used by nxusDebugDetach() before it closes the handle,
+   in 1 ms steps and in two stages: 500 ms first (the original, unchanged budget),
+   then - only when something is still counted - a further 1500 ms, i.e. 2 s in
+   total.  Widening the guard to more commands must not make a healthy detach wait
+   longer, so stage 1 keeps its old length and stage 2 is only entered when stage 1
+   did not drain. */
+#define NXUS_DEBUG_OP_DRAIN_MS        500
+#define NXUS_DEBUG_OP_DRAIN_LATE_MS  1500
+/* 2000 ms: the number the staged drain is documented and logged with. */
+#define NXUS_DEBUG_OP_DRAIN_TOTAL_MS \
+    (NXUS_DEBUG_OP_DRAIN_MS + NXUS_DEBUG_OP_DRAIN_LATE_MS)
 
 static Result debugOpBegin(void) {
     if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire)) {
@@ -98,6 +104,21 @@ static Result debugOpBegin(void) {
 
 static void debugOpEnd(void) {
     atomic_fetch_sub_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
+}
+
+/* One bounded wait for the in-flight counter to reach zero: at most budget_ms
+   steps of 1 ms.  True as soon as nothing is counted any more - also when the
+   count drops during the very last step, so a drained set is never reported as
+   undrained - and false when the whole budget was spent with something still in
+   flight.  Only nxusDebugDetach() calls this, after g_DebugClosing is set: from
+   that point debugOpBegin() refuses new operations, so the count can only fall
+   and a second stage cannot be raced by an endless stream of new users. */
+static bool debugDrainWait(u32 budget_ms) {
+    for (u32 wait = 0; wait < budget_ms; wait++) {
+        if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) return true;
+        svcSleepThread(1000000ull);
+    }
+    return atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0;
 }
 
 /* Why the current stop exists.  The event loop uses it to tell an explicit
@@ -1370,33 +1391,83 @@ Result nxusDebugDetach(void) {
             NXUS_RESULT("ContinueDebugEvent (detach ack)", crc);
         }
 
-        /* Wait for in-flight debug operations: the handle number is reusable the
+        /* Wait for in-flight debug operations in two STAGES: 500 ms, then - only
+           if something is still counted - a further 1500 ms, 2000 ms in total
+           (NXUS_DEBUG_OP_DRAIN_TOTAL_MS).  The handle number is reusable the
            moment it is closed.  Every operation that touches g_Debug is counted
-           (see g_DebugOpUsers above), so this one bounded wait covers registers,
-           the thread list, continue/step/break and break set/clear as well as the
-           memory accessors.  The bound stays at NXUS_DEBUG_OP_DRAIN_MS in total:
-           adding commands to the count must not add a millisecond of waiting. */
+           (see g_DebugOpUsers above), so the staged wait covers registers, the
+           thread list, continue/step/break and break set/clear as well as the
+           memory accessors.
+         *
+         * Stage 1 is the original budget and stage 2 is only entered when stage 1
+           ran out, so a healthy detach waits exactly as long as before and a
+           contended one gets a second chance instead of closing straight away.
+           The detach flag stays set across both stages: no new operation can enter
+           while the count is going down.
+         *
+         * Why closing after the 2 s total is still safe when something IS counted:
+           - debugOpBegin() refuses every new operation from the moment the flag is
+             set, so the counted set can only shrink; nothing can join it during
+             either stage and no fresh syscall can be started on the handle.
+           - an already counted operation has at most a handful of non-blocking
+             svc*Debug* calls left.  Its longest internal wait is the bounded
+             step/stop wait (~42 ms), so 2 s is roughly fifty times the worst
+             legitimate holding time: a count that is still non-zero here means a
+             wedged thread or a leaked counter, not a syscall that is genuinely in
+             progress, and waiting longer would block the detach for ever without
+             making the close any safer.
+           - g_Debug is published as INVALID_HANDLE BEFORE the close below, so an
+             operation that reaches its syscall late cannot pick the old number up
+             again - it reads "no handle" and fails cleanly instead of naming a
+             recycled one.
+           The only theoretical residue is a thread that already loaded the old
+           handle value and was then starved for the whole 2 s before issuing the
+           call; the flag above keeps that from turning into a new user of the
+           session. */
         atomic_store_explicit(&g_DebugClosing, true, memory_order_release);
-        bool drained = false;
-        for (int wait = 0; wait < NXUS_DEBUG_OP_DRAIN_MS; wait++) {
-            if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) {
-                drained = true;
-                break;
+        bool drained = debugDrainWait(NXUS_DEBUG_OP_DRAIN_MS);
+        if (!drained) {
+            /* Stage 2 (1.5 s more, 2 s in total).  The detach flag is re-checked
+               instead of assumed: if anything cleared it, new operations would be
+               admitted while we are still draining and the count would never
+               reach zero. */
+            if (!atomic_load_explicit(&g_DebugClosing, memory_order_acquire)) {
+                atomic_store_explicit(&g_DebugClosing, true, memory_order_release);
             }
-            svcSleepThread(1000000ull);
+            if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) > 0) {
+                NXUS_LOG("debug detach: %d op(s) still in flight after %u ms - "
+                         "waiting up to %u ms more (%u ms in total)",
+                         (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire),
+                         (unsigned)NXUS_DEBUG_OP_DRAIN_MS,
+                         (unsigned)NXUS_DEBUG_OP_DRAIN_LATE_MS,
+                         (unsigned)NXUS_DEBUG_OP_DRAIN_TOTAL_MS);
+                drained = debugDrainWait(NXUS_DEBUG_OP_DRAIN_LATE_MS);
+            } else {
+                drained = true;
+            }
         }
         if (!drained) {
             /* Level 0: closing the handle below can let a still-running operation
                land on a recycled handle (a different kernel object).  Nothing else
-               in the log records this, so keep it at level 0. */
-            NXUS_LOG_ERROR("debug detach: %d debug op(s) still in flight after %d ms - "
-                           "closing the debug handle anyway",
+               in the log records this, so keep it at level 0 - and leave a
+               breadcrumb in g_LastResult as well: the next status reply then shows
+               BUSY instead of the last operation's Result, which is the only
+               in-band evidence a client has that the session was released while an
+               operation was still counted. */
+            NXUS_LOG_ERROR("debug detach: %d debug op(s) still in flight after %u ms "
+                           "(2 s staged drain) - closing the debug handle anyway",
                            (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire),
-                           (int)NXUS_DEBUG_OP_DRAIN_MS);
+                           (unsigned)NXUS_DEBUG_OP_DRAIN_TOTAL_MS);
+            g_LastResult = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
         }
-        svcCloseHandle(g_Debug);   /* detaches and resumes the target */
-        atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
+        /* Publish "no handle" BEFORE the close: an operation that is already
+           counted but has not issued its syscall yet then finds INVALID_HANDLE and
+           fails cleanly, instead of issuing a call with a number the close is
+           about to free for reuse. */
+        const Handle closing = g_Debug;
         g_Debug = INVALID_HANDLE;
+        svcCloseHandle(closing);   /* detaches and resumes the target */
+        atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
     }
 
     /* dmnt may still be tearing the old cheat process down: give it 50 ms, then
@@ -1907,7 +1978,7 @@ Result nxusDebugContinueAll(void) {
        svcContinueDebugEvent() and the re-arm all pass g_Debug to the kernel, and a
        detach that closed in the middle of them would leave the target stopped with
        a stale handle.  Bounded: the retries below add at most 8 ms, far inside
-       NXUS_DEBUG_OP_DRAIN_MS. */
+       the first 500 ms drain stage and inside the 2 s staged total either way. */
     Result op_rc = debugOpBegin();
     if (R_FAILED(op_rc)) return op_rc;
 
@@ -2033,8 +2104,9 @@ Result nxusDebugStep(u64 thread_id) {
     /* Counted against detach: the thread lookup, the context read/write and the
        resume/stop pair inside stepResumeAndStop() all issue syscalls on g_Debug.
        Holding the count for the whole step is what keeps the handle open until the
-       target has been stopped again (the worst case is ~42 ms of bounded waits, and
-       the drain in detach is a single 500 ms budget either way). */
+       target has been stopped again (the worst case is ~42 ms of bounded waits,
+       well inside the first 500 ms drain stage and inside the 2 s staged total
+       either way). */
     Result op_rc = debugOpBegin();
     if (R_FAILED(op_rc)) return op_rc;
 

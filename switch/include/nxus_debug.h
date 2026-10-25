@@ -52,7 +52,7 @@ bool   nxusDebugTargetIs64BitKnown(void);
 /* ---- detach safety -------------------------------------------------------
  * Every entry point below that hands the session handle to an svc*Debug* call is
  * counted by debugOpBegin()/debugOpEnd() in nxus_debug.c, and nxusDebugDetach()
- * waits for that counter to reach zero (one bounded 500 ms budget, unchanged) before
+ * waits for that counter to reach zero (a bounded two-stage drain (500 ms, then 1500 ms more; 2 s total)) before
  * it closes the handle.  That covers BreakSet/BreakClear (hardware arm through the
  * handle), Continue, Step, Break, ThreadList, RegsGet/RegsSet and the debug-mode
  * ContextID re-arm in nxusDebugConfigure(), as well as the memory accessors.

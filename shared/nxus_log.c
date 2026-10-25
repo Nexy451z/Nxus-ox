@@ -37,17 +37,42 @@ static u64    g_LogBytes = 0;
    crash diagnostics (nxusLogExit flushes) while cutting the write count by ~97%. */
 static u32    g_LogPending = 0;
 static u64    g_LogLastFlush = 0;
+/* armGetSystemTick() before which a failed open is not retried (see
+   logWriteLocked).  Declared here rather than next to its only writer because
+   nxusLogInit() clears it: a re-init must not inherit a stale backoff, or the
+   first lines after it would be dropped from the SD file for up to 10 s. */
+static u64    g_LogRetryAt = 0;
 #define NXUS_LOG_FLUSH_BYTES    4096u
 #define NXUS_LOG_FLUSH_INTERVAL 500000000ull   /* 500 ms in ns */
 #define NXUS_LOG_RETRY_NS       10000000000ull /* 10 s between open retries */
 
 void nxusLogInit(int write_to_sd) {
+    /* A second init (__appInit() plus the safety net at the top of main()) used to
+       overwrite the open FILE* and leak the descriptor together with whatever was
+       still buffered in it.  Flush and close it first - under the existing lock,
+       which any prior init has already initialised - and clear the pointer so
+       neither this function nor nxusLogExit() can ever close it twice. */
+    if (g_LogFile != NULL) {
+        mutexLock(&g_LogMutex);
+        if (g_LogFile != NULL) {
+            fflush(g_LogFile);
+            fclose(g_LogFile);
+            g_LogFile = NULL;
+        }
+        mutexUnlock(&g_LogMutex);
+    }
+
     mutexInit(&g_LogMutex);
     g_Ring[0] = 0;
     g_RingLen = 0;
     g_LogToSd = write_to_sd != 0;
     g_LogFile = NULL;
     g_LogBytes = 0;
+    /* Nothing is pending on a stream that was just closed, and the backoff of an
+       earlier failed open says nothing about the new one. */
+    g_LogPending = 0;
+    g_LogLastFlush = 0;
+    g_LogRetryAt = 0;
 }
 
 void nxusLogSetLevel(u32 level) {
@@ -95,8 +120,6 @@ static void logRotateLocked(void) {
     }
     (void)logOpenLocked("ab");
 }
-
-static u64 g_LogRetryAt = 0;
 
 static void logWriteLocked(const char *line, size_t len) {
     if (!g_LogToSd) return;

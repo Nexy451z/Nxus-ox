@@ -9,6 +9,9 @@ switch/source/nxus_server.c and core/nxus_scan.c, including:
     Unknown, change modes, UTF-16 / case-insensitive patterns, aligned walks)
   * the asynchronous scan worker: Running + progress_permille, BUSY while it
     runs, Cancel/Reset (opt in with MockSwitch(scan_async=True))
+  * a one-step scan undo (ScanUndo): a refine stores the pre-refine hit list,
+    ScanUndo restores it and answers NxusStatus, and with no stored baseline it
+    refuses with NXUS_ERR_BAD_STATE (nxusHitListUndo(), nxus_session.c:1995)
   * the asynchronous pointer scan: PtrScanBegin answers NXUS_ERR_PTRSCAN_STARTED
     (0x8003C808), PtrScanGet answers BUSY for async_ptrscan_polls reads and then
     publishes the chain list (opt in with mock.async_ptrscan = True)
@@ -384,6 +387,10 @@ class MockSwitch:
         self.target = MockTarget(money)
         self.watchdog_ms = watchdog_ms
         self.hits: list[tuple[int, int, bytes]] = []   # (mapping_idx, offset, value bytes)
+        # One-step undo point (nxusHitListUndo(), nxus_session.c:1995): ScanNext
+        # stores the list it is about to refine, ScanUndo restores it, and an
+        # empty list means "nothing to rewind" -> NXUS_ERR_BAD_STATE.
+        self.prev_scan_hits: list[tuple[int, int, bytes]] = []
         self.chains: list[dict] = []
         # Pointer scan: the console walks the chain graph on a worker thread
         # (nxus_server.c: ptrScanThread) and answers PtrScanBegin with
@@ -1020,13 +1027,13 @@ class MockSwitch:
         if cmd == P.CMD['ScanUndo']:
             if self._scan_running():
                 return self._error(P.ERR_BUSY)      # nxusSessionScanUndo()
-            if not getattr(self, 'prev_scan_hits', None):
+            if not self.prev_scan_hits:
                 return self._error(P.ERR_BAD_STATE)
             self.hits = list(self.prev_scan_hits)
             self.prev_scan_hits = []
             self.scan_state = P.SCAN_STATE['NxusScanState_Done']
             self.progress = 1000
-            return self._status()
+            return self._status()       # the firmware answers NxusStatus here
         if cmd == P.CMD['ScanGetHits']:
             # reading the hit arrays while the worker reallocs them would be a
             # use-after-free on the console, so it answers BUSY (nxus_server.c:1088)

@@ -40,6 +40,16 @@
 /* Pause between two rebuild bursts (see the server loop): without it a console
    with no network at all would run the 60 s burst back to back forever. */
 #define NXUS_NET_REBUILD_RETRY_PAUSE_NS 10000000000ull
+/* Upper bound for waiting on the server thread in nxusNetExit().  libnx has no
+   timed thread join, and the connection thread may be parked inside a long
+   handler (a pointer scan runs ~90 s), so waiting for it unconditionally used to
+   block __appExit() for minutes.  2 s is far more than a normal teardown needs
+   (one 200 ms poll slice plus the socket close), so anything longer means
+   "abandon it and let process exit reclaim the handle". */
+#define NXUS_NET_EXIT_WAIT_MS           2000u
+/* Granularity of that bounded wait: short enough that the exit returns as soon as
+   the thread raises its done flag, long enough that the poll loop stays free. */
+#define NXUS_NET_EXIT_POLL_NS           10000000ull
 
 static int             g_ListenFd = -1;
 static int             g_ClientFd = -1;
@@ -56,6 +66,13 @@ static u8             *g_RxBuffer = NULL;
    server thread is between its load and its clear can no longer be swallowed by
    a plain read-then-store (lost update). */
 static atomic_bool     g_ResetRequested = false;
+/* Raised by serverThread() as its very last statement, polled by nxusNetExit().
+   threadWaitForExit() cannot be given a timeout in libnx, so this flag is what
+   makes the shutdown bounded: the exit path joins/closes the thread only after
+   seeing it, and abandons the handle (reclaimed by process exit) when the
+   deadline expires.  atomic: written by the server thread, read by the exit
+   thread. */
+static atomic_bool     g_ServerDone = false;
 /* Last armGetSystemTick() at which a packet was received or sent completely.
    Written by the server/sender threads and read by the watchdog in main.c; an
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
@@ -695,6 +712,15 @@ static void serverThread(void *arg) {
         serveClient(fd);
         last_health = armGetSystemTick();
     }
+
+    /* Single exit path: the loop above is the whole body and every way out of it
+       is a `break`/loop-condition failure, so this is always reached.  It must be
+       the LAST statement - nxusNetExit() treats the flag as "the thread has
+       finished" and only then calls threadWaitForExit() (which returns at once)
+       and threadClose().  If a future return is added above it, the flag has to
+       be raised on that path as well or the exit would wait for the deadline and
+       abandon the handle. */
+    atomic_store_explicit(&g_ServerDone, true, memory_order_release);
 }
 
 /* ---- public API --------------------------------------------------------- */
@@ -708,6 +734,9 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     g_HandlerUser = user;
     g_Port = port;
     atomic_store_explicit(&g_ResetRequested, false, memory_order_relaxed);
+    /* Cleared before threadStart(): the flag is only meaningful for the thread
+       this Init is about to create. */
+    atomic_store_explicit(&g_ServerDone, false, memory_order_release);
     g_LastActivityTick = armGetSystemTick();
 
 #ifdef SIGPIPE
@@ -776,6 +805,22 @@ void nxusNetRequestReset(const char *reason) {
     mutexUnlock(&g_SendMutex);
 }
 
+/* Wait (bounded) for serverThread() to raise g_ServerDone.
+ *
+ * libnx's threadWaitForExit() has no timeout parameter, and the connection thread
+ * may sit inside a long handler (ptrscan is ~90 s), so an unconditional join made
+ * __appExit() block for minutes.  Polling the done flag in 10 ms steps caps that
+ * at `timeout_ms`: true means the thread already finished (or is finishing, so
+ * threadWaitForExit() returns immediately), false means the deadline expired. */
+static bool waitServerThreadDone(u32 timeout_ms) {
+    const u64 deadline = armGetSystemTick() + armNsToTicks((u64)timeout_ms * 1000000ull);
+    while (!atomic_load_explicit(&g_ServerDone, memory_order_acquire)) {
+        if (armGetSystemTick() >= deadline) return false;
+        svcSleepThread(NXUS_NET_EXIT_POLL_NS);
+    }
+    return true;
+}
+
 void nxusNetExit(void) {
     if (!g_Running) return;
     g_Running = false;
@@ -788,6 +833,22 @@ void nxusNetExit(void) {
     mutexUnlock(&g_SendMutex);
     if (g_ListenFd >= 0) shutdown(g_ListenFd, SHUT_RDWR);
 
+    /* Join, but only within a deadline.  A thread that raised the flag is joined
+       and closed normally; one that is still stuck in a handler is abandoned -
+       its handle, sockets, rx buffer and the bsd session are left to process exit
+       (which runs immediately after __appExit()), because closing a handle that is
+       still in use is far worse than leaking it until the process dies.  This is
+       a one-way door: nxusNetInit() must not be called afterwards while the old
+       thread is still alive (it would share g_ServerThread and g_ServerDone), which
+       the single boot-then-exit lifecycle in main.c guarantees. */
+    if (!waitServerThreadDone(NXUS_NET_EXIT_WAIT_MS)) {
+        NXUS_LOG_ERROR("net exit: server thread still busy after %u ms - abandoning it "
+                       "(handle/sockets are reclaimed by process exit)",
+                       (unsigned)NXUS_NET_EXIT_WAIT_MS);
+        return;
+    }
+
+    /* The flag is the thread's last statement, so this cannot block for long. */
     threadWaitForExit(&g_ServerThread);
     threadClose(&g_ServerThread);
 

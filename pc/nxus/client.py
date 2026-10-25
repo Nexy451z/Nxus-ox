@@ -309,6 +309,27 @@ class NxusClient:
         _, _, body = self.request(P.CMD['ScanNext'], payload)
         return self._status_from(body)
 
+    def scan_undo(self) -> dict | None:
+        """Rewind the hit list to the baseline the previous pass captured.
+
+        `ScanUndo` carries no payload: the console owns the one-step undo point
+        (`nxusHitListUndo()` in core/nxus_scan.c) and rewinds the list to it.  A
+        successful undo answers NxusStatus for the restored list
+        (nxus_server.c: NxusCmd_ScanUndo fills a status once the session returned
+        0), so it is returned the way `scan_next()` returns its own; a console
+        that answers nothing is accepted as "undone, no status", since the
+        command has no request body either.
+
+        `NXUS_ERR_BAD_STATE` - no undo point left (nothing to rewind, an undo
+        already spent, or a list that belongs to another target / mapping table)
+        - raises NxusError.  Returning silently would present the unchanged list
+        as a successful rewind.
+        """
+        _, _, body = self.request(P.CMD['ScanUndo'])
+        if not body:
+            return None
+        return self._status_from(body)
+
     def scan_status(self) -> dict:
         _, _, body = self.request(P.CMD['ScanStatus'])
         return self._status_from(body)

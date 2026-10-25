@@ -553,6 +553,75 @@ class ScanTruncation(unittest.TestCase):
         self.assertFalse(self.client.last_scan_truncated)
 
 
+class ScanUndoE2E(unittest.TestCase):
+    """ScanUndo has to rewind exactly one refine pass, and refuse by exception.
+
+    The console keeps a single one-step undo point (`nxusHitListUndo()`,
+    core/nxus_scan.c): a refine replaces the hit list, an undo restores the list
+    the previous pass captured - values included, because the rewound list is the
+    snapshot taken before the refine.  "No undo point" is an explicit
+    NXUS_ERR_BAD_STATE (nxus_session.c:1995-2018), so the client has to raise it
+    instead of handing back the unchanged list as a successful rewind.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def begin_money_scan(self, value: int = 6440) -> dict:
+        """A first pass that finds exactly the money address (no undo point yet)."""
+        self.server.target.set_money(value)
+        self.client.scan_reset()
+        st = self.client.scan_begin(value, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(st['hits'], 1)
+        return st
+
+    def test_undo_restores_the_previous_pass(self):
+        self.begin_money_scan(6440)
+        self.server.target.set_money(3940)
+        st = self.client.scan_next(cmp_mode=P.CMP['NxusCmp_Decreased'])
+        self.assertEqual(st['hits'], 1)
+
+        st = self.client.scan_undo()
+        self.assertIsNotNone(st, 'ScanUndo answered no status at all')
+        self.assertEqual(st['hits'], 1, 'the undo did not restore the hit list')
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['count'], 1)
+        self.assertEqual(batch['hits'][0]['address'], MONEY_ADDRESS)
+        self.assertEqual(batch['hits'][0]['value'], 6440,
+                         'the rewound list must be the pre-refine snapshot')
+        self.assertEqual(batch['session'], self.server.session_id,
+                         'an undo must not invalidate the scan session')
+
+        # the undo point is spent: a second undo has nothing left to rewind
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_undo()
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BAD_STATE))
+
+    def test_undo_without_a_history_is_a_bad_state(self):
+        # a fresh session has no pass at all ...
+        self.client.scan_reset()
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_undo()
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BAD_STATE))
+
+        # ... and a first pass has captured no baseline to rewind to either
+        self.begin_money_scan(6440)
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_undo()
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BAD_STATE))
+        self.assertEqual(self.client.scan_status()['hits'], 1,
+                         'a refused undo must not discard the current hit list')
+
+
 class FaultInjectionE2E(unittest.TestCase):
     """The PC error paths a happy-path scan can never reach.
 

@@ -123,6 +123,29 @@ error into a success — merely because a field is missing.
   | Pointer scan is huge | It now runs on a worker thread: `PtrScanBegin` answers immediately, the client polls `PtrScanGet` (250 ms) while the console keeps serving other commands, and the walk stops after 90 s returning the partial chains flagged as truncated. |
   | SD card missing or full | The module still starts and serves over TCP (RAM only); the log lives in the RAM ring, readable with `nxus log`. A stale `scan_base.bin` from a previous boot is deleted at startup. |
   | Something is genuinely stuck | Hold `POWER` to force-off, then boot hekate and remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` to stop the module from starting. |
+
+  **Shutdown path — `__appExit()` is not a stop button.** `main()` ends in an
+  infinite `while (true)` watchdog loop (`switch/source/main.c`), and no protocol
+  command stops the process: a boot2 sysmodule is meant to serve until the console
+  goes down. `__appExit()` therefore runs **only when the process itself is
+  terminated** — that is, through libnx's `__libnx_exit` (a fatal error or an
+  explicit `svcExitProcess`), never on a normal `nxus` command. In normal
+  operation the module stops **only with a reboot** (or a power-off / removing
+  `boot2.flag`, as in the "genuinely stuck" row above); there is no "quit",
+  "shutdown" or "unload" command to document, and none is planned for the wire
+  protocol.
+
+  The teardown that `__appExit()` performs is consequently a **best-effort** path
+  taken at process exit, not a guaranteed clean shutdown: HID join → server
+  (cancel + join the pointer-scan worker, cancel the scan, join the scan worker
+  and release the session) → debug (join the event thread, close the handle, hand
+  the process back to `dmnt`) → net (`shutdown` the socket and join the
+  connection thread) → `dmnt:cht` close → log close last. The order matters
+  because each step still reads what the later ones destroy, but a hard power-off
+  or a crash skips all of it: the joins and closes only happen when the process
+  actually reaches `__libnx_exit`, so treat them as cleanup-on-exit rather than as
+  something a client can trigger.
+
  The console refreshes the cached `pid` / `title id` / `main NSO base` from `dmnt:cht` at most once per second (and right after `forceopen`), and `nxus status` reports that cache, so the target identity no longer stays at zero after the game is (re)started.
 
 ### 3. GDB-Style Disassembler & Live Code Patcher (CLI + GUI)
@@ -281,7 +304,7 @@ Nxus-ox/
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (119 tests)
+    tests/    Cross-language protocol parity & end-to-end test suite (121 tests)
   tests/      Host C unit test suite (1,633 checks across 8 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
@@ -311,6 +334,6 @@ cd tests && bash run_tests.sh
 # 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (119 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (121 tests)
 cd pc && python -m unittest discover -s tests
 ```
