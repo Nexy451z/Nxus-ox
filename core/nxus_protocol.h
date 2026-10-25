@@ -27,9 +27,22 @@
 #define NXUS_MAKE_RESULT(desc) \
     ((u32)(0x80000000u | ((NXUS_RESULT_MODULE & 0x1FFu) << 9) | ((u32)(desc) & 0x1FFu)))
 
+/* ---- error-reply reasons ----
+   An error reply carries the s32 Result and MAY append one u32 reason code
+   saying which validation refused the request.  The tail is optional: older
+   servers send only the Result (4 bytes) and older clients read only the first
+   4 bytes, so both directions stay wire-compatible.  NXUS_REASON_NONE is never
+   sent - a missing tail already means "no detail available". */
+#define NXUS_REASON_NONE            0u
+#define NXUS_REASON_BAD_LENGTH      1u   /* payload shorter than the request struct */
+#define NXUS_REASON_BAD_INDEX       2u   /* index/slot outside the available range */
+#define NXUS_REASON_BAD_BLOCK_SIZE  3u   /* snapshots captured with different blocks */
+#define NXUS_REASON_BUSY_STATE      4u   /* request arrived mid-scan / mid-pause */
+#define NXUS_REASON_NO_MAPPINGS     5u   /* no mapping table yet: attach/scan first */
+
 /* ---- packet header flags ---- */
 #define NXUS_FLAG_ASYNC       0x0001u  /* Switch-initiated event; seq is not a request id */
-#define NXUS_FLAG_ERROR       0x0002u  /* payload is s32 Result */
+#define NXUS_FLAG_ERROR       0x0002u  /* payload is s32 Result [+ optional u32 reason] */
 #define NXUS_FLAG_MORE        0x0004u  /* payload continues in the next packet */
 
 typedef struct NXUS_PACKED {

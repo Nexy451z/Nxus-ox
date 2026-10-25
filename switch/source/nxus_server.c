@@ -66,6 +66,50 @@ static bool pauseIsViaDebug(void);
 static bool pauseTryEnter(void);
 static void pauseLeave(void);
 
+/* Frozen addresses Nxus itself enabled.  dmnt keeps writing them forever, so if
+   the PC disappears while some are frozen the only way out is a console reboot -
+   unless we remember what we froze and release it ourselves.  The dmnt frozen
+   table is capped at 0x80 entries, which is what this array mirrors. */
+#define NXUS_FROZEN_OWNED_MAX 128
+static u64 g_FrozenOwned[NXUS_FROZEN_OWNED_MAX];
+static u32 g_FrozenOwnedCount;
+
+static void frozenOwnedAdd(u64 address) {
+    for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
+        if (g_FrozenOwned[i] == address) return;
+    }
+    if (g_FrozenOwnedCount >= NXUS_FROZEN_OWNED_MAX) {
+        NXUS_LOG("frozen: ownership table full - cannot track %016llX for cleanup",
+                 (unsigned long long)address);
+        return;
+    }
+    g_FrozenOwned[g_FrozenOwnedCount++] = address;
+}
+
+static void frozenOwnedRemove(u64 address) {
+    for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
+        if (g_FrozenOwned[i] == address) {
+            g_FrozenOwned[i] = g_FrozenOwned[--g_FrozenOwnedCount];
+            return;
+        }
+    }
+}
+
+static void releaseOwnedFrozen(void) {
+    if (g_FrozenOwnedCount == 0) return;
+    if (nxusDebugIsAttached()) return;   /* dmnt is closed: nothing to disable */
+    NXUS_LOG("frozen: releasing %u address(es) - the client is gone",
+             (unsigned)g_FrozenOwnedCount);
+    for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
+        Result rc = nxusDmntDisableFrozen(g_FrozenOwned[i]);
+        if (R_FAILED(rc)) {
+            NXUS_LOG("frozen: release of %016llX failed rc=0x%08X",
+                     (unsigned long long)g_FrozenOwned[i], (unsigned)rc);
+        }
+    }
+    g_FrozenOwnedCount = 0;
+}
+
 /* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
 #define NXUS_PTRSCAN_MAX_RESULTS 64
 static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
@@ -230,6 +274,19 @@ static void reply(int fd, u16 type, u32 seq, const void *payload, u32 length) {
 static void replyError(int fd, u16 type, u32 seq, Result rc) {
     s32 value = (s32)rc;
     nxusNetSendFd(fd, type, NXUS_FLAG_ERROR, seq, &value, sizeof(value));
+}
+
+/* Error reply with a machine-readable reason: the s32 Result followed by one
+   u32 NXUS_REASON_* word.  Older clients read only the Result (the first 4
+   bytes) and ignore the tail, and older servers send only the Result, so this
+   stays compatible in both directions.  Used for the argument-validation
+   failures where "result=0x80000186" alone does not tell the user what to fix;
+   OOM / dmnt / IPC errors still go through replyError(). */
+static void replyErrorReason(int fd, u16 type, u32 seq, Result rc, u32 reason) {
+    s32 value[2];
+    value[0] = (s32)rc;
+    value[1] = (s32)reason;
+    nxusNetSendFd(fd, type, NXUS_FLAG_ERROR, seq, value, sizeof(value));
 }
 
 /* How long the console waits for a command before it assumes the PC is gone. */
@@ -556,7 +613,8 @@ static Result serverResume(void) {
 
 static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
     const NxusMappingTable *maps = nxusSessionMappings();
-    if (maps == NULL || maps->count == 0) return 0;
+    if (maps == NULL) return 0;                       /* NULL never pins */
+    if (maps->count == 0) { nxusSessionViewRelease(); return 0; }
 
     u32 found = 0;
     u8 page[0x200];
@@ -583,6 +641,7 @@ static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
             break;
         }
     }
+    nxusSessionViewRelease();
     return found;
 }
 
@@ -590,6 +649,10 @@ static u32 collectModules(NxusModuleInfo *out, u32 max_modules) {
 
 static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_base) {
     const NxusMappingTable *maps = nxusSessionMappings();
+    if (maps == NULL) {          /* NULL never pins; the caller reports NO_MAPPINGS */
+        *out_module_base = nxusSessionMainBase();
+        return 0;
+    }
     const u64 module_base = nxusSessionMainBase();
     const u64 module_end = module_base + nxusSessionMainSize();
     *out_module_base = module_base;
@@ -610,6 +673,7 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
         out[n].reserved = m->reserved;
         n++;
     }
+    nxusSessionViewRelease();
     return n;
 }
 
@@ -690,7 +754,8 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     /* nxusSessionMappings() publishes NULL when there is no table (never
        snapshotted, or already released), so the count needs the NULL guard. */
     if (maps == NULL || maps->count == 0) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS));
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS),
+                         NXUS_REASON_NO_MAPPINGS);
         return;
     }
 
@@ -769,7 +834,8 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
     NxusCheatExportRequest req;
     memcpy(&req, payload, sizeof(req));
     if (req.index >= g_ChainCount) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                         NXUS_REASON_BAD_INDEX);
         return;
     }
 
@@ -796,6 +862,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
        client from crashing the whole sysmodule. */
     if (hits == NULL) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        nxusSessionViewRelease();
         return;
     }
 
@@ -814,6 +881,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
                             (u64)count * (u64)sizeof(NxusHit);
     if (payload_u64 > (u64)NXUS_NET_BUF_SIZE) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
+        nxusSessionViewRelease();
         return;
     }
     const u32 payload_size = (u32)payload_u64;
@@ -821,6 +889,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     u8 *buffer = (u8 *)malloc(payload_size);
     if (buffer == NULL) {
         replyError(fd, NxusCmd_ScanGetHits, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
+        nxusSessionViewRelease();
         return;
     }
 
@@ -863,6 +932,7 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
 
     reply(fd, NxusCmd_ScanGetHits, seq, buffer, payload_size);
     free(buffer);
+    nxusSessionViewRelease();
 }
 
 /* ---- main dispatch ----------------------------------------------------- */
@@ -965,6 +1035,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                    svcQueryDebugProcessMemory instead of failing. */
                 const NxusMappingTable *table = nxusSessionMappings();
                 count = table ? table->count : 0;
+                if (table != NULL) nxusSessionViewRelease();
                 reply(fd, type, seq, &count, sizeof(count));
                 break;
             }
@@ -1006,6 +1077,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                         buffer[got].perm = m->reserved;
                         got++;
                     }
+                    nxusSessionViewRelease();   /* table != NULL here: it pinned */
                 }
             } else {
                 rc = nxusDmntGetMappings(buffer, max_count, (size_t)req.offset, &got);
@@ -1042,7 +1114,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_Read: {
-            if (length < sizeof(NxusReadRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusReadRequest)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusReadRequest req;
             memcpy(&req, payload, sizeof(req));
             u32 size = req.size;
@@ -1228,7 +1304,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* The worker reallocs the hit arrays while it runs; reading them from
                the connection thread would be a use-after-free. */
             if (nxusSessionScanState() == NxusScanState_Running) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
+                                 NXUS_REASON_BUSY_STATE);
                 break;
             }
             if (length < sizeof(NxusGetHitsRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
@@ -1275,6 +1352,27 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             NxusSnapshotSummary summary;
             memset(&summary, 0, sizeof(summary));
+            /* nxusSnapshotCompare() refuses A/B captures with different block
+               sizes, but a bare BAD_STATE Result does not say why.  Mirror that
+               check through the public summaries first so the client gets the
+               reason code; the success path is untouched (an uncaptured slot
+               reports 0, so only two real captures can mismatch). */
+            NxusSnapshotSummary from_sum, to_sum;
+            /* GetSummary() leaves the struct untouched for slot > 1, which a
+               corrupt client can send; zero first so the check never reads
+               uninitialised stack. */
+            memset(&from_sum, 0, sizeof(from_sum));
+            memset(&to_sum, 0, sizeof(to_sum));
+            nxusSnapshotGetSummary(from_slot, &from_sum);
+            nxusSnapshotGetSummary(to_slot, &to_sum);
+            if (from_sum.block_size != 0 && to_sum.block_size != 0 &&
+                from_sum.block_size != to_sum.block_size) {
+                NXUS_LOG("snapshot diff: block size mismatch (%u vs %u) - reporting the reason",
+                         (unsigned)from_sum.block_size, (unsigned)to_sum.block_size);
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_BLOCK_SIZE);
+                break;
+            }
             rc = nxusSnapshotCompare(from_slot, to_slot, &summary);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
             else reply(fd, type, seq, &summary, sizeof(summary));
@@ -1387,7 +1485,10 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             rc = nxusDmntEnableFrozen(req.address, req.width, &value);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
-            else reply(fd, type, seq, &value, sizeof(value));
+            else {
+                frozenOwnedAdd(req.address);
+                reply(fd, type, seq, &value, sizeof(value));
+            }
             break;
         }
 
@@ -1403,7 +1504,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             rc = nxusDmntDisableFrozen(address);
-            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
+            else {
+                frozenOwnedRemove(address);
+                reply(fd, type, seq, NULL, 0);
+            }
             break;
         }
 
@@ -1759,7 +1864,26 @@ static void reapExitedDebugSession(void) {
     pauseLeave();
 }
 
+/* How long a frozen address may outlive its client before Nxus releases it.  Long
+   enough to survive a client restart, short enough that the user does not need a
+   reboot when the PC crashed. */
+#define NXUS_FROZEN_RELEASE_AFTER_MS 30000ull
+
 void nxusServerTick(void) {
+    {
+        static u64 last_client_ms;
+        const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+        if (nxusNetClientFd() >= 0) {
+            last_client_ms = now_ms;
+        } else if (g_FrozenOwnedCount > 0) {
+            /* No client: a fresh boot has no timestamp yet, so start the grace
+               window on the first tick without one. */
+            if (last_client_ms == 0 || now_ms - last_client_ms >= NXUS_FROZEN_RELEASE_AFTER_MS) {
+                releaseOwnedFrozen();
+            }
+        }
+    }
+
     /* Checked first: a long handler (snapshot, pointer scan) blocks the
        connection thread, so both the pause watchdog and the stale-session
        reaper would otherwise fire in the middle of it -- the reaper even closes

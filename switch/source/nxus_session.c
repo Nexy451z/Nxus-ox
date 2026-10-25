@@ -111,15 +111,57 @@ static void sessionStateStore(NxusScanState state) {
  * The old atomic_thread_fence()s were useless here: a fence only orders atomic
  * operations, so the plain pointer/count stores stayed free to be observed torn
  * apart.  The "clear before free" rule stays - the published pair is emptied
- * before free(), so a reader that loses the race anywhere still sees either the
- * old live block or an explicitly empty view, never a pointer into freed memory.
+ * before the block is released, so a reader that loses the race anywhere still
+ * sees either the old view or an explicitly empty one, never a pointer into
+ * memory that is already back in the allocator.
  *
  * Writers are all on the server thread (publish / drop / buildRegions), so the
- * two views can share a single counter without a lock of their own.
+ * two views can share a single seqlock counter without a lock of their own.
+ *
+ * A consistent sample is still only a sample: the block it points at stays the
+ * same memory until somebody replaces it.  Callers outside the connection thread
+ * (the snapshot service keeps the region list for a whole capture, and any future
+ * reader may walk the mapping table) outlive the next publish, so the returned
+ * block must not be freed under them.  Two counters make that safe:
+ *
+ *   - g_ViewReaders counts outstanding view pins.  A reader pins BEFORE it
+ *     samples and drops the pin with nxusSessionViewRelease() when it is done
+ *     (see the contract in nxus_session.h),
+ *   - a writer never frees the block it just replaced: it parks it in
+ *     g_ViewRetired[] (4 generations) and frees the ring only when it observes
+ *     g_ViewReaders == 0 - immediately at retire time or later from the last
+ *     release.
+ *
+ * A caller that never releases keeps its pin forever, which is exactly the safe
+ * side: the block is retained (never reused by a later publish) and the ring
+ * simply fills up, after which further old blocks are kept instead of freed and a
+ * log line reports the growing count.  Memory is recoverable at Exit; a
+ * use-after-free is not.  Such callers should be migrated to release the view.
  */
 #define NXUS_VIEW_RETRY 8u
+/* Retired blocks kept while a pin is outstanding.  A publish happens once per
+   scan / snapshot and a reader holds its pin for one request, so four generations
+   are never actually needed - the ring is a safety valve, not a queue. */
+#define NXUS_VIEW_RETIRE_MAX 4u
 
 static atomic_uint g_ViewSeq;
+/* Outstanding pins (see above).  Incremented before a view is sampled, dropped by
+   nxusSessionViewRelease(); a block is handed back to the allocator only while
+   this is zero. */
+static atomic_uint g_ViewReaders;
+
+typedef struct {
+    void *block;
+    const char *kind;      /* "mappings" / "regions", for diagnostics */
+} NxusRetiredView;
+
+static NxusRetiredView g_ViewRetired[NXUS_VIEW_RETIRE_MAX];
+static u32  g_ViewRetiredCount;
+static u64  g_ViewLeaked;            /* blocks kept alive past the ring (never freed) */
+/* Guards the ring itself.  The writers live on the server thread, but the last
+   nxusSessionViewRelease() may run on a reader thread and drain it. */
+static Mutex g_ViewRetireMutex;
+static bool  g_ViewRetireInited;
 
 static void viewUpdateBegin(void) {
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* odd */
@@ -129,6 +171,107 @@ static void viewUpdateEnd(void) {
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* even */
 }
 
+/* Take a pin before touching the published pair, so a writer that retires the
+   block can never observe zero readers while this one is sampling. */
+static void viewPin(void) {
+    atomic_fetch_add_explicit(&g_ViewReaders, 1u, memory_order_acq_rel);
+}
+
+/* Drop one pin, clamped at zero: an unmatched extra release must not wrap the
+   counter, which would disable retirement for the rest of the session. */
+static void viewReleasePin(void) {
+    u32 cur = atomic_load_explicit(&g_ViewReaders, memory_order_acquire);
+    while (cur > 0) {
+        if (atomic_compare_exchange_weak_explicit(&g_ViewReaders, &cur, cur - 1u,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+            break;
+        }
+    }
+}
+
+/* Caller holds g_ViewRetireMutex.  Re-checks the pin count under the lock: a
+   reader may have pinned between the caller's first observation and the lock, and
+   its pin is what keeps the ring blocks reachable. */
+static void viewDrainLocked(void) {
+    if (atomic_load_explicit(&g_ViewReaders, memory_order_acquire) != 0) return;
+    for (u32 i = 0; i < g_ViewRetiredCount; i++) {
+        free(g_ViewRetired[i].block);
+        g_ViewRetired[i].block = NULL;
+        g_ViewRetired[i].kind = NULL;
+    }
+    g_ViewRetiredCount = 0;
+}
+
+static void viewDrainIfUnpinned(void) {
+    if (!g_ViewRetireInited) return;
+    if (atomic_load_explicit(&g_ViewReaders, memory_order_acquire) != 0) return;
+    mutexLock(&g_ViewRetireMutex);
+    viewDrainLocked();
+    mutexUnlock(&g_ViewRetireMutex);
+}
+
+/* Park a block that was just unpublished.  It is freed right away when nobody
+   pins a view; otherwise it waits in the ring for the last release. */
+static void viewRetire(void *block, const char *kind) {
+    if (block == NULL) return;
+    if (!g_ViewRetireInited) { free(block); return; }
+
+    /* Store-load barrier: the publication above (new pointer + count, then the
+       even g_ViewSeq) is complete, and this makes it visible before the pin count
+       is inspected below.  A reader that is not counted as pinned therefore cannot
+       still be looking at the block being retired.  (The seqlock still does the
+       consistency work; this fence only orders "published" against "freed".) */
+    atomic_thread_fence(memory_order_seq_cst);
+
+    mutexLock(&g_ViewRetireMutex);
+    if (g_ViewRetiredCount == NXUS_VIEW_RETIRE_MAX) {
+        /* Ring full: keep the block instead of freeing it under a live reader, i.e.
+           a leak rather than a use-after-free.  Logged at the first overflow and
+           then every 64 blocks, so a caller that never releases its pins shows up
+           as a growing count instead of a silent heap exhaustion. */
+        g_ViewLeaked++;
+        const bool log = (g_ViewLeaked == 1u) || ((g_ViewLeaked % 64u) == 0u);
+        const u64 leaked = g_ViewLeaked;
+        const u32 pins = atomic_load_explicit(&g_ViewReaders, memory_order_acquire);
+        mutexUnlock(&g_ViewRetireMutex);
+        if (log) {
+            NXUS_LOG("view: retire ring full (%u blocks, %u pin(s), %llu kept alive) - "
+                     "not freeing the old %s block under a reader",
+                     (unsigned)NXUS_VIEW_RETIRE_MAX, (unsigned)pins,
+                     (unsigned long long)leaked, kind);
+        }
+        return;
+    }
+    g_ViewRetired[g_ViewRetiredCount].block = block;
+    g_ViewRetired[g_ViewRetiredCount].kind = kind;
+    g_ViewRetiredCount++;
+    viewDrainLocked();
+    mutexUnlock(&g_ViewRetireMutex);
+}
+
+/* Release the pin taken by a successful nxusSessionMappings()/Regions() call and
+   free the ring if this was the last reader. */
+void nxusSessionViewRelease(void) {
+    viewReleasePin();
+    viewDrainIfUnpinned();
+}
+
+/* Exit is terminal for views: hand every retained block back even when a caller
+   never released its pin, because Exit invalidates every pointer handed out
+   before it (nxus_session.h). */
+static void viewRetireFlush(void) {
+    if (!g_ViewRetireInited) return;
+    mutexLock(&g_ViewRetireMutex);
+    for (u32 i = 0; i < g_ViewRetiredCount; i++) {
+        free(g_ViewRetired[i].block);
+        g_ViewRetired[i].block = NULL;
+        g_ViewRetired[i].kind = NULL;
+    }
+    g_ViewRetiredCount = 0;
+    mutexUnlock(&g_ViewRetireMutex);
+}
+
 static void mappingSnapshotDrop(void) {
     NxusMappingEntry *old = g_Session.map_entries;
     viewUpdateBegin();
@@ -136,7 +279,7 @@ static void mappingSnapshotDrop(void) {
     g_Session.maps.count = 0;
     g_Session.map_entries = NULL;
     viewUpdateEnd();
-    free(old);
+    viewRetire(old, "mappings");
 }
 
 static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
@@ -146,7 +289,7 @@ static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
     viewUpdateEnd();
-    free(old);
+    viewRetire(old, "mappings");
 }
 
 static void regionListDrop(void) {
@@ -155,7 +298,7 @@ static void regionListDrop(void) {
     g_Session.regions = NULL;
     g_Session.region_count = 0;
     viewUpdateEnd();
-    free(old);
+    viewRetire(old, "regions");
 }
 
 /* Publish a freshly built list (buildRegions) as one pair, never as a pointer
@@ -166,7 +309,7 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
     g_Session.regions = regions;
     g_Session.region_count = count;
     viewUpdateEnd();
-    free(old);
+    viewRetire(old, "regions");
 }
 
 /* ---- baseline store (SD card, RAM fallback) ---------------------------- */
@@ -328,10 +471,18 @@ static bool g_Inited;
 void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     if (g_Inited) return;      /* already initialised: keep the live session */
     mutexInit(&g_SessionMutex);
+    mutexInit(&g_ViewRetireMutex);
     memset(&g_Session, 0, sizeof(g_Session));
     atomic_init(&g_Session.state, NxusScanState_Idle);
     atomic_init(&g_Session.cancel, 0);
     atomic_init(&g_ViewSeq, 0);   /* both published views start empty/stable */
+    /* A fresh session starts with no pins and an empty retire ring: Exit() freed
+       every block it knew about, and the published views are gone with the memset
+       above (see the view contract in nxus_session.h). */
+    atomic_init(&g_ViewReaders, 0);
+    g_ViewRetiredCount = 0;
+    g_ViewLeaked = 0;
+    g_ViewRetireInited = true;
     g_Session.chunk_size = chunk_size ? chunk_size : NXUS_SESSION_DEFAULT_CHUNK;
     g_Session.max_hits = max_hits ? max_hits : NXUS_SESSION_DEFAULT_MAXHITS;
     g_Session.window_size = NXUS_SESSION_DEFAULT_WINDOW;
@@ -357,6 +508,14 @@ void nxusSessionExit(void) {
     mappingSnapshotDrop();
     regionListDrop();
     sessionStateStore(NxusScanState_Idle);
+    /* Exit is terminal for views, so the retire ring is emptied even when a pin
+       was never released: after this point no earlier pointer may be used. */
+    const u32 pinned = atomic_load_explicit(&g_ViewReaders, memory_order_acquire);
+    if (pinned != 0) {
+        NXUS_LOG("view: exit with %u unreleased pin(s) - freeing the retire ring",
+                 (unsigned)pinned);
+    }
+    viewRetireFlush();
     g_Inited = false;
 }
 
@@ -413,21 +572,38 @@ const NxusHitList *nxusSessionHits(void) {
 }
 
 /* Never returns a dangling table: the pair is only readable while g_ViewSeq is
-   stable, mappingSnapshotDrop() clears it before free(), and the retry loop
-   rejects a sample that raced with an update - so the caller sees either one
-   consistent snapshot or an empty view.  Callers must tolerate NULL (= no
-   snapshot / after Exit) and must run behind the BUSY gate (the pointer scan and
-   the module walk read the array the worker is using); the returned table is the
-   live one, not a copy. */
+   stable, mappingSnapshotDrop() clears it before the block is retired, and the
+   retry loop rejects a sample that raced with an update - so the caller sees
+   either one consistent snapshot or an empty view.  Callers must tolerate NULL
+   (= no snapshot / after Exit) and must run behind the BUSY gate (the pointer
+   scan and the module walk read the array the worker is using).
+ *
+ * A non-NULL return PINS the sampled block: g_ViewReaders is already incremented,
+ * so a concurrent publish parks the old block instead of freeing it, and the
+ * caller owns one release (nxusSessionViewRelease()) when it stops using the
+ * table.  A caller that never releases stays memory-safe - the block is simply
+ * never freed - but keeps the retire ring occupied (see the contract in
+ * nxus_session.h).  NULL takes no pin, so it must not be released. */
 const NxusMappingTable *nxusSessionMappings(void) {
     for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
+        /* Pin first: a writer that retires the block then observes a reader. */
+        viewPin();
         const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
-        if ((seq & 1u) != 0) continue;              /* update in progress */
+        if ((seq & 1u) != 0) {                      /* update in progress */
+            viewReleasePin();
+            continue;
+        }
         NxusMappingEntry *const entries = g_Session.maps.entries;
         const u32 count = g_Session.maps.count;
-        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
-        if (count == 0 || entries == NULL) return NULL;
-        return &g_Session.maps;
+        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) {
+            viewReleasePin();
+            continue;
+        }
+        if (count == 0 || entries == NULL) {
+            viewReleasePin();                       /* empty view takes no pin */
+            return NULL;
+        }
+        return &g_Session.maps;   /* pin held until nxusSessionViewRelease() */
     }
     return NULL;   /* kept losing the race: report "no table" instead of a torn pair */
 }
@@ -601,20 +777,35 @@ Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end) {
    behind the server's BUSY gate, because preparing a new scan rebuilds this list
    under the running engine.  The pair is sampled behind the seqlock, so a clear
    or a rebuild is reported as one consistent (NULL, 0) / (list, count) instead of
-   a pointer from one publication paired with the count of another. */
+   a pointer from one publication paired with the count of another.
+ *
+ * A non-NULL return pins the list exactly like nxusSessionMappings(): the snapshot
+ * service holds it for a whole capture, so the publish that follows must retain
+ * the block instead of freeing it.  The caller releases with
+ * nxusSessionViewRelease() when it is done with the returned list; NULL takes no
+ * pin (out_count is then 0). */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count) {
     for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
+        /* Pin first: a writer that retires the list then observes a reader. */
+        viewPin();
         const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
-        if ((seq & 1u) != 0) continue;              /* update in progress */
+        if ((seq & 1u) != 0) {                      /* update in progress */
+            viewReleasePin();
+            continue;
+        }
         const NxusScanRegion *regions = g_Session.regions;
         const u32 count = g_Session.region_count;
-        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
+        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) {
+            viewReleasePin();
+            continue;
+        }
         if (regions == NULL || count == 0) {
+            viewReleasePin();                       /* empty view takes no pin */
             if (out_count != NULL) *out_count = 0;
             return NULL;
         }
         if (out_count != NULL) *out_count = count;
-        return regions;
+        return regions;   /* pin held until nxusSessionViewRelease() */
     }
     if (out_count != NULL) *out_count = 0;
     return NULL;   /* kept losing the race: report "no list" instead of a torn pair */

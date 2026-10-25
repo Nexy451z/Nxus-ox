@@ -333,6 +333,42 @@ pub fn net_error_text(e: &std::io::Error) -> String {
     }
 }
 
+/// Human-readable text for the optional reason word of an error reply.
+///
+/// Mirror of `NXUS_REASON_*` in core/nxus_protocol.h: a current console appends
+/// one u32 reason after the Result, older ones send only the Result (no tail,
+/// so no text).  A number this build does not know is still reported by value
+/// rather than dropped, which keeps a newer console's codes visible.
+fn error_reason_text(reason: u32) -> Option<&'static str> {
+    match reason {
+        1 => Some("payload too short for this command"),
+        2 => Some("index or slot out of range"),
+        3 => Some("snapshot block sizes differ"),
+        4 => Some("busy: a scan or pause/resume is in progress"),
+        5 => Some("no mappings yet: attach to the process and scan first"),
+        _ => None,
+    }
+}
+
+/// Build the client error for a `FLAG_ERROR` reply.
+///
+/// The payload is the s32 Result, optionally followed by one u32 reason code
+/// (see [`error_reason_text`]).  A short or reason-less payload keeps the old
+/// message exactly ("command 0x.... failed"), so a console that predates the
+/// reason word still produces the familiar text.
+fn error_from_reply(cmd: u16, body: &[u8]) -> NxusError {
+    let rc = if body.len() >= 4 { rd_u32(body, 0) } else { 0 };
+    let mut message = format!("command 0x{:04X} failed", cmd);
+    if body.len() >= 8 {
+        let reason = rd_u32(body, 4);
+        match error_reason_text(reason) {
+            Some(text) => message.push_str(&format!(" - {} (reason={})", text, reason)),
+            None => message.push_str(&format!(" (reason={})", reason)),
+        }
+    }
+    NxusError { message, result: Some(rc) }
+}
+
 impl NxusClient {
     pub fn connect(host: &str, port: u16) -> Result<NxusClient> {
         let stream = connect_with_timeout(host, port)?;
@@ -411,8 +447,7 @@ impl NxusClient {
         match rx.recv_timeout(timeout) {
             Ok(Some((_kind, flags, body))) => {
                 if flags & FLAG_ERROR != 0 {
-                    let rc = if body.len() >= 4 { rd_u32(&body, 0) } else { 0 };
-                    return Err(NxusError { message: format!("command 0x{:04X} failed", cmd), result: Some(rc) });
+                    return Err(error_from_reply(cmd, &body));
                 }
                 Ok((cmd, body))
             }
@@ -1134,4 +1169,62 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{error_from_reply, error_reason_text};
+    use crate::protocol::put_u32;
+
+    fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_u32(&mut body, rc);
+        if let Some(reason) = reason {
+            put_u32(&mut body, reason);
+        }
+        body
+    }
+
+    #[test]
+    fn error_without_reason_reads_like_before() {
+        let e = error_from_reply(0x0013, &error_body(0x8000_0186, None));
+        assert_eq!(e.message, "command 0x0013 failed");
+        assert_eq!(e.result, Some(0x8000_0186));
+    }
+
+    #[test]
+    fn error_with_reason_names_the_validation() {
+        let e = error_from_reply(0x0032, &error_body(0x8000_0186, Some(2)));
+        assert_eq!(
+            e.message,
+            "command 0x0032 failed - index or slot out of range (reason=2)"
+        );
+        assert_eq!(e.result, Some(0x8000_0186));
+    }
+
+    #[test]
+    fn unknown_reason_is_still_printed() {
+        let e = error_from_reply(0x0011, &error_body(0x8000_0186, Some(99)));
+        assert!(e.message.ends_with("(reason=99)"), "{}", e.message);
+        assert_eq!(error_reason_text(99), None);
+    }
+
+    #[test]
+    fn short_error_reply_decodes_as_zero_result() {
+        let e = error_from_reply(0x0003, &[]);
+        assert_eq!(e.result, Some(0));
+        assert_eq!(e.message, "command 0x0003 failed");
+    }
+
+    #[test]
+    fn every_documented_reason_has_text() {
+        for reason in 1..=5 {
+            assert!(
+                error_reason_text(reason).is_some(),
+                "reason {} has no text",
+                reason
+            );
+        }
+        assert_eq!(error_reason_text(0), None, "0 means 'no detail', never sent");
+    }
 }

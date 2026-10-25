@@ -557,7 +557,7 @@ static bool nxusNetPeerIsPrivate(const struct sockaddr_in *peer) {
     if ((ip >> 20) == 0xAC1u) return true;                      /* 172.16.0.0/12 */
     if ((ip >> 16) == 0xC0A8u) return true;                     /* 192.168.0.0/16*/
     if ((ip >> 16) == 0xA9FEu) return true;                     /* 169.254.0.0/16*/
-    if ((ip >> 22) == 0x64u) return true;                       /* 100.64.0.0/10 */
+    if ((ip >> 22) == 0x191u) return true;                      /* 100.64.0.0/10 */
     return false;
 }
 

@@ -677,6 +677,308 @@ class AsyncScanE2E(unittest.TestCase):
         self.assertFalse(hits['truncated'])
 
 
+class AsyncScanCancelE2E(unittest.TestCase):
+    """ScanCancel on an asynchronous pass (NxusCmd_ScanCancel).
+
+    The server forwards it to nxusSessionScanCancel() (nxus_server.c:1206-1208),
+    which only raises the worker's cancel flag (nxus_session.c:1078-1082): the
+    worker stops at its next block boundary and publishes Cancelled.  So cancel
+    is *not* "wait for a reply and the results are gone" - a cancelled pass must
+    never publish the hits it had already collected, and the session has to stay
+    usable for the next ScanBegin.  Before this, both shapes were only reachable
+    from the Rust CLI (needs a built exe), so a client/mock regression here had
+    no Python-level guard.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(scan_async=True, watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    # ---- helpers ----
+
+    def begin_money_scan(self, value: int = 6440) -> dict:
+        """A first pass that would find exactly the money address if it finished."""
+        self.server.target.set_money(value)
+        self.client.scan_reset()
+        return self.client.scan_begin(value, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                      scope=P.SCOPE['NxusScope_All'])
+
+    def wait_not_running(self, timeout: float = 2.0) -> dict:
+        """Cancel is asynchronous on hardware: poll instead of trusting one reply.
+
+        If the cancel were lost the worker would run to Done, which the caller's
+        assertion catches - a bounded poll is what makes the difference visible
+        rather than turning it into a hang.
+        """
+        deadline = time.time() + timeout
+        state = self.client.scan_status()
+        while (state['scan_state'] == P.SCAN_STATE['NxusScanState_Running']
+               and time.time() < deadline):
+            time.sleep(0.01)
+            state = self.client.scan_status()
+        return state
+
+    def assert_cancelled(self, state: dict):
+        self.assertIn(state['scan_state'],
+                      (P.SCAN_STATE['NxusScanState_Cancelled'], P.SCAN_STATE['NxusScanState_Idle']),
+                      'cancel did not stop the worker: it published '
+                      f"state={state['scan_state']} hits={state['hits']}")
+        self.assertEqual(state['hits'], 0, 'a cancelled pass published hits')
+        self.assertFalse(state['flags'] & P.ST['NXUS_ST_SCANNING'],
+                         'the scanning flag survived the cancel')
+
+    # ---- 1. the cancel discards what the worker had collected ----
+
+    def test_scan_cancel_discards_a_running_pass(self):
+        st = self.begin_money_scan(6440)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.assertEqual(st['hits'], 0, 'results leaked before the worker published them')
+
+        # let the worker get partway: the pass now has real results pending
+        progressed = self.client.scan_status()
+        self.assertEqual(progressed['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.assertGreater(progressed['progress'], 0)
+        self.assertLess(progressed['progress'], 1000)
+
+        self.client.scan_cancel()
+        self.assert_cancelled(self.wait_not_running())
+
+        # a cancelled pass must not leave a readable hit list behind
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['hits'], [], 'a cancelled pass left hits in the batch')
+        self.assertEqual(batch['count'], 0)
+        self.assertEqual(batch['total'], 0, 'the cancelled hit count is still reported')
+
+        # cancelling again is a no-op on the console (nxus_session.c:1079)
+        self.client.scan_cancel()
+        self.assert_cancelled(self.client.scan_status())
+
+    # ---- 2. the session is usable again afterwards ----
+
+    def test_new_scan_after_cancel_succeeds(self):
+        st = self.begin_money_scan(6440)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.client.scan_cancel()
+        self.assert_cancelled(self.wait_not_running())
+        cancelled_session = self.client.scan_hits(0, 16)['session']
+
+        # no ScanReset in between: a fresh ScanBegin alone has to recover the session
+        self.server.target.set_money(1234)
+        st = self.client.scan_begin(1234, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'],
+                         'ScanBegin was still refused after a cancel')
+
+        done = self.client.scan_wait(timeout=5.0)
+        self.assertEqual(done['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(done['hits'], 1)
+        self.assertEqual(done['progress'], 1000)
+
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['count'], 1)
+        self.assertEqual(batch['total'], 1)
+        self.assertEqual(batch['hits'][0]['address'], MONEY_ADDRESS)
+        self.assertEqual(batch['hits'][0]['value'], 1234)
+        # the new pass owns a new session id, so the cancelled batch cannot be
+        # mistaken for it (nxus_protocol.h:336-344)
+        self.assertNotEqual(batch['session'], cancelled_session,
+                            'the cancelled scan session id was reused')
+
+
+class AsyncScanInterleaveE2E(unittest.TestCase):
+    """Commands that touch the arrays the worker owns must answer BUSY.
+
+    ScanGetHits / SnapshotCapture / PtrScanBegin are gated on the scan state
+    (nxus_server.c:1088-1108, 1168-1175) and nxusSessionScanBegin / ScanNext
+    answer NXUS_ERR_BUSY while the worker is alive (nxus_session.c:891-919,
+    1055-1057).  A refusal must be side-effect free: no snapshot written, no
+    chain list replaced, no second worker started, and the running pass has to
+    finish with the results it had already computed.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(scan_async=True, watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def begin_money_scan(self, value: int = 6440) -> dict:
+        self.server.target.set_money(value)
+        self.client.scan_reset()
+        return self.client.scan_begin(value, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                      scope=P.SCOPE['NxusScope_All'])
+
+    def busy_calls(self) -> list:
+        """Every command that must refuse while the worker owns the hit arrays.
+
+        snapshot_capture has no client helper (the GUI talks to it directly), so
+        it goes out as the raw NxusSnapshotRequest - the shape a stale client
+        would send while a scan is in flight.
+        """
+        return [
+            ('snapshot_capture', lambda: self.client.request(
+                P.CMD['SnapshotCapture'],
+                P.SNAPSHOT_REQUEST.pack(0, P.SNAPSHOT_DEFAULT_BLOCK_SIZE,
+                                        P.SCOPE['NxusScope_All'], 0, 0, 0))),
+            ('ptr_scan_begin', lambda: self.client.ptr_scan_begin(
+                MONEY_ADDRESS, module_base=MAIN_BASE, max_depth=3,
+                max_offset=0x1000, value_width=4)),
+            ('scan_next', lambda: self.client.scan_next(
+                cmp_mode=P.CMP['NxusCmp_Decreased'])),
+            ('scan_begin', lambda: self.client.scan_begin(
+                6440, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                scope=P.SCOPE['NxusScope_All'])),
+            ('scan_hits', lambda: self.client.scan_hits(0, 16)),
+        ]
+
+    def assert_all_busy(self):
+        for name, call in self.busy_calls():
+            with self.assertRaises(NxusError, msg=f'{name} was not refused') as ctx:
+                call()
+            self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BUSY),
+                             f'{name} answered the wrong error while scanning')
+
+    def test_interleaved_commands_are_busy_then_the_pass_completes(self):
+        st = self.begin_money_scan(6440)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+
+        self.assert_all_busy()
+
+        # each refusal has to be side-effect free ...
+        self.assertIsNone(self.server.snapshots[0],
+                          'a refused SnapshotCapture still wrote slot A')
+        self.assertEqual(self.server.chains, [],
+                         'a refused PtrScanBegin still replaced the chain list')
+
+        # ... and the worker keeps its own state
+        st = self.client.scan_status()
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'],
+                         'a BUSY reply broke the scan state')
+        self.assertEqual(st['hits'], 0, 'a BUSY reply published results early')
+
+        done = self.client.scan_wait(timeout=5.0)
+        self.assertEqual(done['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(done['hits'], 1)
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['count'], 1, 'the interrupted pass lost its results')
+        self.assertEqual(batch['hits'][0]['address'], MONEY_ADDRESS)
+        self.assertEqual(batch['hits'][0]['value'], 6440)
+        self.assertFalse(batch['truncated'])
+
+    def test_cancel_after_interleave_leaves_the_session_usable(self):
+        st = self.begin_money_scan(6440)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.assert_all_busy()
+
+        self.client.scan_cancel()
+        deadline = time.time() + 2.0
+        state = self.client.scan_status()
+        while (state['scan_state'] == P.SCAN_STATE['NxusScanState_Running']
+               and time.time() < deadline):
+            time.sleep(0.01)
+            state = self.client.scan_status()
+        self.assertIn(state['scan_state'],
+                      (P.SCAN_STATE['NxusScanState_Cancelled'], P.SCAN_STATE['NxusScanState_Idle']),
+                      'the worker kept running after a cancel that followed a BUSY burst')
+        self.assertEqual(state['hits'], 0)
+        self.assertEqual(self.client.scan_hits(0, 16)['hits'], [])
+
+        # the session recovered from both the refusals and the cancel.  1234 is an
+        # even value: the mock target's filler words are all odd on purpose, so it
+        # is the money record and nothing else (777 would also occur in the heap).
+        self.server.target.set_money(1234)
+        st = self.client.scan_begin(1234, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        done = self.client.scan_wait(timeout=5.0)
+        self.assertEqual(done['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['count'], 1)
+        self.assertEqual(batch['hits'][0]['address'], MONEY_ADDRESS)
+        self.assertEqual(batch['hits'][0]['value'], 1234)
+
+
+class AsyncScanProgressE2E(unittest.TestCase):
+    """progress_permille must climb, and "not Running" must mean "results ready".
+
+    fillStatus() publishes the worker's progress and the hit count from the same
+    struct (nxus_server.c:104-160), so a reader that sees Done has to see the
+    final count, and the batch it then fetches has to belong to the same session
+    (NxusHitBatchHeader, nxus_protocol.h:336-344).  A Done status whose count
+    disagrees with the batch - or a batch from the previous session - is the
+    "results are there but the GUI says zero hits" class of bug.
+    """
+
+    WINDOW_BEGIN = MAIN_BASE + 0x1000
+    WINDOW_END = MAIN_BASE + 0x1040
+    VALUE = 0x12345678
+    OFFSETS = (0x00, 0x04, 0x10)          # three aligned copies -> three hits
+
+    def setUp(self):
+        self.server = MockSwitch(scan_async=True, watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+        for off in self.OFFSETS:
+            self.client.write(self.WINDOW_BEGIN + off, struct.pack('<I', self.VALUE))
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def test_progress_is_monotonic_and_done_matches_the_batch(self):
+        self.client.scan_reset()
+        st = self.client.scan_begin(self.VALUE, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_Custom'],
+                                    range_begin=self.WINDOW_BEGIN, range_end=self.WINDOW_END)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.assertEqual(st['progress'], 0)
+        self.assertEqual(st['hits'], 0)
+        session = self.server.session_id       # the id ScanBegin just assigned
+
+        # exactly the poll budget scan_wait()/the GUI uses: 32 status reads
+        progress = [st['progress']]
+        state = st
+        for _ in range(32):
+            state = self.client.scan_status()
+            progress.append(state['progress'])
+            if state['scan_state'] != P.SCAN_STATE['NxusScanState_Running']:
+                break
+
+        self.assertEqual(state['scan_state'], P.SCAN_STATE['NxusScanState_Done'],
+                         '32 status polls did not finish the worker')
+        self.assertEqual(progress, sorted(progress), 'progress_permille went backwards')
+        self.assertLess(progress[0], 1000)
+        self.assertGreater(max(progress[:-1]), 0, 'progress never left 0 while running')
+        self.assertEqual(progress[-1], 1000, 'Done did not report full progress')
+        self.assertFalse(state['flags'] & P.ST['NXUS_ST_SCANNING'])
+        self.assertEqual(state['hits'], len(self.OFFSETS), 'Done reported the wrong hit count')
+
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['total'], state['hits'],
+                         'the batch total disagrees with the Done status count')
+        self.assertEqual(batch['count'], len(self.OFFSETS))
+        self.assertEqual(batch['session'], session,
+                         'the batch belongs to a different scan session')
+        self.assertEqual(batch['session'], self.server.session_id)
+        self.assertEqual([h['address'] for h in batch['hits']],
+                         [self.WINDOW_BEGIN + off for off in self.OFFSETS])
+        self.assertEqual({h['value'] for h in batch['hits']}, {self.VALUE})
+        self.assertFalse(batch['truncated'])
+
+        # paging must keep the same session id, and the next ScanBegin must not
+        self.assertEqual(self.client.scan_hits(1, 1)['session'], session)
+        self.client.scan_begin(self.VALUE, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                               scope=P.SCOPE['NxusScope_Custom'],
+                               range_begin=self.WINDOW_BEGIN, range_end=self.WINDOW_END)
+        self.assertNotEqual(self.server.session_id, session,
+                            'a new scan reused the previous session id')
+
+
 def batch_total(batch):
     return batch['total']
 

@@ -85,6 +85,9 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     NxusScanStats stats;
     int src = nxusSnapshotCapture(&g_Snapshots[slot], regions, region_count,
                                   nxusSessionReadCallback, NULL, chunk, chunk_size, &stats, NULL);
+    /* The region list was pinned by nxusSessionRegions(): drop it now that the
+       capture is finished, or the next rebuild has to keep the old block alive. */
+    nxusSessionViewRelease();
     free(chunk);
 
     NXUS_LOG("snapshot %c: blocks=%u reads=%llu dropped=%u rc=%d",

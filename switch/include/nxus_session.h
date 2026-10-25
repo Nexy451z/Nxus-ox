@@ -43,7 +43,10 @@ static inline u32 nxusSessionHitLimit(u32 value_size) {
 void nxusSessionInit(u32 chunk_size, u32 max_hits);
 /* Tear the session down: stop the worker, free every owned block and unpublish
    the mapping/region views.  Safe to call when not initialised (no-op).  Clears
-   the initialised state, so Init() after Exit() starts a fresh session. */
+   the initialised state, so Init() after Exit() starts a fresh session.
+   Exit is TERMINAL for published views: it frees the blocks behind every pointer
+   nxusSessionMappings()/nxusSessionRegions() ever returned, including ones whose
+   pin was never released, so no view may be used across Exit. */
 void nxusSessionExit(void);
 
 /* ---- status ---- */
@@ -110,6 +113,8 @@ int nxusSessionReadMemory(u64 address, void *buffer, u32 size);
 /* Refresh mappings and rebuild the region list for a scope without starting a
    scan; the snapshot service reuses it. */
 Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end);
+/* Non-NULL return pins the list (see the lifetime contract below): release it with
+   nxusSessionViewRelease() when the walk/capture is done. */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count);
 
 /* ---- results ---- */
@@ -118,9 +123,39 @@ const NxusScanRegion *nxusSessionRegions(u32 *out_count);
    pointer from one publication and the count from the next.  NULL means "no view
    right now" (not yet built, dropped by Exit/Reset, or the reader lost the race
    with an update); callers must always tolerate it.  Walk either view only
-   behind the busy gate: the worker rebuilds these blocks while a scan runs. */
+   behind the busy gate: the worker rebuilds these blocks while a scan runs.
+ *
+ * LIFETIME CONTRACT (the block behind a returned pointer is not stable):
+ *
+ *   - a successful (non-NULL) call PINS the block it sampled.  The session then
+ *     keeps that memory alive even if a later publish replaces it: the old block
+ *     is retired, not freed, until every pin is gone.  So a reader may keep using
+ *     the pointer across a later publish/refresh (the snapshot service holds the
+ *     region list for a whole capture) without hitting freed memory.
+ *   - release the pin with nxusSessionViewRelease(), exactly once per non-NULL
+ *     return, as soon as the view is no longer used.  NULL takes no pin and must
+ *     not be released.
+ *   - callers that never release remain MEMORY-SAFE: the block is simply never
+ *     freed (no use-after-free).  The price is that the pin lasts for the life of
+ *     the session, so every later publish retains its predecessor: the retire
+ *     ring holds 4 generations, and past that the old blocks are kept and only
+ *     logged (at the first overflow and then every 64), i.e. a non-releasing
+ *     caller turns publish traffic into a slow leak.  New code must release;
+ *     existing call sites should be migrated.
+ *   - the pin protects the BLOCK, not the struct fields.  NxusMappingTable is
+ *     returned by address and its entries/count pair is re-published in place, so
+ *     a caller that re-reads table->entries sees the current publication: capture
+ *     the pair you intend to walk right after the call returns.
+ *   - nxusSessionExit() is terminal for views: it frees every retained block, even
+ *     ones whose pin was never released.  Do not use a view across Exit.
+ */
 const NxusHitList      *nxusSessionHits(void);
 const NxusMappingTable *nxusSessionMappings(void);
+/* Drop the pin taken by the last successful nxusSessionMappings() /
+   nxusSessionRegions() call.  Also frees retained old blocks when this was the
+   last outstanding pin.  Safe to call with no pin held (it does not underflow),
+   but every successful sample must be released exactly once. */
+void nxusSessionViewRelease(void);
 
 /* ---- pause / watchdog bookkeeping ---- */
 void nxusSessionSetPaused(bool paused);

@@ -10,7 +10,9 @@ fail=0
 run_test() {
     name="$1"; shift
     echo "--- building $name ---"
-    if ! $CC $CFLAGS -o "$name.exe" "$@" 2> "$name.build.log"; then
+    # TEST_INCS carries per-test include paths / flags (e.g. the libnx stub
+    # headers that let a Switch unit be compiled on the host).
+    if ! $CC $CFLAGS ${TEST_INCS:-} -o "$name.exe" "$@" 2> "$name.build.log"; then
         echo "BUILD FAILED: $name"
         cat "$name.build.log"
         fail=1
@@ -31,6 +33,11 @@ run_test test_snapshot test_snapshot.c ../core/nxus_snapshot.c ../core/nxus_scan
 run_test test_budget test_budget.c
 run_test test_scantypes test_scantypes.c ../core/nxus_scan.c
 run_test test_hotkey test_hotkey.c ../core/nxus_hotkey.c
+# The session is a Switch unit (libnx).  stubs/switch.h supplies the small libnx
+# surface it uses, so the real pin/retire code is compiled and exercised on the
+# host instead of being skipped.
+TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
+    run_test test_session_view test_session_view.c ../core/nxus_scan.c
 
 echo
 if [ $fail -eq 0 ]; then echo "ALL HOST TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

@@ -154,12 +154,19 @@ int main(int argc, char *argv[]) {
     }
     nxusServerInit();
 
-    rc = nxusNetInit(NXUS_DEFAULT_PORT, nxusServerHandle, NULL);
-    NXUS_RESULT("nxusNetInit", rc);
-    if (R_FAILED(rc)) {
-        NXUS_LOG("TCP server failed to start - sysmodule is idle");
-        while (true) svcSleepThread(1000000000ull);
+    /* A boot2 sysmodule usually starts before Wi-Fi is associated, so a single
+       failure must not park the module for the whole boot.  nxusNetInit() cleans
+       up after itself on failure (socketExit), so retrying is safe. */
+    for (u32 attempt = 1; ; attempt++) {
+        rc = nxusNetInit(NXUS_DEFAULT_PORT, nxusServerHandle, NULL);
+        if (R_SUCCEEDED(rc)) break;
+        if (attempt == 1 || (attempt % 20u) == 0) {
+            NXUS_LOG("TCP server failed to start rc=0x%08X (attempt %u) - retrying in 3 s",
+                     (unsigned)rc, (unsigned)attempt);
+        }
+        svcSleepThread(3000000000ull);
     }
+    NXUS_RESULT("nxusNetInit", rc);
 
     NXUS_LOG("ready - connect with the PC client on port %u", (unsigned)NXUS_DEFAULT_PORT);
 
