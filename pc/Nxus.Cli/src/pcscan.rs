@@ -26,6 +26,15 @@
 //!
 //! Reads are chunked and coalesced so a whole-module pass is a few dozen round
 //! trips instead of millions.
+//!
+//! ## State files
+//!
+//! A candidate list is saved atomically: the new state is written to `path.tmp`,
+//! `sync_all`ed, and only then renamed into place, while the previous body is
+//! kept as `.bak` (and the one before that as `.bak2`).  A crash during a save
+//! therefore leaves either the old or the new list readable, never half of one.
+//! Loading tries body, `.bak`, `.bak2` in that order, falls back on corruption
+//! with a warning, and logs which generation it used.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -427,17 +436,68 @@ pub fn compare_value(cur: u64, prev: u64, size: u32, compare: Compare, target: u
 }
 
 const FILE_MAGIC: &[u8; 8] = b"NXUSPC01";
+/// magic(8) + value_size(4) + candidate count(8) + truncated flag(4).
+const HEADER_LEN: usize = 24;
+/// address(8) + value(8).
+const RECORD_LEN: usize = 16;
 
-/// Save / load the candidate list so the CLI can refine across invocations.
+/// One slot of the rotating candidate-file chain.
+///
+/// [`save`] publishes a new [`ScanGeneration::Body`] file and shifts the
+/// previous one to `.bak`, then `.bak2`; [`load`] walks the same chain
+/// backwards.  A torn write, a full disk or a crash therefore costs at most the
+/// newest state, never the whole candidate list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanGeneration {
+    Body,
+    Backup,
+    Backup2,
+}
+
+impl ScanGeneration {
+    /// Suffix appended to the body path to address this generation.
+    fn suffix(self) -> &'static str {
+        match self {
+            ScanGeneration::Body => "",
+            ScanGeneration::Backup => ".bak",
+            ScanGeneration::Backup2 => ".bak2",
+        }
+    }
+
+    /// Human-readable name used by the load/save log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanGeneration::Body => "body",
+            ScanGeneration::Backup => ".bak",
+            ScanGeneration::Backup2 => ".bak2",
+        }
+    }
+
+    /// Path of this generation for a body path.
+    fn path(self, path: &str) -> String {
+        format!("{}{}", path, self.suffix())
+    }
+}
+
+/// Generations a normal load tries, best first.
+const LOAD_CHAIN: [ScanGeneration; 3] =
+    [ScanGeneration::Body, ScanGeneration::Backup, ScanGeneration::Backup2];
+/// Generations `scan undo` walks: only the backups, newest first.
+const BACKUP_CHAIN: [ScanGeneration; 2] = [ScanGeneration::Backup, ScanGeneration::Backup2];
+
+/// Serialise `scan` into `path` and fsync it.
+///
+/// The bytes always land in a staging file (never in the caller's final path),
+/// so the caller decides when - and whether - the data becomes visible.
 ///
 /// A dense scan is streamed straight out of the baseline: nothing is
 /// materialised, so saving a 134 M candidate scan does not build a hit vector.
-pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
+fn write_staged(path: &str, scan: &PcScan) -> std::io::Result<()> {
     use std::io::{BufWriter, Write};
     let total = scan.len();
     debug_assert_eq!(scan.iter().count(), total, "baseline_candidates must match the stored candidates");
 
-    let mut header = [0u8; 24];
+    let mut header = [0u8; HEADER_LEN];
     header[0..8].copy_from_slice(FILE_MAGIC);
     header[8..12].copy_from_slice(&scan.value_size.to_le_bytes());
     header[12..20].copy_from_slice(&(total as u64).to_le_bytes());
@@ -459,33 +519,242 @@ pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
         }
     }
     out.write_all(&batch)?;
-    out.flush()
+    out.flush()?;
+
+    // fsync before the caller renames this file into place: a rename can be
+    // durable while the bytes behind it are not, which is exactly how a scan
+    // state used to vanish when the machine went down mid-save.
+    let file = out.into_inner().map_err(|err| err.into_error())?;
+    file.sync_all()
 }
 
-pub fn load(path: &str) -> std::io::Result<PcScan> {
-    let data = std::fs::read(path)?;
-    if data.len() < 24 || &data[0..8] != FILE_MAGIC {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a Nxus candidate file"));
+/// Remove a staging file that will not be published (and say so if it cannot).
+fn discard_staged(path: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!("warning: could not remove staging file {}: {}", path, err),
+    }
+}
+
+/// Forget the oldest generation so `.bak` has room to become `.bak2`.
+///
+/// Missing files are normal (the first saves); a real I/O error is returned,
+/// because silently continuing would overwrite the only good copy.
+fn rotate_generation(bak: &str, bak2: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(bak2) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(std::io::Error::new(err.kind(), format!("remove stale generation {}: {}", bak2, err))),
+    }
+    if std::path::Path::new(bak).is_file() {
+        std::fs::rename(bak, bak2)
+            .map_err(|err| std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", bak, bak2, err)))?;
+    }
+    Ok(())
+}
+
+/// Make a rename durable by fsyncing the directory that holds it.
+///
+/// On unix the directory entry itself has to be flushed, otherwise a crash can
+/// leave the rename undone even though the file data is on disk.  Windows has no
+/// portable `std` equivalent (FlushFileBuffers on a directory handle needs the
+/// raw Win32 API) and journals the rename itself, so this is a no-op there.
+#[allow(unused_variables)]
+fn sync_parent_dir(path: &str) {
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(err) = dir.sync_all() {
+                    eprintln!("warning: fsync {} failed: {}", parent.display(), err);
+                }
+            }
+            Err(err) => eprintln!("warning: cannot open {} for fsync: {}", parent.display(), err),
+        }
+    }
+}
+
+/// Save the candidate list so a crash can never leave it half written.
+///
+/// 1. the new state is serialised to `path.tmp` and `sync_all`ed;
+/// 2. the generations shift: `.bak2` is dropped, `.bak` becomes `.bak2`, the
+///    current body becomes `.bak`;
+/// 3. `path.tmp` is renamed onto the body - the commit point a reader sees.
+///
+/// Every failure is returned to the caller (nothing is swallowed), the previous
+/// body is never removed before the new one is durable, and if the final rename
+/// fails the old body is moved back so the visible state stays intact.
+pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
+    let tmp = format!("{}.tmp", path);
+    let body = ScanGeneration::Body.path(path);
+    let bak = ScanGeneration::Backup.path(path);
+    let bak2 = ScanGeneration::Backup2.path(path);
+
+    // 1. Stage the new state next to the body and make it durable.
+    if let Err(err) = write_staged(&tmp, scan) {
+        discard_staged(&tmp);
+        return Err(err);
+    }
+
+    // 2. Shift the generations.  If this fails the current body is still the
+    //    newest readable state, so report the error and keep it.
+    let had_body = std::path::Path::new(&body).is_file();
+    let shifted = rotate_generation(&bak, &bak2).and_then(|_| {
+        if had_body {
+            std::fs::rename(&body, &bak)
+                .map_err(|err| std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", body, bak, err)))
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(err) = shifted {
+        discard_staged(&tmp);
+        return Err(err);
+    }
+
+    // 3. Publish.  The rename is atomic, so a reader sees either the old or the
+    //    new body; a crash in the tiny window above is covered by `.bak`.
+    if let Err(err) = std::fs::rename(&tmp, &body) {
+        if had_body {
+            if let Err(restore) = std::fs::rename(&bak, &body) {
+                eprintln!("warning: {} is missing and restoring it from {} failed: {}; \
+                           the candidate list is still readable from the backup generation",
+                          body, bak, restore);
+            }
+        }
+        discard_staged(&tmp);
+        return Err(std::io::Error::new(err.kind(), format!("publish {}: {}", body, err)));
+    }
+    sync_parent_dir(&body);
+    Ok(())
+}
+
+/// Store `scan` as the newest backup generation, leaving the body untouched.
+///
+/// `scan refine --load` uses this when no `--save` is given: nothing new is
+/// published, but the pre-refine list must stay available for `scan undo`.
+pub fn backup(path: &str, scan: &PcScan) -> std::io::Result<()> {
+    let tmp = format!("{}.bak.tmp", path);
+    let bak = ScanGeneration::Backup.path(path);
+    let bak2 = ScanGeneration::Backup2.path(path);
+
+    if let Err(err) = write_staged(&tmp, scan) {
+        discard_staged(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = rotate_generation(&bak, &bak2).and_then(|_| {
+        std::fs::rename(&tmp, &bak)
+            .map_err(|err| std::io::Error::new(err.kind(), format!("publish {}: {}", bak, err)))
+    }) {
+        discard_staged(&tmp);
+        return Err(err);
+    }
+    sync_parent_dir(&bak);
+    Ok(())
+}
+
+/// Decode one candidate file.
+///
+/// Everything here is strict: a header that disagrees with the payload means a
+/// torn write, not an empty scan, so it is an error and the caller falls back to
+/// the next generation.  The count is validated against the real file length
+/// before anything is allocated, so a corrupt header can no longer trigger the
+/// OOM abort the old silent clamp worked around.
+fn parse_scan(data: &[u8]) -> Result<PcScan, String> {
+    if data.len() < HEADER_LEN {
+        return Err(format!("truncated header ({} of {} bytes)", data.len(), HEADER_LEN));
+    }
+    if &data[0..8] != FILE_MAGIC {
+        return Err("bad magic (not a Nxus candidate file)".into());
     }
     let value_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let count = u64::from_le_bytes([data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19]]) as usize;
+    if value_size == 0 || value_size > 8 {
+        return Err(format!("invalid value size {}", value_size));
+    }
+    let count = u64::from_le_bytes(data[12..20].try_into().unwrap());
     let truncated = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) != 0;
-    // A corrupt header can claim billions of hits.  The file length bounds how
-    // many records can really exist, so clamp the pre-allocation instead of
-    // aborting the process on an impossible `with_capacity` (OOM abort).
-    let max_hits = data.len().saturating_sub(24) / 16;
-    let mut hits = Vec::with_capacity(count.min(max_hits));
-    let mut at = 24;
-    for _ in 0..count {
-        if at + 16 > data.len() {
-            break;
-        }
-        let address = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-        let value = u64::from_le_bytes(data[at + 8..at + 16].try_into().unwrap());
+
+    let payload = &data[HEADER_LEN..];
+    if payload.len() % RECORD_LEN != 0 {
+        return Err(format!("torn record area ({} bytes is not a multiple of {})", payload.len(), RECORD_LEN));
+    }
+    let available = payload.len() / RECORD_LEN;
+    if count > available as u64 {
+        return Err(format!("header claims {} candidate(s) but the file holds only {}", count, available));
+    }
+
+    let count = count as usize;
+    let mut hits = Vec::with_capacity(count);
+    for index in 0..count {
+        let at = index * RECORD_LEN;
+        let address = u64::from_le_bytes(payload[at..at + 8].try_into().unwrap());
+        let value = u64::from_le_bytes(payload[at + 8..at + 16].try_into().unwrap());
         hits.push(PcHit { address, value });
-        at += 16;
     }
     Ok(PcScan { value_size, hits, truncated, bytes_read: 0, reads: 0, failed_reads: 0, ..Default::default() })
+}
+
+/// Read the first usable generation of `chain`, reporting every one it skips.
+///
+/// Returns the generation that was read.  Corruption and unreadable files are
+/// logged and skipped; when nothing is usable the error names every generation
+/// that was tried instead of quietly handing back an empty scan.
+fn load_from_chain(path: &str, chain: &[ScanGeneration]) -> std::io::Result<(PcScan, ScanGeneration)> {
+    let mut problems: Vec<String> = Vec::new();
+    let mut saw_file = false;
+    for &generation in chain {
+        let file = generation.path(path);
+        match std::fs::read(&file) {
+            Ok(data) => match parse_scan(&data) {
+                Ok(scan) => return Ok((scan, generation)),
+                Err(msg) => {
+                    saw_file = true;
+                    eprintln!("warning: candidate file {} is corrupt: {}; trying the next generation", file, msg);
+                    problems.push(format!("{}: {}", file, msg));
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                saw_file = true;
+                eprintln!("warning: cannot read candidate file {}: {}; trying the next generation", file, err);
+                problems.push(format!("{}: {}", file, err));
+            }
+        }
+    }
+    if saw_file {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("no usable candidate list for {}: {}", path, problems.join("; ")),
+        ));
+    }
+    let tried: Vec<String> = chain.iter().map(|generation| generation.path(path)).collect();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no candidate list at {} (tried {})", path, tried.join(", ")),
+    ))
+}
+
+/// Load the candidate list, falling back through the backup generations.
+///
+/// The body is tried first, then `.bak`, then `.bak2`; a missing, unreadable or
+/// corrupt generation is logged and skipped, and the generation actually used is
+/// logged too.  A damaged state file never silently turns into an empty scan.
+pub fn load(path: &str) -> std::io::Result<PcScan> {
+    let (scan, generation) = load_from_chain(path, &LOAD_CHAIN)?;
+    eprintln!("pcscan: loaded candidate list from {} ({})", generation.path(path), generation.label());
+    Ok(scan)
+}
+
+/// Load only a backup generation (`.bak`, then `.bak2`): the `scan undo` path.
+///
+/// Returns the generation that was read so the caller can report it.
+pub fn load_backup(path: &str) -> std::io::Result<(PcScan, ScanGeneration)> {
+    load_from_chain(path, &BACKUP_CHAIN)
 }
 
 /// First pass: read every region and keep the raw bytes as a dense baseline.
@@ -967,22 +1236,53 @@ mod tests {
         assert!(compare_value(f64_bits(3.0), f64_bits(1.5), 8, Compare::Different, f64_bits(1.5), 0, f));
     }
 
-    #[test]
-    fn load_clamps_impossible_hit_count() {
+    // ---- state files: atomic save, generations, corruption ----------------
+
+    /// Every file the rotating save may leave behind for a body path.
+    const STATE_SUFFIXES: [&str; 5] = ["", ".bak", ".bak2", ".tmp", ".bak.tmp"];
+
+    fn state_path(name: &str) -> String {
+        std::env::temp_dir().join(format!("nxus_pcscan_{}.bin", name)).to_string_lossy().to_string()
+    }
+
+    /// Remove the body and all generations, asserting that nothing else failed.
+    fn cleanup(path: &str) {
+        for suffix in STATE_SUFFIXES {
+            if let Err(err) = std::fs::remove_file(format!("{}{}", path, suffix)) {
+                assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
+                           "could not clean up {}{}: {}", path, suffix, err);
+            }
+        }
+    }
+
+    fn exists(path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+
+    fn scan_with(values: &[u64]) -> PcScan {
+        PcScan {
+            value_size: 4,
+            hits: values.iter().map(|&value| PcHit { address: 0x1000 + value * 4, value }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// First value of a loaded list: identifies which generation was read.
+    fn marker(scan: &PcScan) -> u64 {
+        scan.hits.first().map(|hit| hit.value).expect("a loaded candidate list must not be empty")
+    }
+
+    fn write_raw(path: &str, data: &[u8]) {
+        std::fs::write(path, data).expect("write raw candidate file");
+    }
+
+    fn header_bytes(value_size: u32, count: u64) -> Vec<u8> {
         let mut blob = Vec::new();
         blob.extend_from_slice(FILE_MAGIC);
-        blob.extend_from_slice(&4u32.to_le_bytes());
-        blob.extend_from_slice(&(1u64 << 40).to_le_bytes()); // ~1 T claimed hits
+        blob.extend_from_slice(&value_size.to_le_bytes());
+        blob.extend_from_slice(&count.to_le_bytes());
         blob.extend_from_slice(&0u32.to_le_bytes());
-
-        let path = std::env::temp_dir().join("nxus_pcscan_huge_count.bin");
-        let path = path.to_string_lossy().to_string();
-        std::fs::write(&path, &blob).expect("write candidate file");
-        let scan = load(&path).expect("corrupt header must still load (clamped)");
-        let _ = std::fs::remove_file(&path);
-
-        assert_eq!(scan.value_size, 4);
-        assert!(scan.hits.is_empty());
+        blob
     }
 
     #[test]
@@ -996,17 +1296,181 @@ mod tests {
             failed_reads: 0,
             ..Default::default()
         };
-        let path = std::env::temp_dir().join("nxus_pcscan_round_trip.bin");
-        let path = path.to_string_lossy().to_string();
+        let path = state_path("round_trip");
+        cleanup(&path);
         save(&path, &scan).expect("save");
         let loaded = load(&path).expect("load");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
 
         assert_eq!(loaded.value_size, 4);
         assert_eq!(loaded.hits.len(), 2);
         assert!(loaded.truncated);
         assert_eq!(loaded.hits[0].address, 0x1000);
         assert_eq!(loaded.hits[1].value, 9);
+    }
+
+    #[test]
+    fn save_publishes_atomically_and_keeps_two_backup_generations() {
+        let path = state_path("generations");
+        cleanup(&path);
+
+        save(&path, &scan_with(&[1])).expect("save v1");
+        assert!(!exists(&format!("{}.tmp", path)), "the staging file must be renamed into place");
+        assert!(!exists(&format!("{}.bak", path)), "the first save has nothing to back up");
+        assert_eq!(marker(&load(&path).expect("load v1")), 1);
+
+        save(&path, &scan_with(&[2])).expect("save v2");
+        assert_eq!(marker(&load(&path).expect("load v2")), 2);
+        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v1")), 1);
+
+        save(&path, &scan_with(&[3])).expect("save v3");
+        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v2")), 2);
+        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v1")), 1);
+        assert!(!exists(&format!("{}.tmp", path)));
+
+        save(&path, &scan_with(&[4])).expect("save v4");
+        assert_eq!(marker(&load(&path).expect("body is v4")), 4);
+        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v3")), 3);
+        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2, v1 was dropped")), 2);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_falls_back_through_the_generations_on_corruption() {
+        let path = state_path("fallback");
+        cleanup(&path);
+        save(&path, &scan_with(&[1])).expect("save v1");
+        save(&path, &scan_with(&[2])).expect("save v2");
+        save(&path, &scan_with(&[3])).expect("save v3");
+
+        // A save that died while writing: the body is no longer parseable.
+        write_raw(&path, b"NXUSPC01\x04\x00\x00\x00\x01");
+        let (scan, generation) = load_from_chain(&path, &LOAD_CHAIN).expect("fall back to .bak");
+        assert_eq!(generation, ScanGeneration::Backup);
+        assert_eq!(marker(&scan), 2);
+
+        // A torn record area: header claims one record, only half of it made it.
+        let mut torn = header_bytes(4, 1);
+        torn.extend_from_slice(&[0u8; 8]);
+        write_raw(&path, &torn);
+        assert_eq!(marker(&load(&path).expect("a torn body falls back to .bak")), 2);
+
+        // Body and .bak are both broken: the oldest generation still loads.
+        write_raw(&format!("{}.bak", path), b"garbage");
+        let (scan, generation) = load_from_chain(&path, &LOAD_CHAIN).expect("fall back to .bak2");
+        assert_eq!(generation, ScanGeneration::Backup2);
+        assert_eq!(marker(&scan), 1);
+
+        // A fully corrupt chain is an error, never a silent empty scan.
+        write_raw(&format!("{}.bak2", path), b"garbage");
+        let err = load(&path).expect_err("a corrupt chain must not load as empty");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(".bak2"), "the error must name every generation: {}", err);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_uses_the_backup_when_a_crash_left_the_body_missing() {
+        let path = state_path("missing_body");
+        cleanup(&path);
+        save(&path, &scan_with(&[7])).expect("save v1");
+        save(&path, &scan_with(&[8])).expect("save v2");
+
+        // The window between "body -> .bak" and "tmp -> body": the body is gone.
+        std::fs::remove_file(&path).expect("drop the body");
+
+        let (scan, generation) = load_from_chain(&path, &LOAD_CHAIN).expect("load the backup");
+        assert_eq!(generation, ScanGeneration::Backup);
+        assert_eq!(marker(&scan), 7, "the pre-crash state must survive");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_rejects_a_header_claiming_more_records_than_the_file_holds() {
+        let path = state_path("huge_count");
+        cleanup(&path);
+
+        // The old loader clamped this to "0 candidates"; a torn write must be
+        // reported instead of silently presenting an empty scan.
+        write_raw(&path, &header_bytes(4, 1 << 40));
+        let err = load(&path).expect_err("a torn write is corruption, not an empty scan");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("only 0"), "unexpected message: {}", err);
+
+        // ... and the good generation next to it still wins.
+        save(&path, &scan_with(&[42])).expect("save a good list");
+        std::fs::rename(&path, format!("{}.bak", path)).expect("move the good list to .bak");
+        write_raw(&path, &header_bytes(4, 1 << 40));
+        assert_eq!(marker(&load(&path).expect("fall back to .bak")), 42);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn backup_shifts_generations_without_touching_the_body() {
+        let path = state_path("backup");
+        cleanup(&path);
+        save(&path, &scan_with(&[1])).expect("save v1");
+
+        backup(&path, &scan_with(&[2])).expect("backup v2");
+        assert_eq!(marker(&load(&path).expect("the body is untouched")), 1);
+        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v2")), 2);
+
+        backup(&path, &scan_with(&[3])).expect("backup v3");
+        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v3")), 3);
+        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2")), 2);
+        assert_eq!(marker(&load(&path).expect("the body is still v1")), 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_backup_walks_bak_then_bak2_and_never_the_body() {
+        let path = state_path("undo");
+        cleanup(&path);
+        save(&path, &scan_with(&[1])).expect("save v1");
+        save(&path, &scan_with(&[2])).expect("save v2");
+        save(&path, &scan_with(&[3])).expect("save v3");
+
+        let (scan, generation) = load_backup(&path).expect("undo reads .bak");
+        assert_eq!(generation, ScanGeneration::Backup);
+        assert_eq!(marker(&scan), 2);
+
+        write_raw(&format!("{}.bak", path), b"garbage");
+        let (scan, generation) = load_backup(&path).expect("undo falls back to .bak2");
+        assert_eq!(generation, ScanGeneration::Backup2);
+        assert_eq!(marker(&scan), 1);
+
+        cleanup(&path);
+        let err = load_backup(&path).expect_err("no backup generation left");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(".bak2"), "the error must name what was tried: {}", err);
+    }
+
+    #[test]
+    fn save_returns_io_errors_instead_of_swallowing_them() {
+        // A missing parent directory makes the staging write fail.
+        let missing = std::env::temp_dir()
+            .join("nxus_pcscan_no_such_directory_9f2c")
+            .join("state.bin")
+            .to_string_lossy()
+            .to_string();
+        let err = save(&missing, &scan_with(&[1])).expect_err("saving into a missing directory must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!exists(&format!("{}.tmp", missing)), "a failed save must not leave a staging file");
+
+        // A directory occupying the body path makes the publish rename fail; the
+        // error must reach the caller and the staged file must be cleaned up.
+        let blocked = std::env::temp_dir().join("nxus_pcscan_blocked_body");
+        cleanup(&blocked.to_string_lossy());
+        std::fs::create_dir_all(&blocked).expect("create the blocking directory");
+        let blocked = blocked.to_string_lossy().to_string();
+        let err = save(&blocked, &scan_with(&[1])).expect_err("publishing onto a directory must fail");
+        assert!(err.to_string().contains("publish"), "unexpected message: {}", err);
+        assert!(!exists(&format!("{}.tmp", blocked)), "a failed publish must remove the staging file");
+        std::fs::remove_dir(&blocked).expect("remove the blocking directory");
     }
 
     // ---- dense baseline --------------------------------------------------
@@ -1181,11 +1645,11 @@ mod tests {
         assert!(scan.hits.is_empty());
         assert_eq!(scan.len(), 2048);
 
-        let path = std::env::temp_dir().join("nxus_pcscan_dense.bin");
-        let path = path.to_string_lossy().to_string();
+        let path = state_path("dense");
+        cleanup(&path);
         save(&path, &scan).expect("save dense scan");
         let loaded = load(&path).expect("load");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
 
         assert_eq!(loaded.hits.len(), 2048);
         assert!(loaded.baseline.is_empty());

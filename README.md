@@ -78,7 +78,17 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   - **CLI**: `nxus continue` (step over the trapping instruction, re-arm, resume), `nxus step [thread_id]` (single instruction), and `nxus watch <addr> --stop` / `nxus break <addr> --stop` which prints `STOPPED thread=… pc=… (main+0x…)`, the surrounding disassembly and all registers. `nxus config --auto-continue 0|1` switches back to the old auto-resume policy at runtime.
   - **GUI**: a `■ STOPPED` badge plus a banner with **[Continue] [Step]**; on every stop the GUI automatically fetches the stopped thread's registers and disassembles the code around its PC (`=>` highlight).
   - **Real freeze / pause**: `nxus pause` suspends every thread of the title. The preferred path is `dmnt:cht`'s `PauseCheatProcess` (`BreakDebugProcess` on dmnt's own debug handle, cmdid `65004`), which keeps the cheat session open so reads, scans and snapshot diffs keep working against the frozen title. If dmnt cannot stop it, the console falls back to opening its own debug session (`svcDebugActiveProcess`) and issuing `svcBreakDebugProcess`; reads/queries/mapping enumeration automatically switch to that handle. `nxus resume` mirrors whichever path was used. The GUI's *"pause target while scanning"* option drives the same mechanism.
-  - **Automatic `dmnt:cht` recovery**: when the cheat process has been dropped (`0x0032C80D`), every `dmnt:cht` command re-issues `ForceOpenCheatProcess` once and retries, so a dropped session no longer turns into a permanent error. `nxus status` also refreshes `pid` / `title id` / `main NSO base` once per second (and right after `forceopen`), so the reported target identity no longer stays at zero after the game is (re)started.
+  - **Automatic `dmnt:cht` recovery**: when the cheat process has been dropped (`0x0032C80D`), every `dmnt:cht` command re-issues `ForceOpenCheatProcess` once and retries, so a dropped session no longer turns into a permanent error.
+- **Recovery matrix (what heals itself, what needs a reboot)**:
+  | Situation | Behaviour |
+  |---|---|
+  | PC closes the CLI mid-debug (stop banner, GUI) | The debug session is released when the connection drops; the target resumes. |
+  | PC disappears while paused | The pause watchdog resumes the target (~15 s). |
+  | PC disappears while addresses are frozen | Nxus remembers what it froze and **releases them 30 s after the client is gone** (otherwise only a reboot would stop `dmnt` writing them). |
+  | Wi-Fi drops / console sleeps | The listener is rebuilt automatically, and a boot-time network failure is retried every 3 s instead of parking the module. |
+  | Hit list fills up | The reply is flagged `NXUS_HITBATCH_TRUNCATED`; refine further or raise the limit. |
+  | Something is genuinely stuck | Hold `POWER` to force-off, then boot hekate and remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` to stop the module from starting. |
+ `nxus status` also refreshes `pid` / `title id` / `main NSO base` once per second (and right after `forceopen`), so the reported target identity no longer stays at zero after the game is (re)started.
 
 ### 3. GDB-Style Disassembler & Live Code Patcher (CLI + GUI)
 - **Built-in Multi-Architecture Decoder (`protocol.rs`)**: Decodes **AArch64**, **AArch32 (ARM32)**, and **Thumb (T16 / T32)** instructions with zero external DLL dependencies.

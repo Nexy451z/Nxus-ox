@@ -346,6 +346,10 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
         3 => Some("snapshot block sizes differ"),
         4 => Some("busy: a scan or pause/resume is in progress"),
         5 => Some("no mappings yet: attach to the process and scan first"),
+        6 => Some("unknown command: this console does not implement it"),
+        7 => Some("slot number out of range"),
+        8 => Some("bad config payload (expected 16 or 32+ bytes)"),
+        9 => Some("argument outside the accepted range"),
         _ => None,
     }
 }

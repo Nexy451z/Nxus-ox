@@ -16,6 +16,11 @@
  * The probe is deliberately conservative: it never terminates the target,
  * it always continues every thread it stopped, clears what it set, and closes
  * the debug handle when done.  The game freezes for well under a second.
+ *
+ * The report is APPENDED to, never truncated: the point of a probe run is to
+ * compare it with the run before it.  Each run starts with a separator line (ISO
+ * 8601 UTC, title, firmware), then that run's verdict, then the details, and the
+ * file is rotated to "<path>.1" once it passes 512 KiB.
  */
 #include <switch.h>
 
@@ -36,6 +41,12 @@ u32 __nx_fs_num_sessions = 1;
 #define PROBE_LOG_FILE  "sdmc:/nxus/probe.txt"
 #define PROBE_CFG_FILE  "sdmc:/nxus/probe_target.txt"
 #define MAX_MAPPINGS    512
+
+/* How long the probe waits for a game before it gives up and reports whatever it
+   could measure.  This used to be 120 s, which parked the only thread of this
+   sysmodule for two minutes on every boot where no game was started yet; see
+   waitForTarget() for why a (short) wait is still needed. */
+#define TARGET_WAIT_MS  30000u
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +100,33 @@ static u64   g_MainBase = 0, g_MainSize = 0;
 static u64   g_HeapBase = 0, g_HeapSize = 0;
 static u64   g_ExecTarget = 0;
 static u64   g_WatchTarget = 0;
+
+/* Which fallback path the report was opened on (see main()), so the "done" line and
+   the fallback note name the file that was actually written. */
+static const char *g_ReportPath = NULL;
+
+/* ---- what this run measured, for the verdict block at the top of the report ---
+ * The verdict is written before the details, i.e. before the details can be
+ * summarised from the report text, so every fact it needs is recorded here by the
+ * probe that measured it.  Keeping them apart from the local Result variables also
+ * makes "not attempted" (no target) distinguishable from "failed". */
+static bool   g_TargetFound;        /* waitForTarget() saw a running title       */
+static u64    g_TargetFoundMs;      /* how long that took                        */
+static u64    g_TitleId;            /* program id of the foreground title, or 0  */
+static bool   g_DmntInitOk;         /* dmnt:cht opened                            */
+static Result g_DmntInitRc;
+static bool   g_DmntMdTried;        /* GetCheatProcessMetadata was reached        */
+static Result g_DmntMdRc;
+static bool   g_DbgTried;           /* svcDebugActiveProcess was reached          */
+static Result g_DbgRc;
+static u32    g_HwbpAccepted;       /* candidate control words the kernel took    */
+static u32    g_HwbpRejected;
+static u32    g_ExecDelivered;      /* instruction breakpoint exceptions received */
+static u32    g_DataDelivered;      /* data breakpoint exceptions received        */
+static bool   g_PerCoreTested;      /* probePerCore() ran at all                  */
+static bool   g_HidTried;
+static Result g_HidRc;
+static u64    g_HidButtons;
 
 /* svcSetHardwareBreakPoint only programs the debug registers of the core the
    calling thread is currently on.  Nxus runs on core 3 while the game runs on
@@ -160,11 +198,66 @@ static Result setHwBpAllCores(u32 slot, u64 ctrl, u64 value) {
    this unconditionally, because every execution breakpoint links to it. */
 #define HWBP_CTX_LINK5   0x003001E1ull
 
-static void out(const char *fmt, ...) {
+/* ---- report writer: append-only, verdict before details ------------------
+ * The report is opened with "ab" (never "wb"): a run that truncated the file made
+ * the previous run disappear, which is exactly what a probe report is for.
+ *
+ * The verdict of a run is only known after the last probe, but it has to be the
+ * first thing after the separator, and an append stream cannot be rewound.  So the
+ * details are spooled in RAM and copied out after the verdict: the out() call order
+ * survives untouched, and the only lines written live are the ones that must be
+ * visible while the probe still runs (the run separator, the target wait's progress
+ * and the verdict).
+ */
+#define PROBE_LOG_MAX_BYTES (512u * 1024u)
+/* 192 KiB of .bss.  A run of details is a few KiB (the worst case is a 512-entry
+   module scan, ~40 KiB), so this is a ceiling, not a target: if it is ever hit the
+   report says so instead of silently losing the rest. */
+#define REPORT_SPOOL_SIZE   (192u * 1024u)
+
+static char   g_Spool[REPORT_SPOOL_SIZE];
+static size_t g_SpoolLen;
+static bool   g_SpoolFull;      /* output had to be dropped                      */
+
+/* Live line: straight to the card, flushed, so it survives a hang in the next probe
+   step and is readable while the probe is still running. */
+static void reportLive(const char *fmt, ...) {
+    if (g_Out == NULL) return;
     va_list ap;
     va_start(ap, fmt);
-    if (g_Out != NULL) { vfprintf(g_Out, fmt, ap); fputc('\n', g_Out); fflush(g_Out); }
+    vfprintf(g_Out, fmt, ap);
     va_end(ap);
+    fputc('\n', g_Out);
+    fflush(g_Out);
+}
+
+static void spoolAppend(const char *text, size_t len) {
+    if (len > sizeof(g_Spool) - g_SpoolLen) { g_SpoolFull = true; return; }
+    memcpy(g_Spool + g_SpoolLen, text, len);
+    g_SpoolLen += len;
+}
+
+/* Details: produced exactly where the probe produced them, written later. */
+static void out(const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n > sizeof(line) - 2) n = (int)sizeof(line) - 2;
+    line[n++] = '\n';
+    spoolAppend(line, (size_t)n);
+}
+
+/* Called once, after the verdict: this is where the details reach the file. */
+static void reportFlushDetails(void) {
+    if (g_Out == NULL) return;
+    if (g_SpoolLen > 0) fwrite(g_Spool, 1, g_SpoolLen, g_Out);
+    if (g_SpoolFull)
+        fputs("(詳細が上限に達したため、以降の詳細は省略されました)\n", g_Out);
+    fflush(g_Out);
+    g_SpoolLen = 0;
 }
 
 static void rec(const char *name, Result rc, u64 d0, u64 d1) {
@@ -172,6 +265,215 @@ static void rec(const char *name, Result rc, u64 d0, u64 d1) {
     snprintf(line, sizeof(line), "%-34s rc=0x%08X d0=0x%llX d1=0x%llX",
              name, (unsigned)rc, (unsigned long long)d0, (unsigned long long)d1);
     out("%s", line);
+}
+
+/* ---- report file: append + rotation ------------------------------------- */
+
+/* Open `path` for appending, rotating it to "<path>.1" first when it is already
+   over PROBE_LOG_MAX_BYTES.  Returns false when the path is not writable, so the
+   caller can fall back to the next candidate path. */
+static bool reportOpenAppend(const char *path) {
+    g_Out = fopen(path, "ab");
+    if (g_Out == NULL) return false;
+
+    long size = 0;
+    if (fseek(g_Out, 0, SEEK_END) == 0) size = ftell(g_Out);
+    if (size > 0 && (u64)size > PROBE_LOG_MAX_BYTES) {
+        char old_path[96];
+        snprintf(old_path, sizeof(old_path), "%s.1", path);
+        /* The previous ".1" is dropped: one old run is worth keeping for a
+           comparison, more are not worth the card space. */
+        fclose(g_Out);
+        g_Out = NULL;
+        remove(old_path);
+        if (rename(path, old_path) == 0) {
+            g_Out = fopen(path, "ab");
+            /* Say it out loud: the file the reader is looking at starts empty, and
+               the run before this one is in ".1", not gone. */
+            if (g_Out != NULL) {
+                reportLive("(report was over %u KiB: the previous block was rotated to %s)",
+                           (unsigned)(PROBE_LOG_MAX_BYTES / 1024u), old_path);
+            }
+        } else {
+            /* A failed rename (e.g. read-only card) must still not let the report
+               grow forever, so truncate instead.  This is the only "wb" left. */
+            g_Out = fopen(path, "wb");
+        }
+        if (g_Out == NULL) return false;
+    }
+    g_ReportPath = path;
+    return true;
+}
+
+/* Civil date/time for a Unix timestamp, UTC.  Done by hand instead of gmtime() so
+   the report does not depend on the console's timezone setting or on newlib's
+   single shared gmtime buffer (Howard Hinnant's days -> civil algorithm). */
+static void formatUtcIso(char *dst, size_t cap, u64 epoch) {
+    const u64 secs = epoch % 86400ull;
+    const u64 z    = epoch / 86400ull + 719468ull;    /* days since 0000-03-01 */
+    const u64 era  = z / 146097ull;
+    const u64 doe  = z % 146097ull;                   /* [0, 146096]           */
+    const u64 yoe  = (doe - doe / 1460ull + doe / 36524ull - doe / 146096ull) / 365ull;
+    u64 y = yoe + era * 400ull;
+    const u64 doy = doe - (365ull * yoe + yoe / 4ull - yoe / 100ull);
+    const u64 mp  = (5ull * doy + 2ull) / 153ull;
+    const u64 d   = doy - (153ull * mp + 2ull) / 5ull + 1ull;
+    const u64 m   = (mp < 10ull) ? mp + 3ull : mp - 9ull;
+    if (m <= 2ull) y += 1ull;
+    snprintf(dst, cap, "%04llu-%02llu-%02lluT%02llu:%02llu:%02lluZ",
+             (unsigned long long)y, (unsigned long long)m, (unsigned long long)d,
+             (unsigned long long)(secs / 3600ull),
+             (unsigned long long)((secs / 60ull) % 60ull),
+             (unsigned long long)(secs % 60ull));
+}
+
+/* ISO8601 UTC for this moment, e.g. "2026-10-26T03:17:40Z".  When time:u is not
+   available (or the console clock is still at the epoch) the boot uptime is used
+   rather than a wrong 1970 date: identifying the run is all the separator needs. */
+static void isoNow(char *dst, size_t cap) {
+    u64 ts = 0;
+    if (R_SUCCEEDED(timeInitialize())) {
+        const Result rc = timeGetCurrentTime(TimeType_UserSystemClock, &ts);
+        timeExit();
+        if (R_SUCCEEDED(rc) && ts != 0) {
+            formatUtcIso(dst, cap, ts);
+            return;
+        }
+    }
+    snprintf(dst, cap, "up %llus",
+             (unsigned long long)(armTicksToNs(armGetSystemTick()) / 1000000000ull));
+}
+
+/* Title id of the foreground application, 0 when nothing is running.  pm:dmnt
+   answers for every running title; dmnt:cht's metadata is the fallback for the case
+   where only the cheat process knows it. */
+static u64 queryTitleId(void) {
+    u64 pid = 0, prog = 0;
+    if (R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid)) && pid != 0 &&
+        R_SUCCEEDED(pmdmntGetProgramId(&prog, pid)) && prog != 0) {
+        return prog;
+    }
+    NxusProcessMetadata md;
+    memset(&md, 0, sizeof(md));
+    if (R_SUCCEEDED(nxusDmntGetMetadata(&md))) return md.program_id;
+    return 0;
+}
+
+/* ---- 区切り / 判定 ---------------------------------------------------------
+ * The separator names the run; it is written after the target wait because it
+ * carries the title id, which does not exist before a title does.  The wait's own
+ * "[wait ...]" lines stay attributable through the timestamp in this line.
+ */
+static void reportRunHeader(const char *run_iso) {
+    const u32 fw = hosversionGet();
+    reportLive("");
+    reportLive("===== Nxus probe run %s (title 0x%016llX, fw %u.%u.%u) =====",
+               run_iso, (unsigned long long)g_TitleId,
+               (fw >> 16) & 0xFF, (fw >> 8) & 0xFF, fw & 0xFF);
+}
+
+/* The wait's progress lines are live (and therefore above the separator), so the
+   details restate the target conclusion that the sections below depend on. */
+static void reportTargetSummary(void) {
+    out("");
+    out("--- target -----------------------------------------------------");
+    if (g_TargetFound) {
+        out("  found after %llu ms (title 0x%016llX)",
+            (unsigned long long)g_TargetFoundMs, (unsigned long long)g_TitleId);
+    } else {
+        out("  NO GAME after %u s: start a title and reload the probe.",
+            TARGET_WAIT_MS / 1000u);
+        out("  Everything below that needs a target is reported as 'untested',");
+        out("  not as a failure.");
+    }
+}
+
+/* ---- "この実行の判定" ------------------------------------------------------
+ * With an appended report the newest run sits at the bottom of a file that can be
+ * hundreds of KiB long, so the answer has to come before the evidence: the
+ * separator, then this block, then the details (still in RAM when this runs).
+ *
+ * Every line is derived from a result the probes above recorded.  Anything this run
+ * could not measure says 未試行 instead of inventing a verdict - "no game" is not a
+ * debug-permission failure.
+ */
+static void reportVerdict(void) {
+    const u32 fw = hosversionGet();
+
+    reportLive("判定 (この実行):");
+    if (!g_TargetFound) {
+        reportLive("  対象      : ゲーム無し (%u 秒待って断念)", TARGET_WAIT_MS / 1000u);
+    } else if (g_TitleId != 0) {
+        reportLive("  対象      : title 0x%016llX (%llu ms で検出)",
+                   (unsigned long long)g_TitleId, (unsigned long long)g_TargetFoundMs);
+    } else {
+        reportLive("  対象      : 検出 (%llu ms) - title id は不明",
+                   (unsigned long long)g_TargetFoundMs);
+    }
+    reportLive("  firmware  : %u.%u.%u", (fw >> 16) & 0xFF, (fw >> 8) & 0xFF, fw & 0xFF);
+
+    if (!g_DmntInitOk) {
+        reportLive("  dmnt:cht  : initialize 失敗 rc=0x%08X", (unsigned)g_DmntInitRc);
+    } else if (!g_DmntMdTried) {
+        reportLive("  dmnt:cht  : 未試行 (メタデータ取得まで到達せず)");
+    } else if (R_FAILED(g_DmntMdRc)) {
+        reportLive("  dmnt:cht  : 失敗 rc=0x%08X", (unsigned)g_DmntMdRc);
+    } else {
+        reportLive("  dmnt:cht  : metadata OK (pid=0x%llX)", (unsigned long long)g_Pid);
+    }
+
+    if (!g_DbgTried) {
+        reportLive("  デバッグ  : 未実行 (対象なし)");
+    } else if (R_FAILED(g_DbgRc)) {
+        reportLive("  デバッグ  : svcDebugActiveProcess 失敗 rc=0x%08X", (unsigned)g_DbgRc);
+    } else {
+        reportLive("  デバッグ  : svcDebugActiveProcess OK (pid=0x%llX)",
+                   (unsigned long long)g_Pid);
+    }
+
+    if (!g_DbgTried || R_FAILED(g_DbgRc)) {
+        reportLive("  HWBP      : 未試行 (デバッグセッションが無い)");
+        reportLive("  例外配達  : 未試行");
+    } else {
+        reportLive("  HWBP      : %u/%u 語を受理 (却下 %u)",
+                   (unsigned)g_HwbpAccepted,
+                   (unsigned)(g_HwbpAccepted + g_HwbpRejected), (unsigned)g_HwbpRejected);
+        reportLive("  例外配達  : 命令BP %u / データBP %u%s",
+                   (unsigned)g_ExecDelivered, (unsigned)g_DataDelivered,
+                   (g_ExecDelivered + g_DataDelivered) == 0 ? "  <- 配達ゼロ" : "");
+    }
+
+    if (!g_PerCoreTested) {
+        reportLive("  コア別BP  : 未試行 (デバッグセッション未確立)");
+    } else if (g_PerCoreFailures == 0) {
+        reportLive("  コア別BP  : 確認済み (4コアの移行と書き込みが全て成功)");
+    } else {
+        reportLive("  コア別BP  : 未確認 (移行/書き込み失敗 %u 件, last rc=0x%08X)",
+                   (unsigned)g_PerCoreFailures, (unsigned)g_LastCoreMigrateRc);
+    }
+
+    if (!g_HidTried) {
+        reportLive("  HID       : 未試行");
+    } else if (R_SUCCEEDED(g_HidRc)) {
+        reportLive("  HID       : 読めた (buttons 0x%08llX)",
+                   (unsigned long long)g_HidButtons);
+    } else {
+        reportLive("  HID       : 読めない rc=0x%08X", (unsigned)g_HidRc);
+    }
+
+    if (!g_TargetFound) {
+        reportLive("  総合      : 対象なし - ゲームを起動して再実行 "
+                   "(この run の「未試行」は失敗ではない)");
+    } else if (!g_DbgTried || R_FAILED(g_DbgRc)) {
+        reportLive("  総合      : デバッガを掴めなかった - NPDM のデバッグ権限と "
+                   "kernel 設定を確認");
+    } else if ((g_ExecDelivered + g_DataDelivered) == 0) {
+        reportLive("  総合      : アタッチ成功・HWBP は受理されたが例外は届かず");
+    } else {
+        reportLive("  総合      : アタッチ成功・例外配達あり (命令 %u / データ %u)",
+                   (unsigned)g_ExecDelivered, (unsigned)g_DataDelivered);
+    }
+    reportLive("");
 }
 
 /* ---- optional target addresses from SD ---------------------------------- */
@@ -200,8 +502,13 @@ static void loadTargets(void) {
 /* ---- dmnt:cht ----------------------------------------------------------- */
 
 static void probeDmnt(void) {
+    out("");
+    out("--- dmnt:cht ---------------------------------------------------");
+
     Result rc = nxusDmntInitialize();
     rec("dmnt:cht initialize", rc, 0, 0);
+    g_DmntInitRc = rc;
+    g_DmntInitOk = R_SUCCEEDED(rc);
     if (R_FAILED(rc)) return;
 
     bool has = false;
@@ -218,6 +525,10 @@ static void probeDmnt(void) {
     memset(&md, 0, sizeof(md));
     rc = nxusDmntGetMetadata(&md);
     rec("GetCheatProcessMetadata", rc, md.process_id, md.program_id);
+    /* Recorded for the verdict block, which cannot look at this text: it is written
+       before the details reach the file. */
+    g_DmntMdTried = true;
+    g_DmntMdRc = rc;
     if (R_SUCCEEDED(rc)) {
         g_Pid      = md.process_id;
         g_MainBase = md.main_nso_base;
@@ -317,6 +628,8 @@ static void probeHardwareBreakpoints(void) {
         u64 value = c->use_watch_target ? (g_WatchTarget & ~7ull) : (g_ExecTarget & ~3ull);
         Result rc = setHwBpAllCores(c->slot, c->ctrl, value);
         rec(c->name, rc, c->slot, value);
+        if (R_SUCCEEDED(rc)) g_HwbpAccepted++;
+        else                 g_HwbpRejected++;
         /* Clear immediately (E=0), except for the context-id link source: keeping
            slot 5 armed is what makes the linked-execution candidate below a
            representative test of the product's configuration. */
@@ -338,6 +651,7 @@ static void coreThread(void *arg) {
 
 static void probePerCore(void) {
     alignas(0x1000) static u8 stacks[4][0x4000];
+    g_PerCoreTested = true;
     for (int core = 0; core < 4; core++) {
         Thread t;
         g_CoreResults[core].core = core;
@@ -406,6 +720,8 @@ static void probeDebugSession(void) {
     Handle dbg = INVALID_HANDLE;
     rc = svcDebugActiveProcess(&dbg, g_Pid);
     rec("svcDebugActiveProcess", rc, g_Pid, 0);
+    g_DbgTried = true;
+    g_DbgRc = rc;
     if (R_FAILED(rc)) {
         nxusDmntForceOpen();
         return;
@@ -593,6 +909,10 @@ static void probeDelivery(Handle dbg, u64 thread_id, u64 pc, u64 sp) {
             DeliveryCount count;
             memset(&count, 0, sizeof(count));
             u32 got = deliverLoop(dbg, 400, &count);
+            /* Totals for the verdict: "accepted" and "actually delivered" are the two
+               answers this probe exists for and they differ, so count both kinds. */
+            g_ExecDelivered += count.instruction_bp;
+            g_DataDelivered += count.data_bp;
             rec("  exceptions delivered", 0, count.instruction_bp, count.other_exceptions);
             if (got > 0) {
                 out("    delivered: %u (exec=%u other=%u) pc=0x%llX lr=0x%llX thread=%llu",
@@ -646,6 +966,8 @@ static void probeDelivery(Handle dbg, u64 thread_id, u64 pc, u64 sp) {
         u32 got = 0;
         if (R_SUCCEEDED(rc)) {
             got = deliverLoop(dbg, 800, &count);      /* longer: a stack write may be rare */
+            g_ExecDelivered += count.instruction_bp;
+            g_DataDelivered += count.data_bp;
         }
         rec(tries[i].name, rc, count.data_bp, watch);
         if (R_SUCCEEDED(rc)) {
@@ -702,6 +1024,9 @@ static void probeHid(void) {
 
     u64 buttons = 0;
     Result rc = nxusHidReadOnce(&buttons);
+    g_HidTried = true;
+    g_HidRc = rc;
+    g_HidButtons = buttons;
     rec("hidInitialize + pad read", rc, buttons, 0);
     if (R_SUCCEEDED(rc)) {
         out("  buttons held right now: 0x%08llX", (unsigned long long)buttons);
@@ -712,43 +1037,86 @@ static void probeHid(void) {
     }
 }
 
-/* Wait until a game (a cheat process) exists: this sysmodule is loaded by boot2,
-   where no title is running yet.  Without this the whole debug section silently
-   reports nothing. */
-static bool waitForTarget(u32 timeout_ms) {
-    u64 start = armTicksToNs(armGetSystemTick()) / 1000000ull;
-    u32 last_note = 0;
+/* Wait until a title is up: this sysmodule is loaded by boot2, where no game runs
+ * yet, and every interesting probe needs one.
+ *
+ * This is the wait that used to be 120 s long, and it is NOT a wait for other
+ * modules: everything the probe needs (sm/setsys/fs/dmnt/pm) is initialized
+ * synchronously in __appInit() before this function is reached, so sleeping here
+ * makes nothing "ready".  It waits for the *user* to start a title, which is worth
+ * TARGET_WAIT_MS at most - after that the rest of the probe runs anyway and reports
+ * the target-dependent parts as untested, instead of parking the report for two
+ * minutes on every boot.
+ *
+ * Its progress is written live (reportLive): this is the one place where the probe
+ * can spend 30 s before producing its first detail line.
+ */
+static bool waitForTarget(u32 timeout_ms, const char *run_iso) {
+    const u64 start = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    u32 last_note = 0xFFFFFFFFu;
     u32 last_open = 0xFFFFFFFFu;
+    bool announced = false;
+
     for (;;) {
+        const u64 elapsed = armTicksToNs(armGetSystemTick()) / 1000000ull - start;
+        bool found = false;
+
         bool has = false;
-        if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has)) && has) {
-            return true;
-        }
+        if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has)) && has) found = true;
+
         /* A running title is visible through pm:dmnt even before its cheat process
            exists, so this is the reliable "a game is up" signal. */
         u64 app_pid = 0;
-        if (R_SUCCEEDED(pmdmntGetApplicationProcessId(&app_pid)) && app_pid != 0) {
-            out("  foreground application pid=0x%llX", (unsigned long long)app_pid);
+        if (!found && R_SUCCEEDED(pmdmntGetApplicationProcessId(&app_pid)) && app_pid != 0) {
+            reportLive("[wait +%llu s] foreground application pid=0x%llX",
+                       (unsigned long long)(elapsed / 1000ull), (unsigned long long)app_pid);
+            found = true;
+        }
+
+        if (found) {
+            /* Recorded for the verdict block, which needs the title and the wait. */
+            g_TargetFound = true;
+            g_TargetFoundMs = elapsed;
+            g_TitleId = queryTitleId();
+            reportLive("[wait +%llu s] target found (title 0x%016llX)",
+                       (unsigned long long)(elapsed / 1000ull), (unsigned long long)g_TitleId);
             return true;
         }
+
+        /* The wait happens before the run separator (the separator carries the title
+           id, which does not exist until a title does), so it stamps its own lines
+           with this run's timestamp. */
+        if (!announced) {
+            announced = true;
+            reportLive("--- %s: waiting up to %u s for a title ---",
+                       run_iso, timeout_ms / 1000u);
+        }
+
         /* Titles that are not auto-attached never report a cheat process, so ask
            dmnt to open one for the foreground application.  This has to be retried
            while we wait: at t=0 there is no game yet, and the user may start one
            15 seconds later.  probeDebugSession() closes it again. */
-        u64 seconds = (armTicksToNs(armGetSystemTick()) / 1000000ull - start) / 1000ull;
-        if ((u32)seconds != last_open && (seconds % 5) == 0) {
+        const u64 seconds = elapsed / 1000ull;
+        if ((u32)seconds != last_open && (seconds % 5ull) == 0ull) {
             last_open = (u32)seconds;
             Result orc = nxusDmntForceOpen();
             if (R_SUCCEEDED(orc)) {
-                out("  opened the cheat process (ForceOpenCheatProcess) at %llu s",
-                    (unsigned long long)seconds);
+                reportLive("[wait +%llu s] opened the cheat process "
+                           "(ForceOpenCheatProcess)", (unsigned long long)seconds);
             }
         }
-        u64 elapsed = armTicksToNs(armGetSystemTick()) / 1000000ull - start;
-        if (elapsed >= timeout_ms) return false;
-        if (elapsed / 10000 != last_note) {          /* every ~10 s */
-            last_note = (u32)(elapsed / 10000);
-            out("  waiting for a running game... (%llu s)", (unsigned long long)(elapsed / 1000));
+
+        if (elapsed >= timeout_ms) {
+            reportLive("[wait +%llu s] no game - giving up on the target wait",
+                       (unsigned long long)seconds);
+            return false;
+        }
+
+        if (elapsed / 5000ull != last_note) {        /* every 5 s, and live */
+            last_note = (u32)(elapsed / 5000ull);
+            reportLive("[wait +%llu s] no target yet - start a game "
+                       "(giving up at %u s)",
+                       (unsigned long long)seconds, timeout_ms / 1000u);
         }
         svcSleepThread(500000000ull);                /* 500 ms */
     }
@@ -759,18 +1127,25 @@ int main(int argc, char *argv[]) {
 
     /* The whole point of the probe is this file, so make several attempts at a path
        that works: sdmc:/nxus may be unwritable (or the card read-only), and a silently
-       missing report would look like "the probe did nothing". */
+       missing report would look like "the probe did nothing".
+       The report is opened for APPENDING - and rotated when it is full, see
+       reportOpenAppend() - so each run leaves its own block behind instead of
+       erasing the run it is meant to be compared with. */
     mkdir("sdmc:/nxus", 0777);
     static const char *const log_paths[] = {
-        "sdmc:/nxus/probe.txt",
+        PROBE_LOG_FILE,
         "sdmc:/probe.txt",
         "sdmc:/switch/probe.txt",     /* always present on an Atmosphère card */
     };
-    for (unsigned i = 0; i < sizeof(log_paths) / sizeof(log_paths[0]) && g_Out == NULL; i++) {
-        g_Out = fopen(log_paths[i], "wb");
-        if (g_Out != NULL && i != 0) {
-            out("(report written to %s - the preferred path was not writable)", log_paths[i]);
-        }
+    unsigned used_path = 0;
+    for (; used_path < sizeof(log_paths) / sizeof(log_paths[0]); used_path++) {
+        if (reportOpenAppend(log_paths[used_path])) break;
+    }
+    /* Before anything else: on a fallback path the reader has to know that
+       sdmc:/nxus/probe.txt is not the file this run wrote. */
+    if (g_Out != NULL && used_path != 0) {
+        reportLive("(report written to %s - the preferred path was not writable)",
+                   log_paths[used_path]);
     }
 
     /* Written and flushed immediately: if this file is missing after a reboot the
@@ -790,23 +1165,22 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    out("================================================================");
-    out(" Nxus hardware probe");
-    {
-        u32 v = hosversionGet();
-        out(" firmware : %u.%u.%u (hosversion 0x%08X)", (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, v);
-    }
-    out(" (build id of this probe: %s %s)", __DATE__, __TIME__);
-    out("================================================================");
+    /* Timestamp of this run.  The header line is written after the target wait
+       (it carries the title id), so the time is taken here, where the run starts. */
+    char run_iso[32];
+    isoNow(run_iso, sizeof(run_iso));
 
-    out("");
-    out("--- waiting for a target ---------------------------------------");
-    if (waitForTarget(120000u)) {
-        out("  target found");
-    } else {
-        out("  NO GAME after 120 s: start one and reload the probe.  Everything below");
-        out("  that needs a target is reported as 'untested', not as a failure.");
-    }
+    /* 30 s instead of 120 s: see waitForTarget().  Its progress goes to the report
+       live, so a boot that is stuck in the wait is visible on the card. */
+    (void)waitForTarget(TARGET_WAIT_MS, run_iso);
+    if (g_TitleId == 0) g_TitleId = queryTitleId();
+
+    /* 区切り -> 判定 -> 詳細.  Only the first two are written to the card now; the
+       details are still in RAM and follow reportVerdict() at the end of main(). */
+    reportRunHeader(run_iso);
+
+    out("(probe build: %s %s)", __DATE__, __TIME__);
+    reportTargetSummary();
 
     /* dmnt:cht was opened in __appInit(); now that waitForTarget() has seen a
        running game (or timed out), query its metadata, mappings and modules. */
@@ -822,7 +1196,13 @@ int main(int argc, char *argv[]) {
     probeDebugSession();
 
     out("");
-    out("--- done.  copy sdmc:/nxus/probe.txt back to the PC -------------");
+    out("--- done.  copy the newest block of %s back to the PC ---------",
+        (g_ReportPath != NULL) ? g_ReportPath : "probe.txt");
+
+    /* Verdict first, details second: the report is append-only, so the verdict is
+       written while the details are still in RAM. */
+    reportVerdict();
+    reportFlushDetails();
 
     if (g_Out != NULL) fclose(g_Out);
     g_Out = NULL;

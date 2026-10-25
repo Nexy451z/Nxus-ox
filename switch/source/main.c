@@ -8,6 +8,7 @@
  */
 #include <switch.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,27 +60,114 @@ void __libnx_initheap(void) {
     fake_heap_end   = inner_heap + sizeof(inner_heap);
 }
 
+/* ---------------------------------------------------------------------------
+ * Boot diagnostics.
+ *
+ * A failure inside __appInit() never reaches main(), so the old "nxusLogInit(1)
+ * as the first statement of main()" left the abort completely silent: the fatal
+ * report carried only a generic libnx placeholder and the SD card had no line
+ * saying which service failed.  The log itself needs the SD card, so the order
+ * is fsdevMountSdmc -> nxusLogInit -> every other init step:
+ *   - sm / fs / the SD mount itself run before any storage exists, so their only
+ *     record is the abort result,
+ *   - from the mount onwards every failure is written before aborting: to
+ *     boot_fail.txt in the short window before the log opens, to nxus.log after,
+ * and every failure is passed to diagAbortWithResult() unchanged so the fatal
+ * report names the real service error.
+ * ------------------------------------------------------------------------- */
+static bool g_SdMounted = false;   /* fsdevMountSdmc() succeeded */
+static bool g_LogReady  = false;   /* nxusLogInit() has run */
+
+#define NXUS_BOOT_FAIL_PATH (NXUS_SESSION_BASELINE_DIR "/boot_fail.txt")
+
+/* Write one line: through the log once it exists, otherwise as an append to
+   boot_fail.txt.  Nothing is attempted before the SD mount - fopen() on an
+   unmounted sdmc:/ would fail, and NXUS_LOG() would take a mutex that
+   nxusLogInit() has not initialised yet. */
+static void bootNoteWrite(const char *msg) {
+    if (g_LogReady) {
+        NXUS_LOG("%s", msg);
+        /* An abort may follow immediately: do not leave the line in the 4 KiB
+           buffered window. */
+        nxusLogFlush();
+        return;
+    }
+    if (!g_SdMounted) return;
+    (void)mkdir(NXUS_SESSION_BASELINE_DIR, 0777);
+    FILE *f = fopen(NXUS_BOOT_FAIL_PATH, "ab");
+    if (f == NULL) return;
+    fprintf(f, "%s\n", msg);
+    fclose(f);
+}
+
+static void bootNote(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void bootNote(const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    bootNoteWrite(msg);
+}
+
+/* Record the failing step, then abort.  The Result is forwarded unchanged: the
+   real error (e.g. 0x00000A3C from fs) is worth more in the fatal report than
+   the LibnxError_InitFail_* placeholder the old code substituted. */
+static void bootFail(const char *stage, Result rc) {
+    bootNote("boot fail: %s rc=0x%08X", stage, (unsigned)rc);
+    diagAbortWithResult(rc);
+}
+
 void __appInit(void) {
     Result rc;
 
+    /* Steps that must work before the log can exist (no SD access yet). */
     rc = smInitialize();
-    if (R_FAILED(rc)) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
-
-    if (R_SUCCEEDED(setsysInitialize())) {
-        SetSysFirmwareVersion fw;
-        if (R_SUCCEEDED(setsysGetFirmwareVersion(&fw)))
-            hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
-        setsysExit();
-    }
+    if (R_FAILED(rc)) bootFail("smInitialize", rc);
 
     rc = fsInitialize();
-    if (R_FAILED(rc)) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
-    fsdevMountSdmc();
-    /* The Unknown scan streams its baseline dump to sdmc:/nxus/scan_base.bin, and
-       the log file lives in the same directory.  EEXIST is expected; any other
-       failure is not fatal because the session falls back to a RAM buffer. */
+    if (R_FAILED(rc)) bootFail("fsInitialize", rc);
+
+    rc = fsdevMountSdmc();
+    if (R_FAILED(rc)) {
+        /* No SD card: the log file and the streaming baseline are unavailable, but
+           memory scanning, the debugger and TCP all still work from RAM.  Keep the
+           module usable instead of aborting the whole sysmodule - the failure is
+           still visible in the fatal report if something else fails later. */
+        g_SdMounted = false;
+    } else {
+        g_SdMounted = true;
+    }
+
+    /* The Unknown scan streams its baseline dump to sdmc:/nxus/scan_base.bin; the
+       log and boot_fail.txt live in the same directory.  EEXIST is expected; any
+       other failure is not fatal because the session falls back to a RAM buffer. */
     (void)mkdir(NXUS_SESSION_BASELINE_DIR, 0777);
 
+    /* SD is reachable: the log starts here, before every remaining init step, so
+       failures below are written to sdmc:/nxus/nxus.log before the abort. */
+    nxusLogInit(1);
+    g_LogReady = true;
+    NXUS_LOG("boot: sdmc mounted, log started");
+
+    /* Firmware version is informational - a failure only costs the number in the
+       log header, so record it and keep booting. */
+    rc = setsysInitialize();
+    if (R_SUCCEEDED(rc)) {
+        SetSysFirmwareVersion fw;
+        Result fw_rc = setsysGetFirmwareVersion(&fw);
+        if (R_SUCCEEDED(fw_rc))
+            hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
+        else
+            bootNote("boot warn: setsysGetFirmwareVersion rc=0x%08X", (unsigned)fw_rc);
+        setsysExit();
+    } else {
+        bootNote("boot warn: setsysInitialize rc=0x%08X", (unsigned)rc);
+    }
+
+    /* dmnt:cht is not fatal either: scans still work without a debug handle, and
+       main() logs this same Result again through NXUS_RESULT(). */
     rc = nxusDmntInitialize();
     (void)rc;
 
@@ -126,7 +214,16 @@ static void logMetadata(void) {
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
-    nxusLogInit(1);
+    /* The log is normally already open: __appInit() starts it right after the SD
+       mount so that boot failures are recorded.  This call stays as the first
+       statement of main() as a safety net, but re-initialising an open log would
+       wipe the ring buffer and drop those boot lines from the `log` command, so
+       it only runs when __appInit() did not get there. */
+    if (!g_LogReady) {
+        nxusLogInit(1);
+        g_LogReady = true;
+    }
+
     NXUS_LOG("==============================================");
     NXUS_LOG("Nxus sysmodule (protocol v%u)", (unsigned)NXUS_PROTO_VERSION);
     logFirmware();
@@ -153,6 +250,13 @@ int main(int argc, char *argv[]) {
                  (unsigned)rc);
     }
     nxusServerInit();
+
+    /* One explicit success marker for the init chain, written before the network
+       wait: a boot2 sysmodule can sit in the retry loop below for a long time
+       (Wi-Fi not associated yet), and without this line the log looked identical
+       to a boot that died halfway.  "ready" is logged separately once the
+       listener is actually up. */
+    NXUS_LOG("boot ok: init chain complete (dmnt/session/debug/snapshot/server)");
 
     /* A boot2 sysmodule usually starts before Wi-Fi is associated, so a single
        failure must not park the module for the whole boot.  nxusNetInit() cleans

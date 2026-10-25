@@ -76,6 +76,8 @@ scanning
                  so the console's small heap is not a limit. Then:
   scan refine --cmp decreased [--load FILE] [--save FILE] [--limit N]
                  (with --load it refines the PC-side list, otherwise the console one)
+                 saved lists are written atomically; FILE.bak / FILE.bak2 are the
+                 previous generations, tried in order when FILE cannot be read
 
 snapshots (dump-free diffing)
   snapshot capture --slot a|b [--scope all] [--block 16384]
@@ -742,8 +744,14 @@ fn execute(opts: &Opts) -> Result<()> {
                     if let Some(path) = opts.flag("load") {
                         let mut scan = crate::pcscan::load(path)
                             .map_err(|e| NxusError { message: e.to_string(), result: None })?;
-                        let bak_base = opts.flag("save").unwrap_or(path);
-                        let _ = crate::pcscan::save(&format!("{}.bak", bak_base), &scan);
+                        // Saving in place shifts the current body into `.bak`, so
+                        // the pre-refine list is already the undo generation.
+                        // Without --save nothing is published: park the pre-refine
+                        // list as the newest backup generation explicitly.
+                        if opts.flag("save").is_none() {
+                            crate::pcscan::backup(path, &scan)
+                                .map_err(|e| NxusError { message: format!("backup {}: {}", path, e), result: None })?;
+                        }
                         let target = opts.num("value")
                             .or_else(|| opts.positional.get(2).and_then(|s| parse_number(s).ok()))
                             .unwrap_or(0);
@@ -760,7 +768,7 @@ fn execute(opts: &Opts) -> Result<()> {
                         }
                         if let Some(path) = opts.flag("save") {
                             crate::pcscan::save(path, &scan)
-                                .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+                                .map_err(|e| NxusError { message: format!("save {}: {}", path, e), result: None })?;
                             println!("saved {}", path);
                         }
                         return Ok(());
@@ -855,13 +863,15 @@ fn execute(opts: &Opts) -> Result<()> {
                 }
                 "undo" => {
                     if let Some(path) = opts.flag("load") {
-                        let bak_path = format!("{}.bak", path);
-                        let scan = crate::pcscan::load(&bak_path)
-                            .map_err(|e| NxusError { message: format!("undo {}: {}", bak_path, e), result: None })?;
+                        // Only the backups are an undo point: the body is the
+                        // state the caller wants to step back from.
+                        let (scan, generation) = crate::pcscan::load_backup(path)
+                            .map_err(|e| NxusError { message: format!("undo {}: {}", path, e), result: None })?;
                         let out_path = opts.flag("save").unwrap_or(path);
                         crate::pcscan::save(out_path, &scan)
-                            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
-                        println!("undo scan: {} candidate(s) restored", scan.len());
+                            .map_err(|e| NxusError { message: format!("save {}: {}", out_path, e), result: None })?;
+                        println!("undo scan: {} candidate(s) restored from {}{}",
+                                 scan.len(), path, generation.label());
                         return Ok(());
                     }
                     let st = client.scan_undo()?;
@@ -1713,7 +1723,10 @@ fn thumb16_text(pc: u64, hw: u16) -> String {
         if hw == 0xBF00 {
             return "nop".to_string();
         }
-        if (hw & 0xFF00) == 0xB000 || (hw & 0xFF00) == 0xB080 {
+        // ADD/SUB SP, #imm7 are 0xB000 and 0xB080: bit 7 selects sub, so the mask
+        // below covers both (the old second clause `== 0xB080` could never match a
+        // value already masked with 0xFF00 - clippy called it an incompatible mask).
+        if (hw & 0xFF00) == 0xB000 {
             let sub = (hw & 0x0080) != 0;
             let off = ((hw & 0x7F) as u32) * 4;
             return format!("{} sp, #{}", if sub { "sub" } else { "add" }, off);

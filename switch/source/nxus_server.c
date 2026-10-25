@@ -720,7 +720,8 @@ static void sendChainList(int fd, u32 seq, u16 type) {
 
 static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
     if (length < sizeof(NxusPtrScanRequest)) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                         NXUS_REASON_BAD_LENGTH);
         return;
     }
     NxusPtrScanRequest req;
@@ -828,7 +829,8 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
 
 static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
     if (length < sizeof(NxusCheatExportRequest)) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                         NXUS_REASON_BAD_LENGTH);
         return;
     }
     NxusCheatExportRequest req;
@@ -1046,7 +1048,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_GetMappings: {
-            if (length < sizeof(NxusMappingsRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusMappingsRequest)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusMappingsRequest req;
             memcpy(&req, payload, sizeof(req));
             u32 max_count = req.max_count;
@@ -1101,7 +1107,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_Query: {
-            if (length < sizeof(u64)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(u64)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             u64 address = 0;
             memcpy(&address, payload, sizeof(address));
             NxusMemoryInfo info;
@@ -1146,11 +1156,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_Write: {
-            if (length < sizeof(NxusWriteHeader)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusWriteHeader)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusWriteHeader wh;
             memcpy(&wh, payload, sizeof(wh));
             if (wh.size == 0 || length < sizeof(NxusWriteHeader) + wh.size) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             /* While attached to the process dmnt:cht is closed, so the write
@@ -1200,7 +1215,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_ScanBegin:
         case NxusCmd_ScanNext: {
-            if (length < sizeof(NxusScanRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusScanRequest)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusScanRequest req;
             memcpy(&req, payload, sizeof(req));
             (void)req;
@@ -1221,14 +1240,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 if (count < 0) {
                     /* malformed, or more entries than the protocol allows: reject rather
                        than clamp, which would read the ext/pattern from the wrong offset */
-                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                    replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                     NXUS_REASON_BAD_LENGTH);
                     break;
                 }
                 nxusSessionSetScanRanges(list, (u32)count);
                 tail = next;
             } else if (req.scope == NxusScope_Ranges) {
                 /* list mode without a list: reject instead of scanning nothing */
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
                 break;
             } else {
                 nxusSessionSetScanRanges(NULL, 0);
@@ -1253,7 +1274,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                         NXUS_LOG("scan: rejecting pattern_len=%u (room=%u, wildcard=%d) - "
                                  "the mask offset would not match the payload",
                                  (unsigned)pattern_len, (unsigned)room, want_mask ? 1 : 0);
-                        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                         NXUS_REASON_BAD_LENGTH);
                         break;
                     }
                     pattern = payload + tail + sizeof(NxusScanExt);
@@ -1308,7 +1330,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                                  NXUS_REASON_BUSY_STATE);
                 break;
             }
-            if (length < sizeof(NxusGetHitsRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusGetHitsRequest)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusGetHitsRequest req;
             memcpy(&req, payload, sizeof(req));
             sendHits(fd, seq, &req);
@@ -1323,11 +1349,19 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             if (length < sizeof(NxusSnapshotRequest)) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             NxusSnapshotRequest req;
             memcpy(&req, payload, sizeof(req));
+            /* nxusSnapshotTake() rejects slot > 1 with a bare BAD_STATE; check it
+               here so the reply names the argument instead of only the state. */
+            if (req.slot > 1) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_SLOT);
+                break;
+            }
             /* nxusSnapshotTake() allocates the slot arrays on first use, before
                it validates scope/target, and never frees them.  Mark the slot
                even when the capture fails so the heap estimate reflects the
@@ -1352,6 +1386,13 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             NxusSnapshotSummary summary;
             memset(&summary, 0, sizeof(summary));
+            /* nxusSnapshotCompare() refuses slot > 1 with a bare BAD_STATE; catch it
+               first so the client knows the slot (not the state) was the problem. */
+            if (from_slot > 1 || to_slot > 1) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_SLOT);
+                break;
+            }
             /* nxusSnapshotCompare() refuses A/B captures with different block
                sizes, but a bare BAD_STATE Result does not say why.  Mirror that
                check through the public summaries first so the client gets the
@@ -1472,9 +1513,20 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_FrozenEnable: {
-            if (length < sizeof(NxusFrozenRequest)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(NxusFrozenRequest)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             NxusFrozenRequest req;
             memcpy(&req, payload, sizeof(req));
+            /* dmnt rejects a width outside {1,2,4,8} with an opaque Result; the
+               field is client input, so name it before the IPC round trip. */
+            if (req.width != 1 && req.width != 2 && req.width != 4 && req.width != 8) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
+                break;
+            }
             u64 value = 0;
             if (nxusDebugIsAttached()) {
                 /* Freezing is a dmnt cheat-VM feature and dmnt is closed while we
@@ -1493,7 +1545,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_FrozenDisable: {
-            if (length < sizeof(u64)) { replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)); break; }
+            if (length < sizeof(u64)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
             u64 address = 0;
             memcpy(&address, payload, sizeof(address));
             if (nxusDebugIsAttached()) {
@@ -1523,6 +1579,14 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                    those 16 bytes as a NxusConfig would zero the controller hotkey.
                Every other length changes nothing instead of being half-applied. */
             const bool debug_only = (length == sizeof(NxusDebugConfig));
+
+            /* Neither shape: the old fall-through applied nothing and answered with
+               the current settings, so a malformed request looked like a success. */
+            if (!debug_only && length < sizeof(NxusConfig)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_CONFIG);
+                break;
+            }
 
             if (!debug_only && length >= sizeof(NxusConfig)) {
                 memcpy(&g_Config, payload, sizeof(g_Config));
@@ -1683,11 +1747,26 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_BreakSet: {
             if (length < sizeof(NxusBreakRequest)) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             NxusBreakRequest request;
             memcpy(&request, payload, sizeof(request));
+            /* Mirrors the checks nxusDebugSetBreak() already makes, so the client
+               learns which field is wrong instead of only "bad state".  The slot is
+               deliberately not checked: SetBreak auto-allocates for an out-of-range
+               slot, which is the documented way to ask for a free one. */
+            if (request.size != 1 && request.size != 2 && request.size != 4 && request.size != 8) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
+                break;
+            }
+            if (request.kind > NxusBp_Access) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
+                break;
+            }
             rc = nxusDebugSetBreak(&request);
             if (R_FAILED(rc)) {
                 replyError(fd, type, seq, rc);
@@ -1701,11 +1780,19 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_BreakClear: {
             if (length < sizeof(u32)) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             u32 slot = 0;
             memcpy(&slot, payload, sizeof(slot));
+            /* Mirrors nxusDebugClearBreak()'s accepted set (six instruction slots
+               0..5, four watch slots 0x10..0x13) so the reply names the slot. */
+            if (slot > 5 && (slot < 0x10 || slot > 0x13)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_SLOT);
+                break;
+            }
             rc = nxusDebugClearBreak(slot);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
@@ -1743,7 +1830,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_RegsGet: {
             if (length < sizeof(u64)) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             u64 thread_id = 0;
@@ -1758,7 +1846,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_RegsSet: {
             if (length < sizeof(NxusThreadContext)) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
                 break;
             }
             NxusThreadContext ctx;
@@ -1793,7 +1882,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         default:
             NXUS_LOG("unknown command 0x%04X", (unsigned)type);
-            replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_UNSUPPORTED));
+            replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_UNSUPPORTED),
+                             NXUS_REASON_UNKNOWN_COMMAND);
             break;
     }
 

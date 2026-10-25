@@ -19,8 +19,26 @@ build_target() {
     description="${5:-Nxus-ox sysmodule}"
     tcp_port="${6:-7332}"
     boot2="${7:-1}"
+    # Space-separated title ids this module must never boot together with; they
+    # end up as metadata.json "conflicts_with".  Both Nxus sysmodules fight over
+    # the single dmnt:cht cheat process, so each one declares the other.
+    conflicts="${8:-}"
 
     echo "== $name ($dir) =="
+    # A typo in a title id would advertise the wrong conflict to every tool that
+    # reads metadata.json, so check the shape before anything is written.
+    for other_tid in $conflicts; do
+        if [ "${#other_tid}" -ne 16 ]; then
+            echo "ERROR: conflicts_with id '$other_tid' is not 16 hex digits" >&2
+            return 1
+        fi
+        case "$other_tid" in
+            *[!0-9A-Fa-f]*)
+                echo "ERROR: conflicts_with id '$other_tid' is not hexadecimal" >&2
+                return 1
+                ;;
+        esac
+    done
     if ! make -C "$NXUS_ROOT/$dir" > "$NXUS_ROOT/$dir/build.log" 2>&1; then
         echo "BUILD FAILED"
         tail -30 "$NXUS_ROOT/$dir/build.log"
@@ -50,6 +68,8 @@ PYEOF
     # single dmnt:cht cheat process at boot, so enabling both makes the probe's
     # numbers look like failures.  docs/HARDWARE_DAY1.md stages them in two runs:
     #   NXUS_STAGE_PROBE=1 tools/build.sh   -> probe gets boot2.flag, nxus does not
+    # The probe folder additionally ships DO_NOT_BOOT_TOGETHER.txt (the manual
+    # procedure) and metadata.json names the other module in conflicts_with.
     # NOTE: `[ cond ] && touch ... || rm -f ...` hides a failed touch (rm succeeds, so
     # the statement returns 0 and `set -e` never fires).  Use explicit branches.
     boot2_flag="$dist/flags/boot2.flag"
@@ -68,8 +88,6 @@ PYEOF
         fi
     fi
 
-    $PY "$TOOLS/verify_artifact.py" "$dist/exefs.nsp"
-
     # Identification metadata.
     #
     # A custom sysmodule carries no name: its NPDM has a title id and nothing else,
@@ -79,7 +97,8 @@ PYEOF
     # self-describing.  These files are inert: Atmosphère only reads exefs.nsp and
     # flags/, so nothing about the module's behaviour depends on them.
 
-    # One timestamp for both files, so README.txt and metadata.json cannot disagree.
+    # One timestamp for every generated file, so README.txt, metadata.json and the
+    # probe warning cannot disagree about which build they describe.
     built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     # README.txt: values are injected with printf, the fixed body is a QUOTED
@@ -101,6 +120,13 @@ PYEOF
         else
             printf 'boot2    : no (this folder must NOT get a flags/boot2.flag)\n'
         fi
+        if [ -n "$conflicts" ]; then
+            conflict_list=""
+            for other_tid in $conflicts; do
+                conflict_list="${conflict_list:+$conflict_list, }0x$other_tid"
+            done
+            printf 'conflicts: %s (never boot both at once - see below)\n' "$conflict_list"
+        fi
         printf 'built    : %s\n' "$built"
         cat <<'README_EOF'
 
@@ -108,32 +134,46 @@ Nxus-ox is a headless remote memory scanner / pointer finder / hardware
 debugger for Nintendo Switch (Atmosphère).  There is no on-screen UI: the PC
 client (nxus.exe) talks to the main sysmodule over TCP port 7332.
 
-This is the main nxus sysmodule and owns port 7332.  The optional diagnostic
-probe (title id 0x4200000000004E59) must never be installed with its own
-flags/boot2.flag at the same time: two custom sysmodules both taking a debug
-handle fight over the same process.
+Two custom sysmodules must never boot at the same time: 0x4200000000004E58 is
+the main module (owns TCP port 7332) and 0x4200000000004E59 is the optional
+diagnostic probe (opens no port, writes sdmc:/nxus/probe.txt).  Both take the
+single dmnt:cht cheat process, so whichever loses the race reports a wrong
+verdict instead of "not available".  Give at most ONE of them a
+flags/boot2.flag; metadata.json names the other title id in "conflicts_with".
 
 PC client : nxus.exe --host <SWITCH_IP> status
 Project   : https://github.com/Nexy451z/Nxus-ox
 Alpha software, no warranty.  Always run on emuMMC with a NAND/SD backup.
+
+If the module does not start, look at sdmc:/nxus/nxus.log (the run log); an init
+failure that happened before the log could be opened is appended to
+sdmc:/nxus/boot_fail.txt instead, with the failing step and its result code.
 
 Files here:
   exefs.nsp     the sysmodule Atmosphère loads
   flags/        boot2.flag makes it start at boot (empty file)
   metadata.json machine-readable copy of this information
 README_EOF
+        # The probe folder gets an extra file, so list it in the same "Files here"
+        # block (the shared body above is deliberately identical for both folders).
+        if [ "$name" = "probe" ]; then
+            printf '  DO_NOT_BOOT_TOGETHER.txt  read before giving this folder a boot2.flag\n'
+        fi
     } > "$readme_tmp"
     mv "$readme_tmp" "$dist/README.txt"
 
     # metadata.json: build it with json.dump so description/role may contain
     # quotes, backslashes or newlines and still produce valid JSON.  The result
-    # is re-parsed before it replaces the old file.
+    # is re-parsed before it replaces the old file.  conflicts_with is always
+    # emitted (a list, empty when nothing conflicts) so a consumer never has to
+    # distinguish "key absent" from "no conflicts".
     meta_tmp="$dist/metadata.json.tmp"
-    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" "$tcp_port" "$boot2" <<'PYEOF'
+    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" "$tcp_port" "$boot2" "$conflicts" <<'PYEOF'
 import json
 import sys
 
-out, name, version, tid, role, description, built, tcp_port, boot2 = sys.argv[1:10]
+(out, name, version, tid, role, description, built, tcp_port, boot2,
+ conflicts) = sys.argv[1:11]
 data = {
     "name": name,
     "project": "Nxus-ox",
@@ -144,6 +184,10 @@ data = {
     "description": description,
     "tcp_port": int(tcp_port),
     "boot2_flag": boot2 == "1",
+    # Title ids that must not run at the same time as this module.  Both Nxus
+    # sysmodules take the single dmnt:cht cheat process, so booting them together
+    # makes the loser's results (the probe's verdict) wrong.
+    "conflicts_with": ["0x" + other_tid for other_tid in conflicts.split()],
     "repository": "https://github.com/Nexy451z/Nxus-ox",
     "built_utc": built,
     "warranty": "none - alpha software, use on emuMMC with a backup",
@@ -154,18 +198,79 @@ with open(out, "w", encoding="utf-8", newline="\n") as f:
 PYEOF
     $PY -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$meta_tmp"
     mv "$meta_tmp" "$dist/metadata.json"
+
+    # Coexistence warning for the probe folder.  The probe and the main module
+    # both take the single dmnt:cht cheat process, so a probe that is silently
+    # enabled next to the main module produces a wrong verdict.  metadata.json
+    # carries the machine-readable half (conflicts_with); this file is the human
+    # half and only exists in the probe folder.  Written to *.tmp and renamed,
+    # same as README.txt.
+    if [ "$name" = "probe" ]; then
+        warn_tmp="$dist/DO_NOT_BOOT_TOGETHER.txt.tmp"
+        {
+            cat <<'WARN_EOF'
+DO NOT BOOT THIS SYS MODULE TOGETHER WITH THE MAIN NXUS SYSMODULE
+=================================================================
+
+This folder is the optional diagnostic probe (title id 0x4200000000004E59).
+It opens no TCP port; it writes its verdict to sdmc:/nxus/probe.txt.
+
+WHY
+  Both nxus sysmodules take the single dmnt:cht cheat process at boot.  If both
+  start, they race for it and the loser gets "already owned" instead of a real
+  answer.  The probe then records a verdict that says hardware debugging is
+  unavailable, when the only problem was the other module.  The numbers in
+  probe.txt are WRONG, not merely missing.
+
+HOW
+  Before this folder's exefs.nsp is allowed to run, move the main module's
+  boot2 flag out of the way (rename it, do not delete it):
+
+    sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+      -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
+
+  Reboot, wait for probe.txt, then restore that flag and make sure THIS folder
+  has no flag at all:
+
+    sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag   must not exist
+
+  tools/build.sh stages exactly that split automatically:
+    NXUS_STAGE_PROBE=1 tools/build.sh    probe gets boot2.flag, nxus does not
+    tools/build.sh                       nxus gets boot2.flag, probe does not
+
+metadata.json in this folder states the same rule machine-readably:
+  "conflicts_with": ["0x4200000000004E58"]
+WARN_EOF
+            printf '\nGenerated by tools/build.sh from Nxus-ox Alpha v%s at %s\n' \
+                "$NXUS_VERSION" "$built"
+        } > "$warn_tmp"
+        mv "$warn_tmp" "$dist/DO_NOT_BOOT_TOGETHER.txt"
+    else
+        # A stale copy left over from an earlier probe build must not appear to
+        # apply to the main module.
+        rm -f "$dist/DO_NOT_BOOT_TOGETHER.txt"
+    fi
+
+    # Verify the finished folder LAST: the check inspects README.txt, metadata.json
+    # and the boot2.flag rule, none of which exist before the generation above - a
+    # clean checkout used to fail its very first build here.
+    $PY "$TOOLS/verify_artifact.py" "$dist/exefs.nsp"
+
     echo
 }
 
 # Sysmodule title ids live in the 0x42... range on a real console; 0x0100... is the
 # homebrew *application* range and is not started at boot2 (Atmosphère 1.12.1 / FW 23).
+# The last argument is the title id each module declares in metadata.json
+# "conflicts_with": the two modules fight over one dmnt:cht cheat process.
 build_target switch 4200000000004E58 nxus \
     "memory scanner / pointer finder / hardware debugger (sysmodule)" \
-    "Nxus-ox main sysmodule: headless remote memory scanner, pointer chain finder and hardware watchpoint/breakpoint debugger for Nintendo Switch (Atmosphère). No on-screen UI; the PC client nxus.exe connects over TCP port 7332."
+    "Nxus-ox main sysmodule: headless remote memory scanner, pointer chain finder and hardware watchpoint/breakpoint debugger for Nintendo Switch (Atmosphère). No on-screen UI; the PC client nxus.exe connects over TCP port 7332." \
+    7332 1 4200000000004E59
 build_target probe  4200000000004E59 probe \
     "hardware diagnostic probe (sysmodule, optional - does NOT listen on port 7332)" \
     "Nxus-ox diagnostic probe: answers the hardware bring-up questions (can a custom sysmodule obtain debug privileges, are hardware breakpoints per-core, which debug control words the kernel accepts) and writes the verdict to sdmc:/nxus/probe.txt. It never opens a TCP port and must not run at the same time as the main nxus sysmodule (0x4200000000004E58), because both would try to own a debug handle." \
-    0 0
+    0 0 4200000000004E58
 
 echo "== dist tree =="
 find "$NXUS_ROOT/dist" -type f | sed "s|$NXUS_ROOT/||"

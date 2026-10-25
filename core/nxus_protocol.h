@@ -39,6 +39,12 @@
 #define NXUS_REASON_BAD_BLOCK_SIZE  3u   /* snapshots captured with different blocks */
 #define NXUS_REASON_BUSY_STATE      4u   /* request arrived mid-scan / mid-pause */
 #define NXUS_REASON_NO_MAPPINGS     5u   /* no mapping table yet: attach/scan first */
+/* Appended only (the values above are on the wire): clients that do not know a
+   code print it as "(reason=N)", so adding here stays compatible. */
+#define NXUS_REASON_UNKNOWN_COMMAND 6u   /* command id this build does not implement */
+#define NXUS_REASON_BAD_SLOT        7u   /* snapshot / breakpoint slot outside its table */
+#define NXUS_REASON_BAD_CONFIG      8u   /* CONFIG payload length matches neither shape */
+#define NXUS_REASON_BAD_ARG         9u   /* field value outside its allowed set (width/kind/scope) */
 
 /* ---- packet header flags ---- */
 #define NXUS_FLAG_ASYNC       0x0001u  /* Switch-initiated event; seq is not a request id */
