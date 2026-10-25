@@ -2019,10 +2019,19 @@ Result nxusSessionScanUndo(void) {
     if (sessionStateLoad() == NxusScanState_Running) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
-    /* Undoing a discarded list would re-publish "Done" over the results of the
-       previous target (and pop an entry the client never saw).  The list is gone
-       from the client's point of view, so the undo has nothing legitimate to do. */
-    if (hitsStale()) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    /* An undo re-publishes the previous pass's results, i.e. it rewinds the list
+       against the baseline that pass captured - and both were taken from ONE target
+       and ONE mapping table (see the ownership block at the top of this file).  After
+       a title switch, or after a rebuilt table, that baseline describes the old
+       process: undoing would present the NEW title's state as if it had been rewound
+       through the OLD title's addresses / mapping_idx - every entry looks plausible
+       and is wrong.  Same rule as ScanNext: refuse (a discarded list is included,
+       hitsStale() is the first thing nxusSessionHitsMatchTarget() checks), so the
+       client rescans instead of seeing a silently wrong list.  The server names the
+       cause and drops the stale results once per mismatch on this return path. */
+    if (!nxusSessionHitsMatchTarget()) {
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
     if (nxusHitListUndo(&g_Session.hits) != NXUS_SCAN_OK) {
         return NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }

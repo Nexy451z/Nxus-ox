@@ -138,6 +138,21 @@ PYEOF
     # probe warning cannot disagree about which build they describe.
     built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # Build identifier, so a dist folder, an SD card or a bug report can be traced
+    # back to the exact source revision it came from.  These are ADDITIVE
+    # metadata.json keys on purpose: verify_artifact.py validates the existing ones,
+    # so an extension must never rename or drop a key.
+    # Neither value may abort the build: a source tree without git (or a git that
+    # refuses to run in this sandbox) yields "unknown" / false instead of failing
+    # after the expensive compile.  `|| source_rev=unknown` is what keeps `set -e`
+    # from turning the failed command substitution into an exit.
+    source_rev=$(cd "$NXUS_ROOT" && git rev-parse --short HEAD 2>/dev/null) || source_rev=unknown
+    [ -n "${source_rev:-}" ] || source_rev=unknown
+    dirty=false
+    if [ -n "$(cd "$NXUS_ROOT" && git status --porcelain 2>/dev/null || true)" ]; then
+        dirty=true
+    fi
+
     # README.txt: values are injected with printf, the fixed body is a QUOTED
     # heredoc so a '$' or a backtick in the text is never expanded (and `set -u`
     # cannot abort on an undefined variable inside the body).  Written to *.tmp
@@ -220,12 +235,12 @@ README_EOF
     # emitted (a list, empty when nothing conflicts) so a consumer never has to
     # distinguish "key absent" from "no conflicts".
     meta_tmp="$dist/metadata.json.tmp"
-    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" "$tcp_port" "$boot2" "$conflicts" <<'PYEOF'
+    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" "$tcp_port" "$boot2" "$conflicts" "$source_rev" "$dirty" <<'PYEOF'
 import json
 import sys
 
 (out, name, version, tid, role, description, built, tcp_port, boot2,
- conflicts) = sys.argv[1:11]
+ conflicts, source_rev, dirty) = sys.argv[1:13]
 data = {
     "name": name,
     "project": "Nxus-ox",
@@ -242,6 +257,14 @@ data = {
     "conflicts_with": ["0x" + other_tid for other_tid in conflicts.split()],
     "repository": "https://github.com/Nexy451z/Nxus-ox",
     "built_utc": built,
+    # Build identifier (additive keys, see README "Version & Compatibility
+    # Matrix"): same UTC stamp as built_utc under its documented name, the short
+    # commit this folder was built from ("unknown" when git is unavailable) and
+    # whether the working tree was dirty at build time.  built_utc is kept
+    # unchanged so existing consumers keep working.
+    "build_utc": built,
+    "source_rev": source_rev,
+    "dirty": dirty == "true",
     "warranty": "none - alpha software, use on emuMMC with a backup",
 }
 with open(out, "w", encoding="utf-8", newline="\n") as f:

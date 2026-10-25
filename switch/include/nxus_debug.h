@@ -49,6 +49,24 @@ void   nxusDebugGetStatus(NxusDebugStatus *out);
 bool   nxusDebugTargetIs64Bit(void);
 bool   nxusDebugTargetIs64BitKnown(void);
 
+/* ---- detach safety -------------------------------------------------------
+ * Every entry point below that hands the session handle to an svc*Debug* call is
+ * counted by debugOpBegin()/debugOpEnd() in nxus_debug.c, and nxusDebugDetach()
+ * waits for that counter to reach zero (one bounded 500 ms budget, unchanged) before
+ * it closes the handle.  That covers BreakSet/BreakClear (hardware arm through the
+ * handle), Continue, Step, Break, ThreadList, RegsGet/RegsSet and the debug-mode
+ * ContextID re-arm in nxusDebugConfigure(), as well as the memory accessors.
+ *
+ * A new operation that uses the session handle has to be wrapped the same way:
+ * svcCloseHandle() frees the handle number for reuse, so an uncounted operation can
+ * issue a syscall on a handle that now names an unrelated object.
+ *
+ * Deliberately outside the count: nxusDebugAttach()/nxusDebugDetach()/nxusDebugExit()
+ * (they own the hand-off, and the detach is the one draining) and the pure state
+ * readers - nxusDebugGetStatus(), nxusDebugGetBreaks(), nxusDebugGetHits(),
+ * nxusDebugHitTotal(), nxusDebugGetConfig(), nxusDebugIsStopped() and friends -
+ * which only read in-process state under g_Mutex or an atomic and never touch the
+ * handle. */
 Result nxusDebugSetBreak(const NxusBreakRequest *request);
 Result nxusDebugClearBreak(u32 slot);
 u32    nxusDebugGetBreaks(NxusBreakEntry *out, u32 max_entries);

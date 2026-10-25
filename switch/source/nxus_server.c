@@ -1927,11 +1927,11 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     if (hits->max_capacity != 0 && hits->count >= hits->max_capacity) {
         header.reserved |= NXUS_HITBATCH_TRUNCATED;
     }
-    header.count = count;
     header.total = hits->count;
     header.value_size = hits->value_size;
     header.mapping_count = map_count;
-    memcpy(buffer, &header, sizeof(header));
+    /* header.count is filled in below: the batch that is actually built may be
+       shorter than `count` when hits are dropped (see the loop). */
 
     u32 offset = (u32)sizeof(header);
     for (u32 i = 0; i < map_count; i++) {
@@ -1939,24 +1939,50 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
         offset += (u32)sizeof(u64);
     }
 
+    /* The PC resolves a hit as mapping_bases[mapping_idx] + offset and has nothing
+       of its own to range-check it against (client.scan_hits() resolves an index it
+       has no base for as 0).  A stale index from a mapping table that shrank (scan
+       while the title remapped, so the target/generation check above did not fire)
+       would therefore resolve to a completely unrelated region - and clamping the
+       index to 0, the old behaviour, produced exactly that: a real-looking wrong
+       address.  Drop such hits from the batch instead and count them.  The wire
+       header has no field for the count (reserved is a flag set and
+       core/nxus_protocol.h is frozen for this change), so it is reported in the log
+       ring - once per drop episode, because every page of the same list would
+       otherwise repeat the same line. */
+    static atomic_int logged_dropped;
+    u32 written = 0;
+    u32 dropped = 0;
     for (u32 i = 0; i < count; i++) {
         u32 index = req->offset + i;
+        if ((u32)hits->addresses[index].mapping_idx >= map_count) {
+            dropped++;
+            continue;
+        }
         NxusHit hit;
         memset(&hit, 0, sizeof(hit));
         hit.offset = hits->addresses[index].offset;
-        /* The PC resolves the hit address as mapping_bases[mapping_idx] + offset,
-           with nothing of its own to range-check it against.  A stale index from a
-           mapping table that shrank (scan while the title remapped) would resolve
-           to somebody else's address, so clamp it to 0 instead of trusting it. */
-        hit.mapping_idx = ((u32)hits->addresses[index].mapping_idx < map_count)
-                              ? hits->addresses[index].mapping_idx : 0;
+        hit.mapping_idx = hits->addresses[index].mapping_idx;
         hit.value_type = hits->addresses[index].reserved;
         memcpy(&hit.value, hits->values + (size_t)index * hits->value_size, hits->value_size);
         memcpy(buffer + offset, &hit, sizeof(hit));
         offset += (u32)sizeof(hit);
+        written++;
+    }
+    if (dropped == 0) {
+        /* A batch with nothing dropped re-arms the latch, so a later shrink is
+           reported again instead of being swallowed by the first episode. */
+        atomic_store_explicit(&logged_dropped, 0, memory_order_relaxed);
+    } else if (atomic_exchange_explicit(&logged_dropped, 1, memory_order_relaxed) == 0) {
+        NXUS_LOG("hits: dropped %u hit(s) whose mapping is gone", (unsigned)dropped);
     }
 
-    reply(fd, NxusCmd_ScanGetHits, seq, buffer, payload_size);
+    header.count = written;
+    memcpy(buffer, &header, sizeof(header));
+
+    /* Dropped hits were never written, so the reply is `offset` bytes - equal to
+       payload_size when nothing was dropped. */
+    reply(fd, NxusCmd_ScanGetHits, seq, buffer, offset);
     free(buffer);
     nxusSessionViewUnpin(&pin);
 }
@@ -2420,6 +2446,21 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             break;
 
         case NxusCmd_ScanUndo: {
+            /* An undo rewinds the hit list to the baseline the previous pass
+               captured, and that baseline - like the list - belongs to one target and
+               one mapping table.  nxusSessionScanUndo() refuses it after a title
+               switch / table rebuild (see there); name the cause and drop the stale
+               results here, on the connection thread, exactly like the hits path.
+               The discard helper owns the once-per-mismatch latch, so a client that
+               retries the undo cannot flood the log ring.  A scan that is still
+               running has no completed list to undo: it keeps the plain BUSY answer
+               from the session (and the status path discards + logs the mismatch). */
+            if (nxusSessionScanState() != NxusScanState_Running &&
+                !nxusSessionHitsMatchTarget()) {
+                discardResultsOfEarlierTarget();
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
             rc = nxusSessionScanUndo();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
             else {

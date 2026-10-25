@@ -55,9 +55,34 @@ static atomic_bool g_HandoffBusy;
    detaching.  svcCloseHandle() frees the handle slot, and the kernel reuses it for
    the next object, so a read that started before the close can end up touching an
    unrelated handle.  Detach marks g_DebugClosing and waits for the in-flight count
-   to reach zero before it closes. */
+   to reach zero before it closes.
+ *
+ * EVERY operation that hands g_Debug to an svc*Debug* call has to be counted with
+ * debugOpBegin()/debugOpEnd(), not just the memory accessors.  Registers, the thread
+ * list, continue/step/break, break set/clear and the ContextID re-arm pass the same
+ * handle to the kernel, and while they were uncounted they could still be issuing a
+ * syscall when nxusDebugDetach() had already closed (and the kernel had recycled)
+ * the handle number.  The count is exactly what the drain in nxusDebugDetach()
+ * waits for, so an operation is only covered once it is wrapped too.
+ *
+ * Deliberately NOT counted:
+ *   - nxusDebugAttach() / nxusDebugDetach() / nxusDebugExit(): they own the
+ *     hand-off, and detach is the thread doing the draining - counting it would
+ *     make it wait for itself.
+ *   - the event thread: detach stops and JOINS it before closing, so it can never
+ *     be in flight across the close (and it cannot join itself either).
+ *   - the pure state readers (GetStatus / GetBreaks / GetHits / GetConfig /
+ *     IsStopped / StoppedThread / TargetIs64Bit* / ExitedPending / IsHandoff):
+ *     they only read in-process state under g_Mutex or an atomic and never touch
+ *     g_Debug, so no closed handle can reach the kernel through them. */
 static atomic_int  g_DebugOpUsers;
 static atomic_bool g_DebugClosing;
+
+/* Upper bound, in 1 ms steps, for the in-flight drain nxusDebugDetach() runs
+   before it closes the handle.  Unchanged at 500 ms: widening the guard to more
+   commands must not make a detach wait longer, it only makes more commands
+   visible to the same single bounded wait. */
+#define NXUS_DEBUG_OP_DRAIN_MS 500
 
 static Result debugOpBegin(void) {
     if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire)) {
@@ -1223,11 +1248,15 @@ Result nxusDebugDetach(void) {
             NXUS_RESULT("ContinueDebugEvent (detach ack)", crc);
         }
 
-        /* Wait for in-flight svcRead/Write/QueryDebugProcessMemory calls: the
-           handle number is reusable the moment it is closed. */
+        /* Wait for in-flight debug operations: the handle number is reusable the
+           moment it is closed.  Every operation that touches g_Debug is counted
+           (see g_DebugOpUsers above), so this one bounded wait covers registers,
+           the thread list, continue/step/break and break set/clear as well as the
+           memory accessors.  The bound stays at NXUS_DEBUG_OP_DRAIN_MS in total:
+           adding commands to the count must not add a millisecond of waiting. */
         atomic_store_explicit(&g_DebugClosing, true, memory_order_release);
         bool drained = false;
-        for (int wait = 0; wait < 500; wait++) {
+        for (int wait = 0; wait < NXUS_DEBUG_OP_DRAIN_MS; wait++) {
             if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) {
                 drained = true;
                 break;
@@ -1235,12 +1264,13 @@ Result nxusDebugDetach(void) {
             svcSleepThread(1000000ull);
         }
         if (!drained) {
-            /* Level 0: closing the handle below can let a still-running read/write
+            /* Level 0: closing the handle below can let a still-running operation
                land on a recycled handle (a different kernel object).  Nothing else
                in the log records this, so keep it at level 0. */
-            NXUS_LOG_ERROR("debug detach: %d debug op(s) still in flight after 500 ms - "
+            NXUS_LOG_ERROR("debug detach: %d debug op(s) still in flight after %d ms - "
                            "closing the debug handle anyway",
-                           (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire));
+                           (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire),
+                           (int)NXUS_DEBUG_OP_DRAIN_MS);
         }
         svcCloseHandle(g_Debug);   /* detaches and resumes the target */
         atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
@@ -1311,6 +1341,14 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     }
     if (request == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
 
+    /* Counted against detach: arming a slot below hands g_Debug to the kernel
+       (svcSetHardwareBreakPoint through armContextIdBreakpoint(), and through
+       setHardwareBreakPointAllCores() for the link slot).  g_Mutex already orders
+       the arm against detach's wipe; the count additionally keeps the handle open
+       while the syscalls are in flight. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
+
     /* Serialised against detach (and against nxusDebugClearBreak): the whole
        reserve-then-arm sequence runs under g_Mutex, and the session is re-checked
        inside it, so an arm can never land after nxusDebugDetach() wiped the
@@ -1320,6 +1358,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     if (!g_Attached || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         mutexUnlock(&g_Mutex);
+        debugOpEnd();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
 
@@ -1337,6 +1376,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
                                                     request->address, g_Config.style);
     if (request->ctrl != 0 && (u64)request->ctrl != expected_ctrl) {
         mutexUnlock(&g_Mutex);
+        debugOpEnd();
         NXUS_LOG("set break: rejected ctrl=%08X (expected %08X, kind=%u size=%u addr=%08llX)",
                  (unsigned)request->ctrl, (unsigned)expected_ctrl,
                  (unsigned)request->kind, (unsigned)size,
@@ -1356,6 +1396,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     }
     if (slot == 0xFFFFFFFFu) {
         mutexUnlock(&g_Mutex);
+        debugOpEnd();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
 
@@ -1371,6 +1412,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     if (entry == NULL) {
         if (g_BreakCount >= NXUS_DEBUG_MAX_BREAKS) {
             mutexUnlock(&g_Mutex);
+            debugOpEnd();
             return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
         }
         entry = &g_Breaks[g_BreakCount++];
@@ -1414,6 +1456,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
             setHardwareBreakPointAllCores(slot, 0, 0);
         }
         mutexUnlock(&g_Mutex);
+        debugOpEnd();
         NXUS_LOG("set break slot=%u kind=%u addr=%08llX hw=%08llX ctrl=%08llX rc=0x%08X",
                  (unsigned)slot, (unsigned)request->kind,
                  (unsigned long long)request->address,
@@ -1432,6 +1475,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     }
     mutexUnlock(&g_Mutex);
 
+    debugOpEnd();
     NXUS_LOG("set break slot=%u kind=%u addr=%08llX hw=%08llX ctrl=%08llX rc=0x%08X",
              (unsigned)slot, (unsigned)request->kind, (unsigned long long)request->address,
              (unsigned long long)hw_addr, (unsigned long long)ctrl, (unsigned)rc);
@@ -1451,6 +1495,14 @@ Result nxusDebugClearBreak(u32 slot) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
 
+    /* Counted against detach: this function clears the hardware slot AND resumes
+       the target afterwards, both through g_Debug.  The resume below happens
+       OUTSIDE g_Mutex, so the mutex alone never covered it - it could still be
+       issuing svcContinueDebugEvent(svcGetDebugEvent) after detach had closed the
+       handle. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
+
     /* Same serialisation as SetBreak, for the same reason: a clear that runs
        concurrently with detach could reprogram (here: wipe) a register after the
        detach wiped them, and a clear that loses the race must not touch the
@@ -1459,6 +1511,7 @@ Result nxusDebugClearBreak(u32 slot) {
     if (!g_Attached || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         mutexUnlock(&g_Mutex);
+        debugOpEnd();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
 
@@ -1495,6 +1548,7 @@ Result nxusDebugClearBreak(u32 slot) {
             }
         }
     }
+    debugOpEnd();
     return rc;
 }
 
@@ -1546,7 +1600,13 @@ void nxusDebugClearHits(void) {
 
 u32 nxusDebugGetThreads(NxusThreadEntry *out, u32 max_entries) {
     if (out == NULL) return 0;
-    if (!g_Attached) {
+
+    /* The live list comes from svcGetThreadList(g_Debug), so it is counted against
+       detach.  The reply is a count, so a refused begin (detaching / not attached)
+       falls back to the cached snapshot - the same list the detached path has
+       always served - instead of reporting "no threads". */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) {
         mutexLock(&g_Mutex);
         u32 n = (g_ThreadCount < max_entries) ? g_ThreadCount : max_entries;
         for (u32 i = 0; i < n; i++) out[i] = g_Threads[i];
@@ -1556,7 +1616,9 @@ u32 nxusDebugGetThreads(NxusThreadEntry *out, u32 max_entries) {
 
     u64 ids[NXUS_DEBUG_MAX_THREADS];
     s32 num = 0;
-    if (R_FAILED(svcGetThreadList(&num, ids, NXUS_DEBUG_MAX_THREADS, g_Debug))) return 0;
+    Result rc = svcGetThreadList(&num, ids, NXUS_DEBUG_MAX_THREADS, g_Debug);
+    debugOpEnd();
+    if (R_FAILED(rc)) return 0;
     u32 n = ((u32)num < max_entries) ? (u32)num : max_entries;
     for (u32 i = 0; i < n; i++) {
         memset(&out[i], 0, sizeof(out[i]));
@@ -1567,12 +1629,18 @@ u32 nxusDebugGetThreads(NxusThreadEntry *out, u32 max_entries) {
 
 Result nxusDebugGetRegs(u64 thread_id, NxusThreadContext *out) {
     if (out == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    /* svcGetDebugThreadContext(g_Debug): counted against detach.  debugOpBegin()
+       also carries the "not attached" rejection this used to do by hand. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
 
     ThreadContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     Result rc = svcGetDebugThreadContext(&ctx, g_Debug, thread_id, RegisterGroup_CpuAll);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        debugOpEnd();
+        return rc;
+    }
 
     memset(out, 0, sizeof(*out));
     out->thread_id = thread_id;
@@ -1596,12 +1664,16 @@ Result nxusDebugGetRegs(u64 thread_id, NxusThreadContext *out) {
         out->sp = ctx.sp;
         out->fp = ctx.fp;
     }
+    debugOpEnd();
     return 0;
 }
 
 Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
     if (in == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    /* Get+SetThreadContext(g_Debug): one counted operation, so the read and the
+       write can never straddle a detach that closes the handle between them. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
 
     ThreadContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -1609,7 +1681,10 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
        read fails we must NOT continue: writing an all-zero context would destroy
        the thread's registers (including the SIMD half) and crash the game. */
     Result rc = svcGetDebugThreadContext(&ctx, g_Debug, thread_id, RegisterGroup_CpuAll);
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        debugOpEnd();
+        return rc;
+    }
     /* Decide the architecture BEFORE writing the user's values into ctx: the
        detector falls back to "any register above 4 GiB means AArch64", which would
        read a 64-bit fp/sp/lr the caller just supplied and flip the decision. */
@@ -1637,7 +1712,9 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
         ctx.cpu_gprs[13].x = (u32)in->sp;
         ctx.cpu_gprs[14].x = (u32)in->lr;
     }
-    return svcSetDebugThreadContext(g_Debug, thread_id, &ctx, RegisterGroup_CpuAll);
+    rc = svcSetDebugThreadContext(g_Debug, thread_id, &ctx, RegisterGroup_CpuAll);
+    debugOpEnd();
+    return rc;
 }
 
 /* One svcContinueDebugEvent with the flags the working reference implementation
@@ -1697,6 +1774,13 @@ Result nxusDebugContinueAll(void) {
     if (!g_Attached || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
+    /* Counted against detach for the whole resume sequence: the drains,
+       svcContinueDebugEvent() and the re-arm all pass g_Debug to the kernel, and a
+       detach that closed in the middle of them would leave the target stopped with
+       a stale handle.  Bounded: the retries below add at most 8 ms, far inside
+       NXUS_DEBUG_OP_DRAIN_MS. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
 
     /* 1. Drain first: with one unread event in m_event_info_list the kernel refuses
           ContinueDebugEvent with ResultBusy (0xF401) and resumes NOTHING, which
@@ -1732,6 +1816,7 @@ Result nxusDebugContinueAll(void) {
 
     g_LastResult = (s32)rc;
     if (R_FAILED(rc)) NXUS_RESULT("ContinueDebugEvent (continue)", rc);
+    debugOpEnd();
     return rc;
 }
 
@@ -1816,6 +1901,13 @@ Result nxusDebugStep(u64 thread_id) {
     if (!g_Attached || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
+    /* Counted against detach: the thread lookup, the context read/write and the
+       resume/stop pair inside stepResumeAndStop() all issue syscalls on g_Debug.
+       Holding the count for the whole step is what keeps the handle open until the
+       target has been stopped again (the worst case is ~42 ms of bounded waits, and
+       the drain in detach is a single 500 ms budget either way). */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
 
     u64 tid = thread_id;
     if (tid == 0) tid = nxusDebugStoppedThread();
@@ -1829,6 +1921,7 @@ Result nxusDebugStep(u64 thread_id) {
     }
     if (tid == 0) {
         NXUS_LOG("debug step: no thread to single-step");
+        debugOpEnd();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
 
@@ -1864,7 +1957,10 @@ Result nxusDebugStep(u64 thread_id) {
 
     rc = stepResumeAndStop(hardware_step);
     g_LastResult = (s32)rc;
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {
+        debugOpEnd();
+        return rc;
+    }
 
     /* Report where the step landed.  The stop event is re-sent with the new PC so
        the PC does not have to poll for it, and a step that did not actually move
@@ -1887,6 +1983,7 @@ Result nxusDebugStep(u64 thread_id) {
              hardware_step ? "hardware single step" : "fallback (no hardware single step)",
              (unsigned long long)tid, (unsigned long long)pc_before,
              (unsigned long long)pc_after);
+    debugOpEnd();
     return 0;
 }
 
@@ -1894,6 +1991,11 @@ Result nxusDebugBreak(void) {
     if (!g_Attached || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
+    /* svcBreakDebugProcess(g_Debug): counted against detach.  Without this a pause
+       that lost the race with a detach could stop the process through a handle that
+       had already been closed and recycled. */
+    Result op_rc = debugOpBegin();
+    if (R_FAILED(op_rc)) return op_rc;
 
     /* Publish the stop BEFORE the break: the kernel pushes a DebuggerBreak
        exception, and the event loop must hold that event instead of acknowledging
@@ -1917,12 +2019,14 @@ Result nxusDebugBreak(void) {
             clearStopState();
         }
         NXUS_RESULT("svcBreakDebugProcess", rc);
+        debugOpEnd();
         return rc;
     }
 
     NXUS_LOG("debug: break requested - target stopped");
     /* Manual break: no breakpoint/kind behind it. */
     sendStopEvent(0, 0, 0, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    debugOpEnd();
     return 0;
 }
 
@@ -1971,8 +2075,17 @@ void nxusDebugConfigure(const NxusDebugConfig *config) {
     /* auto_continue = 0 (default) is GDB-style stop-on-hit; the setter also
        releases a target that is currently held when the mode is switched back. */
     nxusDebugSetAutoContinue(config->auto_continue);
-    if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
-        armContextIdBreakpoint();
+    /* The ContextID link slot below is re-programmed through g_Debug, so this tail
+       is a debug operation like SetBreak and is counted the same way.  The style and
+       auto_continue above are still applied while detached - only the re-arm needs a
+       session, and hammering the hardware slots while detach is closing them would
+       be wrong anyway. */
+    Result op_rc = debugOpBegin();
+    if (R_SUCCEEDED(op_rc)) {
+        if (!atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+            armContextIdBreakpoint();
+        }
+        debugOpEnd();
     }
 }
 

@@ -37,6 +37,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 | **Target Title Architectures** | **AArch64 (64-bit)** & **AArch32 (32-bit ARM32 / Thumb)** | Full support for 32-bit titles (e.g., *Monster Hunter XX*) and 64-bit titles |
 | **Sysmodule Title IDs** | `0x4200000000004E58` (`nxus`)<br>`0x4200000000004E59` (`probe`) | NPDM ACID/ACI0 patched with single-bit `ForceDebug` (`0x08`) |
 | **PC Client (`nxus.exe`)** | **Windows x64** (Rust `eframe` / `egui` + CLI) | **Single unified executable** for both GUI and CLI |
+| **`metadata.json` build stamp** | `build_utc` (ISO 8601 UTC) · `source_rev` (`git rev-parse --short HEAD`, or `unknown` when git is unavailable) · `dirty` (`true` when `git status --porcelain` was non-empty at build time) | Additive keys in every `dist/.../metadata.json`, so a folder on the SD card can be traced to the exact revision that built it; the older `built_utc` key keeps its value and meaning |
 
 ### PC ↔ console wire compatibility (mixed builds)
 
@@ -281,7 +282,7 @@ Nxus-ox/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
     tests/    Cross-language protocol parity & end-to-end test suite (116 tests)
-  tests/      Host C unit test suite (1,406 checks across 7 test binaries)
+  tests/      Host C unit test suite (1,633 checks across 8 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
 
@@ -304,7 +305,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,633 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 189)
+# 1. Host C Core Tests (1,633 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 189, snapshot_owner 202)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
