@@ -16,8 +16,10 @@
 #include <string.h>
 
 static NxusConfig g_Config;
-/* Set while the connection thread is inside a handler (see nxusServerTick). */
-static volatile bool g_CommandActive;
+/* Set while the connection thread is inside a handler (see nxusServerTick).
+   Atomic, not `volatile bool`: the connection thread stores it while the tick
+   (main thread) and the HID thread's hotkey callback load it. */
+static atomic_bool g_CommandActive;
 /* When the current command started, so a handler that never returns (blocked dmnt
    call, stalled send) cannot suppress the watchdog and reaper for the whole boot. */
 static volatile u64  g_CommandStartedMs;
@@ -418,10 +420,18 @@ static bool g_ChainsStale;
 /* Budget state the engine sees through the cancel flag it polls.  nxusPtrScan()
    takes `int *cancel` and only looks at it between roots and inside the walk,
    so the flag is refreshed from the read callback - the one hook that runs
-   throughout the scan - rather than from a timer thread. */
+   throughout the scan - rather than from a timer thread.
+
+   `cancel_flag` is the real owner of the state: the exit path and the tick store
+   it from other threads while the walk is reading, so it has to be atomic.
+   `cancel` is only the plain copy the engine was handed by value/pointer (it
+   cannot take an atomic); it is written exclusively by the walk's own thread -
+   ptrScanReadBudgeted() assigns it from cancel_flag on every read - so the
+   engine's non-atomic poll never races the cancel. */
 typedef struct {
     u64 start_ms;
-    int cancel;      /* the flag nxusPtrScan() reads: 1 = stop the walk */
+    atomic_int cancel_flag;  /* 1 = stop the walk (written from other threads) */
+    int cancel;              /* the flag nxusPtrScan() polls: a per-thread copy */
     int budget_hit;  /* set once the time budget produced that stop */
 } PtrScanBudget;
 
@@ -434,13 +444,20 @@ static int ptrScanOverBudget(const PtrScanBudget *budget) {
 /* Read callback handed to nxusPtrScan(): re-arms the cancel flag before the
    memory read, so a scan that is burning its budget stops within one read of
    the deadline instead of at the next command.  The context is the budget, not
-   the session: nxusSessionReadCallback() ignores it. */
+   the session: nxusSessionReadCallback() ignores it.
+
+   The engine polls the plain `cancel` it was given, so the copy at the end is
+   what carries BOTH sources of a stop to it: the budget decided here and the
+   flag another thread stored (ptrScanRequestCancel / nxusServerExit).  It runs
+   on the walk's own thread, which is why assigning the plain field is safe. */
 static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
     PtrScanBudget *budget = (PtrScanBudget *)ctx;
-    if (!budget->cancel && ptrScanOverBudget(budget)) {
-        budget->cancel = 1;
+    if (!atomic_load_explicit(&budget->cancel_flag, memory_order_acquire) &&
+        ptrScanOverBudget(budget)) {
+        atomic_store_explicit(&budget->cancel_flag, 1, memory_order_release);
         budget->budget_hit = 1;
     }
+    budget->cancel = atomic_load_explicit(&budget->cancel_flag, memory_order_acquire);
     return nxusSessionReadCallback(NULL, address, buffer, size);
 }
 
@@ -595,7 +612,7 @@ static void snapshotReleaseSlots(const char *why) {
    session usable), with the own-debug-session stop only as a fallback. */
 static void onHotkeyFired(void *user) {
     (void)user;
-    if (g_CommandActive) {
+    if (atomic_load_explicit(&g_CommandActive, memory_order_acquire)) {
         NXUS_LOG("hotkey: a command is running - in-flight reads may be dropped by the pause");
     }
     Result rc = serverPauseEx(false);   /* hotkey: never hijack the process */
@@ -1440,10 +1457,12 @@ static void ptrScanReleaseSlot(void) {
 static u64 g_PtrJobStartedMs;
 
 /* Ask the running walk to stop at its next read.  The worker publishes its own
-   Failed/partial result; this only flips the flag the engine already polls. */
+   Failed/partial result; this only flips the flag the engine already polls.
+   Atomic store: the worker (or the connection thread, on the inline path) polls
+   cancel_flag through ptrScanReadBudgeted() while this thread writes it. */
 static void ptrScanRequestCancel(const char *why) {
     if (!ptrScanBusy()) return;
-    g_PtrJob.budget.cancel = 1;
+    atomic_store_explicit(&g_PtrJob.budget.cancel_flag, 1, memory_order_release);
     NXUS_LOG("ptrscan: cancel requested (%s) - the worker stops at its next read", why);
 }
 
@@ -1455,14 +1474,16 @@ static void ptrScanRequestCancel(const char *why) {
      would be overwritten and the worker would run its whole 90 s budget;
  *   - the threadCreate()-failed path runs the walk inline on the connection thread
      without ever publishing Running at all.
-   The engine only ever reads the flag (it never owns it), so writing it while no
-   walk exists is harmless: the next handlePtrScanBegin() overwrites the whole budget
-   struct with its own (cancel = 0) copy.  nxusServerExit() re-issues this under the
-   Thread-slot claim, which is what makes the last write stick - no Begin can start
-   after that point (g_ServerExited is already set and re-checked under the claim). */
+   The engine only ever reads the plain `cancel` copy (it never owns the flag,
+   and that copy is only written by the walk's own thread), so storing
+   cancel_flag while no walk exists is harmless: the next handlePtrScanBegin()
+   resets the atomic to 0 together with the rest of the budget.
+   nxusServerExit() re-issues this under the Thread-slot claim, which is what
+   makes the last write stick - no Begin can start after that point
+   (g_ServerExited is already set and re-checked under the claim). */
 static void ptrScanCancelSticky(const char *why) {
     ptrScanRequestCancel(why);
-    g_PtrJob.budget.cancel = 1;
+    atomic_store_explicit(&g_PtrJob.budget.cancel_flag, 1, memory_order_release);
 }
 
 /* The target's own architecture, as far as the console can tell - the highest
@@ -1513,6 +1534,11 @@ static void ptrScanInit(void) {
     /* No worker exists at boot, so the Thread-slot claim starts free (see
        ptrScanClaimSlot). */
     atomic_init(&g_PtrThreadReaping, false);
+    /* The budget's cancel flag belongs to the previous server lifetime until the
+       first Begin rewrites it; give the boot state an explicit "not cancelled"
+       so a re-init in the same process never starts out cancelled. */
+    atomic_init(&g_PtrJob.budget.cancel_flag, 0);
+    g_PtrJob.budget.cancel = 0;
     g_PtrJobResult = 0;
 }
 
@@ -1562,6 +1588,13 @@ static void ptrScanJobRun(void) {
     const u64 start_ms = g_PtrJob.budget.start_ms;
     u32 count = 0;
 
+    /* Seed the plain copy from the atomic flag before the engine starts: a
+       cancel that arrived between the Begin's setup and this point (the tick,
+       or the sticky one nxusServerExit() raises) must not be lost in the field
+       the engine actually reads.  Safe here - this is the walk's own thread. */
+    g_PtrJob.budget.cancel =
+        atomic_load_explicit(&g_PtrJob.budget.cancel_flag, memory_order_acquire);
+
     /* Start from a clean slate: a previous run's stats must not be published
        together with a failed/empty result (that reads as "0 chains, complete"). */
     memset(&g_PtrStats, 0, sizeof(g_PtrStats));
@@ -1569,8 +1602,10 @@ static void ptrScanJobRun(void) {
        truncated, which is exactly the advice the CLI gives when it fires. */
     const u32 out_cap = g_PtrJob.opts.max_results ? g_PtrJob.opts.max_results
                                                   : NXUS_PTRSCAN_MAX_RESULTS;
-    /* The last argument is the cancel flag the engine polls; ptrScanReadBudgeted
-       raises it once the time budget is spent, so the walk always returns. */
+    /* The last argument is the plain cancel copy the engine polls;
+       ptrScanReadBudgeted() keeps it equal to the atomic cancel_flag on every
+       read, so both the time budget and an external cancel (tick / exit) stop
+       the walk. */
     const int src = nxusPtrScan(g_PtrJob.regions, g_PtrJob.region_count,
                                 g_PtrJob.req.target_address, g_PtrJob.module_base,
                                 &g_PtrJob.opts, g_Chains, out_cap, &count,
@@ -1747,6 +1782,7 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
        handler does has to fit inside the budget. */
     PtrScanBudget budget;
     budget.start_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    atomic_init(&budget.cancel_flag, 0);
     budget.cancel = 0;
     budget.budget_hit = 0;
 
@@ -1875,7 +1911,20 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     g_PtrJob.opts = opts;
     g_PtrJob.walk_width = walk_width;
     g_PtrJob.module_base = module_base;
-    g_PtrJob.budget = budget;
+    /* Field-wise instead of `g_PtrJob.budget = budget`: the budget contains the
+       atomic cancel_flag, and a struct assignment would copy that member with a
+       plain store while the tick / nxusServerExit() may be storing it
+       concurrently - undefined on an object other threads access atomically.
+       The plain fields of the local are only written here, so copying them is
+       fine; the atomic is reset through an atomic store (this Begin's "cancel =
+       0" semantics are unchanged: a cancel that arrives in the setup window is
+       re-issued by the exit path under the Thread-slot claim). */
+    g_PtrJob.budget.start_ms = budget.start_ms;
+    g_PtrJob.budget.cancel = budget.cancel;
+    g_PtrJob.budget.budget_hit = budget.budget_hit;
+    atomic_store_explicit(&g_PtrJob.budget.cancel_flag,
+                          atomic_load_explicit(&budget.cancel_flag, memory_order_relaxed),
+                          memory_order_release);
 
     /* Identity the resulting chains will be stamped with (NxusChainOwner).  Taken
        HERE, not at publish time: the walk may run for 90 s, and if the title is
@@ -2322,7 +2371,7 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
        instead of resuming the target mid-operation.  A pointer scan that DID get a
        worker answers at once, so this flag only covers its setup: the polled
        PtrScanGet then feeds the watchdog like any other traffic. */
-    g_CommandActive = true;
+    atomic_store_explicit(&g_CommandActive, true, memory_order_release);
     g_CommandStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
 
     switch (type) {
@@ -3484,7 +3533,7 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
             break;
     }
 
-    g_CommandActive = false;
+    atomic_store_explicit(&g_CommandActive, false, memory_order_release);
     /* A handler longer than the watchdog timeout leaves the timer expired, so the
        next tick would resume a paused target the moment the command returns.
        Treat the completion as client activity. */
@@ -3627,7 +3676,7 @@ void nxusServerTick(void) {
        connection thread, so both the pause watchdog and the stale-session
        reaper would otherwise fire in the middle of it -- the reaper even closes
        the debug handle the handler is reading through. */
-    if (g_CommandActive) {
+    if (atomic_load_explicit(&g_CommandActive, memory_order_acquire)) {
         /* Protect a long legitimate handler, but never for ever: if it is stuck
            the target would stay paused with no watchdog and no reaper. */
         const u64 started = g_CommandStartedMs;
@@ -3640,7 +3689,7 @@ void nxusServerTick(void) {
         if (started != 0 && now - started < NXUS_COMMAND_GRACE_MS) return;
         NXUS_LOG("a command has been running for %llu ms - watchdog re-enabled",
                  (unsigned long long)(now - started));
-        g_CommandActive = false;
+        atomic_store_explicit(&g_CommandActive, false, memory_order_release);
     }
     reapExitedDebugSession();
     reapStaleDebugSession();
@@ -3696,8 +3745,9 @@ void nxusServerTick(void) {
  * reader from outliving what it reads:
  *
  *   1. Pointer-scan walk.  It walks the target and the mapping/region views for up
- *      to the 90 s budget, so it is CANCELLED first (the engine polls
- *      g_PtrJob.budget.cancel between roots and inside the walk - the same flag
+ *      to the 90 s budget, so it is CANCELLED first (the engine polls the plain
+ *      g_PtrJob.budget.cancel copy, which ptrScanReadBudgeted() refreshes from the
+ *      atomic budget.cancel_flag between roots and inside the walk - the same flag
  *      PtrScanGet's cancel path sets) and only then joined.  threadWaitForExit()
  *      without the cancel would block for the rest of that budget, and not joining
  *      it at all - the state before this function existed - left a live thread
@@ -3787,9 +3837,10 @@ void nxusServerExit(void) {
     for (;;) {
         /* Sticky, not "only when Running": a walk that is still being prepared or
            runs inline on the connection thread has no published Running state, and a
-           Begin that copied cancel = 0 after the first store above would otherwise
-           let its worker run the whole budget. */
-        g_PtrJob.budget.cancel = 1;
+           Begin that reset cancel_flag to 0 after the first store above would
+           otherwise let its worker run the whole budget.  Atomic: the worker polls
+           it through the read callback. */
+        atomic_store_explicit(&g_PtrJob.budget.cancel_flag, 1, memory_order_release);
         if (ptrScanClaimSlot(NXUS_PTRSCAN_EXIT_CLAIM_STEP_MS)) {
             claimed = true;
             break;

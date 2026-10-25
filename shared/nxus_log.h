@@ -12,7 +12,12 @@
 #define NXUS_LOG_LEVEL_DEBUG 2u
 
 void nxusLogInit(int write_to_sd);
-/* Flush and close the SD stream (it stays open for the whole run). */
+/* Flush and close the SD stream (it stays open for the whole run).
+ *
+ * Terminal for this logging lifetime: after this call every nxusLogWriteXXX()
+ * (including a line that arrives through the failed-open backoff) is dropped -
+ * no ring entry and, above all, no fopen() of the log after the exit.  Only a
+ * later nxusLogInit() reopens logging. */
 void nxusLogExit(void);
 
 /* info line: written while the level is >= NXUS_LOG_LEVEL_INFO.  The signature is

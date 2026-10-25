@@ -112,6 +112,19 @@ static Mutex   g_SessionMutex;
  * re-checks it UNDER the claim, so a ScanBegin that passed its Running check
  * just before the shutdown cannot create a worker behind Exit()'s join.
  *
+ * The claim also serialises the OBJECTS that outlive the Thread: the hit list, the
+ * baseline store and the published mapping/region views.  ScanBegin()'s destructive
+ * phase (baselineDiscard, hit-list free/re-init, view republish), Reset()'s free and
+ * Exit()'s teardown all free or replace them, so each of them holds the claim across
+ * that work - not only around the join:
+ *
+ *   - only the claim holder frees/replaces those objects, so no second caller can
+ *     free the same block again (the double free this section used to allow),
+ *   - a caller that cannot take the claim LOGS AND LEAVES THE OBJECTS ALONE:
+ *     Exit() releases nothing, ScanBegin() answers BUSY, Reset() is skipped.  That
+ *     is a leak at shutdown, never a free under a live owner - the same trade-off
+ *     ptrScanClaimSlot() makes at server exit.
+ *
  * Init() resets both, because Exit() may be followed by a fresh Init().
  */
 static atomic_bool g_ScanThreadClaim;
@@ -706,8 +719,16 @@ static void viewRetireFlush(void) {
 }
 
 static void mappingSnapshotDrop(void) {
-    NxusMappingEntry *old = g_Session.map_entries;
+    NxusMappingEntry *old;
     viewUpdateBegin();
+    /* The block being replaced is captured INSIDE the writer lock.  Reading it
+       before viewUpdateBegin() made "which block did this writer replace?" two
+       independent samples: e.g. Exit() on the main thread and a disconnect/target
+       change dropping the table on the connection thread both saw the same pointer
+       and both handed it to viewRetire() - a double free.  Under the lock exactly
+       one writer sees (and therefore retires) each publication: the second one
+       already observes NULL or the first writer's block. */
+    old = g_Session.map_entries;
     g_Session.maps.entries = NULL;
     g_Session.maps.count = 0;
     g_Session.map_entries = NULL;
@@ -715,6 +736,9 @@ static void mappingSnapshotDrop(void) {
     /* An empty table is still a different table: no stored mapping_idx can resolve
        through it any more, so the hits stamped against the old one are unservable. */
     mappingGenerationBump();
+    /* Retiring stays outside: viewRetire() takes g_ViewRetireMutex, and the publish
+       lock is documented to cover only the plain stores.  Release is safe here
+       because this writer owns `old` exclusively (captured above). */
     viewRetire(old, "mappings");
 }
 
@@ -734,11 +758,14 @@ static u64 mappingFingerprint(const NxusMappingEntry *entries, u32 count) {
 static atomic_ullong g_MappingFingerprint;
 
 static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
-    NxusMappingEntry *old = g_Session.map_entries;
+    NxusMappingEntry *old;
     const u64 fingerprint = mappingFingerprint(entries, count);
     const u64 previous =
         atomic_load_explicit(&g_MappingFingerprint, memory_order_acquire);
     viewUpdateBegin();
+    /* Captured under the writer lock, like mappingSnapshotDrop(): two writers must
+       never both sample the same previous block and both retire it. */
+    old = g_Session.map_entries;
     g_Session.map_entries = entries;
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
@@ -752,8 +779,12 @@ static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
 }
 
 static void regionListDrop(void) {
-    NxusScanRegion *old = g_Session.regions;
+    NxusScanRegion *old;
     viewUpdateBegin();
+    /* Same rule as mappingSnapshotDrop(): the replaced block is sampled under the
+       writer lock, so two writers (connection-thread drop vs. a concurrent publish)
+       can never retire the same region list twice. */
+    old = g_Session.regions;
     g_Session.regions = NULL;
     g_Session.region_count = 0;
     viewUpdateEnd();
@@ -763,8 +794,10 @@ static void regionListDrop(void) {
 /* Publish a freshly built list (buildRegions) as one pair, never as a pointer
    without its count. */
 static void regionListPublish(NxusScanRegion *regions, u32 count) {
-    NxusScanRegion *old = g_Session.regions;
+    NxusScanRegion *old;
     viewUpdateBegin();
+    /* Captured under the writer lock (see mappingSnapshotPublish). */
+    old = g_Session.regions;
     g_Session.regions = regions;
     g_Session.region_count = count;
     viewUpdateEnd();
@@ -1099,32 +1132,49 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits) {
 void nxusSessionExit(void) {
     if (!g_Inited) return;     /* nothing initialised (or already exited) */
 
-    /* Shutdown gate first: a startJob() that is about to take the slot re-checks
-       this under the claim instead of creating a worker behind the join below. */
+    /* Shutdown gate first: a startJob()/ScanBegin() that is about to take the slot
+       re-checks this under the claim instead of creating a worker behind the join
+       below. */
     atomic_store_explicit(&g_SessionExited, true, memory_order_release);
 
     nxusSessionScanCancel();
-    /* The worker Thread is joined and closed ONLY by the slot claim holder, so a
-       concurrent startJob()/Reset() can never reap the same Thread (see the slot
-       block at the top of this file).  Bounded: the holder cannot be in an IPC. */
-    if (scanThreadClaim(2000)) {
-        /* A startJob() that took the slot just before g_SessionExited became
-           visible may have started a worker AFTER the cancel above was ignored
-           (startJob() clears the flag).  Re-issue it under the claim so the join
-           is bounded by the worker's own read loop, not by a whole scan. */
-        nxusSessionScanCancel();
-        if (scanThreadJoinLocked()) {
-            NXUS_LOG("scan: worker joined and closed (session exit)");
-        }
-        scanThreadRelease();
-    } else {
-        /* Reset() or a Begin() owns the claim.  A Begin() that owns it re-checks
-           g_SessionExited under the claim and cannot create a worker any more, and
-           Reset() reaps the worker itself: touching the Thread here is exactly the
-           double close this claim exists to prevent. */
-        NXUS_LOG("scan: worker slot still claimed at exit - not joining "
-                 "(the claim holder reaps it; no new worker can start)");
+    /* Everything this function frees - the hit list, the baseline store, both
+       published views and the retire ring behind them - is also freed or replaced
+       by the claim holder: startJob()'s worker reaps and a concurrent Reset() (its
+       free) or ScanBegin() (baselineDiscard / hit-list re-init / view republish) do
+       it under this same claim.  Freeing outside it meant Exit() could free the very
+       block the owner was already freeing: a double free.  So the whole teardown -
+       join -> close -> free -> release - runs under the claim, and there is no
+       "join failed, keep freeing anyway" path left.  The wait stays bounded: the
+       holder may be inside ScanBegin()'s mapping snapshot (a dmnt IPC), and a
+       shutdown that is already gated may not block on it forever. */
+    if (!scanThreadClaim(2000)) {
+        /* Reset()/ScanBegin() (or a startJob() they called) owns the claim and is
+           inside those objects.  No join can prove it is done, and touching the
+           Thread/objects here is exactly the double free/close the claim exists to
+           prevent.  So: release nothing, log it, and leave the memory to the
+           process - the same trade-off ptrScanClaimSlot() makes at server exit.
+           g_Inited stays true on purpose: a later Exit() retries the claim instead
+           of making the leak permanent, and g_SessionExited (already up) keeps every
+           begin/startJob out in the meantime, so nothing can be re-created behind
+           this call.  The published views are left in place here (not unpublished);
+           the server reaches Exit() only after it drained the handlers and gated new
+           ones, so nothing but the claim holder can still touch them. */
+        NXUS_LOG("scan: worker slot still claimed at exit - session NOT released "
+                 "(its owner may still free/read the hit list, baseline and views; "
+                 "the process is exiting)");
+        return;
     }
+
+    /* A startJob() that took the slot just before g_SessionExited became visible
+       may have started a worker AFTER the cancel above was ignored (startJob()
+       clears the flag).  Re-issue it under the claim so the join is bounded by the
+       worker's own read loop, not by a whole scan. */
+    nxusSessionScanCancel();
+    if (scanThreadJoinLocked()) {
+        NXUS_LOG("scan: worker joined and closed (session exit)");
+    }
+
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
     /* Unpublish through the seqlock before releasing: nxusSessionMappings() /
@@ -1150,6 +1200,10 @@ void nxusSessionExit(void) {
        nothing, and nxusSessionViewPinnedCount() reports 0 until the next Init. */
     g_ViewRetireInited = false;
     g_Inited = false;
+    /* Released last: a begin/reset that waited on the claim runs from here, sees
+       g_SessionExited under it and refuses, so it cannot touch what was just
+       freed. */
+    scanThreadRelease();
 }
 
 u32  nxusSessionId(void)            { return g_Session.session_id; }
@@ -1891,20 +1945,14 @@ static void scanThread(void *arg) {
     scanWorkerRelease(false, chunk, window, cur_buf, prev_buf);
 }
 
-static Result startJob(bool first_pass) {
-    if (sessionStateLoad() == NxusScanState_Running) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
-
-    /* Reap the previous worker and create the next one under the slot claim (see
-       the slot block at the top of this file).  A begin that loses the claim to
-       Exit()/Reset() is answered BUSY instead of racing their join; one that wins
-       re-checks g_SessionExited so it cannot start a worker behind Exit()'s join,
-       where the session blocks it is about to read are being freed. */
-    if (!scanThreadClaim(200)) {
-        NXUS_LOG("scan: worker slot busy (exit/reset in progress) - not starting the scan");
-        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
-    }
+/* Reap the previous worker and create the next one.  The CALLER holds the slot
+   claim (see the slot block at the top of this file): ScanBegin() keeps it across
+   its destructive phase and must not drop/re-take it between "freed/replaced the
+   old objects" and "started the worker", and ScanNext() reaches this through
+   startJob().  Re-checks g_SessionExited so a worker cannot be started behind
+   Exit()'s join, where the session blocks it is about to read are being freed. */
+static Result startJobLocked(bool first_pass) {
     if (atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
-        scanThreadRelease();
         NXUS_LOG("scan: session is exiting - not starting the worker");
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
@@ -1920,10 +1968,7 @@ static Result startJob(bool first_pass) {
        per-block locals off the edge. */
     alignas(0x1000) static u8 scanStack[0x10000];
     Result rc = threadCreate(&g_Session.thread, scanThread, NULL, scanStack, sizeof(scanStack), 0x2C, -2);
-    if (R_FAILED(rc)) {
-        scanThreadRelease();
-        return rc;
-    }
+    if (R_FAILED(rc)) return rc;
 
     /* Publish Running only AFTER every worker input is in place (regions, mapping
        snapshot, hit list, job request, thread_live): the release store pairs with
@@ -1931,10 +1976,22 @@ static Result startJob(bool first_pass) {
     g_Session.thread_live = true;
     sessionStateStore(NxusScanState_Running);
     threadStart(&g_Session.thread);
-    /* Released only now: from here on Exit()/Reset() may claim and join the worker
-       this call just started. */
-    scanThreadRelease();
     return 0;
+}
+
+static Result startJob(bool first_pass) {
+    if (sessionStateLoad() == NxusScanState_Running) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+
+    /* A begin/refine that loses the claim to Exit()/Reset() is answered BUSY
+       instead of racing their join/free. */
+    if (!scanThreadClaim(200)) {
+        NXUS_LOG("scan: worker slot busy (exit/reset in progress) - not starting the scan");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    const Result rc = startJobLocked(first_pass);
+    /* Released only now: from here on Exit()/Reset() may claim, join and free. */
+    scanThreadRelease();
+    return rc;
 }
 
 /* Copy the pattern (if any) into the session so the worker thread owns it.
@@ -2012,6 +2069,36 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     if (pattern_len > NXUS_SCAN_MAX_PATTERN) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
+    /* Everything below DESTROYS state that a worker, Exit() or Reset() also owns:
+       baselineDiscard() closes the store, the mapping/region republishes replace the
+       published views, and the hit list is freed and re-initialised.  Exit() and
+       Reset() free those very objects under the worker-slot claim, so this whole
+       destructive phase takes the same claim - not just startJob() at the end, which
+       used to leave "free the old objects" and "take the slot" in two separate
+       windows (a concurrent Exit()/Reset() could free the same block in between).
+       A begin that cannot take the claim is answered BUSY instead of freeing an
+       object the claim holder is freeing too. */
+    if (!scanThreadClaim(200)) {
+        NXUS_LOG("scan: worker slot busy (exit/reset in progress) - not starting the scan");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    if (atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
+        scanThreadRelease();
+        NXUS_LOG("scan: session is exiting - not starting the worker");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+    /* Re-check under the claim: a startJob() that won the slot just after the
+       Running test above had already published Running when it released it, and
+       joining that worker below would block this begin for a whole scan. */
+    if (sessionStateLoad() == NxusScanState_Running) {
+        scanThreadRelease();
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    /* Reap the previous worker right away: from here on no worker, Exit() or
+       Reset() can touch the hit list, the baseline or the views it replaces
+       below. */
+    (void)scanThreadJoinLocked();
+
     g_Session.job_req = *req;
     setPattern(value_type, epsilon_decimals, pattern, pattern_len, mask);
     g_Session.job_pattern.flags = req->flags;
@@ -2025,10 +2112,16 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
 
     cacheProcessInfo();
     Result rc = snapshotMappings();
-    if (R_FAILED(rc)) return rc;
+    if (R_FAILED(rc)) {                 /* claim released: Exit()/Reset() may free */
+        scanThreadRelease();
+        return rc;
+    }
 
     buildRegions(req);
-    if (g_Session.region_count == 0) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    if (g_Session.region_count == 0) {
+        scanThreadRelease();
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
 
     const u32 hit_value_size = listValueSize(req, value_type);
     if (baselineApplies(req, value_type, g_Session.job_pattern.pattern != NULL)) {
@@ -2058,6 +2151,7 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     rc = nxusHitListInit(&g_Session.hits, initial, max_hits, hit_value_size);
     if (R_FAILED(rc)) {
         baselineDiscard();
+        scanThreadRelease();
         return rc;
     }
 
@@ -2070,14 +2164,18 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     hitsOwnerStamp();
     atomic_store_explicit(&g_HitsStale, 0, memory_order_release);
     sessionStateStore(NxusScanState_Idle);
-    Result jr = startJob(true);
+    /* Started under the claim this call still holds: the worker cannot be created
+       behind Exit()'s join (startJobLocked() re-checks the exit gate), and Exit()
+       cannot free the objects above between the free and the start. */
+    Result jr = startJobLocked(true);
     /* No worker: the dump is dead weight.  Unless Exit() owns the session by now:
        it frees the baseline itself, and discarding it here would race that teardown
-       on the FILE* / RAM store (startJob() reports BAD_STATE once the exit gate is
-       up, the same case this check covers). */
+       on the FILE* / RAM store (startJobLocked() reports BAD_STATE once the exit
+       gate is up, the same case this check covers). */
     if (R_FAILED(jr) && !atomic_load_explicit(&g_SessionExited, memory_order_acquire)) {
         baselineDiscard();
     }
+    scanThreadRelease();
     return jr;
 }
 
@@ -2169,8 +2267,11 @@ void nxusSessionReset(void) {
         return;
     }
     (void)scanThreadJoinLocked();
-    scanThreadRelease();
 
+    /* The frees stay UNDER the claim, not after scanThreadRelease(): a begin that
+       takes the slot in that gap frees/re-inits the very same hit list and baseline
+       (ScanBegin's destructive phase now claims the slot for that reason), so
+       releasing first would reopen the double free the join above just closed. */
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
     /* No list is left that could belong to a target: the next ScanBegin stamps a
@@ -2183,4 +2284,5 @@ void nxusSessionReset(void) {
     g_Session.progress = 0;
     g_Session.last_result = 0;
     sessionStateStore(NxusScanState_Idle);
+    scanThreadRelease();
 }

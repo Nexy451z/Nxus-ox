@@ -1,6 +1,7 @@
 #include "nxus_log.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -45,6 +46,21 @@ static u64    g_LogRetryAt = 0;
 #define NXUS_LOG_FLUSH_BYTES    4096u
 #define NXUS_LOG_FLUSH_INTERVAL 500000000ull   /* 500 ms in ns */
 #define NXUS_LOG_RETRY_NS       10000000000ull /* 10 s between open retries */
+/* Terminal flag: raised by nxusLogExit() and cleared by nxusLogInit().
+ *
+ * Without it, a line that reached logWriteLocked() after nxusLogExit() hit the
+ * "file is closed" branch and fopen()ed the log again - i.e. the delayed/backoff
+ * write created a new SD stream *after* __appExit() had run fsExit(), and either
+ * leaked it or faulted on a dead filesystem.  Both the ring and the stream are
+ * therefore refused once this is true, so the exit really is terminal: a later
+ * line is dropped, not buffered for a reopen.
+ *
+ * Atomic because nxusLogExit() runs on the main thread while any other thread may
+ * still be logging; the store/loads are release/acquire and every one of them
+ * happens under g_LogMutex, so the flag cannot be read stale in the window
+ * between the check and the fopen()/fwrite() it is meant to gate.  A
+ * zero-initialised static is "not final", i.e. the boot state. */
+static atomic_bool g_LogFinal;
 
 void nxusLogInit(int write_to_sd) {
     /* A second init (__appInit() plus the safety net at the top of main()) used to
@@ -63,6 +79,13 @@ void nxusLogInit(int write_to_sd) {
     }
 
     mutexInit(&g_LogMutex);
+    /* A re-init after nxusLogExit() reopens the logging lifetime: the exit's
+       "terminal" verdict belongs to the OLD stream, and the caller is explicitly
+       asking for a new one (the test harness boots, exits and boots again in one
+       process).  Cleared under nothing but this thread - Init runs before any
+       other logging thread exists - so a stale "final" cannot drop the first
+       lines of the new run. */
+    atomic_store_explicit(&g_LogFinal, false, memory_order_release);
     g_Ring[0] = 0;
     g_RingLen = 0;
     g_LogToSd = write_to_sd != 0;
@@ -86,6 +109,14 @@ u32 nxusLogGetLevel(void) {
 
 void nxusLogExit(void) {
     mutexLock(&g_LogMutex);
+    /* Raise the terminal flag FIRST, under the writers' lock.  The lock is what
+       makes this final rather than advisory: a line that already holds it has
+       finished its fwrite() (and any reopen) before we get here, so the close
+       below cannot be followed by a new fopen(); a line that arrives afterwards
+       sees the flag in logEmit()/logWriteLocked() and is dropped.  This is the
+       bug this flag exists for - the backoff path used to reopen the file after
+       fsExit(). */
+    atomic_store_explicit(&g_LogFinal, true, memory_order_release);
     if (g_LogFile != NULL) {
         fflush(g_LogFile);
         fclose(g_LogFile);
@@ -122,6 +153,12 @@ static void logRotateLocked(void) {
 }
 
 static void logWriteLocked(const char *line, size_t len) {
+    /* Entry check: nxusLogExit() closed the stream and cleared g_LogFile, so the
+       reopen branch below would fopen() the log again after fsExit().  A final
+       log therefore stops before the SD stream - and before it could create
+       one.  logEmit() already refuses the line (ring included); this guards the
+       helper itself, in case a future caller reaches it another way. */
+    if (atomic_load_explicit(&g_LogFinal, memory_order_acquire)) return;
     if (!g_LogToSd) return;
     if (g_LogFile == NULL) {
         /* A missing/unwritable sdmc:/nxus turned every single log line into an
@@ -213,6 +250,14 @@ static void logEmit(const char *fmt, va_list ap) {
     line[pos] = 0;
 
     mutexLock(&g_LogMutex);
+    /* After nxusLogExit() the whole logging lifetime is over: no ring entry (the
+       ring is the dead server's history) and no SD write (the stream is closed
+       and must not be reopened).  Checked under the same lock the exit takes, so
+       a writer cannot slip between the check and the fwrite()/fopen() below. */
+    if (atomic_load_explicit(&g_LogFinal, memory_order_acquire)) {
+        mutexUnlock(&g_LogMutex);
+        return;
+    }
     ringAppend(line, pos);
     logWriteLocked(line, pos);
     mutexUnlock(&g_LogMutex);
