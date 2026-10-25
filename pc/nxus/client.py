@@ -351,24 +351,21 @@ class NxusClient:
         return body.decode('utf-8')
 
     def _parse_chains(self, body: bytes) -> list[dict]:
-        # The first four header words keep their offsets; Round 17 appends the
-        # pointer width the walk actually used (16 -> 20 bytes).  Reading just the
-        # prefix works with both mirrors, and the payload length says which layout
-        # this reply used - a 16-byte reader must not take the appended word for
-        # the first chain record.
-        count, total, truncated, _res = P.PTR_CHAIN_LIST_HEADER_LEGACY.unpack_from(body, 0)
+        # The first four header words keep their offsets in every revision (the
+        # mirror carries both shapes: LEGACY is the 16-byte prefix).
+        legacy = getattr(P, 'PTR_CHAIN_LIST_HEADER_LEGACY', P.PTR_CHAIN_LIST_HEADER)
+        count, total, truncated, _res = legacy.unpack_from(body, 0)[:4]
         records = count * P.PTR_CHAIN.size
         self.last_ptr_scan_width = 0
         # 16-byte header from an older console, 20-byte with pointer_width appended.
         # The frame length decides: guessing wrong shifts every record by four bytes
-        # and yields plausible-looking garbage instead of an error.
+        # and yields plausible-looking garbage instead of an error, so follow the
+        # length and let a short frame fail in unpack_from below.
         if len(body) == 20 + records:
             pos = 20
             self.last_ptr_scan_width = int.from_bytes(body[16:20], 'little')
         else:
             pos = 16
-            if len(body) != 16 + records:
-                raise NxusError(f"chain list length {len(body)} matches neither header")
         out = []
         for _ in range(count):
             root, final, step_count, _r, *steps = P.PTR_CHAIN.unpack_from(body, pos)

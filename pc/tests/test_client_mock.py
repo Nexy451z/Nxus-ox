@@ -1290,6 +1290,13 @@ class ClientAutoDefaults(unittest.TestCase):
                                          step_count=1, steps=[0x20]))
         self.assertEqual(self.client.last_ptr_scan_width, 8)
 
+    def test_the_walked_width_survives_the_wire(self):
+        """End to end over a real socket: the console walks with 8-byte pointers
+        and the reply has to say so, or a cheat export cannot follow it."""
+        self.server.ptr_scan_width = 8
+        self.client.ptr_scan_begin(MONEY_ADDRESS, module_base=MAIN_BASE, value_width=8)
+        self.assertEqual(self.client.last_ptr_scan_width, 8)
+
 
 def batch_total(batch):
     return batch['total']
