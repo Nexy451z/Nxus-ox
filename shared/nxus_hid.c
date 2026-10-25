@@ -35,6 +35,13 @@ static atomic_bool g_ThreadClosing;
 static bool     g_Available = false;
 static Result   g_InitResult = 0;
 static atomic_bool g_Stop;
+/* Monotonic shutdown latch, claimed once by nxusHidExit() and never cleared
+   again.  nxusHidStart() checks it (before it claims g_ThreadStarting) instead of
+   relying on g_ThreadClosing, which only exists for the duration of one join: the
+   gate also covers the window between "exit set g_Stop" and "exit claimed
+   g_ThreadClosing", in which a Config resend used to create a fresh worker and
+   roll g_Stop back to false underneath the join. */
+static atomic_bool g_Exiting;
 
 static u64      g_Mask = 0;
 static u32      g_HoldMs = 0;
@@ -53,6 +60,7 @@ void nxusHidInit(void) {
     atomic_init(&g_ThreadLive, false);
     atomic_init(&g_ThreadStarting, false);
     atomic_init(&g_ThreadClosing, false);
+    atomic_init(&g_Exiting, false);
 }
 
 void nxusHidSetCallback(NxusHotkeyCallback callback, void *user) {
@@ -203,7 +211,24 @@ static bool hidExitIsSelf(void) {
 }
 
 void nxusHidExit(void) {
-    atomic_store_explicit(&g_Stop, true, memory_order_relaxed);
+    /* Close the start gate FIRST, before the stop flag and before any join: from
+       this point nxusHidStart() must not create a worker and must not roll g_Stop
+       back to false (a Config resend that wins that race restarts the loop of a
+       worker this exit is already joining).  The latch is never cleared - a process
+       that is shutting down does not get a new hotkey producer - and a repeated
+       exit still falls through to the join/close below, which is idempotent through
+       g_ThreadClosing and is what reaps a handle an earlier (self-joining) exit had
+       to leave behind. */
+    bool gate_expected = false;
+    if (!atomic_compare_exchange_strong(&g_Exiting, &gate_expected, true)) {
+        NXUS_LOG_DEBUG("hotkey: exit gate already closed - new starts stay refused");
+    }
+
+    /* seq_cst: ordered against the rollback in nxusHidStart() (see the comment
+       there).  A relaxed store here would let a start that checked the gate before
+       it closed publish g_Stop = false after this store, and the worker it creates
+       would keep polling through the shutdown. */
+    atomic_store_explicit(&g_Stop, true, memory_order_seq_cst);
 
     /* Self-join guard FIRST, before g_ThreadClosing is claimed: a callback may run
        this on the worker thread, and there is nothing safe to join or close there.
@@ -289,6 +314,14 @@ Result nxusHidReadOnce(u64 *out_buttons) {
 /* Started lazily by the server once a hotkey is configured, so an unused
    sysmodule does not hold the input service open. */
 void nxusHidStart(void) {
+    /* Exit gate BEFORE the start claim: once nxusHidExit() has closed it, a Config
+       resend must create no thread and (see the rollback below) must not touch
+       g_Stop.  Checked again under g_ThreadStarting, because the gate can close
+       while this call is between the two checks. */
+    if (atomic_load_explicit(&g_Exiting, memory_order_acquire)) {
+        NXUS_LOG_DEBUG("hotkey: start refused - HID is exiting");
+        return;
+    }
     /* Claim the create/start section; a second start loses and does nothing. */
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(&g_ThreadStarting, &expected, true,
@@ -299,6 +332,15 @@ void nxusHidStart(void) {
        on top of g_Thread (that used to leak the first one and race its close). */
     if (atomic_load_explicit(&g_ThreadLive, memory_order_acquire) ||
         atomic_load_explicit(&g_ThreadClosing, memory_order_acquire)) {
+        atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
+        return;
+    }
+    /* The gate does not block this call (nxusHidExit() never waits for a start to
+       begin), so it can close between the check above and here.  Do not reap or
+       replace the handle in that case: whatever g_ThreadOpen still names is reaped
+       by that exit, and a worker created now is exactly what the gate prevents. */
+    if (atomic_load_explicit(&g_Exiting, memory_order_acquire)) {
+        NXUS_LOG("hotkey: start aborted - HID exit gate closed during start");
         atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
         return;
     }
@@ -320,7 +362,31 @@ void nxusHidStart(void) {
         threadClose(&g_Thread);
     }
 
-    atomic_store_explicit(&g_Stop, false, memory_order_relaxed);
+    /* Roll the stop flag back so the fresh worker runs - but ONLY while the exit
+       gate is still open.  nxusHidExit() publishes g_Stop = true before it starts
+       joining, and a rollback landing after that store restarts the loop of a
+       worker the exit is already collecting.
+       A bare "if (gate open) g_Stop = false" would not close the race: the gate
+       CAS can fall between the load and the store, leaving g_Stop == false after
+       the exit wrote true.  Both operations are seq_cst, which puts the pair in one
+       order with the exit's gate CAS + g_Stop store:
+         - if the re-check still sees the gate open, the exit's CAS is ordered AFTER
+           this load, and its g_Stop = true AFTER the CAS - i.e. after this store;
+         - if the re-check sees the gate closed, the rollback is undone and no
+           worker is created, so the exit has nothing new to join (it is already
+           spinning on g_ThreadStarting above). */
+    if (atomic_load_explicit(&g_Exiting, memory_order_seq_cst)) {
+        NXUS_LOG("hotkey: start aborted - HID exit gate closed during start");
+        atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&g_Stop, false, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_Exiting, memory_order_seq_cst)) {
+        atomic_store_explicit(&g_Stop, true, memory_order_seq_cst);
+        NXUS_LOG("hotkey: start aborted - HID exit gate closed during start");
+        atomic_store_explicit(&g_ThreadStarting, false, memory_order_release);
+        return;
+    }
     alignas(0x1000) static u8 stack[0x4000];
     Result rc = threadCreate(&g_Thread, hidThread, NULL, stack, sizeof(stack), 0x2C, -2);
     if (R_FAILED(rc)) {

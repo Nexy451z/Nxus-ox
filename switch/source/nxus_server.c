@@ -323,6 +323,25 @@ static void releaseOwnedFrozen(void) {
     frozenUnlock();
 }
 
+/* Drop the frozen bookkeeping without touching dmnt.  Only the exit path calls
+   this, once nothing can release those freezes any more: dmnt keeps writing a
+   frozen address until the process ends, and after nxusServerExit() the tick that
+   would have released them is gated too, so the table is pure bookkeeping.  It
+   was the one structure in this file that no path freed (the review's Low
+   finding), and a re-Init would otherwise inherit entries from the round before.
+   Releasing the freezes themselves is deliberately NOT done here - that is a dmnt
+   write, and it belongs to the "the client is gone" path (releaseOwnedFrozen). */
+static void frozenOwnedForgetAll(const char *why) {
+    frozenLock();
+    const u32 dropped = g_FrozenOwnedCount;
+    g_FrozenOwnedCount = 0;
+    frozenUnlock();
+    if (dropped != 0) {
+        NXUS_LOG("frozen: dropped %u owned address(es) at exit (%s) - not released, "
+                 "the process is exiting", (unsigned)dropped, why);
+    }
+}
+
 /* Deliver a queued FrozenReleased notification now that a client is connected. */
 static void flushFrozenReleased(void) {
     u64 addresses[NXUS_FROZEN_RELEASE_ADDR_MAX];
@@ -1322,6 +1341,28 @@ static atomic_bool g_PtrThreadReaping;
    boot state: false, i.e. "running". */
 static atomic_bool g_ServerExited;
 
+/* Handlers currently inside dispatchCommand(), i.e. past the gate and before the
+   last thing nxusServerHandle() does.  nxusServerExit() raises the gate and then
+   waits for this to reach zero before it lets nxusSessionExit() free the mapping /
+   region views and the hit array.
+
+   The gate alone was not enough.  It keeps a handler from STARTING, but one that
+   passed the check just before the gate's compare-exchange is already running and
+   may be anywhere in dispatchCommand - reading a pinned mapping view, copying the
+   hit array, walking the region list - while Exit() freed exactly those.  That is
+   the use-after-free this counter closes: "gate set" says no new reader, "counter
+   zero" says no reader left.
+
+   The increment sits AFTER the gate check and BEFORE anything dispatchCommand()
+   touches, the decrement is the last statement of nxusServerHandle(), so counter
+   == 0 means no handler can name session state any more.  The handshake with
+   "set the gate, then read the counter" in Exit() is a store-buffering pattern:
+   on aarch64 an acq_rel store of the gate may become visible before the gate load
+   is ordered against the counter load, and the drain would miss the handler that
+   just entered.  Both sides are therefore sequentially consistent on purpose; do
+   not weaken these to acquire/release. */
+static atomic_uint g_HandlersInFlight;
+
 /* Put the gate back to "running".  Only nxusServerInit() calls this: the flag is
    terminal for one server lifetime - nxusServerExit() must never be followed by a
    handler that brings state back - but a second Init in the same process (the test
@@ -1331,6 +1372,11 @@ static atomic_bool g_ServerExited;
    every worker, so this store cannot race a reader. */
 static void serverExitGateReset(void) {
     atomic_store_explicit(&g_ServerExited, false, memory_order_release);
+    /* A second Init also starts with a clean drain counter.  No handler can be in
+       flight here (the listener does not exist yet, see above), and a handler the
+       previous Exit gave up on - one that never returned - would otherwise make
+       every later Exit wait the full drain timeout and skip its release again. */
+    atomic_store_explicit(&g_HandlersInFlight, 0u, memory_order_release);
 }
 
 /* How long nxusServerExit() is willing to wait for the worker Thread slot, and the
@@ -1342,6 +1388,16 @@ static void serverExitGateReset(void) {
    out and nothing else would retry it. */
 #define NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS 2000u
 #define NXUS_PTRSCAN_EXIT_CLAIM_STEP_MS   100u
+
+/* How long nxusServerExit() waits for the handlers the connection thread already
+   let through the gate (see g_HandlersInFlight), and the sleep granularity.  Long
+   enough to cover a normal handler - a snapshot, a hex write, a PtrScanBegin that
+   only sets up - and short enough that a handler wedged in a dmnt IPC cannot keep
+   the teardown (and therefore the system's reboot/shutdown) waiting.  The wait is
+   the last chance to free the session at all: the process is exiting, so a timeout
+   means "leak on purpose" (see the end of nxusServerExit). */
+#define NXUS_EXIT_HANDLER_DRAIN_TOTAL_MS 3000u
+#define NXUS_EXIT_HANDLER_DRAIN_STEP_MS    10u
 
 static bool ptrScanBusy(void) {
     return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
@@ -2176,11 +2232,16 @@ NXUS_STATIC_ASSERT(sizeof(NxusLogRequest) == 8, "NxusLogRequest must be 8 bytes"
 
 /* ---- main dispatch ----------------------------------------------------- */
 
+/* One command, with the gate already passed and the handler counted.  Defined
+   right below nxusServerHandle() (which is the only caller); forward-declared
+   because the in-flight accounting has to wrap the call, not sit inside it. */
+static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *payload,
+                            u32 length);
+
 void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload, u32 length, void *user) {
     (void)user;
     const u16 type = header->type;
     const u32 seq = header->seq;
-    Result rc = 0;
 
     /* Terminal gate, first statement for a reason: nxusServerExit() runs while this
        thread is still serving - the network is only shut down afterwards (main.c
@@ -2203,7 +2264,12 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
        Shutdown command (the PC stops the sysmodule itself), and Heartbeat writes the
        session's idle clock - it is refused like the rest, which is also how the PC
        learns that the console is gone. */
-    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
+    /* Sequentially consistent, not acquire: this load is the "read the gate" half
+       of the handshake with the increment below and with Exit()'s "set the gate,
+       then read the counter" (see g_HandlersInFlight).  An acquire load may be
+       reordered after the increment on aarch64, which is exactly the window the
+       drain must not have. */
+    if (atomic_load_explicit(&g_ServerExited, memory_order_seq_cst)) {
         if (type == NxusCmd_Nop) {
             reply(fd, type, seq, NULL, 0);
         } else {
@@ -2220,6 +2286,30 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
         return;
     }
+
+    /* Past the gate, so this command WILL run: count the handler for its whole
+       run, so nxusServerExit() cannot free the views or the hits under it (see
+       g_HandlersInFlight).  Still before the first state read - the heartbeat and
+       g_CommandActive moved into dispatchCommand() - because Exit() may already be
+       spinning on this increment.  Nothing between the gate and this line touches
+       session, snapshot or worker state.
+
+       The split exists for the decrement, not for style: dispatchCommand() has
+       exactly one entry and one exit by construction, so no early `return` added to
+       the switch later can strand the counter above zero and turn every shutdown
+       into "skipped the release". */
+    atomic_fetch_add_explicit(&g_HandlersInFlight, 1u, memory_order_seq_cst);
+    dispatchCommand(fd, header, payload, length);
+    /* Last thing this handler touches: what it read is unreferenced now, so
+       Exit()'s drain can complete and free the session. */
+    atomic_fetch_sub_explicit(&g_HandlersInFlight, 1u, memory_order_seq_cst);
+}
+
+static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *payload,
+                            u32 length) {
+    const u16 type = header->type;
+    const u32 seq = header->seq;
+    Result rc = 0;
 
     /* Any traffic counts as "the PC is still here": without this the pause
        watchdog would resume the target during a long scan or a hex-edit session,
@@ -3638,13 +3728,33 @@ void nxusServerTick(void) {
  *          is to leak the views into the teardown instead of freeing memory a live
  *          reader could still name.
  *
- *   2. The session.  nxusSessionScanCancel() sets the scan worker's flag and
+ *   2. In-flight handlers.  The gate keeps a NEW handler from starting, but one that
+ *      passed it just before the compare-exchange is already inside
+ *      dispatchCommand() and may be reading a pinned mapping view or copying the hit
+ *      array.  Exit() therefore waits - bounded by
+ *      NXUS_EXIT_HANDLER_DRAIN_TOTAL_MS - for g_HandlersInFlight to reach 0.  A
+ *      handler is counted from the moment it passes the gate until its very last
+ *      statement, so 0 means no reader is left.
+ *      If the drain times out, the session and the snapshot slots are NOT freed, for
+ *      the same reason step 1 does not free them when the slot stays claimed: the
+ *      process is exiting, the gate keeps every other reader out, and a leak that
+ *      ends with the process beats memory a live handler can still name.
+ *
+ *   3. The session.  nxusSessionScanCancel() sets the scan worker's flag and
  *      nxusSessionExit() then joins that worker and frees the hit list, the SD
  *      baseline, the mapping/region views and every view pin.  Exit() repeats the
  *      cancel internally; doing it here keeps the shutdown order readable and
  *      makes sure the flag is raised BEFORE the join rather than inside it.  It is
- *      only reached once step 1 proved that no pointer walk can be reading those
- *      views any more.
+ *      only reached once steps 1 and 2 proved that neither a worker nor a handler
+ *      can read those views any more.
+ *
+ *   4. Snapshots and the frozen table - the two things this file owns and no path
+ *      released before (the review's Low finding).  snapshotReleaseSlots() hands the
+ *      A/B captures back to the inner heap (through nxusSnapshotReleaseAll(), plus
+ *      the g_HeldSnapshotSlots bookkeeping), frozenOwnedForgetAll() drops the frozen
+ *      ownership entries WITHOUT writing to dmnt - the process is on its way out and
+ *      the addresses cannot be released any more anyway.  Both are reachable from
+ *      handlers, so they are only touched after step 2 drained.
  *
  * The debug session (nxusDebugExit), the network (nxusNetExit) and dmnt
  * (nxusDmntExit) are deliberately NOT stopped here: they belong to other modules
@@ -3652,10 +3762,13 @@ void nxusServerTick(void) {
  */
 void nxusServerExit(void) {
     /* The compare-exchange is both the "already exited" guard and the flag the
-       connection thread reads: only the first caller proceeds. */
+       connection thread reads: only the first caller proceeds.  Sequentially
+       consistent: it is the "store the gate" half of the handshake documented on
+       g_HandlersInFlight, and an acq_rel store may on aarch64 be observed before
+       the counter load below is ordered against the handlers' increment. */
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(&g_ServerExited, &expected, true,
-                                                 memory_order_acq_rel, memory_order_acquire)) {
+                                                 memory_order_seq_cst, memory_order_acquire)) {
         NXUS_LOG_DEBUG("server: exit already done - ignored");
         return;
     }
@@ -3717,9 +3830,49 @@ void nxusServerExit(void) {
         return;
     }
 
-    /* 2. a running scan, then the session itself.  Only reached once no pointer walk
-       can be in flight, so the views freed here have no reader left. */
+    /* 2. the handlers the gate could not stop.  A command that passed the gate just
+       before the compare-exchange above is running in dispatchCommand() right now
+       and may be reading a pinned mapping/region view, the hit array or a snapshot.
+       Its decrement is the last statement of nxusServerHandle(), so waiting for the
+       counter to reach 0 is waiting until no such reader exists any more.
+
+       Bounded on purpose: a handler can be inside a dmnt IPC or a large snapshot, and
+       nothing after this function would retry the release (the process is exiting),
+       so a wedged handler must not turn the shutdown into an endless wait. */
+    u32 drain_waited_ms = 0;
+    while (atomic_load_explicit(&g_HandlersInFlight, memory_order_seq_cst) != 0) {
+        if (drain_waited_ms >= NXUS_EXIT_HANDLER_DRAIN_TOTAL_MS) break;
+        svcSleepThread((u64)NXUS_EXIT_HANDLER_DRAIN_STEP_MS * 1000000ull);
+        drain_waited_ms += NXUS_EXIT_HANDLER_DRAIN_STEP_MS;
+    }
+    const unsigned handlers_left =
+        (unsigned)atomic_load_explicit(&g_HandlersInFlight, memory_order_seq_cst);
+    if (handlers_left != 0) {
+        /* Same trade-off as the pointer-scan claim above: a handler is still inside a
+           read, and freeing the session or the snapshot slots under it is exactly the
+           use-after-free this whole ordering exists to prevent.  Nothing else can
+           start: the gate is set, the tick is gated, and the pointer walk is joined.
+           So leave the memory to the process exit and say so - silence here would
+           look like a clean release in the log. */
+        NXUS_LOG_ERROR("server: %u handler(s) still in flight after %u ms - session and "
+                       "snapshot slots NOT released (a handler may still read them; the "
+                       "process is exiting)",
+                       handlers_left, (unsigned)NXUS_EXIT_HANDLER_DRAIN_TOTAL_MS);
+        return;
+    }
+
+    /* 3. a running scan, then the session itself.  Only reached once neither the
+       pointer walk (step 1) nor a handler (step 2) can read the views, so the memory
+       freed here has no reader left. */
     (void)nxusSessionScanCancel();
     nxusSessionExit();
     NXUS_LOG("server: scan cancelled and session released");
+
+    /* 4. the two structures nothing else owned or freed.  Both are only reachable
+       from the connection thread's handlers and therefore safe this late: the
+       snapshot slots hand their A/B arrays back to the inner heap (with the
+       g_HeldSnapshotSlots bookkeeping kept in step), and the frozen ownership table
+       is dropped without a dmnt write. */
+    snapshotReleaseSlots("server exit");
+    frozenOwnedForgetAll("server exit");
 }
