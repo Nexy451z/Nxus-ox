@@ -1284,9 +1284,53 @@ static atomic_int  g_PtrJobState;
 static Result      g_PtrJobResult;   /* the failure NxusPtrJob_Failed carries */
 static Thread      g_PtrThread;
 static bool        g_PtrThreadLive;
+/* True while one of the two users of the worker Thread slot (handlePtrScanBegin()
+   preparing the next walk, or nxusServerExit()) owns it.  The Thread object must be
+   joined and closed exactly once - a second threadWaitForExit() on a closed Thread
+   waits on freed state, and closing one that threadStart() is about to use is worse -
+   and the shutdown runs concurrently with the connection thread, so the right to touch
+   the slot is claimed atomically here instead of being decided by g_PtrThreadLive. */
+static atomic_bool g_PtrThreadReaping;
+/* Set by nxusServerExit() (the claim is also its idempotency guard): no new pointer
+   scan may start after that point, or a worker created during the shutdown would
+   outlive the session and the debug handle it reads - the very leak the exit path
+   exists to close.  Atomic because handlePtrScanBegin() on the connection thread
+   re-checks it under the slot claim. */
+static atomic_bool g_ServerExited;
 
 static bool ptrScanBusy(void) {
     return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
+}
+
+/* Join and close the worker Thread.  The caller must hold the slot claim (see
+   ptrScanClaimSlot).  Returns true when a worker was actually reaped. */
+static bool ptrScanJoinSlotLocked(void) {
+    if (!g_PtrThreadLive) return false;
+    threadWaitForExit(&g_PtrThread);
+    threadClose(&g_PtrThread);
+    g_PtrThreadLive = false;
+    return true;
+}
+
+/* Take the worker Thread slot for "reap the previous worker + create/start the next
+   one" (handlePtrScanBegin) or for "cancel + join" (nxusServerExit).  Bounded wait
+   instead of an endless one: the holder never sits in an IPC, only in
+   threadCreate()/threadStart() and one worker join, and a Begin that has to wait for a
+   shutting-down server is better answered BUSY than blocked. */
+static bool ptrScanClaimSlot(u32 spin_ms) {
+    for (u32 waited = 0; ; waited += 1u) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong_explicit(&g_PtrThreadReaping, &expected, true,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            return true;
+        }
+        if (waited >= spin_ms) return false;
+        svcSleepThread(1000000ull);
+    }
+}
+
+static void ptrScanReleaseSlot(void) {
+    atomic_store_explicit(&g_PtrThreadReaping, false, memory_order_release);
 }
 
 /* When the worker last entered Running: the tick uses it to spot a walk that never
@@ -1347,6 +1391,9 @@ static NxusPtrScanArch ptrScanProcessArch(void) {
    boot chain, before the listener is up). */
 static void ptrScanInit(void) {
     atomic_init(&g_PtrJobState, NxusPtrJob_Idle);
+    /* No worker exists at boot, so the Thread-slot claim starts free (see
+       ptrScanClaimSlot). */
+    atomic_init(&g_PtrThreadReaping, false);
     g_PtrJobResult = 0;
 }
 
@@ -1545,6 +1592,18 @@ static Result ptrChainOwnerCheck(void) {
 }
 
 static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
+    /* The server is shutting down (nxusServerExit ran): no new walk may start.  It
+       would outlive the session and the debug handle that the exit path is releasing,
+       and the worker Thread slot may already have been closed (see
+       ptrScanClaimSlot / ptrScanJoinSlotLocked).  Answered as BAD_STATE because
+       nothing will clear - the console is going down - but with the BUSY reason so a
+       client that reconnects during the teardown reads "retry", not "your request was
+       malformed". */
+    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                         NXUS_REASON_BUSY_STATE);
+        return;
+    }
     if (length < sizeof(NxusPtrScanRequest)) {
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                          NXUS_REASON_BAD_LENGTH);
@@ -1722,14 +1781,28 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
                        (unsigned long long)owner.target_address);
     }
 
-    /* Reap the previous worker before reusing its Thread slot (threadCreate()
-       overwrites it).  It has finished, or the BUSY gate above would have
-       refused this request. */
-    if (g_PtrThreadLive) {
-        threadWaitForExit(&g_PtrThread);
-        threadClose(&g_PtrThread);
-        g_PtrThreadLive = false;
+    /* Take the worker Thread slot, re-check the shutdown UNDER the claim (nxusServerExit
+       sets that flag before it claims, so a Begin that passed the check at the top of
+       this handler can still be refused here instead of creating a worker behind the
+       exit path's join) and reap the previous worker before threadCreate() overwrites
+       its Thread.  The previous worker has finished, or the BUSY gate above would have
+       refused this request; the exit path's cancel is what brings a running walk back
+       to ptrScanPublish(). */
+    if (!ptrScanClaimSlot(200)) {
+        free(regions);
+        free(scratch);
+        replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+        return;
     }
+    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
+        ptrScanReleaseSlot();
+        free(regions);
+        free(scratch);
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                         NXUS_REASON_BUSY_STATE);
+        return;
+    }
+    (void)ptrScanJoinSlotLocked();
 
     /* 16 KB: the engine's ~38 KB state is static and the deepest measured frame in
        this module is under 2 KB (the scan worker keeps an even larger engine on
@@ -1745,6 +1818,8 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
         g_PtrJobStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
         atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Running, memory_order_release);
         threadStart(&g_PtrThread);
+        /* Released only now: from here on nxusServerExit() may join the worker. */
+        ptrScanReleaseSlot();
         NXUS_LOG("ptrscan: started on the worker thread (target=%08llX regions=%u) - "
                  "answering PTRSCAN_STARTED, the client polls PtrScanGet",
                  (unsigned long long)req.target_address, (unsigned)region_count);
@@ -1755,6 +1830,7 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     /* No thread available (kernel quota, low memory): walk here instead of failing
        a scan the console can still perform.  That is the old behaviour, so the
        reply is the old one - the chain list (or the walk's own error). */
+    ptrScanReleaseSlot();
     NXUS_RESULT("threadCreate(ptrscan)", trc);
     NXUS_LOG("ptrscan: no worker thread - walking on the connection thread");
     ptrScanJobRun();
@@ -1946,10 +2022,11 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
        would therefore resolve to a completely unrelated region - and clamping the
        index to 0, the old behaviour, produced exactly that: a real-looking wrong
        address.  Drop such hits from the batch instead and count them.  The wire
-       header has no field for the count (reserved is a flag set and
-       core/nxus_protocol.h is frozen for this change), so it is reported in the log
-       ring - once per drop episode, because every page of the same list would
-       otherwise repeat the same line. */
+       header's reserved word only has room for flags (core/nxus_protocol.h is
+       shared by every client), so the batch is flagged with
+       NXUS_HITBATCH_DROPPED - a page walk must not stop on an empty page while it
+       is set - and the count is reported in the log ring, once per drop episode,
+       because every page of the same list would otherwise repeat the same line. */
     static atomic_int logged_dropped;
     u32 written = 0;
     u32 dropped = 0;
@@ -1978,6 +2055,13 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     }
 
     header.count = written;
+    /* Some of the requested hits were dropped because their mapping is gone: this
+       page is lossy and may be empty even though later pages still hold hits, so
+       say so on the wire instead of letting the PC's page walk read "empty" as
+       "end of the list" and lose the rest.  Coexists with the truncated bit. */
+    if (dropped != 0) {
+        header.reserved |= NXUS_HITBATCH_DROPPED;
+    }
     memcpy(buffer, &header, sizeof(header));
 
     /* Dropped hits were never written, so the reply is `offset` bytes - equal to
@@ -2952,6 +3036,17 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 if (resultIsBusyRetryable(rc)) {
                     NXUS_LOG("debug attach: the previous session is still being released");
                     replyBusyReason(fd, type, seq, NXUS_REASON_RETRY_LATER);
+                } else if (rc == (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE)) {
+                    /* The only BAD_STATE nxusDebugAttach() reports is its pid
+                       mismatch refusal: the kernel attached to a process other than
+                       the requested pid, so the session was detached again and
+                       NOTHING is attached now.  Name the rejected argument instead
+                       of sending the bare state error, which a client reads as
+                       "wrong moment to ask" - the pid itself is what has to be
+                       corrected. */
+                    NXUS_LOG("debug attach: pid=%llu is not the process the session took - "
+                             "detached, nothing attached", (unsigned long long)pid);
+                    replyErrorReason(fd, type, seq, rc, NXUS_REASON_BAD_ARG);
                 } else {
                     replyError(fd, type, seq, rc);
                 }
@@ -3380,4 +3475,73 @@ void nxusServerTick(void) {
             NXUS_LOG("watchdog: auto-resume FAILED rc=0x%08X", (unsigned)rc);
         }
     }
+}
+
+/* ---- terminal shutdown -------------------------------------------------- */
+
+/*
+ * Stop every worker and the session this file owns, in the one order that keeps a
+ * reader from outliving what it reads:
+ *
+ *   1. Pointer-scan worker.  It walks the target and the mapping/region views for
+ *      up to the 90 s budget, so it is CANCELLED first (the engine polls
+ *      g_PtrJob.budget.cancel between roots and inside the walk - the same flag
+ *      PtrScanGet's cancel path sets) and only then joined.  threadWaitForExit()
+ *      without the cancel would block for the rest of that budget, and not joining
+ *      it at all - the state before this function existed - left a live thread
+ *      reading target memory while the session and the debug handle were being
+ *      torn down underneath it.
+ *      ptrScanClaimSlot()/ptrScanJoinSlotLocked() are the only way the worker Thread
+ *      is touched: handlePtrScanBegin() holds the same claim across its
+ *      reap/create/start sequence and re-checks g_ServerExited under it, so no worker
+ *      can be created behind this join and no Thread is ever joined or closed twice.
+ *
+ *   2. The session.  nxusSessionScanCancel() sets the scan worker's flag and
+ *      nxusSessionExit() then joins that worker and frees the hit list, the SD
+ *      baseline, the mapping/region views and every view pin.  Exit() repeats the
+ *      cancel internally; doing it here keeps the shutdown order readable and
+ *      makes sure the flag is raised BEFORE the join rather than inside it.
+ *
+ * The debug session (nxusDebugExit), the network (nxusNetExit) and dmnt
+ * (nxusDmntExit) are deliberately NOT stopped here: they belong to other modules
+ * and they are sequenced by __appExit() (main.c), which calls this function first.
+ */
+void nxusServerExit(void) {
+    /* The compare-exchange is both the "already exited" guard and the flag the
+       connection thread reads: only the first caller proceeds. */
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&g_ServerExited, &expected, true,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        NXUS_LOG_DEBUG("server: exit already done - ignored");
+        return;
+    }
+
+    /* 1. pointer-scan worker: cancel, then join exactly once.  The cancel is what
+       makes a running walk return to ptrScanPublish() (the engine only polls the flag
+       between roots / inside the walk), so the join below is bounded by the walk's
+       own read loop instead of by its remaining time budget. */
+    ptrScanRequestCancel("server exit");
+    if (ptrScanClaimSlot(2000)) {
+        /* A Begin that took the slot just before g_ServerExited became visible may have
+           started a walk AFTER the cancel above was ignored (the job was not Running
+           yet).  Re-issue it under the claim, so the join cannot wait for the walk's
+           whole time budget. */
+        ptrScanRequestCancel("server exit (worker started late)");
+        if (ptrScanJoinSlotLocked()) {
+            NXUS_LOG("ptrscan: worker joined and closed (server exit)");
+        }
+        ptrScanReleaseSlot();
+    } else {
+        /* A Begin on the connection thread owns the slot.  It cannot create a new
+           worker any more (it re-checks g_ServerExited under the claim), and
+           nxusNetExit() joins that thread right after this, so the only cost is one
+           log line instead of a silent leak. */
+        NXUS_LOG_ERROR("ptrscan: worker slot still claimed by a Begin at exit - "
+                       "not joining (no new worker can be created)");
+    }
+
+    /* 2. a running scan, then the session itself. */
+    (void)nxusSessionScanCancel();
+    nxusSessionExit();
+    NXUS_LOG("server: scan cancelled and session released");
 }

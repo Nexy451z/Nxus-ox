@@ -601,6 +601,16 @@ impl Hit {
 /// core/nxus_protocol.h.
 pub const NXUS_HITBATCH_TRUNCATED: u32 = 0x0001;
 
+/// `NxusHitBatchHeader.reserved` bit 1: this batch dropped hits whose
+/// `mapping_idx` no longer named a mapping (the table shrank mid-scan), so they
+/// are absent from the reply and cannot be resolved.  Mirrors
+/// NXUS_HITBATCH_DROPPED in core/nxus_protocol.h.
+///
+/// This is *not* the same thing as [`NXUS_HITBATCH_TRUNCATED`]: a page can be
+/// empty *because* every record in it was dropped, which is why a page walk must
+/// keep asking for the next page instead of reading "no hits" as "the list ended".
+pub const NXUS_HITBATCH_DROPPED: u32 = 0x0002;
+
 #[derive(Debug, Clone)]
 pub struct HitBatch {
     pub session_id: u32,
@@ -608,6 +618,10 @@ pub struct HitBatch {
     pub value_size: u32,
     /// The console hit its hit-list capacity, so the list may be incomplete.
     pub truncated: bool,
+    /// This batch dropped hits whose mapping is gone (see
+    /// [`NXUS_HITBATCH_DROPPED`]): an empty `hits` then does not mean the list
+    /// ended.  Cannot be combined into `truncated`: callers react differently.
+    pub dropped: bool,
     pub hits: Vec<Hit>,
 }
 
@@ -619,7 +633,14 @@ impl HitBatch {
     pub const HIT_SIZE: usize = 16;
 
     pub fn empty() -> HitBatch {
-        HitBatch { session_id: 0, total: 0, value_size: 0, truncated: false, hits: Vec::new() }
+        HitBatch {
+            session_id: 0,
+            total: 0,
+            value_size: 0,
+            truncated: false,
+            dropped: false,
+            hits: Vec::new(),
+        }
     }
 
     /// Decode a `SCAN_GET_HITS` reply.
@@ -637,7 +658,10 @@ impl HitBatch {
         let total = rd_u32(data, 8);
         let value_size = rd_u32(data, 12);
         // Bit 0 marks "the console filled its hit list, results may be cut off".
-        let truncated = (rd_u32(data, 20) & NXUS_HITBATCH_TRUNCATED) != 0;
+        // Bit 1 marks "hits were dropped because their mapping is gone".
+        let reserved = rd_u32(data, 20);
+        let truncated = (reserved & NXUS_HITBATCH_TRUNCATED) != 0;
+        let dropped = (reserved & NXUS_HITBATCH_DROPPED) != 0;
         let mut pos = Self::HEADER_SIZE;
 
         let mapping_count = (rd_u32(data, 16) as usize).min((data.len() - pos) / 8);
@@ -663,7 +687,7 @@ impl HitBatch {
                 value,
             });
         }
-        HitBatch { session_id, total, value_size, truncated, hits }
+        HitBatch { session_id, total, value_size, truncated, dropped, hits }
     }
 }
 
@@ -2648,6 +2672,10 @@ mod tests {
         // silently turn a truncated result back into a "complete" one.
         assert_eq!(header_define(HEADER, "NXUS_HITBATCH_TRUNCATED"),
                    Some(NXUS_HITBATCH_TRUNCATED));
+        // Round 23: hits dropped because their mapping is gone.  A drift here would
+        // make the page walk stop on an empty page and lose every later hit.
+        assert_eq!(header_define(HEADER, "NXUS_HITBATCH_DROPPED"),
+                   Some(NXUS_HITBATCH_DROPPED));
         assert_eq!(header_size(HEADER, "NxusDebugStop"), Some(DebugStop::SIZE as u32));
         assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
     }
@@ -2956,16 +2984,36 @@ mod tests {
         assert_eq!(batch.session_id, 7);
         assert_eq!(batch.total, 9);
         assert!(batch.truncated, "reserved bit 0 must surface as truncated");
+        assert!(!batch.dropped, "a capped list must not also claim dropped hits");
         assert_eq!(batch.hits.len(), 1);
         assert_eq!(batch.hits[0].address, 0x1000_0024);
+
+        // Bit 1 is the "hits were dropped (mapping gone)" flag: it has to be
+        // reported separately, because a page that is empty FOR THAT REASON is not
+        // the end of the list.
+        let mut dropped_only = data.clone();
+        dropped_only[20..24].copy_from_slice(&NXUS_HITBATCH_DROPPED.to_le_bytes());
+        let batch = HitBatch::parse(&dropped_only);
+        assert!(batch.dropped, "reserved bit 1 must surface as dropped");
+        assert!(!batch.truncated);
+        // Both flags at once are legal: a capped list that also lost hits.
+        let mut both = data.clone();
+        both[20..24]
+            .copy_from_slice(&(NXUS_HITBATCH_TRUNCATED | NXUS_HITBATCH_DROPPED).to_le_bytes());
+        let batch = HitBatch::parse(&both);
+        assert!(batch.truncated && batch.dropped);
 
         // Older servers always send 0: nothing may be reported as truncated then.
         let mut clean = data.clone();
         clean[20..24].copy_from_slice(&0u32.to_le_bytes());
-        assert!(!HitBatch::parse(&clean).truncated);
+        let batch = HitBatch::parse(&clean);
+        assert!(!batch.truncated);
+        assert!(!batch.dropped);
         // Unknown reserved bits are ignored rather than misread.
         clean[20..24].copy_from_slice(&0x8000_0000u32.to_le_bytes());
-        assert!(!HitBatch::parse(&clean).truncated);
+        let batch = HitBatch::parse(&clean);
+        assert!(!batch.truncated);
+        assert!(!batch.dropped);
     }
 
     // ---- NxusEvent_FrozenReleased -------------------------------------

@@ -477,6 +477,10 @@ pub struct NxusClient {
     max_read: std::sync::atomic::AtomicU32,
     /// Set when a hit batch reports NXUS_HITBATCH_TRUNCATED (see scan_all_hits).
     truncated: std::sync::atomic::AtomicBool,
+    /// Set when a hit batch reports NXUS_HITBATCH_DROPPED: the console dropped
+    /// hits whose mapping is gone, so the collected list is lossy (see
+    /// scan_all_hits).
+    dropped: std::sync::atomic::AtomicBool,
     stream: Mutex<TcpStream>,
     pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
     events: Mutex<Receiver<Event>>,
@@ -647,6 +651,7 @@ impl NxusClient {
         Ok(NxusClient {
             max_read: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_READ),
             truncated: std::sync::atomic::AtomicBool::new(false),
+            dropped: std::sync::atomic::AtomicBool::new(false),
             stream: Mutex::new(stream),
             pending,
             events: Mutex::new(event_rx),
@@ -1085,6 +1090,32 @@ impl NxusClient {
         self.truncated.store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// True when the last `scan_all_hits()` walk saw a batch that had dropped hits
+    /// whose mapping is gone (`NXUS_HITBATCH_DROPPED`), i.e. the returned set is
+    /// missing matches the console could no longer resolve.
+    ///
+    /// This is a different failure mode from [`NxusClient::last_scan_truncated`]:
+    /// truncation means "the list hit its cap", dropping means "a page lost
+    /// records the PC could never address".
+    pub fn last_scan_dropped(&self) -> bool {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_last_scan_dropped(&self, value: bool) {
+        self.dropped.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many consecutive *empty* dropped batches end the walk.
+    ///
+    /// An empty batch with `NXUS_HITBATCH_DROPPED` set is NOT the end of the hit
+    /// list: every record in that page came from a mapping that no longer exists,
+    /// and later pages still hold valid hits.  The page request is positioned by
+    /// the number of hits collected so far, though, which does not advance when a
+    /// whole page is dropped - so the console would answer the same empty page for
+    /// ever.  Three attempts is enough to distinguish "this page is all dropped"
+    /// from "the console keeps repeating itself" without hanging the GUI.
+    pub const MAX_EMPTY_DROPPED_PAGES: u32 = 3;
+
     pub fn scan_all_hits(&self, page: u32) -> Result<Vec<Hit>> {
         // Collected hits are only ever appended, so every growth step used to
         // copy everything gathered so far (thousands of pages -> ~15 reallocs and
@@ -1093,6 +1124,8 @@ impl NxusClient {
         let mut all: Vec<Hit> = Vec::new();
         let mut sized = false;
         let mut truncated = false;
+        let mut dropped = false;
+        let mut empty_dropped_pages = 0u32;
         loop {
             let batch = self.scan_hits(all.len() as u32, page)?;
             if !sized {
@@ -1103,16 +1136,35 @@ impl NxusClient {
                 }
             }
             // The console flags "my hit list filled up" on the batch, so a cut-off
-            // result is not mistaken for the complete set.
+            // result is not mistaken for the complete set.  The dropped flag is
+            // tracked separately: it says a page lost records, not that the list
+            // was capped.
             truncated |= batch.truncated;
+            dropped |= batch.dropped;
             if batch.hits.is_empty() {
-                self.set_last_scan_truncated(truncated);
-                return Ok(all);
+                if !batch.dropped {
+                    self.set_last_scan_truncated(truncated);
+                    self.set_last_scan_dropped(dropped);
+                    return Ok(all);
+                }
+                // An empty page that is empty BECAUSE the console dropped its
+                // records: earlier pages and later pages may still hold hits, so
+                // this is not "done".  The offset does not advance on such a page,
+                // though, so bound the retries instead of spinning for ever.
+                empty_dropped_pages += 1;
+                if empty_dropped_pages >= Self::MAX_EMPTY_DROPPED_PAGES {
+                    self.set_last_scan_truncated(truncated);
+                    self.set_last_scan_dropped(true);
+                    return Ok(all);
+                }
+                continue;
             }
+            empty_dropped_pages = 0;
             let done = all.len() + batch.hits.len() >= batch.total as usize;
             all.extend(batch.hits);
             if done {
                 self.set_last_scan_truncated(truncated);
+                self.set_last_scan_dropped(dropped);
                 return Ok(all);
             }
         }

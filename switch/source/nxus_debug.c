@@ -151,6 +151,17 @@ static u32             g_ThreadCount;
 static NxusDebugConfig g_Config;
 static s32             g_LastResult;
 static Mutex           g_Mutex;
+/* Set by the first nxusDebugInit().  nxusDebugInit() re-creates the session state
+   from scratch (g_Debug, g_Attached, the break/hit/thread tables) and re-inits
+   g_Mutex, which is only safe on a console where nothing has attached yet.  Running
+   it a second time therefore (a) re-initialised a mutex another thread could be
+   queued on, (b) overwrote g_Debug with INVALID_HANDLE without closing the handle,
+   i.e. leaked the debug session (and left the target held as "debugged" by a
+   handle nobody owns), and (c) cleared g_Attached / left g_EventThreadLive alone,
+   so a live event thread became untracked and could never be joined or closed.
+   Init is a boot-time step and stays void, so a repeat call is an early return
+   that keeps the existing state. */
+static bool g_Inited;
 
 /* Whether the debugged process was created as AArch64.  A 32-bit process keeps
    SP/LR/FP in r13/r14/r11, and libnx does not copy them into the header fields.
@@ -171,6 +182,16 @@ static atomic_bool     g_Is64Bit;
    session starts, when it ends, and when the debugee exits, so one target's
    architecture can never leak into the next one's registers or pointer scan. */
 static atomic_bool     g_Is64BitKnown;
+
+/* The pid the kernel reported for the CURRENT session.  The CreateProcess debug
+   event carries the process the debug handle really names, which is the only
+   in-band evidence that svcDebugActiveProcess() attached to the process the
+   caller asked for (svcGetProcessId() on the same handle is the other reading,
+   used when the event has not been consumed yet).  Written by handleDebugEvent()
+   and - as a fallback - by nxusDebugAttach(), read only by nxusDebugAttach()
+   before it publishes the session, and cleared when a session starts and ends so
+   the previous title's pid can never be compared against the next request. */
+static atomic_ullong   g_SessionPid;
 
 /* ---- hit ring ------------------------------------------------------------ */
 
@@ -518,6 +539,56 @@ static void recordHit(const DebugEventInfo *event) {
     hit.thread_id_low = (u32)event->thread_id;
     hit.slot = 0xFFFFFFFFu;
 
+    /* The target's context is read BEFORE g_Mutex is taken: it is an svc on the
+       debug handle, not session state, so holding the session lock across it would
+       park every writer (and every GetStatus) for the length of a syscall. */
+    ThreadContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (R_SUCCEEDED(svcGetDebugThreadContext(&ctx, g_Debug, event->thread_id, RegisterGroup_CpuAll))) {
+        hit.pc = ctx.pc.x;
+        hit.cpsr = ctx.psr;
+        for (u32 i = 0; i < 13; i++) hit.r[i] = ctx.cpu_gprs[i].r;
+        if (isContextAArch32(&ctx)) {
+            hit.sp = ctx.cpu_gprs[13].r;
+            hit.lr = ctx.cpu_gprs[14].r;
+        } else {
+            hit.lr = ctx.lr;
+            hit.sp = ctx.sp;
+        }
+    }
+
+    const u64 now = armGetSystemTick();
+
+    /* Burst auto-disarm guard (see the comment above the threshold): an
+       execution breakpoint that hits 8 times, or a watchpoint that hits 16
+       times, inside one second is attached to a per-frame instruction or a hot
+       loop.  Keeping it armed would stop the title on every iteration for the
+       whole session; disable it after the burst has been recorded and clear the
+       hardware register immediately. */
+    bool auto_disarmed = false;
+    u32  auto_slot = 0;
+    u64  auto_addr = 0;
+    u32  auto_hits = 0;
+
+    mutexLock(&g_Mutex);
+    if (hit_epoch != atomic_load_explicit(&g_HitEpoch, memory_order_relaxed)) {
+        /* The ring was wiped while this hit was being assembled: the session it
+           belongs to is gone (detach/attach) or the user cleared the list.  Storing
+           it now would publish a previous title's hit as this session's hit #0. */
+        mutexUnlock(&g_Mutex);
+        return;
+    }
+
+    /* Attribute the hit to the armed slot that produced it.  Both searches walk
+       g_Breaks/g_BreakCount, which nxusDebugSetBreak(), nxusDebugClearBreak(),
+       the burst guard below and nxusDebugDetach() all mutate under this same
+       g_Mutex.  Scanning the table without it (as this did) could read a
+       half-updated array - a count that grew before the new entry was filled in,
+       or an entry detach had already wiped - and report the hit against the wrong
+       breakpoint, or against none at all (slot=0xFFFFFFFF), which the PC cannot
+       map back to what the user armed.  The scan is a bounded walk over at most
+       NXUS_DEBUG_MAX_BREAKS entries, so it costs nothing inside the section. */
+
     /* The exception reports the value the breakpoint was programmed with, which is
        the aligned address, not necessarily the address the user asked for.  Match
        either form and report the user's address so the PC can identify the hit.
@@ -556,42 +627,6 @@ static void recordHit(const DebugEventInfo *event) {
         }
     }
 
-    ThreadContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    if (R_SUCCEEDED(svcGetDebugThreadContext(&ctx, g_Debug, event->thread_id, RegisterGroup_CpuAll))) {
-        hit.pc = ctx.pc.x;
-        hit.cpsr = ctx.psr;
-        for (u32 i = 0; i < 13; i++) hit.r[i] = ctx.cpu_gprs[i].r;
-        if (isContextAArch32(&ctx)) {
-            hit.sp = ctx.cpu_gprs[13].r;
-            hit.lr = ctx.cpu_gprs[14].r;
-        } else {
-            hit.lr = ctx.lr;
-            hit.sp = ctx.sp;
-        }
-    }
-
-    const u64 now = armGetSystemTick();
-
-    /* Burst auto-disarm guard (see the comment above the threshold): an
-       execution breakpoint that hits 8 times, or a watchpoint that hits 16
-       times, inside one second is attached to a per-frame instruction or a hot
-       loop.  Keeping it armed would stop the title on every iteration for the
-       whole session; disable it after the burst has been recorded and clear the
-       hardware register immediately. */
-    bool auto_disarmed = false;
-    u32  auto_slot = 0;
-    u64  auto_addr = 0;
-    u32  auto_hits = 0;
-
-    mutexLock(&g_Mutex);
-    if (hit_epoch != atomic_load_explicit(&g_HitEpoch, memory_order_relaxed)) {
-        /* The ring was wiped while this hit was being assembled: the session it
-           belongs to is gone (detach/attach) or the user cleared the list.  Storing
-           it now would publish a previous title's hit as this session's hit #0. */
-        mutexUnlock(&g_Mutex);
-        return;
-    }
     hit.index = g_HitTotal++;
     hit.tick = now;
     /* The ring copy is a whole NxusBreakHit structure (112 bytes); no memcpy is
@@ -676,6 +711,18 @@ static void recordHit(const DebugEventInfo *event) {
 }
 
 /* ---- debug event loop -------------------------------------------------- */
+
+/* Drop the cached thread list (thread id per tracked thread).  The table belongs to
+   the debug SESSION, like the hit ring: nxusDebugInit() starts it empty and
+   nxusDebugDetach() wipes it, because otherwise g_ThreadCount kept the last
+   session's ids and nxusDebugGetThreads() - whose cached branch is served whenever
+   debugOpBegin() refuses (not attached / detaching) - answered with the threads of
+   a title nobody debugs any more.  The caller must hold g_Mutex: noteThread()
+   appends under it, and the detach path wipes the rest of the session under it. */
+static void clearThreadTableLocked(void) {
+    g_ThreadCount = 0;
+    memset(g_Threads, 0, sizeof(g_Threads));
+}
 
 static void noteThread(u64 thread_id) {
     if (thread_id == 0) return;
@@ -774,6 +821,12 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
                "known" is published after the value so a reader that sees known
                also sees the matching value. */
             const bool is64 = (event->info.create_process.flags & 1u) != 0;
+            /* The event names the process this handle actually refers to:
+               nxusDebugAttach() compares it with the requested pid (see
+               g_SessionPid).  Published before "known" so a reader that sees the
+               session as announced also sees the pid it runs on. */
+            atomic_store_explicit(&g_SessionPid, event->info.create_process.process_id,
+                                  memory_order_release);
             atomic_store_explicit(&g_Is64Bit, is64, memory_order_release);
             atomic_store_explicit(&g_Is64BitKnown, true, memory_order_release);
             NXUS_LOG("debug: process created (pid=%llu, %s)",
@@ -970,10 +1023,17 @@ static void eventThread(void *arg) {
 /* ---- public API -------------------------------------------------------- */
 
 void nxusDebugInit(void) {
+    /* Idempotent: keep the live session instead of rebuilding the state on top of
+       it.  See g_Inited for what a second pass would break (leaked debug handle,
+       untracked event thread, re-initialised mutex). */
+    if (g_Inited) {
+        NXUS_LOG_DEBUG("debug: init called again - keeping the existing session state");
+        return;
+    }
     mutexInit(&g_Mutex);
     memset(g_Breaks, 0, sizeof(g_Breaks));
     memset(g_Hits, 0, sizeof(g_Hits));
-    memset(g_Threads, 0, sizeof(g_Threads));
+    clearThreadTableLocked();   /* no session yet, so the mutex is not needed */
     g_Config.style = NXUS_WATCH_STYLE_DEFAULT;
     /* GDB-style by default: a breakpoint hit stops the title and keeps it stopped
        until the PC sends DebugContinue/DebugStep.  A client that wants the old
@@ -998,6 +1058,9 @@ void nxusDebugInit(void) {
     atomic_init(&g_StopReason, (unsigned)StopReason_Hit);
     atomic_init(&g_StopSeq, 0u);
     atomic_init(&g_ExceptionSeq, 0u);
+    /* Last: from here on a second Init() is refused instead of resetting the state
+       above (the flag is only read by init paths, so no lock is needed). */
+    g_Inited = true;
 }
 
 void nxusDebugExit(void) {
@@ -1069,6 +1132,11 @@ Result nxusDebugAttach(u64 pid) {
      * cheat process, so asking the kernel first costs one failed call in the
      * "dmnt owns it" case and touches nothing in the "someone else owns it"
      * case. */
+
+    /* A stale pid from the previous session must never be compared against this
+       request: clear it before the kernel starts queueing this session's events. */
+    atomic_store_explicit(&g_SessionPid, 0, memory_order_release);
+
     Handle debug = INVALID_HANDLE;
     Result rc = svcDebugActiveProcess(&debug, pid);
     if (R_FAILED(rc)) {
@@ -1137,6 +1205,51 @@ Result nxusDebugAttach(u64 pid) {
        that used to report a 64-bit title as AArch32.  The event thread drains
        whatever is left (and re-drains if the event had not landed yet). */
     drainDebugEvents(NULL);
+
+    /* Verify that the session really landed on the requested process.
+     *
+     * svcDebugActiveProcess() is asked for one pid, and until this point nothing
+     * proved the kernel honoured it.  dmnt's metadata is read BEFORE the attach
+     * (svcDebugActiveProcess closes dmnt's cheat process), so a title that exits
+     * inside that window hands us a pid that now names a different process; the
+     * attach then succeeds on the WRONG title.  That failure is invisible from the
+     * PC side - Status answers, reads succeed, the session looks healthy - it just
+     * describes the wrong program, so the user is told "attached to pid X" and
+     * debugs something else.  Refuse such a session instead of publishing it.
+     *
+     * The pid comes from the CreateProcess event this drain just consumed (the
+     * event names the process the handle really refers to); svcGetProcessId() on
+     * our own debug handle is the fallback for a kernel that has not queued the
+     * event yet.  pid 0 means "no explicit target", so there is nothing to
+     * compare. */
+    if (pid != 0) {
+        u64 actual_pid = (u64)atomic_load_explicit(&g_SessionPid, memory_order_acquire);
+        if (actual_pid == 0) {
+            const Result pid_rc = svcGetProcessId(&actual_pid, g_Debug);
+            if (R_FAILED(pid_rc)) {
+                /* Without an answer the comparison is impossible.  Failing an
+                   otherwise working attach over a missing diagnostic would be
+                   worse than running it unverified, so say so and continue. */
+                NXUS_RESULT("svcGetProcessId (attach pid check)", pid_rc);
+                NXUS_LOG("debug attach: the attached pid could not be read - "
+                         "target pid unverified");
+                actual_pid = 0;
+            }
+        }
+        if (actual_pid != 0 && actual_pid != pid) {
+            NXUS_LOG("debug: attach landed on pid %llu, not the requested %llu - detaching",
+                     (unsigned long long)actual_pid, (unsigned long long)pid);
+            /* Undo the take-over through the ordinary detach path: nothing of the
+               session has been handed to the PC yet, but the ContextID breakpoint
+               is already armed and dmnt's cheat process is closed, so the abort has
+               to clear the slots, close the handle (which resumes the target) and
+               ForceOpen dmnt again.  Detach also leaves g_HandoffBusy clear. */
+            nxusDebugDetach();
+            g_LastResult = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+            return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+        }
+    }
+
     if (nxusDebugTargetIs64BitKnown()) {
         NXUS_LOG("debug attach: target architecture known at attach (%s)",
                  nxusDebugTargetIs64Bit() ? "AArch64" : "AArch32");
@@ -1182,6 +1295,7 @@ Result nxusDebugDetach(void) {
            with that even on this no-op path. */
         atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
         atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
+        atomic_store_explicit(&g_SessionPid, 0, memory_order_release);
         nxusDmntSetAutoReopen(true);
         return 0;
     }
@@ -1217,11 +1331,19 @@ Result nxusDebugDetach(void) {
     }
     g_BreakCount = 0;
     g_Attached = false;
+    /* The thread table is per session as well: the detach that just joined the event
+       thread leaves g_ThreadCount pointing at the previous title's threads, which the
+       cached branch of nxusDebugGetThreads() would keep serving (see
+       clearThreadTableLocked).  Still under g_Mutex, together with the break table. */
+    clearThreadTableLocked();
     /* The session is gone, so the target's architecture is no longer known: the
        next attach must not answer a pointer scan with the previous title's bitness
        before its own CreateProcess event has been consumed. */
     atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
     atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
+    /* The session - and with it the pid it ran on - is over: the next attach must
+       verify against its own answer, not against this one's (see g_SessionPid). */
+    atomic_store_explicit(&g_SessionPid, 0, memory_order_release);
     /* All ten slots (0..5 plus 0x10..0x13) on all four cores: the ContextID link
        source (4/5) included, because armContextIdBreakpoint() programs it for
        every style.  No conditional "if enabled" here: a stale register is
@@ -1315,8 +1437,6 @@ void nxusDebugGetStatus(NxusDebugStatus *out) {
     memset(out, 0, sizeof(*out));
     out->attached = g_Attached ? 1 : 0;
     out->watch_style = g_Config.style;
-    out->break_count = g_BreakCount;
-    out->thread_count = g_ThreadCount;
     out->auto_continue = g_Config.auto_continue;
     out->last_result = g_LastResult;
     /* Publish the SAME stop record twice: the legacy low half first (old PC
@@ -1327,7 +1447,16 @@ void nxusDebugGetStatus(NxusDebugStatus *out) {
     const u64 stopped_thread = nxusDebugStoppedThread();
     out->stopped_thread_low = (u32)(stopped_thread & 0xFFFFFFFFull);
     out->stopped_thread = stopped_thread;
+    /* The three counters are written under g_Mutex: the break table and the thread
+       table are wiped there by nxusDebugDetach() (g_BreakCount / clearThreadTable),
+       and the hit total is bumped by recordHit().  Read one by one WITHOUT the lock
+       (as this did), a status reply that overlapped a detach could pair a
+       still-populated break count with an already-cleared thread count - a session
+       that never existed, half from each side of the wipe.  One critical section
+       reads all of them out of the same state. */
     mutexLock(&g_Mutex);
+    out->break_count = g_BreakCount;
+    out->thread_count = g_ThreadCount;
     out->hit_count = g_HitTotal;
     mutexUnlock(&g_Mutex);
 }

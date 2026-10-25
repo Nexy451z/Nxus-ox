@@ -1208,29 +1208,6 @@ bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current
     return owner != current;
 }
 
-/* Set from the moment ScanBegin/ScanNext starts preparing its mapping snapshot
-   until the worker is actually running.  The state still reads Idle in that
-   window, so "not Running" alone does not prove the tables are free: the 100 ms
-   tick could free them under prepare (use-after-free) or make the scan fail with a
-   spurious BAD_INPUT. */
-static atomic_bool g_ScanPreparing;
-
-static void scanPreparingBegin(void) {
-    atomic_store_explicit(&g_ScanPreparing, true, memory_order_release);
-}
-
-static void scanPreparingEnd(void) {
-    atomic_store_explicit(&g_ScanPreparing, false, memory_order_release);
-}
-
-static bool scanPreparing(void) {
-    return atomic_load_explicit(&g_ScanPreparing, memory_order_acquire);
-}
-
-/* The main-thread tick cannot see a scan inside ScanBegin's prepare window (the
-   state still reads Idle), so it passes drop_tables = false and only refuses the
-   results.  Connection-thread callers are serialized with the prepare and may
-   free the tables. */
 void nxusSessionInvalidateHitsEx(bool drop_tables) {
     /* Publish "unservable" first, so any reader that arrives while the rest of this
        runs already sees the discard. */
@@ -1249,9 +1226,9 @@ void nxusSessionInvalidateHitsEx(bool drop_tables) {
        status path and the tick) drops them then.  Nothing stale is served in the
        meantime: the hits are already refused above. */
     if (sessionStateLoad() == NxusScanState_Running) return;
-    /* Same reason as Running: a scan between "snapshot published" and "worker
-       started" owns these tables while the state still reads Idle. */
-    if (scanPreparing()) return;
+    /* The main-thread tick passes false: it cannot see a scan that is between
+       "snapshot published" and "worker started" (the state still reads Idle), so
+       only the connection-thread callers may free these tables. */
     if (!drop_tables) return;
 
     /* Readers of these views are pin-protected (see the view contract in

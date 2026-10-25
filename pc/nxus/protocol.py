@@ -36,6 +36,11 @@ HIT_BATCH_HEADER = struct.Struct('<IIIIII')
 
 # NxusHitBatchHeader.reserved flags - mirrors NXUS_HITBATCH_* in core/nxus_protocol.h.
 HITBATCH_TRUNCATED = 0x0001   # the console filled its hit list; results may be cut off
+# This batch dropped hits whose mapping_idx no longer named a mapping (the table
+# shrank mid-scan): they are absent from the reply, so an EMPTY page with this bit
+# set is not "the list ended" - keep requesting the next page.  Coexists with
+# HITBATCH_TRUNCATED (a list can be both capped and lossy).
+HITBATCH_DROPPED = 0x0002
 HIT = struct.Struct('<IHHQ')   # offset, mapping_idx, value_type, value
 FROZEN_ENTRY = struct.Struct('<QQII')
 FROZEN_REQUEST = struct.Struct('<QII')

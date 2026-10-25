@@ -423,6 +423,79 @@ class ScanBreakHitIsolation(unittest.TestCase):
 HIT_LIST_LIMIT = 8
 
 
+class _AllDroppedMock(MockSwitch):
+    """Every ScanGetHits page is EMPTY and says "hits were dropped".
+
+    That is what a page built entirely from hits whose mapping_idx no longer
+    names a mapping looks like on the wire: count 0, total unchanged, and
+    NXUS_HITBATCH_DROPPED set.  The client has to keep asking instead of reading
+    "no hits" as "the list ended", but must still stop (the offset cannot advance
+    past a fully dropped page).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hit_pages = 0
+
+    def _get_hits(self, payload):
+        self.hit_pages += 1
+        return P.HIT_BATCH_HEADER.pack(self.session_id, 0, 1, self.value_size, 0,
+                                       P.HITBATCH_DROPPED)
+
+
+class ScanDroppedHits(unittest.TestCase):
+    """NXUS_HITBATCH_DROPPED has to survive the wire and change the page walk.
+
+    Round 23 made the console drop hits whose mapping is gone (instead of resolving
+    them to a wrong address).  The flag is the only wire evidence, and without it
+    an empty page looks exactly like a complete list.
+    """
+
+    def setUp(self):
+        self.server = None
+        self.client = None
+
+    def tearDown(self):
+        if self.client is not None:
+            self.client.close()
+        if self.server is not None:
+            self.server.stop()
+
+    def connect(self, server):
+        self.server = server.start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def test_the_flag_reaches_the_client_and_the_hits_still_come_through(self):
+        self.connect(MockSwitch(hit_batch_dropped=True, watchdog_ms=100000))
+        self.server.target.set_money(6440)
+        self.client.scan_reset()
+        st = self.client.scan_begin(6440, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['hits'], 1)
+
+        batch = self.client.scan_hits(0, 4096)
+        self.assertIs(batch['dropped'], True, 'the drop flag was not reported')
+        self.assertIs(batch['truncated'], False, 'drop is not truncation')
+
+        self.assertEqual(len(self.client.scan_all_hits()), 1)
+        self.assertTrue(self.client.last_scan_dropped)
+        self.assertFalse(self.client.last_scan_truncated)
+
+        # 0 / False = the stock mock: no drop, nothing reported
+        self.server.hit_batch_dropped = False
+        self.assertIs(self.client.scan_hits(0, 4096)['dropped'], False)
+        self.assertEqual(len(self.client.scan_all_hits()), 1)
+        self.assertFalse(self.client.last_scan_dropped)
+
+    def test_an_empty_dropped_page_does_not_end_the_walk(self):
+        self.connect(_AllDroppedMock(watchdog_ms=100000))
+        self.assertEqual(self.client.scan_all_hits(), [])
+        self.assertEqual(self.server.hit_pages, NxusClient.MAX_EMPTY_DROPPED_PAGES,
+                         'the walk must retry an empty dropped page, then give up')
+        self.assertTrue(self.client.last_scan_dropped,
+                        'the dropped hits must be reported, not silently ignored')
+
+
 class ScanTruncation(unittest.TestCase):
     """NXUS_HITBATCH_TRUNCATED has to survive the wire and reach client.scan_hits().
 

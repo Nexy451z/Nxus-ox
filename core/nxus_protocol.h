@@ -390,6 +390,20 @@ NXUS_STATIC_ASSERT(sizeof(NxusHitBatchHeader) == 24, "NxusHitBatchHeader must be
    hits exist but were not collected.  Clients that ignore the field keep working
    (older servers always send 0). */
 #define NXUS_HITBATCH_TRUNCATED 0x0001u
+/* THIS BATCH DROPPED N HITS WHOSE MAPPING IS GONE.
+   The console drops a hit instead of sending it when its mapping_idx is outside
+   the mapping table that follows the header (the table shrank mid-scan), because
+   the PC would resolve such an index to a wrong address.  Those hits are absent
+   from the reply and cannot be counted from it, so this bit is the only wire
+   evidence that the page is lossy.
+
+   A PAGE WALK MUST NOT TREAT AN EMPTY PAGE AS "THE LIST IS DONE" WHILE THIS BIT
+   IS SET: keep requesting the next page, or every hit that follows the dropped
+   block is silently lost (the hit list is ordered by (mapping_idx, offset), so a
+   page can consist entirely of dropped records).  Coexists with
+   NXUS_HITBATCH_TRUNCATED.  Bit 0 keeps its value; a server that predates this
+   bit keeps sending 0 in it, and an old client ignores it. */
+#define NXUS_HITBATCH_DROPPED 0x0002u
 
 typedef struct NXUS_PACKED {
     u32 offset;          /* offset from mapping base */

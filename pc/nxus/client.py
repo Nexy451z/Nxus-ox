@@ -71,6 +71,11 @@ class NxusClient:
         # the ones the console dropped since then (see frozen_list_diff()).
         self._last_frozen: list[int] = []
         self._released_frozen: list[int] = []
+        # Bulk-scan quality flags, filled in by scan_all_hits(): a capped hit list is
+        # truncation, a page the console could not resolve is "dropped".  Both mean
+        # the returned list is not the complete match set.
+        self.last_scan_truncated = False
+        self.last_scan_dropped = False
 
     # ---- lifecycle ----
 
@@ -462,7 +467,8 @@ class NxusClient:
             hits.append(dict(address=base + off, offset=off, mapping_idx=map_idx, value=value))
         return dict(session=session, count=n, total=total, value_size=value_size,
                     bases=bases, hits=hits,
-                    truncated=bool(flags & P.HITBATCH_TRUNCATED))
+                    truncated=bool(flags & P.HITBATCH_TRUNCATED),
+                    dropped=bool(flags & P.HITBATCH_DROPPED))
 
     def _check_scan_session(self, session: int) -> None:
         """Keep one scan's hit pages in one session; refuse a rebuilt table.
@@ -479,23 +485,53 @@ class NxusClient:
             raise NxusError(P.CMD['ScanGetHits'], P.make_result(P.ERR_BAD_STATE),
                             SESSION_INVALIDATED)
 
+    #: How many consecutive *empty* dropped batches end scan_all_hits().
+    #:
+    #: An empty page whose header carries HITBATCH_DROPPED is NOT the end of the
+    #: hit list: every record in it came from a mapping that no longer exists, and
+    #: later pages may still hold valid hits.  The request offset only advances by
+    #: the hits actually collected, though, so a fully dropped page repeats for
+    #: ever; three attempts distinguish "all dropped" from a stuck console.
+    MAX_EMPTY_DROPPED_PAGES = 3
+
     def scan_all_hits(self, page: int = 4096) -> list[dict]:
         self.last_scan_truncated = False
+        self.last_scan_dropped = False
         out = []
         truncated = False
+        dropped = False
+        empty_dropped_pages = 0
         while True:
             batch = self.scan_hits(len(out), page)
             truncated = truncated or batch.get('truncated', False)
+            dropped = dropped or batch.get('dropped', False)
+            if not batch['hits']:
+                if not batch.get('dropped', False):
+                    # A page with nothing in it and no drop flag is the end.
+                    break
+                # Empty because the console dropped this page's records (their
+                # mapping is gone).  That is not "done": keep asking, but bound the
+                # retries since the offset cannot advance past a fully dropped page.
+                empty_dropped_pages += 1
+                if empty_dropped_pages >= self.MAX_EMPTY_DROPPED_PAGES:
+                    break
+                continue
+            empty_dropped_pages = 0
             out.extend(batch['hits'])
-            if len(out) >= batch['total'] or not batch['hits']:
-                # The console reports "hit list full" through the batch flags; keep
-                # it so callers (and users) can tell a complete list from a cut-off
-                # one instead of treating both as final.
-                self.last_scan_truncated = truncated
-                if truncated:
-                    print(f"warning: the console hit its hit-list limit - "
-                          f"{len(out)} hits collected, more may exist")
-                return out
+            if len(out) >= batch['total']:
+                break
+        # The console reports both "hit list full" and "hits dropped" through the
+        # batch flags; keep them so callers (and users) can tell a complete list
+        # from a cut-off or lossy one instead of treating all three as final.
+        self.last_scan_truncated = truncated
+        self.last_scan_dropped = dropped
+        if truncated:
+            print(f"warning: the console hit its hit-list limit - "
+                  f"{len(out)} hits collected, more may exist")
+        if dropped:
+            print(f"warning: the console dropped hits whose mapping is gone - "
+                  f"{len(out)} hits collected, some may be missing")
+        return out
 
     def _status_from(self, body: bytes) -> dict:
         (proto, mode, flags, scan_state, pid, title, main_base, main_size,

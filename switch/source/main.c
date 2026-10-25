@@ -250,13 +250,47 @@ void __appInit(void) {
        of those calls fail, which on hardware means "no TCP server at all". */
 }
 
+/*
+ * Shutdown order.  The previous version closed the debug handle before the scan /
+ * pointer-scan workers were stopped, and it never joined the pointer-scan worker at
+ * all: that thread could still be reading the target through the handle that had just
+ * been closed, and it kept walking a session and mapping table that had already been
+ * freed.  The order below is what each step still needs from the steps after it.
+ *
+ *   1. HID     - stop the hotkey producer FIRST.  Its callback calls serverPauseEx(),
+ *                which can attach Nxus's own debug session and touch the session
+ *                state, so nothing may start a pause while the rest is torn down.
+ *                nxusHidExit() joins the thread, and it is itself idempotent.
+ *   2. SERVER  - nxusServerExit(): cancel + join + close the pointer-scan worker,
+ *                cancel a running scan, then release the session (nxusSessionExit
+ *                joins the scan worker and frees the views).  Both workers read the
+ *                target through the debug handle and the session, so they must be
+ *                gone before either is destroyed.  Before the network as well: the
+ *                connection thread is what starts those workers, and once the
+ *                session is terminal a handler that is still draining answers
+ *                BAD_STATE/Idle instead of touching released memory.
+ *   3. DEBUG   - nxusDebugExit(): join the event thread, close the debug handle,
+ *                hand the process back to dmnt (ForceOpen).  Only now, with no
+ *                reader left, can the handle be closed at all.  Kept before the
+ *                network: a client that is still connected must not be able to
+ *                attach/detach or read through the handle while it is closed.
+ *   4. NET     - nxusNetExit(): shut the socket down and join the connection thread.
+ *                Before the log, because that thread and every handler log.
+ *   5. DMNT    - nxusDmntExit(): close dmnt:cht.  Must follow nxusDebugExit() (a
+ *                detach re-opens dmnt) and nxusNetExit() (no command can ask for it
+ *                any more).
+ *   6. LOG     - nxusLogExit() LAST.  Every step above logs its outcome, and the log
+ *                ring is what `nxus log` serves, so closing it earlier would drop the
+ *                shutdown trail (the order this file used before could not be read
+ *                back on a console that rebooted).
+ */
 void __appExit(void) {
-    nxusNetExit();
-    nxusHidExit();
-    nxusDebugExit();
-    nxusSessionExit();
-    nxusDmntExit();
-    nxusLogExit();
+    nxusHidExit();        /* 1. hotkey producer (its callback drives Pause/Resume) */
+    nxusServerExit();     /* 2. ptrscan worker + scan worker + session           */
+    nxusDebugExit();      /* 3. event thread + debug handle + dmnt hand-back     */
+    nxusNetExit();        /* 4. listener + client socket + connection thread     */
+    nxusDmntExit();       /* 5. dmnt:cht (re-opened by the detach above)         */
+    nxusLogExit();        /* 6. log last: everything above wrote to it           */
     fsdevUnmountAll();
     fsExit();
 }

@@ -30,6 +30,16 @@
 #define NXUS_RESULT_PTRSCAN_STARTED ((Result)NXUS_MAKE_RESULT(NXUS_ERR_PTRSCAN_STARTED))
 
 void nxusServerInit(void);
+/* Terminal shutdown of everything this file owns.  Cancels and JOINS the
+   pointer-scan worker (it used to outlive every exit path), cancels a running scan
+   and then releases the session through nxusSessionExit().  Idempotent: a second
+   call returns without touching the already closed worker Thread.
+
+   Call it from the exit path BEFORE nxusDebugExit() and nxusNetExit() - the worker
+   and the connection-thread handlers read target memory through the debug handle
+   and through the session, so both have to be stopped first (see __appExit in
+   main.c for the full order). */
+void nxusServerExit(void);
 void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload, u32 length, void *user);
 /* Called periodically from the main loop: watchdog + deferred work. */
 void nxusServerTick(void);

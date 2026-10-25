@@ -261,6 +261,15 @@ class ProtocolParity(unittest.TestCase):
         for name, value in protocol.ST.items():
             self.assertEqual(value, self.defines[name], name)
 
+    def test_hit_batch_flags(self):
+        # NxusHitBatchHeader.reserved: bit 0 = the list was capped, bit 1 = hits
+        # were dropped because their mapping is gone.  A drift here makes the PC
+        # read an empty page as "the hit list ended" and silently lose the rest.
+        self.assertEqual(protocol.HITBATCH_TRUNCATED, self.defines['NXUS_HITBATCH_TRUNCATED'])
+        self.assertEqual(protocol.HITBATCH_DROPPED, self.defines['NXUS_HITBATCH_DROPPED'])
+        self.assertEqual(protocol.HITBATCH_TRUNCATED, 0x0001, 'bit 0 must keep its value')
+        self.assertEqual(protocol.HITBATCH_DROPPED, 0x0002, 'the new flag must not reuse bit 0')
+
     def test_scan_flags(self):
         for name, value in protocol.SCAN_F.items():
             self.assertEqual(value, self.defines[name], name)

@@ -17,6 +17,10 @@ switch/source/nxus_server.c and core/nxus_scan.c, including:
   * a hit-list cap (hit_list_limit) that ends the published list the way
     nxusHitList stops recording at max_capacity, and sets
     NXUS_HITBATCH_TRUNCATED on ScanGetHits like sendHits() does
+  * a dropped-hit flag (hit_batch_dropped) that sets NXUS_HITBATCH_DROPPED on
+    ScanGetHits like sendHits() does when it skips hits whose mapping_idx is
+    outside the mapping table; clients must not read an empty page as "done"
+    while that bit is set
   * fault injection for the PC-side error paths: fail_next (one queued Result
     per command number), drop_after_bytes (cut a reply short and hang up),
     empty_mappings (0-entry mapping table) and dmnt_not_attached (dmnt's
@@ -354,10 +358,14 @@ class MockSwitch:
     # The stock mock never fills a hit list; a subclass may set a cap here, and
     # MockSwitch(hit_list_limit=N) sets it on the instance (0 = unlimited).
     hit_list_limit = 0
+    # The stock mock never drops hits; set it (constructor or attribute) to make
+    # every ScanGetHits batch carry NXUS_HITBATCH_DROPPED, the way sendHits()
+    # flags a batch whose hits had no mapping left to resolve against.
+    hit_batch_dropped = False
 
     def __init__(self, host: str = '127.0.0.1', port: int = 0, watchdog_ms: int = 15000,
                  money: int = 6440, scan_async: bool = False,
-                 hit_list_limit: int = 0):
+                 hit_list_limit: int = 0, hit_batch_dropped: bool = False):
         # A real scan is a worker thread (nxus_session.c:891-919): ScanBegin
         # answers with NxusScanState_Running, the PC polls ScanStatus and watches
         # progress_permille climb, and ScanGetHits / SnapshotCapture /
@@ -450,6 +458,9 @@ class MockSwitch:
         # cannot make the client take those branches at all.
         if hit_list_limit:
             self.hit_list_limit = int(hit_list_limit)      # 0 = unlimited
+        # True: every hit batch says "hits were dropped because their mapping is
+        # gone" (NXUS_HITBATCH_DROPPED).  Tests flip it on the instance too.
+        self.hit_batch_dropped = bool(hit_batch_dropped)
         # command number -> Result, answered ONCE and consumed (a single bad reply)
         self.fail_next: dict[int, int] = {}
         # >0: send that many bytes of the reply and close the connection
@@ -1776,6 +1787,12 @@ class MockSwitch:
         reserved = 0
         if self.hit_list_limit and len(self.hits) >= self.hit_list_limit:
             reserved |= P.HITBATCH_TRUNCATED
+        # sendHits()'s drop rule: a hit whose mapping_idx is outside the mapping
+        # table is skipped instead of being resolved against a wrong base, and the
+        # batch says so.  The mock only carries the flag (its hits are always
+        # resolvable), which is what the client's page walk has to react to.
+        if self.hit_batch_dropped:
+            reserved |= P.HITBATCH_DROPPED
         # The scan session id the PC matches hit batches against lives here, in
         # NxusHitBatchHeader (nxus_protocol.h:336-344) - NxusStatus has no field
         # for it.  A new ScanBegin (or a Reset) bumps it, so a stale batch from a
