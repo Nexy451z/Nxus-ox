@@ -328,7 +328,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,633 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 189, snapshot_owner 202)
+# 1. Host C Core Tests (1,697 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 40, scantypes 275, hotkey 11, session_view 252, snapshot_owner 202)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
