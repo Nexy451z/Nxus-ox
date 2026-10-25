@@ -1,7 +1,23 @@
 #include "nxus_dmntcht.h"
 #include "nxus_log.h"
 
+#include <stdatomic.h>
 #include <string.h>
+
+/*
+ * Optional hand-off hook into the Nxus debug session (switch/source/nxus_debug.c).
+ *
+ * dmntRunCommand() below must not ForceOpen() while nxusDebugAttach()/Detach() is
+ * handing the process over - even when the decision to reopen was made a moment
+ * earlier and nxusDmntSetAutoReopen(false) raced it.  The debug session publishes
+ * that state through nxusDebugIsHandoff(); it is not part of this translation unit,
+ * and this file is also linked into targets that do not contain the debug session
+ * (the probe sysmodule).  The reference is therefore weak: when nxus_debug.c is
+ * linked in, its strong definition wins; otherwise the linker resolves the
+ * undefined weak symbol to NULL and the guard is skipped.  Neither case produces
+ * an undefined symbol / link error.
+ */
+__attribute__((weak)) bool nxusDmntHandoffBlocked(void);
 
 static Service g_DmntSrv;
 static bool    g_DmntActive = false;
@@ -9,6 +25,10 @@ static bool    g_DmntActive = false;
    the target.  The Nxus debug session turns it off for the duration of its
    attach/detach hand-off. */
 static volatile bool g_AutoReopen = true;
+/* True while one thread is inside the automatic ForceOpen.  Static storage is
+   zero-initialised (false), so it is valid before the first atomic operation; no
+   worker exists before nxusDmntInitialize() anyway. */
+static atomic_bool g_ForceOpenBusy;
 
 void nxusDmntSetAutoReopen(bool enabled) {
     g_AutoReopen = enabled;
@@ -125,7 +145,15 @@ static bool dmntResultMayNeedRepair(Result rc) {
  *      that stole the cheat process from other tools mid-scan.
  *
  * The retry never happens with auto-reopen disabled: the Nxus debug session owns
- * the process then, and a ForceOpen would take it back mid-attach. */
+ * the process then, and a ForceOpen would take it back mid-attach.
+ *
+ * That decision is deliberately re-checked right before the takeover.  The check
+ * at the top of this function is a check-then-act pair with the ForceOpen below,
+ * and nxusDebugAttach()/Detach() can flip the state in between (it calls
+ * nxusDmntSetAutoReopen(false) and raises its own hand-off flag).  Acting on the
+ * stale value would ForceOpen() and steal the process mid-attach.  Both the
+ * volatile flag and the hand-off hook are read again, after the cooldown test so a
+ * blocked attempt does not consume the reopen window. */
 static Result dmntRunCommand(NxusDmntOp op, void *ctx, bool reopen_on_any_failure, const char *what) {
     (void)reopen_on_any_failure;
 
@@ -139,12 +167,32 @@ static Result dmntRunCommand(NxusDmntOp op, void *ctx, bool reopen_on_any_failur
         g_ReopenSuppressed++;
         return rc;
     }
-    g_LastReopenTick = now;
 
+    /* The second check: the debug session may have disabled auto-reopen (or
+       started its hand-off) since the check above.  nxusDmntHandoffBlocked() is a
+       weak reference, NULL when the debug session is not linked in (read through a
+       pointer so the check never trips a "address always true" diagnostic). */
+    bool (*handoff_hook)(void) = nxusDmntHandoffBlocked;
+    const bool handoff = (handoff_hook != NULL) && handoff_hook();
+    if (!g_AutoReopen || handoff) return rc;
+
+    /* Only one ForceOpen at a time: the compare-exchange makes the check-then-act
+       above atomic against a second command thread that reached this point with
+       the same stale view.  Without it both would reopen - the second one closing
+       (or replacing) the process the first just took. */
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&g_ForceOpenBusy, &expected, true,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        return rc;
+    }
+
+    g_LastReopenTick = now;
     const u32 suppressed = g_ReopenSuppressed;
     g_ReopenSuppressed = 0;
 
     Result open_rc = nxusDmntForceOpen();
+    atomic_store_explicit(&g_ForceOpenBusy, false, memory_order_release);
+
     NXUS_LOG("dmnt: %s failed rc=0x%08X; ForceOpen rc=0x%08X (%u deferred) - retrying once",
              what, (unsigned)rc, (unsigned)open_rc, (unsigned)suppressed);
     if (R_FAILED(open_rc)) return rc;

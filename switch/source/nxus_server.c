@@ -10,6 +10,7 @@
 #include "nxus_session.h"
 #include "nxus_snapshot_srv.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,13 +43,28 @@ static volatile u64  g_CommandStartedMs;
 static bool g_PauseViaDebug = false;
 /* Pause/Resume arrive from the connection thread AND from the HID hotkey thread;
    attach/detach is a multi-step hand-off (ForceClose -> svcDebugActiveProcess ->
-   event thread) and must not interleave. */
+   event thread) and must not interleave.
+
+   The hand-off is serialised by g_PauseBusy, NOT by a lock: the HID thread has to
+   answer the controller immediately, so a second Pause/Resume is refused with
+   BUSY instead of queueing behind a 200 ms attach, a thread join or a dmnt IPC.
+   g_PauseLock only guards the state fields (g_PauseViaDebug plus the session pause
+   flag) and is never held across anything that can block. */
 static Mutex g_PauseLock;
 static bool   g_PauseLockReady = false;
+/* True while one pause/resume hand-off is running (atomic claim, see
+   pauseTryEnter/pauseLeave). */
+static atomic_bool g_PauseBusy;
 
 static Result serverPause(void);
 static Result serverPauseEx(bool allow_attach);
 static Result serverResume(void);
+/* Defined below; forward-declared because fillStatus reports the pause state. */
+static void pauseLock(void);
+static void pauseUnlock(void);
+static bool pauseIsViaDebug(void);
+static bool pauseTryEnter(void);
+static void pauseLeave(void);
 
 /* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
 #define NXUS_PTRSCAN_MAX_RESULTS 64
@@ -68,6 +84,12 @@ static void onHotkeyFired(void *user) {
         NXUS_LOG("hotkey: a command is running - in-flight reads may be dropped by the pause");
     }
     Result rc = serverPauseEx(false);   /* hotkey: never hijack the process */
+    if (rc == (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY)) {
+        /* Another Pause/Resume owns the hand-off: give up at once instead of
+           blocking the controller reader behind it. */
+        NXUS_LOG("hotkey: pause/resume already in progress - ignored");
+        return;
+    }
     NXUS_RESULT("hotkey pause", rc);
     if (R_SUCCEEDED(rc)) {
         nxusNetSendEvent(NxusEvent_HotkeyPaused, NULL, 0);
@@ -86,6 +108,7 @@ void nxusServerInit(void) {
        config handler, long after this. */
     if (!g_PauseLockReady) {
         mutexInit(&g_PauseLock);
+        atomic_init(&g_PauseBusy, false);
         g_PauseLockReady = true;
     }
 
@@ -161,7 +184,7 @@ static void fillStatus(NxusStatus *st) {
        stop (breakpoint/watchpoint/GDB-style hold) is the same thing from the
        client's point of view and must light the same flag, otherwise the GUI shows
        "running" while the title is frozen. */
-    if (g_PauseViaDebug || nxusSessionIsPaused()) flags |= NXUS_ST_PAUSED;
+    if (pauseIsViaDebug() || nxusSessionIsPaused()) flags |= NXUS_ST_PAUSED;
     if (nxusDebugIsStopped()) flags |= NXUS_ST_PAUSED;
     if (nxusSessionScanState() == NxusScanState_Running) flags |= NXUS_ST_SCANNING;
     st->status_flags = flags;
@@ -177,6 +200,49 @@ static void pauseUnlock(void) {
     if (g_PauseLockReady) mutexUnlock(&g_PauseLock);
 }
 
+/* Claim the pause/resume hand-off.  Returns false when another one is already
+   running, so the caller can answer BUSY immediately -- blocking here is exactly
+   what made the hotkey freeze for seconds while an attach finished. */
+static bool pauseTryEnter(void) {
+    bool expected = false;
+    return atomic_compare_exchange_strong(&g_PauseBusy, &expected, true);
+}
+
+static void pauseLeave(void) {
+    atomic_store_explicit(&g_PauseBusy, false, memory_order_release);
+}
+
+/* The pause state is only ever read/written in these short sections; every IPC,
+   attach/detach and thread join happens outside the lock. */
+static void pauseCommitState(bool via_debug, bool paused) {
+    pauseLock();
+    g_PauseViaDebug = via_debug;
+    nxusSessionSetPaused(paused);
+    pauseUnlock();
+}
+
+static bool pauseIsViaDebug(void) {
+    pauseLock();
+    const bool via_debug = g_PauseViaDebug;
+    pauseUnlock();
+    return via_debug;
+}
+
+/* Releases a pause that was held through Nxus's own debug session, after the
+   session itself is gone.  Kept in one section so Status never observes
+   g_PauseViaDebug cleared while the session still reports "paused" (or the
+   reverse).  Returns true when such a pause was released. */
+static bool pauseReleaseDebugSessionPause(void) {
+    pauseLock();
+    const bool was = g_PauseViaDebug;
+    if (was) {
+        g_PauseViaDebug = false;
+        nxusSessionSetPaused(false);
+    }
+    pauseUnlock();
+    return was;
+}
+
 /* Freeze every thread of the target.
  *
  * Preferred path: dmnt's own stop.  dmnt:cht 65004 PauseCheatProcess is
@@ -188,14 +254,18 @@ static void pauseUnlock(void) {
  * Fallback: when dmnt cannot stop it (no cheat process open, another debugger
  * took the process over, ...), take the process over with Nxus's own debug
  * session and break it there.  That closes dmnt for the duration of the pause,
- * which is why it is only the second choice. */
-static Result pauseTargetLocked(bool allow_attach) {
+ * which is why it is only the second choice.
+ *
+ * Runs with the hand-off claimed but WITHOUT g_PauseLock: the dmnt IPCs, the
+ * 200 ms debug attach and the event-thread hand-off all happen lock-free, and the
+ * state fields are only touched in pauseCommitState(). */
+static Result pauseTarget(bool allow_attach) {
     if (nxusDebugIsAttached()) {
         /* Our session already owns the process (DebugAttach, or a repeated
            Pause): one kernel call is enough. */
         Result rc = nxusDebugBreak();
         if (R_SUCCEEDED(rc)) {
-            nxusSessionSetPaused(true);
+            pauseCommitState(pauseIsViaDebug(), true);
             NXUS_LOG("pause: stopped the owned debug session");
         }
         return rc;
@@ -206,8 +276,7 @@ static Result pauseTargetLocked(bool allow_attach) {
        the target is held. */
     Result dmnt_rc = nxusDmntPause();
     if (R_SUCCEEDED(dmnt_rc)) {
-        g_PauseViaDebug = false;
-        nxusSessionSetPaused(true);
+        pauseCommitState(false, true);
         NXUS_LOG("pause: dmnt stopped the cheat process (65004) - dmnt session kept");
         return 0;
     }
@@ -286,15 +355,16 @@ static Result pauseTargetLocked(bool allow_attach) {
     nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
                                     md.main_nso_base, md.main_nso_size);
 
-    g_PauseViaDebug = true;
-    nxusSessionSetPaused(true);
+    pauseCommitState(true, true);
     NXUS_LOG("pause: debug session attached to pid=%llu - every thread stopped",
              (unsigned long long)md.process_id);
     return 0;
 }
 
-static Result resumeTargetLocked(void) {
-    if (g_PauseViaDebug) {
+/* Same rules as pauseTarget(): runs with the hand-off claimed, never with
+   g_PauseLock held, and commits the state fields once the real work is done. */
+static Result resumeTarget(void) {
+    if (pauseIsViaDebug()) {
         /* The pause owns the process through the debug session: release the stop,
            then detach, which ForceOpens dmnt again so scans/cheats go back to the
            normal path.  Detaching even when the continue failed matters: closing
@@ -302,8 +372,7 @@ static Result resumeTargetLocked(void) {
            frozen because one IPC failed. */
         Result cont_rc = nxusDebugContinueAll();
         Result detach_rc = nxusDebugDetach();
-        g_PauseViaDebug = false;
-        nxusSessionSetPaused(false);
+        pauseCommitState(false, false);
         NXUS_LOG("resume: debug pause released (continue rc=0x%08X, detach rc=0x%08X)",
                  (unsigned)cont_rc, (unsigned)detach_rc);
         /* Detaching is what actually releases the target: closing the debug
@@ -316,7 +385,7 @@ static Result resumeTargetLocked(void) {
     if (nxusDebugIsAttached()) {
         /* Debug mode was started explicitly: continue it, keep the session. */
         Result rc = nxusDebugContinueAll();
-        if (R_SUCCEEDED(rc)) nxusSessionSetPaused(false);
+        if (R_SUCCEEDED(rc)) pauseCommitState(false, false);
         return rc;
     }
 
@@ -325,7 +394,7 @@ static Result resumeTargetLocked(void) {
        again the moment the title runs. */
     Result rc = nxusDmntResume();
     if (R_SUCCEEDED(rc)) {
-        nxusSessionSetPaused(false);
+        pauseCommitState(false, false);
         return 0;
     }
 
@@ -335,7 +404,7 @@ static Result resumeTargetLocked(void) {
        the only remaining way to release the target. */
     if (nxusDebugIsAttached()) {
         Result debug_rc = nxusDebugContinueAll();
-        if (R_SUCCEEDED(debug_rc)) nxusSessionSetPaused(false);
+        if (R_SUCCEEDED(debug_rc)) pauseCommitState(false, false);
         return debug_rc;
     }
     return rc;
@@ -346,9 +415,14 @@ static Result resumeTargetLocked(void) {
    hotkey must not, because closing dmnt destroys cheat/frozen state shared with
    other tools and wipes the hardware BP slots. */
 static Result serverPauseEx(bool allow_attach) {
-    pauseLock();
-    Result rc = pauseTargetLocked(allow_attach);
-    pauseUnlock();
+    /* Never block a caller (the HID hotkey runs here too) behind another
+       pause/resume: it would wait for the attach, the thread join or a dmnt IPC. */
+    if (!pauseTryEnter()) {
+        NXUS_LOG("pause: another pause/resume is in progress - refusing (busy)");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    Result rc = pauseTarget(allow_attach);
+    pauseLeave();
     return rc;
 }
 
@@ -357,9 +431,12 @@ static Result serverPause(void) {
 }
 
 static Result serverResume(void) {
-    pauseLock();
-    Result rc = resumeTargetLocked();
-    pauseUnlock();
+    if (!pauseTryEnter()) {
+        NXUS_LOG("resume: another pause/resume is in progress - refusing (busy)");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
+    Result rc = resumeTarget();
+    pauseLeave();
     return rc;
 }
 
@@ -425,8 +502,19 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
 }
 
 static void sendChainList(int fd, u32 seq, u16 type) {
-    u32 payload = (u32)(sizeof(NxusPtrChainListHeader) + g_ChainCount * sizeof(NxusPtrChainWire));
-    u8 *buffer = (u8 *)malloc(payload ? payload : 1);
+    /* header + one wire record per chain, sized in u64: a wrapped u32 product
+       would look small enough to pass the buffer check and then be written past
+       the end of the allocation.  (The old `payload ? payload : 1` fallback was
+       dead - the header alone makes payload non-zero - and would have written the
+       16-byte header into a 1-byte allocation if it ever had been taken.) */
+    const u64 payload_u64 = (u64)sizeof(NxusPtrChainListHeader) +
+                            (u64)g_ChainCount * (u64)sizeof(NxusPtrChainWire);
+    if (payload_u64 > (u64)NXUS_NET_BUF_SIZE) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
+        return;
+    }
+    const u32 payload = (u32)payload_u64;
+    u8 *buffer = (u8 *)malloc(payload);
     if (buffer == NULL) {
         replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
         return;
@@ -573,11 +661,18 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     else if (req->offset + count > hits->count) count = hits->count - req->offset;
 
     const u32 map_count = (maps != NULL) ? maps->count : 0;
-    u32 payload_size = (u32)sizeof(NxusHitBatchHeader) + map_count * (u32)sizeof(u64) + count * (u32)sizeof(NxusHit);
-    if (payload_size > NXUS_NET_BUF_SIZE) {
+    /* header + mapping bases + hits.  Sized in u64: map_count comes from the
+       target's mapping table and count from the client, so a u32 product could
+       wrap, pass the buffer check and then overrun the allocation while filling
+       it.  Refuse anything one reply cannot carry. */
+    const u64 payload_u64 = (u64)sizeof(NxusHitBatchHeader) +
+                            (u64)map_count * (u64)sizeof(u64) +
+                            (u64)count * (u64)sizeof(NxusHit);
+    if (payload_u64 > (u64)NXUS_NET_BUF_SIZE) {
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
         return;
     }
+    const u32 payload_size = (u32)payload_u64;
 
     u8 *buffer = (u8 *)malloc(payload_size);
     if (buffer == NULL) {
@@ -654,7 +749,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Real stop: dmnt breaks the cheat process it owns (65004 ->
                svc::BreakDebugProcess) while keeping the session, so scans and
                snapshots keep working.  Only if dmnt cannot stop it does
-               pauseTargetLocked take the process over with an own debug session. */
+               pauseTarget() take the process over with an own debug session. */
             rc = serverPause();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
@@ -763,13 +858,23 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                         got++;
                     }
                 }
-                reply(fd, type, seq, buffer, (u32)(got * sizeof(NxusMemoryInfo)));
-                free(buffer);
-                break;
+            } else {
+                rc = nxusDmntGetMappings(buffer, max_count, (size_t)req.offset, &got);
+                if (R_FAILED(rc)) {
+                    replyError(fd, type, seq, rc);
+                    free(buffer);
+                    break;
+                }
             }
-            rc = nxusDmntGetMappings(buffer, max_count, (size_t)req.offset, &got);
-            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
-            else reply(fd, type, seq, buffer, (u32)(got * sizeof(NxusMemoryInfo)));
+            /* One reply must fit a net buffer.  got is bounded by max_count here
+               (the buffer is sized from that), but the wire length is computed in
+               u64 and checked so the u32 cast below cannot truncate silent. */
+            const u64 reply_u64 = (u64)got * (u64)sizeof(NxusMemoryInfo);
+            if (reply_u64 > (u64)NXUS_NET_BUF_SIZE) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
+            } else {
+                reply(fd, type, seq, buffer, (u32)reply_u64);
+            }
             free(buffer);
             break;
         }
@@ -1028,7 +1133,15 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             u32 n = nxusSnapshotGetChanged(blocks, count, offset);
-            reply(fd, type, seq, blocks, n * (u32)sizeof(NxusChangedBlockWire));
+            /* Same u64 sizing rule as the hit batch: the count comes from the
+               client, so the wire length is computed and checked before the u32
+               cast instead of being multiplied in u32. */
+            const u64 reply_u64 = (u64)n * (u64)sizeof(NxusChangedBlockWire);
+            if (reply_u64 > (u64)NXUS_NET_BUF_SIZE) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_TOO_LARGE));
+            } else {
+                reply(fd, type, seq, blocks, (u32)reply_u64);
+            }
             free(blocks);
             break;
         }
@@ -1159,14 +1272,14 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                    settings round-trip: auto_continue=1 releases a held target at
                    once (that is what the setter is for), which would thaw the game
                    behind the PC's back while it still believes it is frozen.
-                   Resume is the only way out of a debug-session pause. */
-                pauseLock();
-                if (g_PauseViaDebug && dbg.auto_continue != 0) {
+                   Resume is the only way out of a debug-session pause.
+                   The state read is a short locked section; the configure call
+                   itself must not run under the lock. */
+                if (dbg.auto_continue != 0 && pauseIsViaDebug()) {
                     NXUS_LOG("debug config: auto_continue kept at 0 while a debug-session pause holds the target");
                     dbg.auto_continue = 0;
                 }
                 nxusDebugConfigure(&dbg);
-                pauseUnlock();
                 NXUS_LOG("debug config%s: watch style=%u auto_continue=%u",
                          debug_only ? " (debug-only payload)" : "",
                          (unsigned)dbg.style, (unsigned)dbg.auto_continue);
@@ -1265,16 +1378,14 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_DebugDetach:
-            pauseLock();
+            /* The detach (thread join + handle close) runs outside the state
+               lock; only the resulting pause/flag change is committed under it. */
             rc = nxusDebugDetach();
-            if (R_SUCCEEDED(rc) && g_PauseViaDebug) {
+            if (R_SUCCEEDED(rc) && pauseReleaseDebugSessionPause()) {
                 /* Detaching ends a pause that went through the session: keep the
                    reported pause flag in step with the released target. */
-                g_PauseViaDebug = false;
-                nxusSessionSetPaused(false);
                 NXUS_LOG("debug detach released a debug-session pause");
             }
-            pauseUnlock();
             if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
             break;
 
@@ -1416,17 +1527,18 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 static void reapStaleDebugSession(void) {
     if (!nxusDebugIsAttached()) return;
     if (!nxusSessionIdleExpired(NXUS_DEBUG_IDLE_TIMEOUT_MS)) return;
+    /* Same hand-off claim as Pause/Resume: nxusDebugDetach() joins the event
+       thread, so it must not run underneath an attach/detach that is in flight.
+       If one is running, skip and retry on the next tick. */
+    if (!pauseTryEnter()) return;
     NXUS_LOG("no client activity for %u ms - detaching the debug session",
              (unsigned)NXUS_DEBUG_IDLE_TIMEOUT_MS);
-    pauseLock();
     nxusDebugDetach();
-    if (g_PauseViaDebug) {
-        g_PauseViaDebug = false;
-        nxusSessionSetPaused(false);
+    if (pauseReleaseDebugSessionPause()) {
         NXUS_LOG("stale debug-session pause released");
         nxusNetSendEvent(NxusEvent_AutoResume, NULL, 0);
     }
-    pauseUnlock();
+    pauseLeave();
 }
 
 /* Keep the session's cached identity in step with dmnt, at most once a second.
@@ -1455,17 +1567,16 @@ static void refreshTargetIdentityThrottled(void) {
    thread, wipes the hardware slots, closes the handle and reopens dmnt. */
 static void reapExitedDebugSession(void) {
     if (!nxusDebugExitedPending()) return;
+    /* Do not join a session that a Pause/Resume is currently using: the claim
+       keeps the handle stable and the next tick retries. */
+    if (!pauseTryEnter()) return;
     NXUS_LOG("debug: debugee exited - releasing the dead debug session");
-    pauseLock();
     Result rc = nxusDebugDetach();
     if (R_FAILED(rc)) NXUS_RESULT("debug session release after exit", rc);
-    if (g_PauseViaDebug) {
-        /* The process is gone, so the pause it was held for is meaningless. */
-        g_PauseViaDebug = false;
-        nxusSessionSetPaused(false);
+    /* The process is gone, so any pause it was held for is meaningless. */
+    if (pauseReleaseDebugSessionPause())
         NXUS_LOG("debug-session pause released (debugee exited)");
-    }
-    pauseUnlock();
+    pauseLeave();
 }
 
 void nxusServerTick(void) {

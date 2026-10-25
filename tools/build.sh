@@ -48,11 +48,22 @@ PYEOF
     # single dmnt:cht cheat process at boot, so enabling both makes the probe's
     # numbers look like failures.  docs/HARDWARE_DAY1.md stages them in two runs:
     #   NXUS_STAGE_PROBE=1 tools/build.sh   -> probe gets boot2.flag, nxus does not
+    # NOTE: `[ cond ] && touch ... || rm -f ...` hides a failed touch (rm succeeds, so
+    # the statement returns 0 and `set -e` never fires).  Use explicit branches.
+    boot2_flag="$dist/flags/boot2.flag"
     if [ "${NXUS_STAGE_PROBE:-0}" = "1" ]; then
         # stage 1: the probe alone boots, so its numbers are the only measurement
-        [ "$name" = "probe" ] && touch "$dist/flags/boot2.flag" || rm -f "$dist/flags/boot2.flag"
+        if [ "$name" = "probe" ]; then
+            touch "$boot2_flag"
+        else
+            rm -f "$boot2_flag"
+        fi
     else
-        [ "$name" = "nxus" ] && touch "$dist/flags/boot2.flag" || rm -f "$dist/flags/boot2.flag"
+        if [ "$name" = "nxus" ]; then
+            touch "$boot2_flag"
+        else
+            rm -f "$boot2_flag"
+        fi
     fi
 
     $PY "$TOOLS/verify_artifact.py" "$dist/exefs.nsp"
@@ -65,11 +76,21 @@ PYEOF
     # Ship a plain-text + JSON description next to the exefs so the folder is
     # self-describing.  These files are inert: Atmosphère only reads exefs.nsp and
     # flags/, so nothing about the module's behaviour depends on them.
-    cat > "$dist/README.txt" <<EOF
-$name - part of Nxus-ox (Alpha v$NXUS_VERSION)
-title id : 0x$tid
-role     : $role
-built    : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # One timestamp for both files, so README.txt and metadata.json cannot disagree.
+    built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # README.txt: values are injected with printf, the fixed body is a QUOTED
+    # heredoc so a '$' or a backtick in the text is never expanded (and `set -u`
+    # cannot abort on an undefined variable inside the body).  Written to *.tmp
+    # and renamed, so an interrupted run never leaves a half-written file.
+    readme_tmp="$dist/README.txt.tmp"
+    {
+        printf '%s - part of Nxus-ox (Alpha v%s)\n' "$name" "$NXUS_VERSION"
+        printf 'title id : 0x%s\n' "$tid"
+        printf 'role     : %s\n' "$role"
+        printf 'built    : %s\n' "$built"
+        cat <<'README_EOF'
 
 Nxus-ox is a headless remote memory scanner / pointer finder / hardware
 debugger for Nintendo Switch (Atmosphère).  There is no on-screen UI: the PC
@@ -83,23 +104,38 @@ Files here:
   exefs.nsp     the sysmodule Atmosphère loads
   flags/        boot2.flag makes it start at boot (empty file)
   metadata.json machine-readable copy of this information
-EOF
+README_EOF
+    } > "$readme_tmp"
+    mv "$readme_tmp" "$dist/README.txt"
 
-    cat > "$dist/metadata.json" <<EOF
-{
-  "name": "$name",
-  "project": "Nxus-ox",
-  "version": "$NXUS_VERSION",
-  "channel": "alpha",
-  "title_id": "0x$tid",
-  "role": "$role",
-  "description": "$description",
-  "tcp_port": 7332,
-  "repository": "https://github.com/Nexy451z/Nxus-ox",
-  "built_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "warranty": "none - alpha software, use on emuMMC with a backup"
+    # metadata.json: build it with json.dump so description/role may contain
+    # quotes, backslashes or newlines and still produce valid JSON.  The result
+    # is re-parsed before it replaces the old file.
+    meta_tmp="$dist/metadata.json.tmp"
+    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" <<'PYEOF'
+import json
+import sys
+
+out, name, version, tid, role, description, built = sys.argv[1:8]
+data = {
+    "name": name,
+    "project": "Nxus-ox",
+    "version": version,
+    "channel": "alpha",
+    "title_id": "0x" + tid,
+    "role": role,
+    "description": description,
+    "tcp_port": 7332,
+    "repository": "https://github.com/Nexy451z/Nxus-ox",
+    "built_utc": built,
+    "warranty": "none - alpha software, use on emuMMC with a backup",
 }
-EOF
+with open(out, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+    $PY -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$meta_tmp"
+    mv "$meta_tmp" "$dist/metadata.json"
     echo
 }
 

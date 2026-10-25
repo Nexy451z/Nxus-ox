@@ -471,6 +471,11 @@ static void recordHit(const DebugEventInfo *event) {
     mutexLock(&g_Mutex);
     hit.index = g_HitTotal++;
     hit.tick = now;
+    /* The ring copy is a whole NxusBreakHit structure (112 bytes); no memcpy is
+       sized by the watch `size`/a value_size, so a size above 8 cannot overrun the
+       hit array.  nxusDebugSetBreak() already rejects sizes outside {1,2,4,8} and
+       the record carries no value buffer at all, so the only size-related field is
+       informational. */
     g_Hits[g_HitNext] = hit;
     g_HitNext = (g_HitNext + 1) % NXUS_DEBUG_MAX_HITS;
     if (g_HitCount < NXUS_DEBUG_MAX_HITS) g_HitCount++;
@@ -866,6 +871,15 @@ bool nxusDebugIsHandoff(void) {
     return atomic_load_explicit(&g_HandoffBusy, memory_order_relaxed);
 }
 
+/* Strong definition of the optional hook that shared/nxus_dmntcht.c declares weak.
+ * The dmnt client re-reads it immediately before an automatic ForceOpen(), so a
+ * hand-off that began after its own auto-reopen check still blocks the takeover
+ * (the check-then-act window this hook exists to close). */
+bool nxusDmntHandoffBlocked(void);
+bool nxusDmntHandoffBlocked(void) {
+    return nxusDebugIsHandoff();
+}
+
 Result nxusDebugAttach(u64 pid) {
     if (g_Attached) return 0;
     if (pid == 0) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
@@ -1091,6 +1105,27 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
 
+    /* The control word the hardware gets always comes from
+       nxusDebugBuildControl(), whose BAS is exactly watchBas(size, address).  A raw
+       ctrl from the wire is never written as-is: it could select BAS bytes that do
+       not cover the watched range, clear E so the slot never fires, or name a LINK
+       slot that is not the ContextID source - and the session would then disarm and
+       re-arm a slot whose hardware meaning it does not know.  A supplied word is
+       accepted only when it equals the one this configuration produces; the check
+       runs before a slot is reserved so a rejection touches neither the table nor
+       the registers. */
+    const u32 size = request->size ? request->size : 4;
+    const u64 expected_ctrl = nxusDebugBuildControl(request->kind, size,
+                                                    request->address, g_Config.style);
+    if (request->ctrl != 0 && (u64)request->ctrl != expected_ctrl) {
+        mutexUnlock(&g_Mutex);
+        NXUS_LOG("set break: rejected ctrl=%08X (expected %08X, kind=%u size=%u addr=%08llX)",
+                 (unsigned)request->ctrl, (unsigned)expected_ctrl,
+                 (unsigned)request->kind, (unsigned)size,
+                 (unsigned long long)request->address);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+
     u32 slot = request->slot;
     if (request->kind == NxusBp_Execute) {
         /* 4/5 hold the context-id link source: an execution breakpoint placed there
@@ -1126,10 +1161,8 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
         previous = *entry;
     }
 
-    const u32 size = request->size ? request->size : 4;
-    const u64 ctrl = request->ctrl ? request->ctrl
-                                   : nxusDebugBuildControl(request->kind, size,
-                                                           request->address, g_Config.style);
+    /* Already validated above: this is exactly nxusDebugBuildControl()'s word. */
+    const u64 ctrl = expected_ctrl;
     /* DBGWVR/DBGBVR must hold the aligned word: the byte mask lives in BAS.
        An unaligned value loses the high BAS bits and never fires.  The original
        address is kept in BreakSlot so hits can be reported in user terms. */

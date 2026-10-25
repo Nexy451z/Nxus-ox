@@ -1,5 +1,6 @@
 #include "nxus_ptrscan.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -59,6 +60,10 @@ typedef struct {
 } PtrScan;
 
 static int regionContaining(const NxusPtrRegion *regions, u32 count, u64 address, u32 width) {
+    /* address + width must not wrap: a pointer near UINT64_MAX would otherwise
+       end at a tiny address that compares "inside" the region, and the walk would
+       dereference an address that is not mapped at all. */
+    if (address > UINT64_MAX - (u64)width) return -1;
     for (u32 i = 0; i < count; i++) {
         if (address >= regions[i].base && address + width <= regions[i].base + regions[i].size)
             return (int)i;
@@ -69,6 +74,7 @@ static int regionContaining(const NxusPtrRegion *regions, u32 count, u64 address
 /* regions sorted by base: find the last region starting at or below `address`
    and verify containment. */
 static int regionContainingSorted(const NxusPtrRegion *regions, u32 count, u64 address, u32 width) {
+    if (address > UINT64_MAX - (u64)width) return -1;
     u32 lo = 0, hi = count;
     while (lo < hi) {
         u32 mid = lo + (hi - lo) / 2;
@@ -82,6 +88,9 @@ static int regionContainingSorted(const NxusPtrRegion *regions, u32 count, u64 a
 }
 
 static int isMapped(const PtrScan *scan, u64 address, u32 width) {
+    /* Reject the wrap before adding: address + width would otherwise become a
+       small value that passes the max_mapped / region containment tests. */
+    if (address > UINT64_MAX - (u64)width) return 0;
     if (address < scan->min_mapped || address + width > scan->max_mapped) return 0;
     if (scan->sorted)
         return regionContainingSorted(scan->regions, scan->region_count, address, width) >= 0;
