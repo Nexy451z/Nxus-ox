@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::*;
 
+/// One entry of the target's memory map, under the name this module's
+/// pointer-width rule speaks of (`mappings`).
+pub use crate::protocol::MemoryInfo as Mapping;
 pub use crate::protocol::ValueType;
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,57 @@ impl fmt::Display for NxusError {
 impl std::error::Error for NxusError {}
 
 pub type Result<T> = std::result::Result<T, NxusError>;
+
+/// The title's pointer width in bytes (4 or 8) - the ONE width rule on the PC.
+///
+/// Nothing here is ever sent to the console: a pointer scan request carries
+/// `value_width = 0` ("automatic") and the console decides.  This mirrors the
+/// console's `nxusPtrScanAutoWidth()` (core/nxus_ptrscan.c) so the PC can
+/// *explain* that decision and pick the matching parts: the address format in
+/// the GUI, the pointer width a PC-side dump walk uses, and the 540F/580F pointer
+/// load plus the 640F/680F value write of a cheat export.
+///
+/// It exists because the PC used to answer this in three places with three
+/// different rules (the GUI said 4 for an unknown base, a dump walk said 8, and
+/// the CLI decided from the mapping table), so a display, a PC-side scan and an
+/// exported cheat could disagree about the very same title.
+///
+/// The rule, in the console's order:
+///
+/// * `mappings` is the target's memory map.  An entry whose end lies above 4 GiB
+///   proves a 64-bit address space; when every entry ends at or below 4 GiB,
+///   4-byte pointers cover the whole map.  An end exactly at 4 GiB still holds
+///   only 32-bit-addressable bytes, so it does not prove 8 (the console compares
+///   the same way).  Entries the console could not walk (size 0, not readable)
+///   are ignored exactly like `buildPtrRegions()` ignores them.
+/// * Without a usable mapping table the main module base is the only evidence:
+///   `0` means "unknown" and defaults to 8 (AArch64 is the common case, and a
+///   wide load on a 32-bit title only costs a failed scan while a narrow load on
+///   a 64-bit title silently loses every chain), a base at or above 4 GiB is
+///   already outside the 32-bit address space, everything else is 4.
+pub fn pointer_width_for(metadata: &Metadata, mappings: Option<&[Mapping]>) -> u32 {
+    /// Highest address a 4-byte pointer can describe.
+    const WIDTH_LIMIT: u64 = 0x1_0000_0000;
+
+    let mut have_mapping = false;
+    let mut wide = false;
+    for mapping in mappings.unwrap_or(&[]) {
+        if mapping.size == 0 || mapping.perm & PERM_R == 0 {
+            continue;
+        }
+        have_mapping = true;
+        // A wrapping base+size covers the top of the address space, which no
+        // 32-bit pointer reaches: saturating at u64::MAX is the right answer,
+        // not a wrapped (small) end.
+        if mapping.base.saturating_add(mapping.size) > WIDTH_LIMIT {
+            wide = true;
+        }
+    }
+    if have_mapping {
+        return if wide { 8 } else { 4 };
+    }
+    if metadata.main_base == 0 || metadata.main_base >= WIDTH_LIMIT { 8 } else { 4 }
+}
 
 /// `sizeof(NxusDebugConfig)` on the wire.  A CONFIG payload of exactly this
 /// length means "apply the debug block, leave the hotkey/watchdog settings
@@ -1525,8 +1579,9 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text, is_retry_later, released_addresses,
-                select_stopped_thread, NxusError, RESULT_BUSY};
+    use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
+                released_addresses, select_stopped_thread, Mapping, Metadata, NxusError,
+                PERM_R, RESULT_BUSY};
     use crate::protocol::{put_u32, DebugStatus};
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
@@ -1536,6 +1591,49 @@ mod tests {
             put_u32(&mut body, reason);
         }
         body
+    }
+
+    fn mapping(base: u64, size: u64, perm: u32) -> Mapping {
+        Mapping { base, size, memory_type: 5, attr: 0, perm }
+    }
+
+    fn metadata(main_base: u64) -> Metadata {
+        Metadata { main_base, ..Default::default() }
+    }
+
+    /// The mapping table decides: any traversable mapping ending above 4 GiB
+    /// means 8-byte pointers, an end at or below it does not.
+    #[test]
+    fn pointer_width_follows_the_console_auto_rule() {
+        let low = 0x0070_0000u64;              // MockSwitch's main module base
+        // A 32-bit title: every mapping ends below 4 GiB.
+        assert_eq!(pointer_width_for(&metadata(low), Some(&[mapping(0x0070_0000, 0x80000, PERM_R),
+                                                            mapping(0x42CA_0000, 0x3000, PERM_R)])), 4);
+        // A 64-bit title whose main module ASLR'd below 4 GiB: the high mapping
+        // is the evidence that the address space is wide.
+        assert_eq!(pointer_width_for(&metadata(low), Some(&[mapping(low, 0x80000, PERM_R),
+                                                            mapping(0x7F_0000_0000, 0x1000, PERM_R)])), 8);
+        // An end exactly at 4 GiB still addresses only 32-bit-reachable bytes.
+        assert_eq!(pointer_width_for(&metadata(low),
+                                     Some(&[mapping(0xFFFF_F000, 0x1000, PERM_R)])), 4);
+        // A mapping that wraps past the top is 64-bit evidence, not a small end.
+        assert_eq!(pointer_width_for(&metadata(low),
+                                     Some(&[mapping(u64::MAX - 0xFFF, 0x2000, PERM_R)])), 8);
+    }
+
+    /// Without a mapping table the main module base decides, and 0 is "unknown"
+    /// (the console's AArch64 default), not a 32-bit hint.
+    #[test]
+    fn without_mappings_an_unknown_base_is_64bit() {
+        assert_eq!(pointer_width_for(&metadata(0), None), 8);
+        assert_eq!(pointer_width_for(&metadata(0), Some(&[])), 8);
+        assert_eq!(pointer_width_for(&metadata(0x0780_4000), None), 4);
+        assert_eq!(pointer_width_for(&metadata(0x1_0000_0000), None), 8);
+        // Entries the console would not walk are not evidence either.
+        let unusable = [mapping(0x7F_0000_0000, 0x1000, 0), mapping(0x0070_0000, 0, PERM_R)];
+        assert_eq!(pointer_width_for(&metadata(0x0070_0000), Some(&unusable)), 4,
+                   "unreadable / empty mappings fall back to the main base");
+        assert_eq!(pointer_width_for(&metadata(0), Some(&unusable)), 8);
     }
 
     #[test]

@@ -362,12 +362,16 @@ static void walkFrom(PtrScan *scan, u64 reg, u32 depth) {
    bytes, so it does not by itself prove 64-bit pointers. */
 #define NXUS_PTRSCAN_32BIT_LIMIT 0x100000000ull
 
-u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
-                         u64 main_base, u64 *out_max_end) {
+u32 nxusPtrScanAutoWidthFor(const NxusPtrRegion *regions, u32 region_count,
+                            u64 main_base, NxusPtrScanArch process_arch,
+                            u64 *out_max_end, const char **out_reason) {
     u64 max_end = 0;
     int have_mapping = 0;
     int wide = 0;
 
+    /* The mapping evidence is collected unconditionally: even when the process
+       architecture decides the width, max_end is what the caller logs next to it
+       (and a disagreement between the two is the interesting case to see). */
     for (u32 i = 0; (regions != NULL) && i < region_count; i++) {
         const u64 base = regions[i].base;
         const u64 size = regions[i].size;
@@ -390,6 +394,25 @@ u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
     }
 
     if (out_max_end != NULL) *out_max_end = max_end;
+
+    /* 1. The process's own architecture, when the caller knows it.  This has to
+       outrank the mapping rule: a 64-bit title can have every mapping below 4 GiB
+       (AArch64 ASLR places main at e.g. 0x00700000 and the heap at 0x36000000), and
+       the old "every mapping ends below 4 GiB -> 4" rule then walked it with
+       4-byte loads and silently returned zero chains.  A 32-bit title can never
+       hold a pointer above 4 GiB, so AARCH32 is equally authoritative -- but only
+       when the caller really knows it: UNKNOWN must not be read as AArch32. */
+    if (process_arch == NXUS_PTRSCAN_ARCH_AARCH64) {
+        if (out_reason != NULL) *out_reason = NXUS_PTRSCAN_WIDTH_REASON_PROCESS64;
+        return 8u;
+    }
+    if (process_arch == NXUS_PTRSCAN_ARCH_AARCH32) {
+        if (out_reason != NULL) *out_reason = NXUS_PTRSCAN_WIDTH_REASON_PROCESS32;
+        return 4u;
+    }
+
+    /* 2. Fallback: the mappings the walk is about to traverse. */
+    if (out_reason != NULL) *out_reason = NXUS_PTRSCAN_WIDTH_REASON_MAPPINGS;
     if (have_mapping) return wide ? 8u : 4u;
 
     /* No mapping to look at (a scope that produced no region): the module base is
@@ -405,6 +428,27 @@ u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
     return 8u;
 }
 
+u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
+                         u64 main_base, u64 *out_max_end) {
+    return nxusPtrScanAutoWidthFor(regions, region_count, main_base,
+                                   NXUS_PTRSCAN_ARCH_UNKNOWN, out_max_end, NULL);
+}
+
+NxusPtrScanArch nxusPtrScanArchFromAddressSpace(u64 aslr_base, u64 aslr_size) {
+    /* Larger than a 32-bit pointer can describe: only AArch64 gets such a space. */
+    if (aslr_size > NXUS_PTRSCAN_32BIT_LIMIT) return NXUS_PTRSCAN_ARCH_AARCH64;
+    /* The whole region sits inside the AArch32 address space.  Written as a
+       subtraction so a hostile/overflowing aslr_base + aslr_size cannot wrap into
+       "inside 4 GiB". */
+    if (aslr_size != 0 && aslr_base < NXUS_PTRSCAN_32BIT_LIMIT &&
+        aslr_size <= NXUS_PTRSCAN_32BIT_LIMIT - aslr_base) {
+        return NXUS_PTRSCAN_ARCH_AARCH32;
+    }
+    /* No size at all, or a region that starts below 4 GiB and ends above it: no
+       side of the question can be answered from this metadata. */
+    return NXUS_PTRSCAN_ARCH_UNKNOWN;
+}
+
 int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
                 u64 target_address, u64 module_base,
                 const NxusPtrScanOptions *options,
@@ -416,20 +460,26 @@ int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
         out == NULL || out_count == NULL || scratch_size < 0x1000) {
         return NXUS_SCAN_ERR_PARAM;
     }
-    /* value_width 0 = "infer it from the regions", the same rule the server uses
-       for NxusPtrScanRequest.value_width 0.  The copy is local and lives for the
-       whole call, so the caller's struct is never written and scan.opts (which
-       points at it) stays valid.  module_base is only the fallback hint here. */
+    /* value_width 0 = "infer it from the regions (and the caller's process
+       architecture hint)", the same rule the server uses for
+       NxusPtrScanRequest.value_width 0.  The copy is local and lives for the whole
+       call, so the caller's struct is never written and scan.opts (which points at
+       it) stays valid.  module_base is only the fallback hint here. */
     NxusPtrScanOptions auto_opts;
     u64 auto_max_end = 0;
+    const char *auto_reason = NULL;
     if (options->value_width == 0) {
         auto_opts = *options;
-        auto_opts.value_width = nxusPtrScanAutoWidth(regions, region_count,
-                                                    module_base, &auto_max_end);
+        auto_opts.value_width = nxusPtrScanAutoWidthFor(regions, region_count,
+                                                       module_base,
+                                                       (NxusPtrScanArch)options->process_arch,
+                                                       &auto_max_end, &auto_reason);
         options = &auto_opts;
         fprintf(stderr,
-                "ptrscan: pointer width auto = %u (main=%08llX, max mapping end=%08llX)\n",
-                (unsigned)options->value_width, (unsigned long long)module_base,
+                "ptrscan: pointer width auto = %u (%s) (main=%08llX, max mapping end=%08llX)\n",
+                (unsigned)options->value_width,
+                auto_reason ? auto_reason : NXUS_PTRSCAN_WIDTH_REASON_MAPPINGS,
+                (unsigned long long)module_base,
                 (unsigned long long)auto_max_end);
     }
     if (options->value_width != 4 && options->value_width != 8) return NXUS_SCAN_ERR_PARAM;

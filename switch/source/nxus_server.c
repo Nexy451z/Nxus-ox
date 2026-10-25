@@ -319,7 +319,8 @@ static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
  *   per snapshot slot
  *     hashes + addresses    NXUS_SNAPSHOT_MAX_BLOCKS * 2 * 8 B     256 KiB
  *                           (lazily allocated by nxus_snapshot_srv.c,
- *                            never freed before reboot)
+ *                            freed again by nxusSnapshotReleaseAll() and
+ *                            re-allocated by the next capture)
  *   hit list                retained capacity, <= NXUS_SESSION_HIT_BUDGET_BYTES
  *                           (8 B NxusHitAddress + value_size per hit; the
  *                            estimate reads the live capacity, so an empty or
@@ -334,13 +335,13 @@ static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
  *                           = max(256 KiB + 4097*24 B, 1 MiB)
  *
  * With the hit list at its cap and no snapshot slot the estimate is
- * 8,052,736 B (7.68 MiB); one slot adds 256 KiB (7.93 MiB, still inside the
- * budget) and the A/B pair adds 512 KiB, crossing 8 MiB at 8,577,024 B
- * (8.18 MiB).  That is exactly the "snapshot 2 slots + pointer scan + maximum
- * hit list" combination the guard in handlePtrScanBegin() refuses.  With an
- * empty/reset hit list the same two slots give 5,505,024 B (5.25 MiB), so the
- * guard does not fire; without a held snapshot it never runs at all, which
- * keeps the previous behaviour of PtrScanBegin unchanged.
+ * 6,742,016 B (6.43 MiB).  A held slot adds exactly the 256 KiB its two arrays
+ * occupy, so the A/B pair brings it to 7,266,304 B (6.93 MiB) - inside the budget,
+ * which is why the guard is a backstop today rather than a routine refusal.  A
+ * released slot adds nothing at all now that nxusSnapshotReleaseAll() frees the
+ * arrays (see its comment), so the charge follows the resident memory exactly.
+ * Without a held snapshot the guard never runs, which keeps the previous behaviour
+ * of PtrScanBegin unchanged.
  */
 #define NXUS_HEAP_BUDGET_BYTES         (8u * 1024u * 1024u)
 /* Session hard caps (nxus_session.c: mapping/region lists are clamped to 4096). */
@@ -352,16 +353,12 @@ static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
 #define NXUS_HEAP_PTRSCAN_SCRATCH_BYTES (256u * 1024u)
 
 /* Bit n set: snapshot slot n has its hash/address arrays allocated and is charged
-   against the heap budget.  Set by SnapshotCapture (before the capture, because the
-   service allocates the arrays before validating the request) and cleared by
-   snapshotReleaseSlots() / ScanReset.
-
-   A release does NOT hand the arrays back to the allocator: nxus_snapshot_srv.c
-   allocates them on first use and never frees them (freeing would fragment an 8 MB
-   heap and the next capture would need them again), so after a release the bytes are
-   still resident but no longer counted.  That is the deliberate trade the release
-   makes: it is the only way a client can lift the HEAP_BUDGET refusal of
-   PtrScanBegin, and the capture path re-claims the slot on its next use. */
+   against the heap budget.  Kept in step with the service - it is refreshed from
+   nxusSnapshotResidentSlots() after every capture and release, never guessed - so
+   the set of charged slots is exactly the set of resident arrays.  (It used to be
+   maintained by the server because a release only dropped the bookkeeping while
+   the arrays stayed allocated; nxusSnapshotReleaseAll() now frees them, which makes
+   "released" and "not resident" the same thing.) */
 static u32 g_HeldSnapshotSlots;
 
 static u64 estimateHeapPeak(void) {
@@ -371,8 +368,12 @@ static u64 estimateHeapPeak(void) {
         (u64)NXUS_HEAP_MAX_MAPPINGS * (u64)sizeof(NxusMappingEntry) +
         (u64)NXUS_HEAP_MAX_REGIONS * (u64)sizeof(NxusScanRegion);
 
-    /* hashes + addresses, one array each, u64 per block */
-    const u64 slot_bytes = (u64)NXUS_SNAPSHOT_MAX_BLOCKS * 2u * (u64)sizeof(u64);
+    /* hashes + addresses of the slots that are actually allocated right now, taken
+       from the service that owns them (nxusSnapshotResidentBytes()).  This used to
+       be "the slot was ever used", which overstated the heap after a release only
+       because the release did not free anything; now it under- or over-states
+       nothing: a released slot costs 0 because its arrays are gone. */
+    const u64 held = nxusSnapshotResidentBytes();
 
     /* The chain reply (up to one net buffer) is built after the scratch has
        been freed; taking the larger of the two keeps the estimate independent
@@ -381,11 +382,6 @@ static u64 estimateHeapPeak(void) {
                          (u64)(NXUS_HEAP_MAX_MAPPINGS + 1u) * (u64)sizeof(NxusPtrRegion);
     const u64 ptr_peak = (ptr_work > (u64)NXUS_NET_BUF_SIZE) ? ptr_work
                                                              : (u64)NXUS_NET_BUF_SIZE;
-
-    u64 held = 0;
-    for (u32 slot = 0; slot < 2; slot++) {
-        if (g_HeldSnapshotSlots & (1u << slot)) held += slot_bytes;
-    }
 
     /* The hit list survives between scans; use its real capacity so an empty
        or reset session is not charged for results it does not hold.  PtrScanBegin
@@ -416,35 +412,33 @@ static u64 estimateHeapPeak(void) {
 /* ---- releasing the snapshot slots -------------------------------------- */
 
 /*
- * Drop both A/B captures and the heap-budget claim they hold.
+ * Drop both A/B captures and hand their memory back to the 8 MB inner heap.
  *
- * Why this is a server-side function rather than one line in the handler: the
- * service (nxus_snapshot_srv.c) exposes only Take / Compare / GetChanged /
- * GetSummary, so its own invalidate path (snapshotSlotInvalidate(), the same reset a
- * failed capture performs) is not reachable from here.  nxusSnapshotTake() clears
- * the slot BEFORE it validates the request - so a request it must reject still
- * invalidates - and the one scope it always rejects is NxusScope_Ranges, because a
- * capture request carries no region list ("NxusScope_Ranges has no list of its
- * own here" in nxusSessionPrepareRegions()).  That rejection happens before any
- * read, view pin, malloc or IPC, and for a held slot the hash arrays were already
- * allocated by the capture that set the bit, so nothing is allocated either.  (The
- * one exception is a slot whose capture failed to allocate them: Ensure runs - and
- * fails the same way - before the invalidate, and the slot is uncaptured already,
- * so the release simply leaves it that way.)  The postcondition is verified below
- * instead of being assumed: if a future refactor moves the invalidate behind the
- * validation, the log says so rather than the release silently keeping a stale
- * capture.
+ * nxusSnapshotReleaseAll() (nxus_snapshot_srv.c) now really frees the hash/address
+ * arrays and leaves each slot in the "never used" state, so this is the release the
+ * PC's HEAP_BUDGET advice promises ("release the snapshots (or reset)") and the next
+ * capture re-allocates on demand through the existing snapshotSlotEnsure() path.
+ * The bookkeeping below is refreshed FROM the service instead of being cleared
+ * blindly, so g_HeldSnapshotSlots and estimateHeapPeak() always describe the
+ * resident arrays.
  *
- * The PC's HEAP_BUDGET advice is "release the snapshots (or reset)"; this is the
- * release, and NxusCmd_ScanReset calls it too.
+ * No capture can be mid-flight here: captures run on the connection thread, and the
+ * server serialises commands (SnapshotCapture additionally refuses while the pointer
+ * scan worker runs).
+ *
+ * NxusCmd_ScanReset calls this too.
  */
 static void snapshotReleaseSlots(const char *why) {
-    /* The service owns the validity marker: ask it to drop both slots instead of
-       driving nxusSnapshotTake() with a request that is meant to be rejected. */
+    /* The service owns the storage and the validity marker: ask it to release both
+       slots instead of driving nxusSnapshotTake() with a request that is meant to be
+       rejected. */
     const u32 held = g_HeldSnapshotSlots;
+    const u64 resident = nxusSnapshotResidentBytes();
     nxusSnapshotReleaseAll();
-    g_HeldSnapshotSlots = 0;
-    NXUS_LOG("snapshot: released both slots (held=0x%X)", (unsigned)held);
+    g_HeldSnapshotSlots = nxusSnapshotResidentSlots();
+    NXUS_LOG("snapshot: released both slots (held=0x%X, %llu B freed, now held=0x%X)",
+             (unsigned)held, (unsigned long long)resident,
+             (unsigned)g_HeldSnapshotSlots);
     if (why != NULL) NXUS_LOG_DEBUG("snapshot: release reason: %s", why);
 }
 
@@ -1073,6 +1067,47 @@ static void ptrScanRequestCancel(const char *why) {
     NXUS_LOG("ptrscan: cancel requested (%s) - the worker stops at its next read", why);
 }
 
+/* The target's own architecture, as far as the console can tell - the highest
+ * priority input of the pointer-width inference.  Two sources, both "process
+ * metadata", because the process's bitness is a fact about the process while the
+ * mapping table only says where its memory happens to sit this run:
+ *
+ *   1. the debug session's CreateProcess event (DebugEventInfo.flags bit 0), via
+ *      nxusDebugTargetIs64Bit()/Known().  Exact, but only exists in debug mode.
+ *   2. dmnt's CheatProcessMetadata (65002).  It carries no explicit architecture
+ *      flag, but aslr_base/aslr_size describe the process's *address space*, and
+ *      the kernel hands out two unmistakably different pairs: AArch32 gets
+ *      0x200000 + 0xFFE00000 (sums to exactly 4 GiB - the measured MHXX values in
+ *      docs/work/probe.txt), AArch64 gets 0x8000000 + 0x7FF8000000 (512 GiB).  A
+ *      region that cannot fit in 4 GiB therefore proves AArch64 and one that ends
+ *      inside it proves AArch32.  The rule itself lives in core
+ *      (nxusPtrScanArchFromAddressSpace()) so it can be tested on the host; an
+ *      inconsistent region answers "unknown".
+ *
+ * Returns UNKNOWN when neither source has an answer (or a debug session owns the
+ * process but has not seen CreateProcess yet: dmnt is closed then, so asking it
+ * would only re-open it and steal the process back). */
+static NxusPtrScanArch ptrScanProcessArch(void) {
+    if (nxusDebugTargetIs64BitKnown()) {
+        return nxusDebugTargetIs64Bit() ? NXUS_PTRSCAN_ARCH_AARCH64
+                                       : NXUS_PTRSCAN_ARCH_AARCH32;
+    }
+    /* Mid-handoff / no CreateProcess yet: do NOT touch dmnt here (a failed call
+       auto-reopens it, which would take the process away from our debug session). */
+    if (nxusDebugIsAttached() || nxusDebugIsHandoff()) return NXUS_PTRSCAN_ARCH_UNKNOWN;
+
+    NxusProcessMetadata md;
+    memset(&md, 0, sizeof(md));
+    if (R_FAILED(nxusDmntGetMetadata(&md))) return NXUS_PTRSCAN_ARCH_UNKNOWN;
+    const NxusPtrScanArch arch = nxusPtrScanArchFromAddressSpace(md.aslr_base, md.aslr_size);
+    if (arch == NXUS_PTRSCAN_ARCH_UNKNOWN) {
+        NXUS_LOG_DEBUG("ptrscan: dmnt metadata gives no usable architecture "
+                       "(aslr=%08llX+%08llX)",
+                       (unsigned long long)md.aslr_base, (unsigned long long)md.aslr_size);
+    }
+    return arch;
+}
+
 /* No walk has run yet, and none can be running while init runs (it is part of the
    boot chain, before the listener is up). */
 static void ptrScanInit(void) {
@@ -1363,23 +1398,35 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     if (opts.max_results > NXUS_PTRSCAN_MAX_RESULTS) opts.max_results = NXUS_PTRSCAN_MAX_RESULTS;
     /* Pointer width.  An explicit 4/8 request always wins.  When the client lets
        the console decide (0 - and for any other value, as this handler has always
-       treated "not 4/8" as "infer it"), the width comes from the mappings the walk
-       is about to traverse, not from the module base: on AArch64 ASLR puts the main
-       module below 4 GiB for roughly 1.6% of launches while the heap is randomised
-       independently, and the old "module_base < 4 GiB means 32-bit" rule then walked
-       a 64-bit title with 4-byte loads and silently returned zero chains.  The rule
-       lives in nxusPtrScanAutoWidth() (core/nxus_ptrscan.c), which the engine's own
-       value_width == 0 path uses too, so the console and a host caller cannot drift
-       apart.  module_base is only the fallback hint when no mapping was collected. */
+       treated "not 4/8" as "infer it"), the width comes from:
+         1. the target process's own architecture, as ptrScanProcessArch() reports
+            it (the debug session's CreateProcess flag, else dmnt's process
+            metadata address-space size).  This outranks everything address based:
+            a 64-bit title can have its main module AND heap below 4 GiB (main
+            0x00700000 / heap 0x36000000 is a real AArch64 ASLR outcome, and the
+            fixture the old "every mapping <= 4 GiB -> 4" rule walked with 4-byte
+            loads, silently returning zero chains), while a 32-bit title can never
+            hold a pointer above 4 GiB.
+         2. the mappings the walk is about to traverse (see nxusPtrScanAutoWidthFor()
+            in core/nxus_ptrscan.c), with the module base as the empty-table hint.
+       Both paths go through the same function, so the console and a host caller
+       cannot drift apart. */
+    const NxusPtrScanArch process_arch = ptrScanProcessArch();
+    opts.process_arch = (u32)process_arch;
     if (req.value_width == 4 || req.value_width == 8) {
         opts.value_width = req.value_width;
     } else {
         u64 max_mapping_end = 0;
-        opts.value_width = nxusPtrScanAutoWidth(regions, region_count,
-                                               module_base, &max_mapping_end);
-        NXUS_LOG("ptrscan: pointer width auto = %u (main=%08llX, max mapping end=%08llX)",
-                 (unsigned)opts.value_width, (unsigned long long)module_base,
-                 (unsigned long long)max_mapping_end);
+        const char *width_reason = NULL;
+        opts.value_width = nxusPtrScanAutoWidthFor(regions, region_count, module_base,
+                                                  process_arch, &max_mapping_end,
+                                                  &width_reason);
+        NXUS_LOG("ptrscan: pointer width auto = %u (%s) "
+                 "(main=%08llX, max mapping end=%08llX, process arch=%u)",
+                 (unsigned)opts.value_width,
+                 width_reason ? width_reason : NXUS_PTRSCAN_WIDTH_REASON_MAPPINGS,
+                 (unsigned long long)module_base,
+                 (unsigned long long)max_mapping_end, (unsigned)process_arch);
     }
     opts.window_size = 0x400;
     opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
@@ -2124,15 +2171,22 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                                  NXUS_REASON_BAD_SLOT);
                 break;
             }
-            /* nxusSnapshotTake() allocates the slot arrays on first use, before
-               it validates scope/target, and never frees them.  Mark the slot
-               even when the capture fails so the heap estimate reflects the
-               memory that is actually resident from now on. */
-            if (req.slot <= 1) g_HeldSnapshotSlots |= (1u << req.slot);
+            /* nxusSnapshotTake() allocates the slot arrays on first use (and only
+               frees them again on SnapshotRelease / ScanReset).  Refresh the
+               accounting from the service AFTER the call instead of guessing: the
+               capture can fail before or after allocation, and the charge must
+               describe the arrays that actually exist.  The old pre-set bit marked
+               a slot even when nothing was ever allocated and could not notice a
+               release that freed the arrays. */
             NxusSnapshotSummary summary;
             memset(&summary, 0, sizeof(summary));
             rc = nxusSnapshotTake(req.slot, req.scope, req.range_begin, req.range_end,
                                   req.block_size, &summary);
+            g_HeldSnapshotSlots = nxusSnapshotResidentSlots();
+            NXUS_LOG_DEBUG("snapshot: slot accounting after capture (held=0x%X, "
+                           "%llu B resident)",
+                           (unsigned)g_HeldSnapshotSlots,
+                           (unsigned long long)nxusSnapshotResidentBytes());
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
             else reply(fd, type, seq, &summary, sizeof(summary));
             break;

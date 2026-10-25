@@ -37,7 +37,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dump::{MemoryDump, PtrScanOptions, PtrScanResult};
-use crate::protocol::{PtrChain, MEMTYPE_HEAP, PERM_R, PERM_W};
+use crate::protocol::{Metadata, MemoryInfo, PtrChain, MEMTYPE_HEAP, PERM_R, PERM_W};
 
 pub const MAGIC_EDZN: u32 = 0x4E5A_4445; // "EDZN", uncompressed
 pub const MAGIC_EFZN: u32 = 0x4E5A_4665; // "eFZN", LZ8 compressed
@@ -224,6 +224,35 @@ impl EdizonDump {
 #[inline]
 fn in_range(value: u64, base: u64, end: u64) -> bool {
     base != end && value >= base && value < end
+}
+
+/// The title's pointer width, as the console would infer it, for an EdiZon dump.
+///
+/// An EdiZon file records exactly two ranges (main and heap), which are the whole
+/// address space the dump describes, so they are handed to the one shared rule
+/// [`crate::client::pointer_width_for`] as its mapping table.  This replaces the
+/// hard-coded 8 the callers used: that guess exported 580F loads (and an 8-byte
+/// value write) for a 32-bit title whose dump looked wide only because it was not
+/// examined at all.
+pub fn pointer_width(dump: &EdizonDump) -> u32 {
+    let ranges = [
+        MemoryInfo {
+            base: dump.main_base,
+            size: dump.main_end.saturating_sub(dump.main_base),
+            memory_type: 3,
+            attr: 0,
+            perm: PERM_R,
+        },
+        MemoryInfo {
+            base: dump.heap_base,
+            size: dump.heap_end.saturating_sub(dump.heap_base),
+            memory_type: MEMTYPE_HEAP,
+            attr: 0,
+            perm: PERM_R | PERM_W,
+        },
+    ];
+    let metadata = Metadata { main_base: dump.main_base, ..Default::default() };
+    crate::client::pointer_width_for(&metadata, Some(&ranges))
 }
 
 /// Reverse pointer scan over an EdiZon dump.
@@ -599,6 +628,31 @@ mod tests {
 
         // PointerSearcher-SE binary-searches by source address.
         assert!(dump.pairs.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    /// The pointer width of an EdiZon dump comes from the ranges the file itself
+    /// records - not from a hard-coded 8 and not from the main base alone.
+    #[test]
+    fn pointer_width_comes_from_the_dumps_own_ranges() {
+        let narrow = EdizonDump {
+            main_base: 0x0070_0000, main_end: 0x0078_0000,
+            heap_base: 0x3600_0000, heap_end: 0x3600_4000,
+            ..Default::default()
+        };
+        assert_eq!(pointer_width(&narrow), 4);
+
+        let wide = EdizonDump {
+            main_base: 0x0070_0000, main_end: 0x0078_0000,
+            heap_base: 0x7F00_0000_0000, heap_end: 0x7F00_0000_1000,
+            ..Default::default()
+        };
+        assert_eq!(pointer_width(&wide), 8, "a heap above 4 GiB proves 64-bit");
+
+        // No ranges at all: the main base stays the only hint, and an empty main
+        // range makes the base itself the evidence.
+        let empty = EdizonDump { main_base: 0x1_0000_0000, ..Default::default() };
+        assert_eq!(pointer_width(&empty), 8);
+        assert_eq!(pointer_width(&EdizonDump::default()), 8, "unknown defaults wide");
     }
 
     /// Exact LZ8 encoder from EdiZon-SE `lz.cpp` / `NoexsDumpDataReader.cs`,

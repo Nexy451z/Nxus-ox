@@ -36,30 +36,80 @@ typedef struct {
 } NxusPtrRegion;
 
 /*
+ * The target process's own bitness, as far as the caller can tell.  This is the
+ * ground truth the pointer-width inference prefers over any address-space
+ * evidence: the address space of a 64-bit title is not a property of *this*
+ * launch (AArch64 ASLR routinely places the main module - and sometimes the whole
+ * low heap - below 4 GiB, e.g. main 0x00700000 / heap 0x36000000), while a 32-bit
+ * title can never hold a pointer above 4 GiB.
+ *
+ * UNKNOWN is not a synonym for AArch32: it means "nobody told us", which must fall
+ * back to the mappings instead of forcing 4-byte loads.
+ */
+typedef enum {
+    NXUS_PTRSCAN_ARCH_UNKNOWN = 0,   /* no debug session / no metadata answer */
+    NXUS_PTRSCAN_ARCH_AARCH32 = 1,   /* 32-bit process: 4-byte pointers */
+    NXUS_PTRSCAN_ARCH_AARCH64 = 2,   /* 64-bit process: 8-byte pointers */
+} NxusPtrScanArch;
+
+/* Reason strings the width came from, for logging ("width auto = 8 (process is
+   64-bit)").  Static storage: never freed, safe to log without copying. */
+#define NXUS_PTRSCAN_WIDTH_REASON_PROCESS64 "process is 64-bit"
+#define NXUS_PTRSCAN_WIDTH_REASON_PROCESS32 "process is AArch32"
+#define NXUS_PTRSCAN_WIDTH_REASON_MAPPINGS  "mapping ends"
+
+/* Derive the process architecture from the size of its address space (dmnt's
+   CheatProcessMetadata aslr_base/aslr_size, or the equivalent from another
+   metadata source).  This is the second-best evidence after an explicit flag: the
+   kernel gives AArch32 processes 0x200000 + 0xFFE00000 (ending exactly at 4 GiB)
+   and AArch64 processes 0x8000000 + 0x7FF8000000 (512 GiB), so the address-space
+   size answers the question even though the metadata carries no architecture bit.
+   Anything inconsistent (zero size, or a region that straddles the 4 GiB boundary)
+   yields NXUS_PTRSCAN_ARCH_UNKNOWN, never a guess. */
+NxusPtrScanArch nxusPtrScanArchFromAddressSpace(u64 aslr_base, u64 aslr_size);
+
+/*
  * Pointer width to walk with when the caller does not know it (value_width == 0).
  *
- * A 32-bit title (MHXX and friends) maps everything below 4 GiB and MUST be walked
- * with 4-byte loads: an 8-byte load folds the neighbouring field into the pointer,
- * so no chain is found at all.  A 64-bit title needs 8-byte loads for the opposite
- * reason.  Deciding from the module base alone was wrong on AArch64: ASLR puts the
- * main module below 4 GiB for roughly 1.6% of launches while the heap is randomised
- * independently, so a 64-bit title was walked with 4-byte loads and silently
- * produced zero chains.  The mappings the walk is about to traverse are the real
- * evidence, so:
+ * A 32-bit title (MHXX and friends) must be walked with 4-byte loads: an 8-byte
+ * load folds the neighbouring field into the pointer, so no chain is found at
+ * all.  A 64-bit title needs 8-byte loads for the opposite reason.
  *
- *   any mapping ends above 4 GiB   -> 8
- *   every mapping ends below 4 GiB -> 4
- *   no mapping at all              -> main_base >= 4 GiB ? 8 : 4
- *   neither known                  -> 8 (the AArch64 default: guessing wide on a
- *                                     32-bit title finds nothing, guessing narrow
- *                                     on a 64-bit one also finds nothing, but 8 is
- *                                     the common case and never over-reads)
+ * Priority, highest first:
+ *
+ *   1. process_arch != UNKNOWN -> 8 for AARCH64, 4 for AARCH32.  The process's
+ *      own architecture outranks every address-space observation: a 64-bit title
+ *      whose main module and heap both sit below 4 GiB (a real AArch64 ASLR
+ *      outcome, and the mock fixture the old rule failed on) still walks with
+ *      8-byte loads, and a 32-bit title is never guessed wide.
+ *      On the console the caller supplies this from the process metadata: the
+ *      debug session's CreateProcess flag (nxusDebugTargetIs64Bit()/Known()) when
+ *      attached, otherwise dmnt's CheatProcessMetadata, whose ASLR region size is
+ *      the process's address space size (> 4 GiB can only be AArch64, a region
+ *      inside 4 GiB can only be AArch32).  A caller that has no metadata passes
+ *      UNKNOWN and gets the mapping rule below.
+ *   2. No answer from the process -> the mappings the walk is about to traverse:
+ *        any mapping ends above 4 GiB   -> 8
+ *        every mapping ends below 4 GiB -> 4
+ *        no mapping at all              -> main_base >= 4 GiB ? 8 : 4
+ *        neither known                  -> 8 (AArch64 default: guessing wide on a
+ *                                          32-bit title finds nothing, guessing
+ *                                          narrow on a 64-bit one also finds
+ *                                          nothing, but 8 is the common case and
+ *                                          never over-reads)
  *
  * main_base is only the auxiliary hint for an empty table; 0 means "unknown" and is
  * ignored (it never forces 4 on its own, which is what the old server-side rule
- * did).  out_max_end is optional and receives the highest mapping end examined, so
- * the caller can log the evidence.  The return value is always 4 or 8.
+ * did).  out_max_end is optional and receives the highest mapping end examined;
+ * out_reason is optional and receives one of the NXUS_PTRSCAN_WIDTH_REASON_*
+ * strings (never NULL when set).  The return value is always 4 or 8.
  */
+u32 nxusPtrScanAutoWidthFor(const NxusPtrRegion *regions, u32 region_count,
+                            u64 main_base, NxusPtrScanArch process_arch,
+                            u64 *out_max_end, const char **out_reason);
+
+/* Same, with no process-architecture evidence (the historical rule).  Kept for
+   callers that genuinely know nothing about the process. */
 u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
                          u64 main_base, u64 *out_max_end);
 
@@ -76,9 +126,15 @@ typedef struct {
     u32 max_offset;     /* how far a pointer value may be from its target */
     u32 max_results;
     u32 value_width;    /* 4 for 32-bit titles, 8 for 64-bit titles, 0 = infer it
-                           with nxusPtrScanAutoWidth() from the region table */
+                           with nxusPtrScanAutoWidthFor() from the region table
+                           (and process_arch below) */
     u32 window_size;    /* bytes read per dereference step (e.g. 0x400) */
     u32 max_reads;      /* hard budget so a scan cannot hang the console */
+    /* NxusPtrScanArch: the target process's own bitness when the caller knows it
+       (0 = unknown).  Only consulted when value_width == 0, where it outranks the
+       mapping ends - see nxusPtrScanAutoWidthFor().  A struct tail field, so an
+       existing caller that zero-initialises keeps the historical behaviour. */
+    u32 process_arch;
 } NxusPtrScanOptions;
 
 typedef struct {

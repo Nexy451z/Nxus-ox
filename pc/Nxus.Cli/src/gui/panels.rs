@@ -415,15 +415,16 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
         // One line that says what the scan actually runs with: the GUI has no
         // width selector, so it always asks the console for automatic (0) and
         // the console decides from the title.  This is also what the 540F/580F
-        // cheat form follows.
+        // pointer load and the 640F/680F value write follow.
         let pointer_width = app.st.pointer_width();
         ui.label(RichText::new(format!(
             "pointer width: auto ({}-bit) - sent as 0, the console infers it from the title",
             if pointer_width == 4 { 32 } else { 64 }
         )).color(DIM))
-            .on_hover_text("32-bit titles (main module below 4 GiB) walk 4-byte pointers and \
-                            export 540F loads; everything else walks 8-byte pointers and \
-                            exports 580F loads");
+            .on_hover_text("the shared rule: any mapping ending above 4 GiB means \
+                            8-byte pointers (580F loads, 8-byte value writes), \
+                            otherwise 4 (540F loads, 4-byte value writes). The \
+                            value write always uses the same width as the pointer walk");
         ui.horizontal(|ui| {
             ui.label("depth");
             ui.add(egui::DragValue::new(&mut app.prefs.ptr_depth).range(1..=8));
@@ -489,9 +490,10 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                                                       chain.root_offset, steps, chain.final_offset)).clicked() {
                     let val = parse_value(&app.prefs.cheat_value, 4);
                     // 540F vs 580F follows the title's pointer width, not a
-                    // hard-coded "32-bit": a 64-bit chain needs 580F loads.
+                    // hard-coded "32-bit": a 64-bit chain needs 580F loads - and
+                    // the value write uses the same width (680F, not 640F).
                     app.st.cheat_text = crate::dump::format_cheat(
-                        chain, val, 4, pointer_width == 4, "Nxus");
+                        chain, val, pointer_width, pointer_width == 4, "Nxus");
                 }
             });
         }
@@ -501,10 +503,13 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
             if ui.button("Generate code").clicked() {
                 let val = parse_value(&app.prefs.cheat_value, 4);
                 if let Some(first) = chains.first() {
+                    // Same width for the value as for the pointer walk: a 64-bit
+                    // title stores 8 bytes (680F), never the old 4 (640F).
                     app.st.cheat_text = crate::dump::format_cheat(
-                        first, val, 4, pointer_width == 4, "Nxus");
+                        first, val, pointer_width, pointer_width == 4, "Nxus");
                 } else {
-                    app.send(Cmd::Cheat { index: 0, value: val }, "generating cheat");
+                    app.send(Cmd::Cheat { index: 0, value: val, width: pointer_width },
+                             "generating cheat");
                 }
             }
             if !app.st.cheat_text.is_empty() && ui.button("Copy").clicked() {

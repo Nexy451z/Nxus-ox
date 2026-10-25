@@ -128,6 +128,16 @@ static Mutex           g_Mutex;
    wrong registers.  Release/acquire publishes the flag together with the rest of
    the session state. */
 static atomic_bool     g_Is64Bit;
+/* The flag above is only meaningful once the kernel's CreateProcess event has
+   been consumed.  It used to default to false for the whole window between
+   svcDebugActiveProcess() returning and the event thread handling that event, and
+   isContextAArch32() read "not known" as "AArch32": a RegsGet or a recordHit in
+   that window reported a 64-bit title's SP/LR/FP truncated to 32 bits (and set
+   NXUS_THREADCTX_FLAG_AARCH32).  So the answer is tri-state now: g_Is64BitKnown
+   says whether g_Is64Bit means anything.  Both are explicitly cleared when a
+   session starts, when it ends, and when the debugee exits, so one target's
+   architecture can never leak into the next one's registers or pointer scan. */
+static atomic_bool     g_Is64BitKnown;
 
 /* ---- control word construction ----------------------------------------- */
 
@@ -254,10 +264,21 @@ static bool isDebugBusyResult(Result rc) {
    with acquire so a caller that sees the AArch32 state also sees the session
    state published with it. */
 static bool isContextAArch32(const ThreadContext *ctx) {
+    const bool known = atomic_load_explicit(&g_Is64BitKnown, memory_order_acquire);
     const bool is64 = atomic_load_explicit(&g_Is64Bit, memory_order_acquire);
-    return !is64 ||
-           (ctx->sp == 0 && ctx->lr == 0 &&
-            (ctx->cpu_gprs[13].r != 0 || ctx->cpu_gprs[14].r != 0));
+    if (known) return !is64;
+    /* Unknown: the CreateProcess event has not been consumed yet (or the kernel
+       never announced one).  Reading "unknown" as AArch32 is what truncated a
+       64-bit title's SP/LR to 32 bits.  A 32-bit process cannot hold a value above
+       4 GiB in any register, so a high GPR (or high header SP/LR) proves AArch64
+       on its own; only when every register fits in 32 bits does the AArch32 shape
+       (zero header SP/LR, live r13/r14) decide. */
+    if (ctx->sp > 0xFFFFFFFFull || ctx->lr > 0xFFFFFFFFull) return false;
+    for (u32 i = 0; i < 29; i++) {
+        if (ctx->cpu_gprs[i].x > 0xFFFFFFFFull) return false;
+    }
+    return ctx->sp == 0 && ctx->lr == 0 &&
+           (ctx->cpu_gprs[13].x != 0 || ctx->cpu_gprs[14].x != 0);
 }
 
 /* Byte-address-select for a watchpoint: bits 5..8 of DBGWCR select which bytes of
@@ -675,9 +696,12 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
         case DebugEventType_CreateProcess: {
             /* The flags bit 0 tells whether the process is AArch64; the
                32-bit view keeps SP/LR/FP in r13/r14/r11.  Release-published so the
-               command thread never observes a half-updated session state. */
+               command thread never observes a half-updated session state, and
+               "known" is published after the value so a reader that sees known
+               also sees the matching value. */
             const bool is64 = (event->info.create_process.flags & 1u) != 0;
             atomic_store_explicit(&g_Is64Bit, is64, memory_order_release);
+            atomic_store_explicit(&g_Is64BitKnown, true, memory_order_release);
             NXUS_LOG("debug: process created (pid=%llu, %s)",
                      (unsigned long long)event->info.create_process.process_id,
                      is64 ? "AArch64" : "AArch32");
@@ -711,6 +735,11 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
             clearStopState();
             atomic_store_explicit(&g_ExitSeen, true, memory_order_relaxed);
             atomic_store_explicit(&g_StopLoop, true, memory_order_relaxed);
+            /* The target is gone: neither its registers nor its architecture is
+               known any more (a pointer scan that runs before the session is
+               collected must not inherit them). */
+            atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
+            atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
             g_Attached = false;
             nxusDmntSetAutoReopen(true);
             NXUS_LOG("debug: process exited (reason=%u) - session released, dmnt reopened "
@@ -878,6 +907,7 @@ void nxusDebugInit(void) {
        NxusDebugConfig. */
     g_Config.auto_continue = 0;
     atomic_init(&g_Is64Bit, false);
+    atomic_init(&g_Is64BitKnown, false);
     g_Attached = false;
     g_Debug = INVALID_HANDLE;
     atomic_init(&g_StopLoop, true);
@@ -901,6 +931,25 @@ void nxusDebugExit(void) {
 }
 
 bool nxusDebugIsAttached(void) { return g_Attached; }
+
+/* The target's own architecture, as learned from the kernel's CreateProcess
+   event.  "Unknown" and "AArch32" must stay distinguishable: the pointer-width
+   inference has to fall back to the mapping ends when nothing is known, whereas a
+   real AArch32 title must be walked with 4-byte loads whatever its addresses look
+   like.  Is64Bit() therefore reports false while the answer is unknown, and only
+   Is64BitKnown() says whether that false means anything. */
+bool nxusDebugTargetIs64Bit(void) {
+    if (!nxusDebugTargetIs64BitKnown()) return false;
+    return atomic_load_explicit(&g_Is64Bit, memory_order_acquire);
+}
+
+bool nxusDebugTargetIs64BitKnown(void) {
+    /* A session that was released (or has not been established) has no answer; the
+       flag is cleared on detach/exit as well, and this guard keeps a reader that
+       races the release from seeing the previous target's architecture. */
+    if (!g_Attached) return false;
+    return atomic_load_explicit(&g_Is64BitKnown, memory_order_acquire);
+}
 
 bool nxusDebugExitedPending(void) {
     return atomic_load_explicit(&g_ExitSeen, memory_order_relaxed);
@@ -987,8 +1036,29 @@ Result nxusDebugAttach(u64 pid) {
     clearStopState();
     atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
     atomic_store_explicit(&g_StopLoop, false, memory_order_relaxed);
+    /* A fresh session starts out knowing nothing about the target's architecture.
+       Both fields are written explicitly (instead of inheriting the previous
+       session's answer) and "known" is cleared before the value, so no reader can
+       pair a stale value with known == true. */
+    atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
+    atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
 
     armContextIdBreakpoint();
+
+    /* The kernel queues the CreateProcess event (which carries the AArch64 flag)
+       as part of svcDebugActiveProcess(), so it is already waiting here.  Take it
+       on this thread BEFORE the event thread exists: an immediate RegsGet or
+       pointer scan then sees a known architecture instead of the "unknown" window
+       that used to report a 64-bit title as AArch32.  The event thread drains
+       whatever is left (and re-drains if the event had not landed yet). */
+    drainDebugEvents(NULL);
+    if (nxusDebugTargetIs64BitKnown()) {
+        NXUS_LOG("debug attach: target architecture known at attach (%s)",
+                 nxusDebugTargetIs64Bit() ? "AArch64" : "AArch32");
+    } else {
+        NXUS_LOG("debug attach: target architecture not announced yet "
+                 "(waiting for the event thread)");
+    }
 
     alignas(0x1000) static u8 eventStack[0x8000];
     rc = threadCreate(&g_EventThread, eventThread, NULL, eventStack, sizeof(eventStack), 0x2A, -2);
@@ -1001,6 +1071,9 @@ Result nxusDebugAttach(u64 pid) {
         svcCloseHandle(g_Debug);
         g_Debug = INVALID_HANDLE;
         g_Attached = false;
+        /* No session, so nothing is known about the target any more. */
+        atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
+        atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
         /* armContextIdBreakpoint() already programmed the link slot: do not
            leave it behind when the event thread cannot be created. */
         clearAllHardwareSlots();
@@ -1020,6 +1093,10 @@ Result nxusDebugAttach(u64 pid) {
 Result nxusDebugDetach(void) {
     if (!g_Attached && !g_EventThreadLive) {
         atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
+        /* Nothing is attached, so nothing is known: keep the two flags consistent
+           with that even on this no-op path. */
+        atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
+        atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
         nxusDmntSetAutoReopen(true);
         return 0;
     }
@@ -1055,6 +1132,11 @@ Result nxusDebugDetach(void) {
     }
     g_BreakCount = 0;
     g_Attached = false;
+    /* The session is gone, so the target's architecture is no longer known: the
+       next attach must not answer a pointer scan with the previous title's bitness
+       before its own CreateProcess event has been consumed. */
+    atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
+    atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
     /* All ten slots (0..5 plus 0x10..0x13) on all four cores: the ContextID link
        source (4/5) included, because armContextIdBreakpoint() programs it for
        every style.  No conditional "if enabled" here: a stale register is
@@ -1459,6 +1541,10 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
        the thread's registers (including the SIMD half) and crash the game. */
     Result rc = svcGetDebugThreadContext(&ctx, g_Debug, thread_id, RegisterGroup_CpuAll);
     if (R_FAILED(rc)) return rc;
+    /* Decide the architecture BEFORE writing the user's values into ctx: the
+       detector falls back to "any register above 4 GiB means AArch64", which would
+       read a 64-bit fp/sp/lr the caller just supplied and flip the decision. */
+    const bool aarch32 = isContextAArch32(&ctx);
     ctx.pc.x = in->pc;
     ctx.lr = in->lr;
     ctx.sp = in->sp;
@@ -1474,7 +1560,7 @@ Result nxusDebugSetRegs(u64 thread_id, const NxusThreadContext *in) {
             if (in->x[i] != 0) ctx.cpu_gprs[i].x = in->x[i];
         }
     }
-    if (isContextAArch32(&ctx)) {
+    if (aarch32) {
         /* 32-bit: the header fields above are not what the core restores, so the
            values the user typed must go into the real registers.  Done after the
            generic block on purpose: that block writes r11 via x[11]/r[11]. */

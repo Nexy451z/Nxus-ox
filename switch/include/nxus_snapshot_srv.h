@@ -20,6 +20,16 @@ u32 nxusSnapshotGetChanged(NxusChangedBlockWire *out, u32 max_entries, u32 offse
 
 void nxusSnapshotGetSummary(u32 slot, NxusSnapshotSummary *out);
 
-/* Drop both captures so the heap they charge can be reused (SnapshotRelease /
-   ScanReset).  The next capture reallocates on demand. */
+/* Release both captures and FREE the hash/address arrays (2 x 256 KiB once both
+   slots were captured), so the memory really goes back to the 8 MB inner heap
+   instead of staying resident while the bookkeeping says otherwise (SnapshotRelease
+   / ScanReset).  The next capture re-allocates them through the same on-demand
+   path the first capture uses (snapshotSlotEnsure()), so a released session keeps
+   working; the slots simply read as "not captured" until then. */
 void nxusSnapshotReleaseAll(void);
+
+/* Which slots currently own their hash/address arrays (bit n = slot n), and how
+   many bytes that is.  The server charges exactly this against its heap budget, so
+   "released" and "resident" cannot differ. */
+u32  nxusSnapshotResidentSlots(void);
+u64  nxusSnapshotResidentBytes(void);

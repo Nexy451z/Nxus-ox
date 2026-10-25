@@ -65,7 +65,12 @@ pub enum Cmd {
     PtrScan { target: u64, module_base: u64, depth: u32, max_offset: u32, width: u32 },
     PtrScanPc { target: u64, module_base: u64, depth: u32, max_offset: u32, dump_path: Option<String> },
     SaveDump { path: String, scope: u32, begin: u64, end: u64 },
-    Cheat { index: u32, value: u64 },
+    /// Generate the cheat block for a chain the console already published.
+    /// `width` is the title's pointer width taken from the single shared rule
+    /// ([`crate::client::pointer_width_for`]); the value write uses the same
+    /// width, so a 64-bit title gets 580F loads and an 8-byte (680F) value
+    /// instead of the old 4-byte one on top of 580F loads.
+    Cheat { index: u32, value: u64, width: u32 },
     Attach,
     Detach,
     BreakSet { address: u64, kind: u32, size: u32 },
@@ -176,17 +181,11 @@ pub fn truncated_hit_message(hits: usize) -> String {
     format!("hit list full: {} hits collected, more may exist (refine or raise the limit)", hits)
 }
 
-/// Pointer width the console infers from the title when the PC sends 0 ("auto").
-///
-/// The same rule the CLI documents for `--width`: a main module below 4 GiB is
-/// a 32-bit title and needs 4-byte pointers, everything else 8.  The GUI has no
-/// width selector, so this is what it sends (always 0) and what it displays -
-/// the console is still the one that decides.
-pub fn inferred_pointer_width(main_base: u64) -> u32 {
-    if main_base < 0x1_0000_0000 { 4 } else { 8 }
-}
-
 /// Number of hex digits an address of a title is shown with.
+///
+/// The width itself comes from [`crate::client::pointer_width_for`] - the one
+/// rule the whole PC side shares, so the GUI cannot disagree with the CLI or with
+/// the cheat form about the same title.
 pub fn address_digits(pointer_width: u32) -> usize {
     if pointer_width == 4 { 8 } else { 16 }
 }
@@ -450,7 +449,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                 module_size: dump.main_end.saturating_sub(dump.main_base),
                                 max_depth: depth,
                                 max_offset,
-                                width: 8,
+                                // Same rule as everywhere else: an EdiZon dump
+                                // records its main/heap ranges, which are the whole
+                                // address space it describes (this used to be a
+                                // hard-coded 8).
+                                width: crate::edizon::pointer_width(&dump),
                                 max_results: 64,
                             },
                             &cancel,
@@ -466,7 +469,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         let module_base = if module_base != 0 { module_base } else { inf_base };
                         // The walker must use the same pointer width as the title
                         // (the old hard-coded 4 could not follow a 64-bit chain).
-                        let width = inferred_pointer_width(module_base);
+                        // The dump carries the console's own mapping table, so the
+                        // shared rule sees exactly what it would see live.
+                        let width = crate::client::pointer_width_for(
+                            &Metadata { main_base: module_base, ..Default::default() },
+                            Some(&dump.infos),
+                        );
                         let res = crate::dump::ptrscan_dump(
                             &dump,
                             &crate::dump::PtrScanOptions {
@@ -738,8 +746,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let (inf_base, inf_size) = dump.infer_main_module();
                             let module_base = if module_base != 0 { module_base } else { inf_base };
                             // Same rule as the console-side scan: a 64-bit title
-                            // needs 8-byte pointers, not the old fixed 4.
-                            let width = inferred_pointer_width(module_base);
+                            // needs 8-byte pointers, not the old fixed 4.  The
+                            // captured dump's mapping table is the evidence.
+                            let width = crate::client::pointer_width_for(
+                                &Metadata { main_base: module_base, ..Default::default() },
+                                Some(&dump.infos),
+                            );
                             let res = crate::dump::ptrscan_dump(
                                 &dump,
                                 &crate::dump::PtrScanOptions {
@@ -774,14 +786,18 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                 "saved NDMP dump to {} ({} blocks, {} MB)",
                                 path, dump.indices.len(), dump.total_bytes() / (1024 * 1024))));
                         }
-                        Cmd::Cheat { index, value } => {
+                        Cmd::Cheat { index, value, width } => {
                             // 540F (32-bit) vs 580F (64-bit) pointer loads follow
                             // the title's pointer width, exactly like the CLI's
-                            // `cheat` (metadata is the cheap authoritative source;
-                            // an unknown base falls back to the 32-bit form).
-                            let module_base = c.metadata().map(|md| md.main_base).unwrap_or(0);
-                            let is_32bit = inferred_pointer_width(module_base) == 4;
-                            let text = c.cheat_export(index, value, 4, is_32bit).map_err(|e| e.to_string())?;
+                            // `cheat`, and the value write follows it too: an
+                            // 8-byte title needs 680F (the console's 6T0F form
+                            // with T = the byte width), not 640F.  The width comes
+                            // from the UI, which is the side that knows the
+                            // mapping table (the Cmd carries it so the worker
+                            // cannot re-guess with a different rule).
+                            let width = if width == 4 { 4 } else { 8 };
+                            let text = c.cheat_export(index, value, width, width == 4)
+                                .map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Cheat(text));
                         }
                         Cmd::Attach => {
@@ -1219,9 +1235,19 @@ impl State {
     }
 
     /// Pointer width the console will infer for this title (0 is sent on the
-    /// wire, so this only drives the display and the 540F/580F choice).
+    /// wire, so this only drives the display, the address format and the
+    /// 540F/580F + 640F/680F cheat form).
+    ///
+    /// The GUI has no width selector: it hands both pieces of evidence the console
+    /// uses to [`crate::client::pointer_width_for`] - the mapping table fetched on
+    /// connect and the main module base (metadata first, the status reply as the
+    /// fallback) - so there is no second, local rule that could drift.
     pub fn pointer_width(&self) -> u32 {
-        inferred_pointer_width(self.main_base())
+        let mut metadata = self.metadata.clone().unwrap_or_default();
+        if metadata.main_base == 0 {
+            metadata.main_base = self.main_base();
+        }
+        crate::client::pointer_width_for(&metadata, Some(&self.mappings))
     }
 
     /// Is this a 32-bit (AArch32) title?
@@ -1411,20 +1437,61 @@ mod font_tests {
 #[cfg(test)]
 mod pointer_width_tests {
     use super::*;
+    use crate::protocol::{MemoryInfo, PERM_R};
+
+    fn state_with(main_base: u64, mappings: Vec<MemoryInfo>) -> State {
+        let mut st = State::new();
+        st.status = Some(Status { main_base, ..Default::default() });
+        st.mappings = mappings;
+        st
+    }
 
     /// MHXX's measured main base is 0x07804000: below the old 0x0800_0000
     /// boundary, so the fixed range check called this 32-bit title 64-bit.
     #[test]
     fn a_low_main_base_is_a_32bit_title() {
-        assert_eq!(inferred_pointer_width(0x0780_4000), 4);
-        assert_eq!(inferred_pointer_width(0x0070_0000), 4);
-        assert_eq!(inferred_pointer_width(0), 4, "unknown base: keep the CLI's 32-bit fallback");
+        assert_eq!(state_with(0x0780_4000, Vec::new()).pointer_width(), 4);
+        assert_eq!(state_with(0x0070_0000, Vec::new()).pointer_width(), 4);
+    }
+
+    /// An unknown base is "unknown", not "32-bit": the console defaults to the
+    /// wide AArch64 case there, and the GUI used to say 4.
+    #[test]
+    fn an_unknown_base_defaults_to_64bit() {
+        assert_eq!(State::new().pointer_width(), 8);
     }
 
     #[test]
     fn a_main_base_at_or_above_4gib_is_a_64bit_title() {
-        assert_eq!(inferred_pointer_width(0x1_0000_0000), 8);
-        assert_eq!(inferred_pointer_width(0x0000_0001_0080_0000), 8);
+        assert_eq!(state_with(0x1_0000_0000, Vec::new()).pointer_width(), 8);
+        assert_eq!(state_with(0x0000_0001_0080_0000, Vec::new()).pointer_width(), 8);
+    }
+
+    /// The mapping table is the evidence the console acts on, and the GUI now
+    /// uses it too: a 64-bit title whose main module ASLR'd below 4 GiB must not
+    /// be shown (or exported) as 32-bit.
+    #[test]
+    fn a_mapping_above_4gib_proves_a_64bit_title() {
+        let mappings = vec![
+            MemoryInfo { base: 0x0070_0000, size: 0x80000, perm: PERM_R, ..Default::default() },
+            MemoryInfo { base: 0x42CA_0000, size: 0x3000, perm: PERM_R, ..Default::default() },
+        ];
+        assert_eq!(state_with(0x0070_0000, mappings.clone()).pointer_width(), 4);
+
+        let mut wide = mappings;
+        wide.push(MemoryInfo { base: 0x7F_0000_0000, size: 0x1000, perm: PERM_R, ..Default::default() });
+        assert_eq!(state_with(0x0070_0000, wide).pointer_width(), 8,
+                   "the high mapping beats the low main base");
+    }
+
+    /// Metadata is preferred over the status reply, because that is the reply the
+    /// console fills from the target itself.
+    #[test]
+    fn metadata_is_the_main_base_source() {
+        let mut st = State::new();
+        st.status = Some(Status { main_base: 0x0070_0000, ..Default::default() });
+        st.metadata = Some(Metadata { main_base: 0x1_0000_0000, ..Default::default() });
+        assert_eq!(st.pointer_width(), 8);
     }
 
     #[test]

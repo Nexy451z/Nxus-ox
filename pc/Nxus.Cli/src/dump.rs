@@ -503,19 +503,18 @@ pub fn ptrscan_dump(
     let module_end = module_base.saturating_add(module_size);
 
     // Pointer width.  An explicit 4/8 always wins; anything else (notably the
-    // CLI default of 0) is inferred: a module base below 4 GiB belongs to a
-    // 32-bit title (MHXX etc.), everything else is a 64-bit one.  Guessing
-    // wrong used to produce chains that could never resolve.
+    // CLI default of 0) is inferred by the one shared rule
+    // (`client::pointer_width_for`), from the dump's own mapping table - the same
+    // table the console would answer with - and from the module base only when the
+    // dump has no usable entry.  This used to be a second, local rule ("below
+    // 4 GiB is 32-bit"), which disagreed with the GUI for an unknown base.
     let width = match opts.width {
         4 => 4usize,
         8 => 8usize,
-        _ => {
-            if module_base != 0 && module_base < 0x1_0000_0000 {
-                4
-            } else {
-                8
-            }
-        }
+        _ => crate::client::pointer_width_for(
+            &crate::protocol::Metadata { main_base: module_base, ..Default::default() },
+            Some(&dump.infos),
+        ) as usize,
     };
 
     // 1. Collect all valid aligned pointer pairs `(target_val, src_addr)`
@@ -777,7 +776,8 @@ mod tests {
         assert!(cheat.contains("780F0000 00000004"));
         assert!(cheat.contains("640F0000 00000000 0098967F"));
 
-        // width == 0 means "infer"; the low module base selects the 32-bit layout.
+        // width == 0 means "infer": every mapping in this dump ends below 4 GiB,
+        // so the shared rule selects the 32-bit layout.
         let auto = ptrscan_dump(
             &loaded,
             &PtrScanOptions {
@@ -791,7 +791,8 @@ mod tests {
             },
             &cancel,
         );
-        assert!(!auto.chains.is_empty(), "width=0 must infer 4-byte pointers from a <4 GiB module base");
+        assert!(!auto.chains.is_empty(),
+                "width=0 must infer 4-byte pointers from the dump's mappings (all below 4 GiB)");
         assert_eq!(auto.chains[0].steps, vec![0x2500]);
     }
 
@@ -897,6 +898,61 @@ mod tests {
         assert!(!res.chains.is_empty(), "width=0 must infer 8-byte pointers for a 64-bit module base");
         assert_eq!(res.chains[0].root_offset, 0x10);
         assert_eq!(res.chains[0].steps, vec![0]);
+    }
+
+    /// The width must be inferred from the dump's mapping table, not from the main
+    /// module base: a 64-bit title whose main module ASLR'd below 4 GiB has its
+    /// heap above it.  The old local rule ("main base below 4 GiB -> 4") read this
+    /// dump as 32-bit and lost the chain; the shared rule sees the high mapping.
+    #[test]
+    fn ptrscan_infers_64bit_from_a_high_mapping_below_a_low_main_base() {
+        let main_base = 0x0070_0000u64;
+        let heap_base = 0x7F00_0000_0000u64;
+        let target = heap_base + 0x200;
+
+        let mut main_seg = vec![0u8; 0x1000];
+        let mut heap_seg = vec![0u8; 0x1000];
+        main_seg[0x10..0x18].copy_from_slice(&(heap_base + 0x100).to_le_bytes());
+        heap_seg[0x100..0x108].copy_from_slice(&target.to_le_bytes());
+
+        let mut data = Vec::new();
+        let pos_main = NDMP_DATA_OFFSET;
+        data.extend_from_slice(&main_seg);
+        let pos_heap = NDMP_DATA_OFFSET + data.len() as u64;
+        data.extend_from_slice(&heap_seg);
+
+        let dump = MemoryDump {
+            tid: 0x0100_C380_0049_C000,
+            infos: vec![
+                info(main_base, 0x1000, 3, PERM_R | PERM_X),
+                info(heap_base, 0x1000, 5, PERM_R | PERM_W),
+            ],
+            indices: vec![
+                DumpIndex { addr: main_base, file_pos: pos_main, size: 0x1000 },
+                DumpIndex { addr: heap_base, file_pos: pos_heap, size: 0x1000 },
+            ],
+            data_base: NDMP_DATA_OFFSET,
+            data,
+        };
+
+        let cancel = AtomicBool::new(false);
+        let res = ptrscan_dump(
+            &dump,
+            &PtrScanOptions {
+                target,
+                module_base: main_base,
+                module_size: 0x1000,
+                max_depth: 3,
+                max_offset: 0x300,
+                width: 0,
+                max_results: 16,
+            },
+            &cancel,
+        );
+        assert!(!res.chains.is_empty(),
+                "width=0 must read the dump's mapping table (heap above 4 GiB -> 8-byte \
+                 pointers), not the < 4 GiB main base");
+        assert_eq!(res.chains[0].root_offset, 0x10);
     }
 
     #[test]

@@ -21,10 +21,6 @@ type Result<T> = std::result::Result<T, NxusError>;
 /// value - the same one the header now defines.  It must stay in step with it.
 const CMD_SNAPSHOT_RELEASE: u16 = 0x0072;
 
-/// 4 GiB - the boundary between an AArch32 and an AArch64 address space.  Both
-/// the console and this client use it to pick the pointer width.
-const WIDTH_32BIT_LIMIT: u64 = 0x1_0000_0000;
-
 /// Page size for reading the mapping table when estimating the pointer width.
 const MAPPING_PAGE: u32 = 1024;
 
@@ -121,8 +117,11 @@ analysis
                     auto (or no address) with --dump FILE uses the target saved in
                     an EdiZon-SE (EDZN/eFZN) dump
   cheat <index> --value N [--width 4|8] [--64bit] [--out FILE]
-                    --width 8 emits the 64-bit (580F) load form, 4 the 32-bit
-                    (540F) one; omitted = automatic, the same way as ptrscan
+                    --width 8 emits the 64-bit (580F) pointer load form and an
+                    8-byte (680F) value write; 4 emits 540F loads and a 4-byte
+                    (640F) value. Omitted = automatic, the same way as ptrscan:
+                    the pointer width decides BOTH (a 64-bit title no longer
+                    gets 8-byte loads with a 4-byte store).
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
                   [--count N] [--seconds N] [--keep] [--stop]
                   on every hit: pc / lr / sp / r0-r3, then a disassembly window
@@ -357,9 +356,12 @@ fn execute(opts: &Opts) -> Result<()> {
                     })?
                 };
                 let width = pointer_width(opts)?;
-                // Offline: no console mapping table to consult, so the estimate
-                // comes from the dump's main module base alone - and says so.
-                let estimate = estimate_width_from_main_base(module_base);
+                // Offline: the dump's main/heap ranges ARE its mapping table, so
+                // the shared rule sees the same evidence it would see live.
+                let estimate = WidthEstimate {
+                    width: crate::edizon::pointer_width(&dump),
+                    from_mappings: true,
+                };
                 if width == 0 {
                     print_width_estimate(estimate);
                 }
@@ -395,7 +397,9 @@ fn execute(opts: &Opts) -> Result<()> {
                 })?
             };
             let width = pointer_width(opts)?;
-            let estimate = estimate_width_from_main_base(module_base);
+            // Same evidence as a live scan: the NDMP dump carries the console's
+            // mapping table, so the width comes from the one shared rule.
+            let estimate = estimate_width_from_mappings(module_base, &dump.infos);
             if width == 0 {
                 print_width_estimate(estimate);
             }
@@ -1158,13 +1162,6 @@ fn execute(opts: &Opts) -> Result<()> {
             let max_results = opts.num("max").unwrap_or(64) as usize;
 
             if opts.has("pc") || opts.flag("save-dump").is_some() {
-                // A PC-side scan walks a dump and infers the width from the
-                // module base alone (see dump::ptrscan_dump), so the display
-                // says that the mapping table was not consulted.
-                let estimate = estimate_width_from_main_base(module_base);
-                if width == 0 {
-                    print_width_estimate(estimate);
-                }
                 let cancel = std::sync::atomic::AtomicBool::new(false);
                 let mut last = Instant::now();
                 let dump = crate::dump::MemoryDump::capture(
@@ -1175,6 +1172,13 @@ fn execute(opts: &Opts) -> Result<()> {
                         }
                     },
                 ).map_err(|e| NxusError { message: e, result: None })?;
+                // The walk and the display now use the dump's own mapping table -
+                // the very evidence the console would have answered with - so the
+                // PC-side width is the console's width instead of a local guess.
+                let estimate = estimate_width_from_mappings(module_base, &dump.infos);
+                if width == 0 {
+                    print_width_estimate(estimate);
+                }
                 if let Some(save_path) = opts.flag("save-dump") {
                     dump.save(save_path).map_err(|e| NxusError { message: e.to_string(), result: None })?;
                     println!("saved NDMP dump to {}", save_path);
@@ -1213,7 +1217,6 @@ fn execute(opts: &Opts) -> Result<()> {
         "cheat" => {
             let index = parse_number(opts.positional.get(1).ok_or_else(|| usage("cheat <index> --value N"))?)? as u32;
             let value = opts.num("value").ok_or_else(|| usage("cheat <index> --value N"))?;
-            let width = opts.num("width").unwrap_or(4) as u32;
             // The 540F (32-bit) load form used to be hard-coded; follow --width
             // and, when it is omitted, the title's pointer width.
             let module_base = initial_status.as_ref().map(|st| st.main_base)
@@ -1233,7 +1236,11 @@ fn execute(opts: &Opts) -> Result<()> {
                 estimate_width(&client, module_base)
             };
             let is_32bit = cheat_is_32bit(opts, estimate);
-            let text = client.cheat_export(index, value, width, is_32bit)?;
+            // The VALUE width follows the load form: the old fixed 4 produced
+            // "580F loads + 640F store" for a 64-bit title.  64-bit titles store
+            // 8 bytes (680F), 32-bit ones 4 (640F), exactly as the console's
+            // nxusCheatGenerate() lays it out.
+            let text = client.cheat_export(index, value, cheat_value_width(is_32bit), is_32bit)?;
             match opts.flag("out") {
                 Some(path) => {
                     std::fs::write(path, &text).map_err(|e| NxusError { message: e.to_string(), result: None })?;
@@ -2475,11 +2482,14 @@ fn pointer_width(opts: &Opts) -> Result<u32> {
 /// What the console's automatic pointer-width choice is expected to be.
 ///
 /// The console owns that decision (the client keeps sending `value_width = 0`),
-/// but the CLI still has to explain the number and to pick the matching
-/// 540F/580F cheat form, so it mirrors the rule here.
+/// but the CLI still has to explain the number, pick the width an offline dump
+/// walk uses and pick the matching 540F/580F + 640F/680F cheat form.  The rule
+/// itself exists exactly once, in [`crate::client::pointer_width_for`], which the
+/// GUI, the dump scanner and the EdiZon export call too - so no two of them can
+/// disagree about the same title.
 ///
-/// `from_mappings` records whether the mapping table was available: without it
-/// the estimate falls back to the main module base alone, and the display says
+/// `from_mappings` records whether a usable mapping table backed the estimate:
+/// without one the fallback is the main module base alone, and the display says
 /// so rather than pretending the mappings were part of the decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WidthEstimate {
@@ -2487,74 +2497,65 @@ struct WidthEstimate {
     from_mappings: bool,
 }
 
-/// Estimate from the main module base alone: offline dumps have no console
-/// mapping table, and a closed dmnt cannot answer for one either.  This is the
-/// console's own fallback (a base at or above 4 GiB means 64-bit; 0 is unknown
-/// and defaults to the wide AArch64 case).
+/// The main module base as the only evidence (the shared rule looks at nothing
+/// else in `Metadata`).
+fn main_base_metadata(main_base: u64) -> Metadata {
+    Metadata { main_base, ..Default::default() }
+}
+
+/// Estimate from the main module base alone: a closed dmnt cannot answer for a
+/// mapping table, and 0 there means "unknown" (the wide AArch64 default).
 fn estimate_width_from_main_base(main_base: u64) -> WidthEstimate {
     WidthEstimate {
-        width: if main_base != 0 && main_base < WIDTH_32BIT_LIMIT { 4 } else { 8 },
+        width: crate::client::pointer_width_for(&main_base_metadata(main_base), None),
         from_mappings: false,
     }
 }
 
-/// The rule `nxusPtrScanAutoWidth()` (core/nxus_ptrscan.c) applies on the console.
-///
-/// A mapping whose end lies above 4 GiB proves the address space is 64-bit; when
-/// every mapping ends at or below 4 GiB, 4-byte pointers are enough (an end
-/// exactly at 4 GiB still addresses only bytes a 32-bit pointer can reach).  The
-/// main module base is only the fallback hint when no mapping was collected -
-/// deciding from it alone mis-read a 64-bit title as 32-bit whenever ASLR placed
-/// its main module below 4 GiB while its heap was randomised above it, and the
-/// 4-byte loads then folded adjacent fields into the pointer and found no chains.
-fn width_from_mapping_end(main_base: u64, max_mapping_end: Option<u64>) -> WidthEstimate {
-    match max_mapping_end {
-        Some(max_end) => WidthEstimate {
-            width: if max_end > WIDTH_32BIT_LIMIT { 8 } else { 4 },
-            from_mappings: true,
-        },
-        None => estimate_width_from_main_base(main_base),
-    }
+/// Estimate from a mapping table: the console's own, or the one a dump file
+/// carries (both are the same evidence the console's `buildPtrRegions()` walks).
+fn estimate_width_from_mappings(main_base: u64, mappings: &[MemoryInfo]) -> WidthEstimate {
+    let width = crate::client::pointer_width_for(&main_base_metadata(main_base), Some(mappings));
+    // "backed by mappings" only when at least one entry is walkable, which is the
+    // set the rule (and the console) actually looks at.
+    let from_mappings = mappings.iter().any(|m| m.size != 0 && m.perm & PERM_R != 0);
+    WidthEstimate { width, from_mappings }
 }
 
 /// Estimate what the console's automatic pointer-width choice will be.
 ///
 /// The client still sends `value_width = 0`: the console owns the decision.  The
-/// CLI needs the same answer to explain it and to pick the matching 540F/580F
-/// cheat form, so it mirrors the rule instead of guessing locally.
+/// CLI needs the same answer to explain it and to pick the matching cheat form,
+/// so it mirrors the rule instead of guessing locally.
 fn estimate_width(client: &NxusClient, main_base: u64) -> WidthEstimate {
-    width_from_mapping_end(main_base, mapping_max_end(client))
+    match all_mappings(client) {
+        Some(mappings) => estimate_width_from_mappings(main_base, &mappings),
+        None => estimate_width_from_main_base(main_base),
+    }
 }
 
-/// Highest end address across the mappings a pointer scan may traverse.
+/// The console's whole mapping table, or `None` when it cannot be read.
 ///
 /// `None` means "cannot tell" (dmnt closed, no mappings yet, a scan owning the
 /// table, ...) - never "no mappings", which would silently look like a 32-bit
 /// address space.  The table is paged with the same `NxusMappingsRequest` the
-/// `mappings` command uses, so a large table still yields every entry.  Only
-/// readable mappings count, which is the set `buildPtrRegions()` walks on the
-/// console.
-fn mapping_max_end(client: &NxusClient) -> Option<u64> {
+/// `mappings` command uses, so a large table still yields every entry.
+fn all_mappings(client: &NxusClient) -> Option<Vec<MemoryInfo>> {
     let count = client.mapping_count().ok()?;
     if count == 0 {
         return None;
     }
-    let mut max_end = 0u64;
+    let mut all = Vec::new();
     let mut offset = 0u64;
     while offset < count {
         let page = client.mappings(offset, MAPPING_PAGE).ok()?;
         if page.is_empty() {
             break;
         }
-        for mapping in &page {
-            if mapping.size == 0 || mapping.perm & PERM_R == 0 {
-                continue;
-            }
-            max_end = max_end.max(mapping.base.saturating_add(mapping.size));
-        }
         offset += page.len() as u64;
+        all.extend(page);
     }
-    if max_end == 0 { None } else { Some(max_end) }
+    if all.is_empty() { None } else { Some(all) }
 }
 
 /// One line saying which width the console is expected to pick, and whether the
@@ -2587,6 +2588,18 @@ fn cheat_is_32bit(opts: &Opts, estimate: WidthEstimate) -> bool {
     }
 }
 
+/// Width of the value a cheat write stores.
+///
+/// The export used to write 4 bytes no matter how wide the pointers were, so a
+/// 64-bit title got `580F` loads followed by a 4-byte store (the "540F-equivalent"
+/// value write).  The value now follows the SAME choice as the pointer load: the
+/// console's `6T0F` form takes the byte width as its `T` nibble, so 32-bit is
+/// `640F` (4 bytes) and 64-bit is `680F` (8 bytes).  One `--width` / `--64bit`
+/// pins both, and "auto" derives both from the one pointer-width rule.
+fn cheat_value_width(is_32bit: bool) -> u32 {
+    if is_32bit { 4 } else { 8 }
+}
+
 fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str,
                         estimate: WidthEstimate, opts: &Opts) -> Result<()> {
     if chains.is_empty() {
@@ -2611,12 +2624,12 @@ fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str,
         println!("[{}] main+{:#x}{} +{:#x}", i, chain.root_offset, steps, chain.final_offset);
     }
     if let Some(value) = opts.num("cheat-value") {
-        // The write keeps its 4-byte default (the console also falls back to 4
-        // for value_width 0); the 540F/580F pointer load form follows the same
-        // width estimate the pointer scan used.
-        let width = opts.num("width").filter(|w| *w == 4 || *w == 8).unwrap_or(4) as u32;
+        // The pointer load form AND the value width follow the same pointer
+        // width: a 64-bit title needs 580F loads plus an 8-byte (680F) store, not
+        // a 4-byte store on top of 8-byte loads.
         let is_32bit = cheat_is_32bit(opts, estimate);
-        let text = crate::dump::format_cheat(&chains[0], value, width, is_32bit, "Nxus pointer chain");
+        let text = crate::dump::format_cheat(&chains[0], value, cheat_value_width(is_32bit),
+                                             is_32bit, "Nxus pointer chain");
         if let Some(path) = opts.flag("out") {
             std::fs::write(path, &text).map_err(|e| NxusError { message: e.to_string(), result: None })?;
             println!("wrote {}", path);
@@ -2642,22 +2655,45 @@ mod tests {
     /// traversable mapping ending above 4 GiB means 8-byte pointers, an end at or
     /// below it does not.  The main module base only decides when nothing is
     /// mapped (offline dumps), and 0 there is unknown -> the wide default.
+    /// The rule itself lives in `client::pointer_width_for` (tested there); this
+    /// only checks the CLI's estimate wrapper reports the same answer.
     #[test]
     fn pointer_width_follows_the_console_auto_rule() {
         let low = 0x0070_0000u64;              // MockSwitch's main module base
+        let mapping = |base: u64, size: u64| MemoryInfo {
+            base, size, memory_type: 5, attr: 0, perm: PERM_R,
+        };
         // A 32-bit title: every mapping ends below 4 GiB.
-        assert_eq!(width_from_mapping_end(low, Some(0x42CA_2000)),
+        assert_eq!(estimate_width_from_mappings(low, &[mapping(0x0070_0000, 0x80000),
+                                                      mapping(0x42CA_0000, 0x2000)]),
                    WidthEstimate { width: 4, from_mappings: true });
         // A 64-bit title whose main module ASLR'd below 4 GiB: the high mapping
         // is the evidence that the address space is wide.
-        assert_eq!(width_from_mapping_end(low, Some(0x7F_0000_0000)).width, 8);
+        assert_eq!(estimate_width_from_mappings(low, &[mapping(0x7F_0000_0000, 0x1000)]).width, 8);
         // An end exactly at 4 GiB still addresses only 32-bit-reachable bytes.
-        assert_eq!(width_from_mapping_end(low, Some(WIDTH_32BIT_LIMIT)).width, 4);
+        assert_eq!(estimate_width_from_mappings(low, &[mapping(0xFFFF_F000, 0x1000)]).width, 4);
         // No mapping at all: the main base is the fallback hint, and 0 is unknown.
-        assert_eq!(width_from_mapping_end(low, None),
+        assert_eq!(estimate_width_from_main_base(low),
                    WidthEstimate { width: 4, from_mappings: false });
-        assert_eq!(width_from_mapping_end(WIDTH_32BIT_LIMIT, None).width, 8);
-        assert_eq!(width_from_mapping_end(0, None).width, 8);
+        assert_eq!(estimate_width_from_main_base(0x1_0000_0000).width, 8);
+        assert_eq!(estimate_width_from_main_base(0).width, 8);
+    }
+
+    /// The value width of a cheat export must follow the pointer width, not stay
+    /// at the old hard-coded 4: a 64-bit title needs 680F (8 bytes) after its
+    /// 580F loads, a 32-bit one 640F.
+    #[test]
+    fn cheat_value_width_follows_the_pointer_width() {
+        assert_eq!(cheat_value_width(true), 4);
+        assert_eq!(cheat_value_width(false), 8);
+
+        let chain = crate::protocol::PtrChain { root_offset: 0x81000, final_offset: 4, steps: vec![0x20] };
+        let wide = crate::dump::format_cheat(&chain, 9_999_999, cheat_value_width(false), false, "Nxus");
+        assert!(wide.starts_with("[Nxus]\n580F0000 00081000\n"), "{wide}");
+        assert!(wide.contains("680F0000 00000000 0098967F"), "{wide}");
+        let narrow = crate::dump::format_cheat(&chain, 9_999_999, cheat_value_width(true), true, "Nxus");
+        assert!(narrow.contains("540F0000 00081000"), "{narrow}");
+        assert!(narrow.contains("640F0000 00000000 0098967F"), "{narrow}");
     }
 
     /// The 32-bit ASLR window that Atmosphère gives an AArch32 title.

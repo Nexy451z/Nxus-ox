@@ -40,11 +40,21 @@ static void snapshotSlotEnsure(u32 slot) {
              (unsigned)NXUS_SNAPSHOT_MAX_BLOCKS);
 }
 
+/* Bytes one slot's hash + address arrays occupy while they are allocated. */
+#define NXUS_SNAPSHOT_SLOT_BYTES (2ull * (u64)NXUS_SNAPSHOT_MAX_BLOCKS * (u64)sizeof(u64))
+
+/* Is `slot` holding its arrays right now?  Both the struct (which points at them)
+   and the owner pointers are checked: a slot is only "resident" when the storage
+   exists for the capture/diff code to use. */
+static bool snapshotSlotResident(u32 slot) {
+    return g_Hashes[slot] != NULL || g_Addresses[slot] != NULL ||
+           g_Snapshots[slot].hashes != NULL || g_Snapshots[slot].addresses != NULL;
+}
+
 /*
  * Reset a slot to exactly the state a never-used one has: no block grid
- * (block_size 0), no blocks, no regions.  The hash/address buffers stay
- * allocated - the server counts them against the heap budget once the slot is
- * first used - but there is no capture to diff any more.
+ * (block_size 0), no blocks, no regions.  The hash/address buffers are NOT
+ * touched here - that is snapshotSlotFree() below.
  *
  * This is what makes "the take failed" distinguishable from "a capture that
  * found zero blocks": the old code only left count 0 behind, so a failed
@@ -59,14 +69,64 @@ static void snapshotSlotInvalidate(u32 slot) {
     g_SlotTruncated[slot] = 0;
 }
 
-/* Release both slots.  The service is the only owner of the validity marker, so
-   the server must not try to fake a release through nxusSnapshotTake(): the clean
-   call keeps the invalidation rule in one place. */
+/*
+ * Give one slot's arrays back to the allocator and leave the slot in the exact
+ * state a never-used one has, so the next capture re-allocates through the same
+ * snapshotSlotEnsure() path that the first capture uses (it keys on
+ * NxusSnapshot.hashes).
+ *
+ * The invalidate runs FIRST: block_size 0 and count 0 mean no diff and no paging
+ * can reach the storage while it is being freed, and nxusSnapshotCompare() sees
+ * hashes == NULL afterwards and refuses the comparison instead of diffing freed
+ * memory.
+ *
+ * No capture can be in flight here: captures run on the connection thread and the
+ * server serialises commands (and refuses SnapshotCapture while the pointer scan
+ * worker runs), so the only references to the arrays are the ones freed below.
+ */
+static void snapshotSlotFree(u32 slot) {
+    snapshotSlotInvalidate(slot);
+    free(g_Hashes[slot]);
+    free(g_Addresses[slot]);
+    g_Hashes[slot] = NULL;
+    g_Addresses[slot] = NULL;
+    memset(&g_Snapshots[slot], 0, sizeof(g_Snapshots[slot]));
+}
+
+/* Release both slots - this really frees the arrays (2 x 256 KiB once both slots
+   have been captured), so a release returns the memory to the 8 MB inner heap
+   instead of only dropping the bookkeeping for memory that stays resident.  The
+   server's heap-budget estimate asks nxusSnapshotResidentBytes() so its charge and
+   the actual resident bytes can never drift apart again.
+ *
+ * The next capture re-allocates on demand (snapshotSlotEnsure()); nothing else has
+ * to be reset. */
 void nxusSnapshotReleaseAll(void) {
-    for (u32 slot = 0; slot < 2; slot++) snapshotSlotInvalidate(slot);
+    u64 returned = 0;
+    for (u32 slot = 0; slot < 2; slot++) {
+        if (snapshotSlotResident(slot)) returned += NXUS_SNAPSHOT_SLOT_BYTES;
+        snapshotSlotFree(slot);
+    }
     g_ChangedCount = 0;
     g_DiffTruncated = 0;
-    NXUS_LOG("snapshot: both slots released");
+    NXUS_LOG("snapshot: both slots released (%llu B returned to the heap, "
+             "re-allocated by the next capture)", (unsigned long long)returned);
+}
+
+u32 nxusSnapshotResidentSlots(void) {
+    u32 mask = 0;
+    for (u32 slot = 0; slot < 2; slot++) {
+        if (snapshotSlotResident(slot)) mask |= (1u << slot);
+    }
+    return mask;
+}
+
+u64 nxusSnapshotResidentBytes(void) {
+    u64 bytes = 0;
+    for (u32 slot = 0; slot < 2; slot++) {
+        if (snapshotSlotResident(slot)) bytes += NXUS_SNAPSHOT_SLOT_BYTES;
+    }
+    return bytes;
 }
 
 Result nxusSnapshotServiceInit(void) {
@@ -199,15 +259,15 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
     g_ChangedCount = 0;
     g_DiffTruncated = 0;
 
-    if (g_Snapshots[from_slot].hashes == NULL || g_Snapshots[to_slot].hashes == NULL)
-        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-
-    /* An uncaptured slot (never taken, the take failed, or not a single block
-       could be hashed - it then has no block grid, block_size 0, and no blocks)
-       cannot be compared: the diff would report every block of the other side as
-       vanished, i.e. success with a full-size changed list for a comparison that
-       never happened.  BAD_STATE is what the client can act on ("capture that
-       slot first"). */
+    /* An uncaptured slot (never taken, the take failed, released by
+       nxusSnapshotReleaseAll(), or not a single block could be hashed - it then has
+       no block grid, block_size 0, and no blocks) cannot be compared: the diff would
+       report every block of the other side as vanished, i.e. success with a
+       full-size changed list for a comparison that never happened.  BAD_STATE is
+       what the client can act on ("capture that slot first").  Checked before the
+       NULL-array test below on purpose: a release frees the arrays AND invalidates
+       the grid, and that must read as "not captured", not as "service not
+       initialised". */
     const int from_valid = g_Snapshots[from_slot].block_size != 0 && g_Snapshots[from_slot].count != 0;
     const int to_valid = g_Snapshots[to_slot].block_size != 0 && g_Snapshots[to_slot].count != 0;
     if (!from_valid || !to_valid) {
@@ -216,6 +276,11 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
                  !from_valid ? (from_slot ? 'B' : 'A') : (to_slot ? 'B' : 'A'));
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
+    /* A valid grid always has its arrays (the service allocates them before
+       nxusSnapshotInit() publishes the grid), so this is a defensive guard: report
+       the missing storage instead of walking a NULL pointer. */
+    if (g_Snapshots[from_slot].hashes == NULL || g_Snapshots[to_slot].hashes == NULL)
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
 
     /* An incomplete slot makes the whole comparison unreliable, even if the diff
        itself does not overflow (otherwise a truncated A looks like a clean A). */

@@ -33,6 +33,22 @@ Result nxusDebugDetach(void);
 bool   nxusDebugIsAttached(void);
 void   nxusDebugGetStatus(NxusDebugStatus *out);
 
+/* ---- target architecture -------------------------------------------------
+ * The debugee's own bitness, as announced by the kernel's CreateProcess event
+ * (DebugEventInfo.flags bit 0).  It is collected during nxusDebugAttach() before
+ * the event thread starts, so an immediate RegsGet / pointer scan already sees it,
+ * and it is cleared on detach / exit so one target's architecture can never leak
+ * into the next one.
+ *
+ * nxusDebugTargetIs64Bit() is false whenever the answer is unknown (no session, or
+ * the CreateProcess event has not arrived); "unknown" is deliberately NOT the same
+ * as "AArch32" - ask nxusDebugTargetIs64BitKnown() first and fall back to address
+ * space evidence when it says false.  The pointer scan uses exactly this pair to
+ * pick its load width: a 64-bit title can put its main module and heap below
+ * 4 GiB, so the mapping ends alone are not trustworthy evidence. */
+bool   nxusDebugTargetIs64Bit(void);
+bool   nxusDebugTargetIs64BitKnown(void);
+
 Result nxusDebugSetBreak(const NxusBreakRequest *request);
 Result nxusDebugClearBreak(u32 slot);
 u32    nxusDebugGetBreaks(NxusBreakEntry *out, u32 max_entries);
