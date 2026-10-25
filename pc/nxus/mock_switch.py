@@ -661,6 +661,18 @@ class MockSwitch:
         if cmd == P.CMD['FrozenDisable']:
             return b''
         if cmd == P.CMD['Config']:
+            # The console accepts two shapes (switch/source/nxus_server.c): a bare
+            # 16-byte NxusDebugConfig changes only the debug policy (what the CLI /
+            # GUI send when arming a watchpoint, so a controller hotkey configured
+            # earlier is never wiped), a full NxusConfig (+ optional debug tail)
+            # replaces everything.  Mirror both, otherwise a debug-only payload
+            # raises in unpack_from and kills the accept thread.
+            if len(payload) == P.DEBUG_CONFIG.size:
+                style, auto, _a, _b = P.DEBUG_CONFIG.unpack_from(payload, 0)
+                self.watch_style = style
+                self.auto_continue = auto
+                return P.CONFIG.pack(self.hotkey['mask'], self.hotkey['hold_ms'],
+                                     self.hotkey['enabled'], 0, self.watchdog_ms, 5000, 1)
             cfg = P.CONFIG.unpack_from(payload, 0)      # payload may carry a debug tail
             self.hotkey = dict(mask=cfg[0], hold_ms=cfg[1], enabled=cfg[2])
             if cfg[4]:

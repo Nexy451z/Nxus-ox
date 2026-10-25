@@ -4,7 +4,7 @@ use eframe::egui;
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use super::{App, Cmd, Tab, DISASM_PAGE, SCOPE_NAMES, WATCH_KINDS};
+use super::{auto_continue_for, App, Cmd, Tab, DISASM_PAGE, SCOPE_NAMES, WATCH_KINDS};
 use crate::protocol::VALUE_TYPE_NAMES;
 
 const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
@@ -565,6 +565,12 @@ fn watch_section(app: &mut App, ui: &mut egui::Ui) {
 /// sense (Continue / Step).  It sits above the tab bar so it is visible whichever
 /// tab the hit interrupted.
 fn stop_banner(app: &mut App, ui: &mut egui::Ui) {
+    // The console's status bit is the only truth for "the target is held": the
+    // DebugStopped event sets it early (that is the instant refresh), but a
+    // status reply that no longer reports the stop must take the banner away.
+    if !app.st.is_stopped() {
+        return;
+    }
     // Only a stop with details is a "hit": a manual break (the Pause button, the
     // scan pause) is shown by the STOPPED badge in the top bar instead, because
     // there is no hitting instruction to jump to.
@@ -927,7 +933,9 @@ fn watch_tab(app: &mut App, ui: &mut egui::Ui) {
             .on_hover_text("auto_continue=0: the target is held at the hit and the disassembly \
                             opens at the PC; off = only the hit is recorded")
             .changed();
-        if let Some(stop) = app.st.debug_stop.clone() {
+        // `is_stopped()` decides the state (status_flags); `debug_stop` only
+        // supplies the details of a breakpoint hit.
+        if let Some(stop) = app.st.debug_stop.clone().filter(|_| app.st.is_stopped()) {
             ui.label(RichText::new(format!("■ STOPPED thread {} at main+{:#x}", stop.thread_id,
                                            stop.pc.wrapping_sub(app.st.main_base())))
                 .monospace().color(RED));
@@ -1609,6 +1617,10 @@ pub fn settings_window(app: &mut App, ctx: &egui::Context) {
                     enabled,
                     watchdog: app.prefs.watchdog_ms,
                     style: app.prefs.watch_style,
+                    // The console rewrites its whole config from this request, so
+                    // the current policy travels along: sending a constant 1 here
+                    // released a target held at a stop (and disarmed the next one).
+                    auto_continue: auto_continue_for(app.prefs.watch_stop_on_hit),
                 }, "applying settings");
             }
             ui.label(RichText::new("settings are remembered between runs").color(DIM));

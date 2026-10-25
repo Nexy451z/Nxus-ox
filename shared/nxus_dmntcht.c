@@ -89,25 +89,62 @@ static bool dmntResultIsCheatNotAttached(Result rc) {
 
 typedef Result (*NxusDmntOp)(void *ctx);
 
+/* dmnt also reports BAD_STATE (0x8003C806) while it tears an old cheat process
+   down, so that one is worth a repair attempt.  Everything else - most notably
+   0xD401 InvalidCurrentMemory for an unmapped address - is a normal failure of
+   the *command*, not of the session. */
+#define NXUS_DMNT_RESULT_BAD_STATE 0x8003C806u
+
+/* Re-opening the cheat process is a takeover: dmnt:cht holds one process at a
+   time, and ForceOpen steals it from whatever opened it last (EdiZon-SE-style
+   cheat sysmodules, another debugger, or Atmosphère's own cheat manager).  Two
+   guards keep Nxus from fighting a well-behaved owner:
+     - only repair on the two Results above, never on an address failure,
+     - at most one attempt every two seconds, with the suppressed count folded
+       into a single log line (the log writes to the SD card, so a per-read line
+       was both a flood and an I/O cost). */
+#define NXUS_DMNT_REOPEN_COOLDOWN_NS 2000000000ull
+
+static u64 g_LastReopenTick = 0;
+static u32 g_ReopenSuppressed = 0;
+
+static bool dmntResultMayNeedRepair(Result rc) {
+    if (R_SUCCEEDED(rc)) return false;
+    if ((u32)rc == NXUS_DMNT_RESULT_BAD_STATE) return true;
+    return dmntResultIsCheatNotAttached(rc);
+}
+
 /* Run one dmnt command, then repair the cheat process and repeat it once when the
    process has been dropped.
  *
- *   reopen_on_any_failure - the historical behaviour of Read/Write/GetMetadata:
- *      those also retried after BAD_STATE (0x8003C806), which dmnt reports while
- *      it tears an old cheat process down.  Every other command only retries on
- *      ResultCheatNotAttached, so an ordinary failure (invalid address, ...) never
- *      steals the process from dmnt.
+ *   reopen_on_any_failure - historical knob, now ignored: Read/Write/GetMetadata
+ *      used to retry after *any* failure, which meant one read of an unmapped
+ *      address triggered a ForceOpen (and an SD log line) - the exact behaviour
+ *      that stole the cheat process from other tools mid-scan.
  *
  * The retry never happens with auto-reopen disabled: the Nxus debug session owns
  * the process then, and a ForceOpen would take it back mid-attach. */
 static Result dmntRunCommand(NxusDmntOp op, void *ctx, bool reopen_on_any_failure, const char *what) {
+    (void)reopen_on_any_failure;
+
     Result rc = op(ctx);
     if (R_SUCCEEDED(rc) || !g_AutoReopen) return rc;
-    if (!reopen_on_any_failure && !dmntResultIsCheatNotAttached(rc)) return rc;
+    if (!dmntResultMayNeedRepair(rc)) return rc;
+
+    const u64 now = armGetSystemTick();
+    if (g_LastReopenTick != 0 &&
+        armTicksToNs(now - g_LastReopenTick) < NXUS_DMNT_REOPEN_COOLDOWN_NS) {
+        g_ReopenSuppressed++;
+        return rc;
+    }
+    g_LastReopenTick = now;
+
+    const u32 suppressed = g_ReopenSuppressed;
+    g_ReopenSuppressed = 0;
 
     Result open_rc = nxusDmntForceOpen();
-    NXUS_LOG("dmnt: %s failed rc=0x%08X; ForceOpen rc=0x%08X - retrying once",
-             what, (unsigned)rc, (unsigned)open_rc);
+    NXUS_LOG("dmnt: %s failed rc=0x%08X; ForceOpen rc=0x%08X (%u deferred) - retrying once",
+             what, (unsigned)rc, (unsigned)open_rc, (unsigned)suppressed);
     if (R_FAILED(open_rc)) return rc;
     return op(ctx);
 }

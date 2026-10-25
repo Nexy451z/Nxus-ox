@@ -36,6 +36,11 @@ impl std::error::Error for NxusError {}
 
 pub type Result<T> = std::result::Result<T, NxusError>;
 
+/// `sizeof(NxusDebugConfig)` on the wire.  A CONFIG payload of exactly this
+/// length means "apply the debug block, leave the hotkey/watchdog settings
+/// alone"; the full `NxusConfig` (32 bytes, +16 with a debug tail) rewrites them.
+pub const DEBUG_CONFIG_LEN: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: u16,
@@ -711,10 +716,23 @@ impl NxusClient {
         Ok(self.debug_status()?.stopped_thread())
     }
 
-    /// Set the watchpoint encoding and the auto-continue policy
-    /// (`auto_continue == 0` makes a hit hold the target until `debug_continue`).
-    pub fn set_debug_config(&self, style: u32, auto_continue: u32) -> Result<()> {
-        self.set_config(0, 0, 0, 0, 15000, 5000, 1, Some((style, auto_continue))).map(|_| ())
+    /// Push ONLY the debug block (a bare `NxusDebugConfig`, 16 bytes): the
+    /// watchpoint encoding plus the auto-continue policy (`auto_continue == 0`
+    /// makes a hit hold the target until `debug_continue`).
+    ///
+    /// The console reads a CONFIG payload of exactly `DEBUG_CONFIG_LEN` bytes as
+    /// "debug settings only" and keeps the rest of its configuration.  That
+    /// matters: the full request ([`set_config`], 32+ bytes) rewrites every
+    /// field, so a `watch`/`break` run used to zero the controller hotkey the
+    /// user had applied from the Settings window (and a GUI arm did the same).
+    pub fn set_debug_auto_continue(&self, style: u32, auto_continue: u32) -> Result<()> {
+        let mut payload = Vec::with_capacity(DEBUG_CONFIG_LEN);
+        put_u32(&mut payload, style);
+        put_u32(&mut payload, auto_continue);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 0);
+        debug_assert_eq!(payload.len(), DEBUG_CONFIG_LEN, "NxusDebugConfig is 16 bytes");
+        self.request(cmd::CONFIG, &payload).map(|_| ())
     }
 
     pub fn break_set(&self, address: u64, kind: u32, size: u32, slot: u32, ctrl: u64) -> Result<Vec<BreakEntry>> {
@@ -773,6 +791,11 @@ impl NxusClient {
 
     // ---- configuration ----
 
+    /// The FULL configuration request (`NxusConfig` = 32 bytes, plus the optional
+    /// 16-byte `NxusDebugConfig` tail).  This is what the Settings window sends
+    /// when the user applies their settings: it rewrites every field, so it must
+    /// NOT be used to flip a single debug flag behind the user's back - see
+    /// [`set_debug_auto_continue`], which sends the 16-byte debug-only form.
     pub fn set_config(&self, hotkey_mask: u64, hotkey_hold_ms: u32, hotkey_enabled: u32,
                       chunk_size: u32, watchdog_ms: u32, heartbeat_ms: u32, log_level: u32,
                       debug: Option<(u32, u32)>) -> Result<Vec<u8>> {
@@ -784,6 +807,7 @@ impl NxusClient {
         put_u32(&mut payload, watchdog_ms);
         put_u32(&mut payload, heartbeat_ms);
         put_u32(&mut payload, log_level);
+        debug_assert_eq!(payload.len(), 32, "NxusConfig is 32 bytes");
         if let Some((style, auto_continue)) = debug {
             put_u32(&mut payload, style);
             put_u32(&mut payload, auto_continue);

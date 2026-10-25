@@ -93,7 +93,17 @@ In the **[GitHub Releases](https://github.com/Nexy451z/Nxus-ox/releases)** page,
    ```text
    SD:/atmosphere/contents/4200000000004E58/exefs.nsp
    SD:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+   SD:/atmosphere/contents/4200000000004E58/README.txt      (identification)
+   SD:/atmosphere/contents/4200000000004E58/metadata.json   (identification)
    ```
+
+   **What are `README.txt` / `metadata.json` for?** A custom sysmodule's NPDM carries
+   a title id and nothing else, so tools that simply list SD contents (DBI, homebrew
+   file managers) show a bare `4200000000004E58` with no idea what it belongs to.
+   These two files make the folder self-describing — name, version, role, TCP port,
+   repository and the "no warranty" note — for humans, other tools, and other agents
+   reading the card. They are inert: Atmosphère only reads `exefs.nsp` and `flags/`,
+   so removing them changes nothing functionally.
 2. To use **Hardware Watchpoints / Breakpoints**, enable kernel debug mode in Atmosphère / hekate:
    - In `SD:/bootloader/hekate_ipl.ini`: add `debugmode=1` to your boot entry, **and/or**
    - In `SD:/atmosphere/config/system_settings.ini`: ensure Atmosphère debug mode is enabled.

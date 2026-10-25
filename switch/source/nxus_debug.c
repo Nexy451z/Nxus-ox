@@ -8,9 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NXUS_DEBUG_MAX_BREAKS  8
 #define NXUS_DEBUG_MAX_HITS    32
 #define NXUS_DEBUG_MAX_THREADS 32
+
+/* The break table size (NXUS_DEBUG_MAX_BREAKS) lives in nxus_debug.h: the server
+   sizes its break-list reply from it, and the table must cover all ten hardware
+   slots (6 instruction + 4 watch). */
 
 typedef struct {
     u32 slot;
@@ -32,6 +35,19 @@ static bool   g_Attached = false;
 static Thread g_EventThread;
 static bool   g_EventThreadLive = false;
 static atomic_bool g_StopLoop;
+/* Set when the debugee exits: the session is dead but must be collected from a
+   thread that is not the event thread (detach joins it).  nxusServerTick() does
+   that and restores dmnt; until then nxusDebugAttach() refuses to start again. */
+static atomic_bool g_ExitSeen;
+
+/* Why the current stop exists.  The event loop uses it to tell an explicit
+   debugger stop (Pause, Step) apart from a stop left over from auto_continue == 0
+   mode: only the former may hold the target while auto-continue is on. */
+typedef enum {
+    StopReason_Hit    = 0,   /* breakpoint / watchpoint hit (GDB-style hold) */
+    StopReason_Manual = 1,   /* svcBreakDebugProcess: an explicit Pause        */
+    StopReason_Step   = 2,   /* nxusDebugStep(): an explicit single step        */
+} StopReason;
 
 /* GDB-style stop state.  With g_Config.auto_continue == 0 (the default) a
    breakpoint/watchpoint hit must HOLD the target instead of resuming it, so the
@@ -41,10 +57,17 @@ static atomic_bool g_StopLoop;
    and read from the command thread. */
 static atomic_bool   g_Stopped;
 static atomic_ullong g_StoppedThread;
+static atomic_uint   g_StopReason;
 /* Bumped for every published stop.  nxusDebugContinueAll() uses it to tell "the
    stop I am resuming from" apart from "a hit that fired while the slots were
-   going back in", which must not be cleared when the continue returns. */
+   going back in", which must not be cleared when the continue returns.  Only
+   publishStopState() may touch it, so a manual Break or a Step can never leave a
+   stale sequence number behind. */
 static atomic_uint   g_StopSeq;
+/* Bumped for every exception event consumed (by either the event thread or a
+   command-thread drain).  nxusDebugStep() uses it to wait - bounded - for the
+   exception that stops the target again after it resumed. */
+static atomic_uint   g_ExceptionSeq;
 
 static BreakSlot g_Breaks[NXUS_DEBUG_MAX_BREAKS];
 static u32       g_BreakCount;
@@ -247,19 +270,30 @@ static void armContextIdBreakpoint(void) {
 /* Publish a GDB-style stop.  The kernel has already debug-suspended every thread
    of the process when the exception is queued, so the state below simply records
    that the event loop must NOT acknowledge the event: the target stays frozen and
-   the PC can inspect it. */
-static void publishStop(const DebugEventInfo *event, const NxusBreakHit *hit) {
-    atomic_store_explicit(&g_Stopped, true, memory_order_relaxed);
-    atomic_store_explicit(&g_StoppedThread, event->thread_id, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_StopSeq, 1, memory_order_relaxed);
+   the PC can inspect it.
 
+   This is the ONLY place that sets g_Stopped and the only place that increments
+   g_StopSeq: a breakpoint hit, a manual Pause (svcBreakDebugProcess) and a single
+   step all publish through it, so a stop can never appear without a new sequence
+   number (which nxusDebugContinueAll() relies on).  The reason and the thread are
+   stored before the flag, and the flag store is a release, so a reader that sees
+   g_Stopped == true also sees a consistent thread/reason. */
+static void publishStopState(u64 thread_id, StopReason reason) {
+    atomic_store_explicit(&g_StoppedThread, thread_id, memory_order_relaxed);
+    atomic_store_explicit(&g_StopReason, (unsigned)reason, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_StopSeq, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_Stopped, true, memory_order_release);
+}
+
+/* Send the stop to the PC and log it (shared by hits and explicit stops). */
+static void sendStopEvent(u64 thread_id, u64 pc, u64 address, u32 kind, u32 slot) {
     NxusDebugStop stop;
     memset(&stop, 0, sizeof(stop));
-    stop.thread_id = event->thread_id;
-    stop.pc = hit->pc;
-    stop.address = hit->address;
-    stop.kind = hit->kind;
-    stop.slot = hit->slot;
+    stop.thread_id = thread_id;
+    stop.pc = pc;
+    stop.address = address;
+    stop.kind = kind;
+    stop.slot = slot;
 
     NXUS_LOG("debug: stopped thread=%016llX pc=%016llX kind=%u slot=%u addr=%016llX "
              "(send DebugContinue/DebugStep to resume)",
@@ -268,6 +302,22 @@ static void publishStop(const DebugEventInfo *event, const NxusBreakHit *hit) {
              (unsigned long long)stop.address);
     /* Without a client connected this is a no-op; the hit ring still holds it. */
     nxusNetSendEvent(NxusEvent_DebugStopped, &stop, (u32)sizeof(stop));
+}
+
+static void publishStop(const DebugEventInfo *event, const NxusBreakHit *hit) {
+    publishStopState(event->thread_id, StopReason_Hit);
+    sendStopEvent(event->thread_id, hit->pc, hit->address, hit->kind, hit->slot);
+}
+
+/* Only a stop the debugger asked for explicitly may hold the target while
+   auto-continue is enabled. */
+static bool stopIsExplicit(void) {
+    return atomic_load_explicit(&g_StopReason, memory_order_relaxed) != (unsigned)StopReason_Hit;
+}
+
+static void clearStopState(void) {
+    atomic_store_explicit(&g_Stopped, false, memory_order_release);
+    atomic_store_explicit(&g_StoppedThread, 0, memory_order_relaxed);
 }
 
 static void recordHit(const DebugEventInfo *event) {
@@ -518,6 +568,10 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
             noteThread(event->thread_id);
             break;
         case DebugEventType_Exception:
+            /* Every exception is a suspend point: nxusDebugStep() waits on this
+               counter to know that the target is stopped again (see
+               waitForStopException()). */
+            atomic_fetch_add_explicit(&g_ExceptionSeq, 1, memory_order_relaxed);
             if (event->info.exception.type == DebugException_BreakPoint) {
                 recordHit(event);
                 is_break = true;
@@ -527,7 +581,22 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
             }
             break;
         case DebugEventType_ExitProcess:
-            NXUS_LOG("debug: process exited");
+            /* The debugee is gone.  The kill/exit event is the end of the debug
+               session, but nxusDebugDetach() cannot run here: it joins this very
+               thread (self-deadlock) and closes the handle we are reading events
+               from.  So drop the stop/attach state right here, re-enable dmnt's
+               self-healing and let nxusServerTick() collect the session (close the
+               handle, wipe the slots, ForceOpen dmnt).  Leaving g_Attached true
+               with auto-reopen disabled used to zombify the sysmodule until a
+               restart. */
+            clearStopState();
+            atomic_store_explicit(&g_ExitSeen, true, memory_order_relaxed);
+            atomic_store_explicit(&g_StopLoop, true, memory_order_relaxed);
+            g_Attached = false;
+            nxusDmntSetAutoReopen(true);
+            NXUS_LOG("debug: process exited (reason=%u) - session released, dmnt reopened "
+                     "by the server tick",
+                     (unsigned)event->info.exit_process.reason);
             break;
         default:
             break;
@@ -563,23 +632,50 @@ static void eventThread(void *arg) {
            the CreateProcess/CreateThread burst. */
         bool had_break = false;
         const u32 processed = drainDebugEvents(&had_break);
+        if (atomic_load_explicit(&g_ExitSeen, memory_order_relaxed)) {
+            /* ExitProcess was among the events above: nothing is left to continue
+               and the handle must be closed by a thread that can join this one. */
+            NXUS_LOG("debug: event loop stopping after ExitProcess");
+            break;
+        }
         if (processed == 0) {
             /* no event pending (or the session ended): yield and retry */
             svcSleepThread(2000000ull);
             continue;
         }
 
-        /* With auto_continue == 0 a breakpoint hit is meant to STOP the target
-           (that is what a debugger stop is for), so it must not be resumed until
-           the PC asks for it.  Once a stop has been published every further
-           exception is held too: the single-step exception produced by
-           nxusDebugStep() and the DebuggerBreak exception produced by
-           svcBreakDebugProcess() arrive here as ordinary exceptions, and
-           auto-continuing them would silently release the title again.
-           Everything else - the initial CreateProcess / CreateThread /
-           DebuggerAttached burst in particular - is always continued, otherwise
-           attach itself would freeze the title. */
-        if (nxusDebugIsStopped() || (had_break && g_Config.auto_continue == 0)) {
+        /* Holding policy - auto_continue is evaluated FIRST:
+             - auto_continue == 0 (GDB-style, the default): a breakpoint hit is a
+               stop the PC is meant to inspect, and once a stop has been published
+               every further exception is held too (the single-step exception from
+               nxusDebugStep(), the DebuggerBreak from svcBreakDebugProcess()), so
+               auto-continuing them cannot silently release the title.
+             - auto_continue != 0: a hit was already recorded and must be
+               acknowledged, so the target keeps running.  A stop left over from
+               the previous stop-on-hit mode is dropped here instead of freezing
+               the title for ever; only an explicit stop (manual Pause, Step) is
+               honoured.  Everything else - the CreateProcess / CreateThread /
+               DebuggerAttached burst in particular - is always continued,
+               otherwise attach itself would freeze the title. */
+        bool hold = false;
+        if (g_Config.auto_continue == 0) {
+            hold = nxusDebugIsStopped() || had_break;
+        } else if (nxusDebugIsStopped()) {
+            if (stopIsExplicit()) {
+                hold = true;
+            } else {
+                clearStopState();
+                static u64 stale_log_tick = 0;
+                const u64 stale_now = armGetSystemTick();
+                if (stale_log_tick == 0 ||
+                    armTicksToNs(stale_now - stale_log_tick) > 5000000000ull) {
+                    NXUS_LOG("debug: auto_continue=1 - discarded a stale stop");
+                    stale_log_tick = stale_now;
+                }
+            }
+        }
+
+        if (hold) {
             /* A hot loop can queue these faster than the PC consumes them; one log
                line per five seconds is enough to see what is going on. */
             static u64 hold_log_tick = 0;
@@ -651,9 +747,12 @@ void nxusDebugInit(void) {
     g_Attached = false;
     g_Debug = INVALID_HANDLE;
     atomic_init(&g_StopLoop, true);
+    atomic_init(&g_ExitSeen, false);
     atomic_init(&g_Stopped, false);
     atomic_init(&g_StoppedThread, 0);
+    atomic_init(&g_StopReason, (unsigned)StopReason_Hit);
     atomic_init(&g_StopSeq, 0u);
+    atomic_init(&g_ExceptionSeq, 0u);
 }
 
 void nxusDebugExit(void) {
@@ -662,9 +761,20 @@ void nxusDebugExit(void) {
 
 bool nxusDebugIsAttached(void) { return g_Attached; }
 
+bool nxusDebugExitedPending(void) {
+    return atomic_load_explicit(&g_ExitSeen, memory_order_relaxed);
+}
+
 Result nxusDebugAttach(u64 pid) {
     if (g_Attached) return 0;
     if (pid == 0) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+    /* A session whose debugee exited is collected by nxusServerTick() (the event
+       thread cannot join itself).  Starting a second session before that would
+       overwrite g_EventThread/g_Debug and leak both. */
+    if (g_EventThreadLive || atomic_load_explicit(&g_ExitSeen, memory_order_relaxed)) {
+        NXUS_LOG("debug attach: the previous session is still being released");
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
 
     /* While we take the process over, a concurrent scan read that fails must not
        auto-reopen dmnt and race the hand-off.  Restored on every failure path and
@@ -699,8 +809,8 @@ Result nxusDebugAttach(u64 pid) {
     g_ThreadCount = 0;
     /* A stop left over from a previous session must not make the event loop hold
        the DebuggerAttached/CreateProcess burst and freeze the fresh attach. */
-    atomic_store_explicit(&g_Stopped, false, memory_order_relaxed);
-    atomic_store_explicit(&g_StoppedThread, 0, memory_order_relaxed);
+    clearStopState();
+    atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
     atomic_store_explicit(&g_StopLoop, false, memory_order_relaxed);
 
     armContextIdBreakpoint();
@@ -728,6 +838,7 @@ Result nxusDebugAttach(u64 pid) {
 
 Result nxusDebugDetach(void) {
     if (!g_Attached && !g_EventThreadLive) {
+        atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
         nxusDmntSetAutoReopen(true);
         return 0;
     }
@@ -744,6 +855,12 @@ Result nxusDebugDetach(void) {
         g_EventThreadLive = false;
     }
 
+    /* g_Attached=false and the register wipe happen under g_Mutex, in that order:
+       nxusDebugSetBreak() re-checks g_Attached while holding the same mutex just
+       before it programs a slot, so it either wins (and detach sees the table
+       entry and wipes the slot) or loses and returns NXUS_ERR_NOT_ATTACHED.
+       Without the ordering an arm could land after the wipe and leave a live
+       breakpoint in a process nobody is debugging. */
     mutexLock(&g_Mutex);
     for (u32 i = 0; i < NXUS_DEBUG_MAX_BREAKS; i++) {
         g_Breaks[i].enabled = 0;
@@ -752,18 +869,17 @@ Result nxusDebugDetach(void) {
     }
     g_BreakCount = 0;
     g_Attached = false;
-    mutexUnlock(&g_Mutex);
-
-    /* Nothing is held once the session is gone; a stale stop would make the next
-       attach believe the target is frozen. */
-    atomic_store_explicit(&g_Stopped, false, memory_order_relaxed);
-    atomic_store_explicit(&g_StoppedThread, 0, memory_order_relaxed);
-
     /* All ten slots (0..5 plus 0x10..0x13) on all four cores: the ContextID link
        source (4/5) included, because armContextIdBreakpoint() programs it for
        every style.  No conditional "if enabled" here: a stale register is
        invisible to the break table but still fires. */
     clearAllHardwareSlots();
+    mutexUnlock(&g_Mutex);
+
+    /* Nothing is held once the session is gone; a stale stop would make the next
+       attach believe the target is frozen. */
+    clearStopState();
+    atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
 
     if (g_Debug != INVALID_HANDLE) {
         /* Drain the queue and acknowledge every pending exception as handled
@@ -818,7 +934,18 @@ void nxusDebugGetStatus(NxusDebugStatus *out) {
 
 Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     if (request == NULL) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+
+    /* Serialised against detach (and against nxusDebugClearBreak): the whole
+       reserve-then-arm sequence runs under g_Mutex, and the session is re-checked
+       inside it, so an arm can never land after nxusDebugDetach() wiped the
+       registers.  Draining events must not happen here (recordHit() takes this
+       same non-recursive mutex). */
+    mutexLock(&g_Mutex);
+    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+        atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        mutexUnlock(&g_Mutex);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    }
 
     u32 slot = request->slot;
     if (request->kind == NxusBp_Execute) {
@@ -830,55 +957,107 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
     } else {
         if (slot < 0x10 || slot > 0x13) slot = allocSlot(request->kind);
     }
-    if (slot == 0xFFFFFFFFu) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    if (slot == 0xFFFFFFFFu) {
+        mutexUnlock(&g_Mutex);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+    }
 
-    u64 ctrl = request->ctrl ? request->ctrl
-                             : nxusDebugBuildControl(request->kind, request->size ? request->size : 4,
-                                                     request->address, g_Config.style);
+    /* Reserve the table entry BEFORE the hardware is touched.  Arming first and
+       storing afterwards is what left an armed, untracked slot behind whenever the
+       table was full (it used to be smaller than the hardware: 8 < 10), and an
+       untracked slot can neither be listed nor cleared.  A full table is reported
+       as BUSY without any syscall. */
+    BreakSlot *entry = findBreakBySlot(slot);
+    BreakSlot  previous;
+    bool       is_new = false;
+    memset(&previous, 0, sizeof(previous));
+    if (entry == NULL) {
+        if (g_BreakCount >= NXUS_DEBUG_MAX_BREAKS) {
+            mutexUnlock(&g_Mutex);
+            return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+        }
+        entry = &g_Breaks[g_BreakCount++];
+        is_new = true;
+    } else {
+        previous = *entry;
+    }
+
+    const u32 size = request->size ? request->size : 4;
+    const u64 ctrl = request->ctrl ? request->ctrl
+                                   : nxusDebugBuildControl(request->kind, size,
+                                                           request->address, g_Config.style);
     /* DBGWVR/DBGBVR must hold the aligned word: the byte mask lives in BAS.
        An unaligned value loses the high BAS bits and never fires.  The original
        address is kept in BreakSlot so hits can be reported in user terms. */
-    u64 hw_addr = hwBreakValue(request->kind, request->address);
+    const u64 hw_addr = hwBreakValue(request->kind, request->address);
+    entry->slot = slot;
+    entry->kind = request->kind;
+    entry->size = size;
+    entry->address = request->address;
+    entry->ctrl = ctrl;
+    entry->enabled = 1;
+    entry->hits_in_window = 0;
+    entry->window_start_tick = 0;
+
     Result rc = setHardwareBreakPointAllCores(slot, ctrl, hw_addr);
     g_LastResult = (s32)rc;
-    NXUS_LOG("set break slot=%u kind=%u addr=%08llX hw=%08llX ctrl=%08llX rc=0x%08X",
-             (unsigned)slot, (unsigned)request->kind, (unsigned long long)request->address,
-             (unsigned long long)hw_addr, (unsigned long long)ctrl, (unsigned)rc);
-    if (R_FAILED(rc)) return rc;
-
-    mutexLock(&g_Mutex);
-    BreakSlot *existing = findBreakBySlot(slot);
-    if (existing == NULL && g_BreakCount < NXUS_DEBUG_MAX_BREAKS) {
-        existing = &g_Breaks[g_BreakCount++];
+    if (R_FAILED(rc)) {
+        /* Put the table back: nothing may claim a slot the kernel refused.  The
+           kernel may also have programmed a subset of the cores before the error,
+           so the slot is restored (or wiped when the entry was auto-disarmed) to
+           keep the table and the hardware in agreement. */
+        if (is_new) {
+            g_BreakCount--;
+            memset(&g_Breaks[g_BreakCount], 0, sizeof(g_Breaks[0]));
+        } else {
+            *entry = previous;
+        }
+        if (previous.enabled) {
+            setHardwareBreakPointAllCores(previous.slot, previous.ctrl,
+                                          hwBreakValue(previous.kind, previous.address));
+        } else {
+            setHardwareBreakPointAllCores(slot, 0, 0);
+        }
+        mutexUnlock(&g_Mutex);
+        NXUS_LOG("set break slot=%u kind=%u addr=%08llX hw=%08llX ctrl=%08llX rc=0x%08X",
+                 (unsigned)slot, (unsigned)request->kind,
+                 (unsigned long long)request->address,
+                 (unsigned long long)hw_addr, (unsigned long long)ctrl, (unsigned)rc);
+        return rc;
     }
-    if (existing != NULL) {
-        existing->slot = slot;
-        existing->kind = request->kind;
-        existing->size = request->size ? request->size : 4;
-        existing->enabled = 1;
-        existing->address = request->address;
-        existing->ctrl = ctrl;
-        existing->hits_in_window = 0;
-        existing->window_start_tick = 0;
-    }
-    mutexUnlock(&g_Mutex);
 
     /* Every execution breakpoint and watchpoint links to the ContextID slot.  If
        the last breakpoint was auto-disarmed, that slot is clear too; without
-       re-arming it here the newly set breakpoint silently never fires. */
-    if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+       re-arming it here the newly set breakpoint silently never fires.  The
+       session is re-checked under the mutex, so a detach that got here first is
+       respected instead of being undone. */
+    if (g_Attached && g_Debug != INVALID_HANDLE &&
+        !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         armContextIdBreakpoint();
     }
+    mutexUnlock(&g_Mutex);
+
+    NXUS_LOG("set break slot=%u kind=%u addr=%08llX hw=%08llX ctrl=%08llX rc=0x%08X",
+             (unsigned)slot, (unsigned)request->kind, (unsigned long long)request->address,
+             (unsigned long long)hw_addr, (unsigned long long)ctrl, (unsigned)rc);
     return 0;
 }
 
 Result nxusDebugClearBreak(u32 slot) {
-    if (!g_Attached) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    /* Same serialisation as SetBreak, for the same reason: a clear that runs
+       concurrently with detach could reprogram (here: wipe) a register after the
+       detach wiped them, and a clear that loses the race must not touch the
+       hardware at all. */
+    mutexLock(&g_Mutex);
+    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+        atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        mutexUnlock(&g_Mutex);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
+    }
 
     Result rc = setHardwareBreakPointAllCores(slot, 0, 0);
     g_LastResult = (s32)rc;
 
-    mutexLock(&g_Mutex);
     for (u32 i = 0; i < g_BreakCount; i++) {
         if (g_Breaks[i].slot == slot) {
             g_Breaks[i] = g_Breaks[g_BreakCount - 1];
@@ -1064,7 +1243,10 @@ static Result continueAllOnce(void) {
 }
 
 bool nxusDebugIsStopped(void) {
-    return atomic_load_explicit(&g_Stopped, memory_order_relaxed);
+    /* Acquire: publishStopState() stores the flag with release after it wrote the
+       thread and the reason, so a caller that sees true also sees a consistent
+       stop record. */
+    return atomic_load_explicit(&g_Stopped, memory_order_acquire);
 }
 
 u64 nxusDebugStoppedThread(void) {
@@ -1126,8 +1308,7 @@ Result nxusDebugContinueAll(void) {
           back in (that stop is the one the user is looking at). */
     if (R_SUCCEEDED(rc) &&
         atomic_load_explicit(&g_StopSeq, memory_order_relaxed) == stop_seq) {
-        atomic_store_explicit(&g_Stopped, false, memory_order_relaxed);
-        atomic_store_explicit(&g_StoppedThread, 0, memory_order_relaxed);
+        clearStopState();
     }
 
     g_LastResult = (s32)rc;
@@ -1139,6 +1320,78 @@ Result nxusDebugContinueAll(void) {
    it when MESOSPHERE_ENABLE_HARDWARE_SINGLE_STEP is compiled in; on the stock
    kernel the call fails with InvalidEnumValue and nxusDebugStep() falls back. */
 #define NXUS_DEBUG_CTX_FLAG_SET_SINGLE_STEP 2u
+/* Upper bound for "the exception that stopped the target again has arrived". */
+#define NXUS_DEBUG_STOP_WAIT_MS 20u
+
+/* Bounded wait for the exception that stopped the target again.  seq_before is
+   read BEFORE the continue; anything that bumps g_ExceptionSeq afterwards (an
+   exception consumed by our own drain or by the event thread) proves that the
+   kernel delivered one.  Returns false when nothing arrived in time. */
+static bool waitForStopException(unsigned seq_before, u32 timeout_ms) {
+    for (u32 elapsed = 0; elapsed < timeout_ms; elapsed++) {
+        drainDebugEvents(NULL);
+        if (atomic_load_explicit(&g_ExceptionSeq, memory_order_relaxed) != seq_before) {
+            return true;
+        }
+        svcSleepThread(1000000ull);
+    }
+    return false;
+}
+
+/* Resume the target for "one instruction" and guarantee that it is stopped again
+   before returning.  Both step paths use this, so the stop published for the PC is
+   always truthful:
+     - hardware_step: the kernel's single-step exception IS the stop;
+     - fallback (no hardware single step): the target runs for ~2 ms and is stopped
+       again with svcBreakDebugProcess, whose DebuggerBreak exception is drained.
+   The breaks are disarmed before the continue and re-armed only after the stop has
+   been confirmed: a slot left armed would trap on the very instruction the PC never
+   advanced past, and the title would freeze in a trap loop instead of stepping. */
+static Result stepResumeAndStop(bool hardware_step) {
+    const unsigned exc_before = atomic_load_explicit(&g_ExceptionSeq, memory_order_relaxed);
+
+    disarmAllBreaks();
+    drainDebugEvents(NULL);
+    Result rc = continueAllOnce();
+    if (R_FAILED(rc)) {
+        /* Nothing was acknowledged: the target really is still stopped, so the
+           slots can go back in and the PC can retry. */
+        rearmAllBreaks();
+        NXUS_RESULT("ContinueDebugEvent (step)", rc);
+        return rc;
+    }
+
+    bool stopped = false;
+    if (hardware_step) {
+        stopped = waitForStopException(exc_before, NXUS_DEBUG_STOP_WAIT_MS);
+        if (!stopped) {
+            NXUS_LOG("debug step: no single-step exception within %u ms - forcing a stop",
+                     (unsigned)NXUS_DEBUG_STOP_WAIT_MS);
+        }
+    }
+    if (!stopped) {
+        /* Give the core time to retire at least one instruction before stopping it
+           again (the fallback cannot do better than "approximately one"). */
+        svcSleepThread(2000000ull);
+        rc = svcBreakDebugProcess(g_Debug);
+        if (R_FAILED(rc)) {
+            /* No confirmed stop, so the slots stay clear: re-arming now could trap
+               a running target on its next instruction.  The stop state stays
+               published and the PC can retry. */
+            NXUS_RESULT("svcBreakDebugProcess (step stop)", rc);
+            return rc;
+        }
+        const unsigned brk_before = atomic_load_explicit(&g_ExceptionSeq, memory_order_relaxed);
+        if (!waitForStopException(brk_before, NXUS_DEBUG_STOP_WAIT_MS)) {
+            NXUS_LOG("debug step: no DebuggerBreak event within %u ms after the forced stop",
+                     (unsigned)NXUS_DEBUG_STOP_WAIT_MS);
+        }
+    }
+
+    /* The target is stopped again, so programming the slots cannot retrap. */
+    rearmAllBreaks();
+    return 0;
+}
 
 Result nxusDebugStep(u64 thread_id) {
     if (!g_Attached || g_Debug == INVALID_HANDLE) {
@@ -1160,58 +1413,62 @@ Result nxusDebugStep(u64 thread_id) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
 
-    /* The stop stays published for the whole step: the PC keeps seeing a stopped
-       target and can issue the next step right away. */
-    atomic_store_explicit(&g_Stopped, true, memory_order_relaxed);
-    atomic_store_explicit(&g_StoppedThread, tid, memory_order_relaxed);
+    /* The stop stays published for the whole step, through publishStopState() so
+       g_StopSeq moves like it does for a hit: the PC keeps seeing a stopped target
+       and can issue the next step right away.  A step is an explicit debugger
+       action, hence StopReason_Step (honoured even in auto-continue mode). */
+    publishStopState(tid, StopReason_Step);
 
     /* Preferred path: the kernel's own hardware single step.  Setting the flag on
        a copy of the current context keeps every register intact; the kernel then
        executes exactly one instruction and raises a debug exception, which the
        event loop holds because the stop above is still published. */
+    u64 pc_before = 0;
+    bool have_context = false;
+    bool hardware_step = false;
     ThreadContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     Result rc = svcGetDebugThreadContext(&ctx, g_Debug, tid, RegisterGroup_CpuAll);
     if (R_SUCCEEDED(rc)) {
-        const u64 pc_before = ctx.pc.x;
+        have_context = true;
+        pc_before = ctx.pc.x;
         rc = svcSetDebugThreadContext(g_Debug, tid, &ctx,
                                       NXUS_DEBUG_CTX_FLAG_SET_SINGLE_STEP);
-        if (R_SUCCEEDED(rc)) {
-            drainDebugEvents(NULL);
-            rc = continueAllOnce();
-            g_LastResult = (s32)rc;
-            if (R_SUCCEEDED(rc)) {
-                /* The single-step exception is queued as soon as the instruction
-                   retires; give it a moment so the PC's next RegsGet already shows
-                   the new PC. */
-                svcSleepThread(2000000ull);
-                NXUS_LOG("debug step: hardware single step thread=%016llX pc=%016llX",
-                         (unsigned long long)tid, (unsigned long long)pc_before);
-            } else {
-                NXUS_RESULT("ContinueDebugEvent (step)", rc);
-            }
-            return rc;
+        hardware_step = R_SUCCEEDED(rc);
+        if (!hardware_step) {
+            NXUS_LOG("debug step: SetThreadContext(SingleStep) rc=0x%08X - using fallback",
+                     (unsigned)rc);
         }
-        NXUS_LOG("debug step: SetThreadContext(SingleStep) rc=0x%08X - using fallback",
-                 (unsigned)rc);
     } else {
         NXUS_LOG("debug step: GetThreadContext rc=0x%08X - using fallback", (unsigned)rc);
     }
 
-    /* Fallback: this kernel has no hardware single step (or the thread context is
-       not readable right now).  Disarm, resume long enough for at least one
-       instruction to retire, then re-arm.  The stop state deliberately stays
-       published - but this path cannot guarantee "exactly one instruction", which
-       is why it is logged explicitly. */
-    disarmAllBreaks();
-    drainDebugEvents(NULL);
-    rc = continueAllOnce();
-    svcSleepThread(2000000ull);
-    rearmAllBreaks();
+    rc = stepResumeAndStop(hardware_step);
     g_LastResult = (s32)rc;
-    NXUS_LOG("debug step: fallback (no hardware single step) thread=%016llX rc=0x%08X",
-             (unsigned long long)tid, (unsigned)rc);
-    return rc;
+    if (R_FAILED(rc)) return rc;
+
+    /* Report where the step landed.  The stop event is re-sent with the new PC so
+       the PC does not have to poll for it, and a step that did not actually move
+       the PC is called out instead of being reported as a successful step. */
+    u64 pc_after = pc_before;
+    ThreadContext after;
+    memset(&after, 0, sizeof(after));
+    if (R_SUCCEEDED(svcGetDebugThreadContext(&after, g_Debug, tid, RegisterGroup_CpuAll))) {
+        pc_after = after.pc.x;
+    }
+    if (have_context && pc_after == pc_before) {
+        NXUS_LOG("debug step: WARNING pc did not advance (thread=%016llX pc=%016llX) - "
+                 "the target may have stopped on the same instruction",
+                 (unsigned long long)tid, (unsigned long long)pc_before);
+    }
+
+    publishStopState(tid, StopReason_Step);
+    sendStopEvent(tid, pc_after, 0, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    NXUS_LOG("debug step: %s thread=%016llX pc=%016llX -> %016llX",
+             hardware_step ? "hardware single step" : "fallback (no hardware single step)",
+             (unsigned long long)tid, (unsigned long long)pc_before,
+             (unsigned long long)pc_after);
+    return 0;
 }
 
 Result nxusDebugBreak(void) {
@@ -1222,24 +1479,31 @@ Result nxusDebugBreak(void) {
     /* Publish the stop BEFORE the break: the kernel pushes a DebuggerBreak
        exception, and the event loop must hold that event instead of acknowledging
        it immediately (it also holds it in auto-continue mode, because a manual
-       pause is explicit). */
-    atomic_store_explicit(&g_Stopped, true, memory_order_relaxed);
-    atomic_store_explicit(&g_StoppedThread, 0, memory_order_relaxed);
+       pause is explicit).  Going through publishStopState() keeps g_StopSeq in
+       step with the stop, which ContinueAll relies on. */
+    const bool was_stopped = nxusDebugIsStopped();
+    const u64 was_thread = nxusDebugStoppedThread();
+    const unsigned was_reason = atomic_load_explicit(&g_StopReason, memory_order_relaxed);
+    publishStopState(0, StopReason_Manual);
 
     Result rc = svcBreakDebugProcess(g_Debug);
     g_LastResult = (s32)rc;
     if (R_FAILED(rc)) {
-        atomic_store_explicit(&g_Stopped, false, memory_order_relaxed);
+        /* The break did not happen: do not keep the stop we just published (or the
+           one that was already there). */
+        if (was_stopped) {
+            atomic_store_explicit(&g_StoppedThread, was_thread, memory_order_relaxed);
+            atomic_store_explicit(&g_StopReason, was_reason, memory_order_relaxed);
+        } else {
+            clearStopState();
+        }
         NXUS_RESULT("svcBreakDebugProcess", rc);
         return rc;
     }
 
     NXUS_LOG("debug: break requested - target stopped");
-    NxusDebugStop stop;
-    memset(&stop, 0, sizeof(stop));
-    stop.kind = 0xFFFFFFFFu;   /* manual break: no breakpoint/kind behind it */
-    stop.slot = 0xFFFFFFFFu;
-    nxusNetSendEvent(NxusEvent_DebugStopped, &stop, (u32)sizeof(stop));
+    /* Manual break: no breakpoint/kind behind it. */
+    sendStopEvent(0, 0, 0, 0xFFFFFFFFu, 0xFFFFFFFFu);
     return 0;
 }
 

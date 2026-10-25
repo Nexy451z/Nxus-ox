@@ -95,7 +95,13 @@ analysis
                   whole 32-bit register set.
                   --stop holds the target on the hit (auto-continue 0): prints
                   STOPPED thread=... pc=... (main+0x...) with the code around the
-                  pc and every register; 'nxus continue' resumes, 'nxus step' steps
+                  pc and every register; 'nxus continue' resumes, 'nxus step' steps.
+                  A stopped target is never left behind: without --keep nxus
+                  detaches as soon as the last hit is printed (the game runs
+                  again, armed breakpoints cleared); with --keep the session stays
+                  alive, heartbeating, until --seconds expires and is then detached
+                  too.  Arming only changes the debug settings: the controller
+                  hotkey / watchdog applied from the GUI are left untouched.
   break <address> [--size 4] [--seconds S] [--keep] [--stop]
                   execute breakpoint (same as watch --kind exec), same hit context
 
@@ -1018,6 +1024,10 @@ fn execute(opts: &Opts) -> Result<()> {
 /// `default_kind` is the only difference between the two spellings: `watch`
 /// defaults to a write watchpoint, `break` to an execute breakpoint.  `--kind`
 /// still overrides both, so `watch <addr> --kind exec` keeps working.
+///
+/// The session is always handed back: [`DebugSession`] detaches on every exit
+/// path (including the `?` ones), and a `--stop` hit is never left holding the
+/// game after this process exits - see the cleanup block at the end.
 fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) -> Result<()> {
     let kind = opts.flag("kind").and_then(|k| break_kind::parse(k)).unwrap_or(default_kind);
     // --width is accepted as well: the docs and the GUI call it that, and an
@@ -1040,14 +1050,22 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
 
     let status = client.debug_attach()?;
     println!("debug mode: attached={} watch_style={}", status.attached, status.watch_style);
+
+    // dmnt is ours from this point on.  The guard hands it back on EVERY way out
+    // of this function - a `?` on break_set/break_clear/hit_clear used to return
+    // with the console still attached (the next scan then failed with BUSY until
+    // the console's 20 s reaper noticed).
+    let mut session = DebugSession::new(client);
+
     // The console's policy is explicit here, not assumed: --stop holds the target
     // on a hit, and without it a hit must resume the title exactly as before (the
     // switch defaults to the GDB-style hold, so "no flag" has to say so).
+    // 16 bytes only: the hotkey/watchdog settings applied from the GUI survive.
     if stop {
-        client.set_debug_config(status.watch_style, 0)?;
+        client.set_debug_auto_continue(status.watch_style, 0)?;
         println!("stop mode    : on (target held on a hit; nxus continue resumes)");
     } else {
-        client.set_debug_config(status.watch_style, 1)?;
+        client.set_debug_auto_continue(status.watch_style, 1)?;
     }
 
     client.hit_clear()?;
@@ -1059,8 +1077,18 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
     println!("waiting for {} hit(s) on {:08X} ...", want, address);
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut seen = 0usize;
+    // The console parks the target at the LAST --stop hit on purpose (that is
+    // the state `nxus continue` / `nxus step` inspect).  The cleanup below is
+    // what guarantees it does not outlive this process.
+    let mut held = false;
     let mut last_keepalive = Instant::now();
-    while seen < want && Instant::now() < deadline {
+    while Instant::now() < deadline {
+        // `--stop --keep` keeps the session (and the hold) alive until --seconds
+        // expires instead of exiting on the first hit: leaving a held target
+        // behind is the "hostage" state this command must never produce.
+        if seen >= want && !(stop && keep) {
+            break;
+        }
         // The console detaches a debug session after 20 s with no command at
         // all, which clears the breakpoint: keep the session alive or this
         // loop reports "no hit observed" for a watchpoint that still works.
@@ -1076,7 +1104,8 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
                     seen += 1;
                     // A held target cannot hit again, so release it for the next
                     // stop the caller asked for; the last one stays held.
-                    if seen < want {
+                    held = seen >= want;
+                    if !held {
                         let _ = client.debug_continue();
                     }
                 }
@@ -1101,20 +1130,93 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
         println!("no hit observed");
     }
 
-    if !keep {
-        client.break_clear(slot)?;
-        client.hit_clear()?;
+    // ---- cleanup: never leave the console holding the game -------------------
+    // `--stop` puts a hold policy on the console, so a session left behind would
+    // freeze the title at the next hit with no PC around to continue it.  Both
+    // a hit (`held`) and a kept `--stop` session therefore end with a detach -
+    // the difference is only WHEN: immediately without --keep (after the loop
+    // broke), or once --seconds expired with --keep.  A plain --keep (no --stop)
+    // still leaves the watchpoint armed, exactly as before: nothing is held
+    // then, the game keeps running.
+    let detaching = !keep || stop;
+    if detaching {
+        // A detach clears every hardware breakpoint anyway; clear the slot first
+        // so a failed detach still leaves nothing armed, and never `?` here: the
+        // detach below must run even when the clear fails.
+        if let Err(e) = client.break_clear(slot) {
+            eprintln!("warning: cannot clear breakpoint slot {:#x}: {}", slot, e);
+        }
+        let _ = client.hit_clear();
         if stop {
             // Leave the console on the default policy: a later non-stop watch must
             // not freeze the title because this run configured a hold.
-            let _ = client.set_debug_config(status.watch_style, 1);
+            let _ = client.set_debug_auto_continue(status.watch_style, 1);
         }
-        client.debug_detach()?;
-        println!("detached (dmnt restored)");
+        if session.detach() {
+            println!("detached (dmnt restored)");
+            if held {
+                println!("the game is running again (the stop was released, armed breakpoints cleared)");
+            }
+        } else {
+            eprintln!("warning: detach failed - the console's reaper releases dmnt in ~20 s");
+            if held {
+                eprintln!("warning: the target is still held; run 'nxus continue' to resume it");
+            }
+        }
     } else {
+        // Nothing is held (a plain --keep): the watchpoint may stay armed, so the
+        // guard must not detach on the way out.
+        session.leave_armed();
         println!("leaving the watchpoint armed (use: nxus detach)");
     }
     Ok(())
+}
+
+/// Detach-on-drop guard for the debug session `run_watch` owns.
+///
+/// Every early return (`?`) in that function has to give dmnt back: returning
+/// with the console still attached takes the cheat process away from every other
+/// client until the console's 20 s reaper notices.  A `Drop` cannot be
+/// forgotten, a cleanup label can.
+struct DebugSession<'a> {
+    client: &'a NxusClient,
+    /// True while this process still owes the console a detach.
+    must_detach: bool,
+}
+
+impl<'a> DebugSession<'a> {
+    fn new(client: &'a NxusClient) -> DebugSession<'a> {
+        DebugSession { client, must_detach: true }
+    }
+
+    /// Give dmnt back.  Returns false when the console refused: the caller must
+    /// not claim a state it has not reached, and `Drop` retries once.
+    fn detach(&mut self) -> bool {
+        if !self.must_detach {
+            return true;
+        }
+        if self.client.debug_detach().is_ok() {
+            self.must_detach = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Leave the session to whoever comes next (`--keep` on a target that is
+    /// still running): nothing is held, so exiting with the watchpoint armed is
+    /// what the user asked for.  The console reaps an idle session after 20 s.
+    fn leave_armed(&mut self) {
+        self.must_detach = false;
+    }
+}
+
+impl Drop for DebugSession<'_> {
+    fn drop(&mut self) {
+        if self.must_detach {
+            let _ = self.client.debug_detach();
+        }
+    }
 }
 
 /// The `--stop` counterpart of a hit: one STOPPED line, then the same context a

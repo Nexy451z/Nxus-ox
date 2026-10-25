@@ -66,15 +66,20 @@ pub enum Cmd {
     HitClear,
     SnapshotCapture { slot: u32, scope: u32 },
     SnapshotDiff { from: u32, to: u32 },
-    Config { mask: u64, hold: u32, enabled: u32, watchdog: u32, style: u32 },
+    /// The Settings window's "Apply": the FULL config request (hotkey, watchdog,
+    /// chunk, watch style) plus the current stop-on-hit policy, because the
+    /// console rewrites every field from it and a stale auto_continue would thaw
+    /// a target the user expects to be held.
+    Config { mask: u64, hold: u32, enabled: u32, watchdog: u32, style: u32,
+             auto_continue: u32 },
     Pause,
     Resume,
-    /// Push the console's debug block before arming: `auto_continue = 0` means
-    /// "hold the target at the hit" (GDB style), `1` means "record the hit and
-    /// resume".  The server rewrites its whole config from one CONFIG request,
-    /// so the hotkey/watchdog half travels along instead of being zeroed.
-    DebugConfigure { auto_continue: u32, mask: u64, hold: u32, enabled: u32,
-                     watchdog: u32, style: u32 },
+    /// Push ONLY the debug block before arming (a 16-byte `NxusDebugConfig`):
+    /// `auto_continue = 0` means "hold the target at the hit" (GDB style), `1`
+    /// means "record the hit and resume".  The console treats that length as
+    /// "debug settings only", so the hotkey/watchdog block applied from Settings
+    /// is NOT rewritten (sending the full request used to zero it).
+    DebugConfigure { auto_continue: u32, style: u32 },
     /// Resume the threads the console parked at a breakpoint
     /// (NxusCmd_DebugContinue -> svcContinueDebugEvent).
     DebugContinue,
@@ -115,6 +120,11 @@ pub enum Ev {
     /// The UI turns this into the stop banner, a register fetch and the
     /// disassembly around the PC.
     DebugStopped { thread_id: u64, pc: u64, address: u64, kind: u32, slot: u32 },
+    /// The debug session itself changed (Attach / Detach answered).  Everything
+    /// the UI knows about a parked thread belongs to the session that reported
+    /// it, so the banner and the cached register/code views are dropped; the
+    /// status reply sent just before this event decides whether anything is held.
+    DebugSession { attached: bool },
     Snapshot { summary: P::SnapshotSummary, changed: Vec<ChangedBlock> },
     Async { kind: u16, payload: Vec<u8> },
     Progress { done: u64, total: u64, label: String },
@@ -646,10 +656,21 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         Cmd::Attach => {
                             let st = c.debug_attach().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message(format!("debug attached (watch style {})", st.watch_style)));
+                            // A fresh session owns whatever the previous one left
+                            // parked: re-read the status so the stop badge comes
+                            // from the console again, and tell the UI to drop the
+                            // banner/caches of the old session.
+                            push_status(c, &tx);
+                            let _ = tx.send(Ev::DebugSession { attached: true });
                         }
                         Cmd::Detach => {
                             c.debug_detach().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message("debug detached (dmnt restored)".into()));
+                            // dmnt cannot be holding anything after a detach: the
+                            // status reply (no stopped bit) clears the badge, the
+                            // event clears the banner and the cached context.
+                            push_status(c, &tx);
+                            let _ = tx.send(Ev::DebugSession { attached: false });
                         }
                         Cmd::BreakSet { address, kind, size } => {
                             let slot = if kind == break_kind::EXECUTE { 0 } else { 0x10 };
@@ -688,11 +709,18 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let _ = tx.send(Ev::Message(format!("diff: {} changed block(s)", summary.changed_count)));
                             let _ = tx.send(Ev::Snapshot { summary, changed });
                         }
-                        Cmd::Config { mask, hold, enabled, watchdog, style } => {
-                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, 1, Some((style, 1)))
+                        Cmd::Config { mask, hold, enabled, watchdog, style, auto_continue } => {
+                            // "Apply" is the full request on purpose: the user is
+                            // applying EVERY setting.  auto_continue is the current
+                            // stop-on-hit choice - hardcoding 1 here used to
+                            // silently release a held target / break a --stop watch.
+                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, 1,
+                                         Some((style, auto_continue)))
                                 .map_err(|e| e.to_string())?;
-                            let _ = tx.send(Ev::Message(format!("settings applied (hotkey 0x{:X}, watchdog {} ms)",
-                                                                mask, watchdog)));
+                            let _ = tx.send(Ev::Message(format!(
+                                "settings applied (hotkey 0x{:X}, watchdog {} ms, {} on hit)",
+                                mask, watchdog,
+                                if auto_continue == 0 { "stop" } else { "auto-resume" })));
                         }
                         Cmd::Pause => {
                             c.pause().map_err(|e| e.to_string())?;
@@ -706,12 +734,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let _ = tx.send(Ev::Message("resumed".into()));
                             push_status(c, &tx);
                         }
-                        Cmd::DebugConfigure { auto_continue, mask, hold, enabled, watchdog, style } => {
-                            // One request carries both blocks (that is how the server
-                            // parses it), so the hotkey/watchdog settings are re-sent
-                            // unchanged instead of being silently reset.
-                            c.set_config(mask, hold, enabled, 0, watchdog, 5000, 1,
-                                         Some((style, auto_continue)))
+                        Cmd::DebugConfigure { auto_continue, style } => {
+                            // 16 bytes only (NxusDebugConfig): the console applies
+                            // the debug half and keeps its hotkey/watchdog block,
+                            // so arming a watchpoint cannot reset the settings the
+                            // user applied from the Settings window.
+                            c.set_debug_auto_continue(style, auto_continue)
                                 .map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message(format!(
                                 "debug: {} (auto_continue={})",
@@ -1035,11 +1063,15 @@ impl State {
         self.status.as_ref().map(|s| s.main_base).unwrap_or(0)
     }
 
-    /// The target is held: either a breakpoint stop with details (banner) or just
-    /// the console's status bit (a manual break/scan pause, badge only).
+    /// The target is held.  `NxusStatus.status_flags & ST_DEBUG_STOPPED` is the
+    /// ONLY source of truth: a `DebugStopped` event sets the bit immediately (that
+    /// is what makes the badge appear without waiting for a poll), and every
+    /// status reply corrects it - including to "running" when the console resumed
+    /// the target (Continue, the watchdog, a detach).  `debug_stop` only carries
+    /// the details of a breakpoint hit; it never decides the state on its own,
+    /// because a failed Continue would otherwise show a running game.
     pub fn is_stopped(&self) -> bool {
-        self.debug_stop.is_some()
-            || self.status.as_ref().map(|s| s.debug_stopped()).unwrap_or(false)
+        self.status.as_ref().map(|s| s.debug_stopped()).unwrap_or(false)
     }
 
     pub fn heap_base(&self) -> u64 {
@@ -1507,6 +1539,20 @@ impl App {
                     thread_id, pc, size: DISASM_PAGE,
                 });
             }
+            Ev::DebugSession { attached } => {
+                // Attach/Detach answered.  Whatever the previous session parked is
+                // gone: the banner and the cached context describe a thread that no
+                // longer exists.  The stopped badge is NOT decided here - the status
+                // reply the worker sent just before this event is the truth
+                // (a fresh attach can legitimately report a held target again).
+                self.st.debug_stop = None;
+                self.invalidate_debug_views();
+                self.st.log(if attached {
+                    "debug session attached - stop state re-read from the console"
+                } else {
+                    "debug session detached - stop banner and cached context cleared"
+                });
+            }
             Ev::Snapshot { summary, changed } => {
                 self.st.snapshot.summary = Some(summary);
                 self.st.snapshot.changed = changed;
@@ -1528,15 +1574,21 @@ impl App {
                 }
                 event::HOTKEY_PAUSED => {
                     self.st.log("hotkey: target paused");
+                    // NXUS_ST_PAUSED (0x0001).  0x0004 is NXUS_ST_HAS_PROCESS, and
+                    // setting it here claimed a process existed long after the
+                    // game had gone.  Only this bit is touched: an event must not
+                    // rewrite the rest of the flag word.
                     if let Some(st) = self.st.status.as_mut() {
-                        st.status_flags |= 0x0004;
+                        st.status_flags |= P::ST_PAUSED;
                     }
                 }
                 event::AUTO_RESUME => {
                     self.st.log("watchdog: target auto-resumed");
+                    // The console released the target: clear the paused flag and
+                    // the debug-stop bit it implies, nothing else (a `&= !bits`
+                    // keeps every other flag the status reply reported).
                     if let Some(st) = self.st.status.as_mut() {
-                        st.status_flags &= !0x0004;
-                        st.status_flags &= !P::ST_DEBUG_STOPPED;
+                        st.status_flags &= !(P::ST_PAUSED | P::ST_DEBUG_STOPPED);
                     }
                     self.st.debug_stop = None;   // it is running again, banner goes
                 }
@@ -1855,20 +1907,12 @@ impl App {
         self.send(Cmd::Resume, "resuming target");
     }
 
-    /// Build the CONFIG request that carries the debug block.  It has to be sent
-    /// BEFORE the breakpoint is set, otherwise the first hit resumes behind the
-    /// user's back.  The whole config travels because the server rewrites all of
-    /// it, and the hotkey/watchdog half must not be zeroed as a side effect.
+    /// Build the arm-time policy push.  It carries ONLY the debug block (16
+    /// bytes, `NxusDebugConfig`): the console's hotkey/watchdog settings belong
+    /// to the Settings window, and rewriting them here used to wipe a hotkey the
+    /// user had just applied (the CLI had the same bug).
     fn debug_config_cmd(&self, auto_continue: u32) -> Cmd {
-        let enabled = self.prefs.hotkey_enabled as u32;
-        Cmd::DebugConfigure {
-            auto_continue,
-            mask: if enabled == 0 { 0 } else { self.prefs.hotkey_mask },
-            hold: self.prefs.hotkey_hold,
-            enabled,
-            watchdog: self.prefs.watchdog_ms,
-            style: self.prefs.watch_style,
-        }
+        Cmd::DebugConfigure { auto_continue, style: self.prefs.watch_style }
     }
 
     /// Arm a breakpoint the way the WATCHPOINT section does: push "stop on hit"
@@ -1901,18 +1945,30 @@ impl App {
         self.arm_breakpoint(address, kind, size, "arming watchpoint");
     }
 
-    /// Continue past a debug stop (banner button, F10).  The console has no
-    /// "resumed" event, so the banner clears here and the status reply the worker
-    /// fetches afterwards confirms it (and corrects the banner if it failed).
+    /// Continue past a debug stop (banner button, F10).
+    ///
+    /// The stop is NOT cleared here: the console has no "resumed" event, so the
+    /// status reply the worker fetches right after the command is what clears the
+    /// banner and the STOPPED flag.  Clearing it optimistically showed a running
+    /// game for a target a failed `DebugContinue` had left stopped (and the
+    /// banner, with Continue/Step on it, was gone with it).
     pub fn debug_continue(&mut self) {
-        self.clear_stop();
-        self.send(Cmd::DebugContinue, "continuing");
+        if !self.st.connected {
+            self.st.log("not connected: Continue needs a live debug session (F8 attaches)");
+            return;
+        }
+        self.send(Cmd::DebugContinue, "continuing (the banner clears once the console confirms)");
     }
 
     /// Single step the held thread.  A step does NOT release the target (the
     /// console keeps the stop published), so the banner stays and the context is
-    /// re-read afterwards - only the PC moves.
+    /// re-read afterwards - only the PC moves.  Nothing is cleared before the
+    /// console answers, for the same reason as [`App::debug_continue`].
     pub fn debug_step(&mut self) {
+        if !self.st.connected {
+            self.st.log("not connected: Step needs a live debug session (F8 attaches)");
+            return;
+        }
         let stop = self.st.debug_stop.clone();
         let thread_id = stop.as_ref().map(|s| s.thread_id).unwrap_or(0);
         let pc = stop.as_ref().map(|s| s.pc).unwrap_or(0);
@@ -1927,13 +1983,20 @@ impl App {
         }
     }
 
-    /// The console has no "resumed" event: clear the stop locally when the user
-    /// asks to run again, and let the next status reply correct a stale banner.
+    /// Drop the register bar and the code listing: both belong to the thread the
+    /// session had parked, so they are meaningless once the session changes
+    /// (attach, detach, a fresh stop on another thread).
+    fn invalidate_debug_views(&mut self) {
+        self.st.last_regs = None;
+        self.st.disasm_bytes.clear();
+        self.st.disasm_highlight_pc = None;
+    }
+
+    /// Forget the stop DETAILS.  The stopped state itself is not cleared here:
+    /// `status_flags & ST_DEBUG_STOPPED` is the only truth, and only the console
+    /// (through the next status reply) can say the target runs again.
     fn clear_stop(&mut self) {
         self.st.debug_stop = None;
-        if let Some(status) = self.st.status.as_mut() {
-            status.status_flags &= !P::ST_DEBUG_STOPPED;
-        }
     }
 }
 

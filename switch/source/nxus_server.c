@@ -22,6 +22,15 @@ static volatile bool g_CommandActive;
 static volatile u64  g_CommandStartedMs;
 #define NXUS_COMMAND_GRACE_MS 30000u
 
+/* Break-list reply size.  The debugger tracks every hardware slot now (ten: six
+   instruction + four watch, NXUS_DEBUG_MAX_BREAKS), and nxus_server.h still carries
+   the older 8, so the arrays are sized from the larger of the two - a smaller array
+   would silently truncate BreakSet/BreakList replies and hide a live breakpoint. */
+#define NXUS_DEBUG_SERVER_BREAK_MAX \
+    ((NXUS_DEBUG_SERVER_MAX_BREAKS > NXUS_DEBUG_MAX_BREAKS) \
+         ? NXUS_DEBUG_SERVER_MAX_BREAKS \
+         : NXUS_DEBUG_MAX_BREAKS)
+
 /* ---- pause / resume state ---------------------------------------------- */
 
 /* True while Pause holds the target through Nxus's own debug session
@@ -1028,7 +1037,18 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_Config: {
-            if (length >= sizeof(NxusConfig)) {
+            /* Two payload shapes share this command:
+                 - sizeof(NxusConfig) (32 B), optionally followed by a
+                   sizeof(NxusDebugConfig) (16 B) debug tail: the full settings;
+                 - exactly sizeof(NxusDebugConfig) (16 B): the debug settings alone
+                   (watch style, auto_continue).  The PC sends this shape when it
+                   toggles stop-on-hit while a breakpoint is armed, and the hotkey /
+                   watchdog / chunk fields must keep their current values - reading
+                   those 16 bytes as a NxusConfig would zero the controller hotkey.
+               Every other length changes nothing instead of being half-applied. */
+            const bool debug_only = (length == sizeof(NxusDebugConfig));
+
+            if (!debug_only && length >= sizeof(NxusConfig)) {
                 memcpy(&g_Config, payload, sizeof(g_Config));
                 nxusSessionSetWatchdogTimeout(g_Config.watchdog_timeout_ms);
                 nxusSessionSetChunkSize(g_Config.chunk_size);
@@ -1036,9 +1056,10 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 if (g_Config.hotkey_enabled && g_Config.hotkey_mask != 0) nxusHidStart();
             }
             /* optional tail: NxusDebugConfig (watchpoint encoding style) */
-            if (length >= sizeof(NxusConfig) + sizeof(NxusDebugConfig)) {
+            if (debug_only || length >= sizeof(NxusConfig) + sizeof(NxusDebugConfig)) {
                 NxusDebugConfig dbg;
-                memcpy(&dbg, payload + sizeof(NxusConfig), sizeof(dbg));
+                const u8 *dbg_src = debug_only ? payload : payload + sizeof(NxusConfig);
+                memcpy(&dbg, dbg_src, sizeof(dbg));
                 /* A pause that went through the debug session must survive a
                    settings round-trip: auto_continue=1 releases a held target at
                    once (that is what the setter is for), which would thaw the game
@@ -1051,7 +1072,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 }
                 nxusDebugConfigure(&dbg);
                 pauseUnlock();
-                NXUS_LOG("debug config: watch style=%u auto_continue=%u",
+                NXUS_LOG("debug config%s: watch style=%u auto_continue=%u",
+                         debug_only ? " (debug-only payload)" : "",
                          (unsigned)dbg.style, (unsigned)dbg.auto_continue);
             }
             reply(fd, type, seq, &g_Config, sizeof(g_Config));
@@ -1179,8 +1201,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (R_FAILED(rc)) {
                 replyError(fd, type, seq, rc);
             } else {
-                NxusBreakEntry entries[NXUS_DEBUG_SERVER_MAX_BREAKS];
-                u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_MAX_BREAKS);
+                NxusBreakEntry entries[NXUS_DEBUG_SERVER_BREAK_MAX];
+                u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_BREAK_MAX);
                 reply(fd, type, seq, entries, n * (u32)sizeof(NxusBreakEntry));
             }
             break;
@@ -1199,8 +1221,8 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_BreakList: {
-            NxusBreakEntry entries[NXUS_DEBUG_SERVER_MAX_BREAKS];
-            u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_MAX_BREAKS);
+            NxusBreakEntry entries[NXUS_DEBUG_SERVER_BREAK_MAX];
+            u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_BREAK_MAX);
             reply(fd, type, seq, entries, n * (u32)sizeof(NxusBreakEntry));
             break;
         }
@@ -1330,6 +1352,27 @@ static void refreshTargetIdentityThrottled(void) {
     (void)nxusSessionRefreshIdentity();
 }
 
+/* The debugee exited while we were attached.  The event thread has already
+   dropped g_Attached / the stop state and re-enabled dmnt's auto-reopen, but it
+   cannot close the debug handle itself (nxusDebugDetach() joins the event thread,
+   so calling it from there would self-deadlock).  Collect the dead session here,
+   on the main thread: nxusDebugDetach() then joins the already-finished event
+   thread, wipes the hardware slots, closes the handle and reopens dmnt. */
+static void reapExitedDebugSession(void) {
+    if (!nxusDebugExitedPending()) return;
+    NXUS_LOG("debug: debugee exited - releasing the dead debug session");
+    pauseLock();
+    Result rc = nxusDebugDetach();
+    if (R_FAILED(rc)) NXUS_RESULT("debug session release after exit", rc);
+    if (g_PauseViaDebug) {
+        /* The process is gone, so the pause it was held for is meaningless. */
+        g_PauseViaDebug = false;
+        nxusSessionSetPaused(false);
+        NXUS_LOG("debug-session pause released (debugee exited)");
+    }
+    pauseUnlock();
+}
+
 void nxusServerTick(void) {
     /* Checked first: a long handler (snapshot, pointer scan) blocks the
        connection thread, so both the pause watchdog and the stale-session
@@ -1345,6 +1388,7 @@ void nxusServerTick(void) {
                  (unsigned long long)(now - started));
         g_CommandActive = false;
     }
+    reapExitedDebugSession();
     reapStaleDebugSession();
     refreshTargetIdentityThrottled();
     if (nxusSessionWatchdogExpired(nxusSessionWatchdogTimeout())) {

@@ -7,10 +7,16 @@ TOOLS=$NXUS_ROOT/tools
 PY=python
 BLDPFS0=/opt/devkitpro/tools/bin/build_pfs0
 
+# Shown in the per-folder README.txt / metadata.json so DBI, file managers and
+# other agents can tell what 4200000000004E58 actually is.
+NXUS_VERSION=0.1.0-alpha
+
 build_target() {
     dir="$1"        # switch | probe
     tid="$2"        # title id used for the SD path
     name="$3"       # target name (nso/npdm basename)
+    role="${4:-sysmodule}"
+    description="${5:-Nxus-ox sysmodule}"
 
     echo "== $name ($dir) =="
     if ! make -C "$NXUS_ROOT/$dir" > "$NXUS_ROOT/$dir/build.log" 2>&1; then
@@ -50,13 +56,61 @@ PYEOF
     fi
 
     $PY "$TOOLS/verify_artifact.py" "$dist/exefs.nsp"
+
+    # Identification metadata.
+    #
+    # A custom sysmodule carries no name: its NPDM has a title id and nothing else,
+    # so tools that list SD contents (DBI, homebrew file managers) show the bare
+    # 4200000000004E58 and the user (or another agent) cannot tell what it is.
+    # Ship a plain-text + JSON description next to the exefs so the folder is
+    # self-describing.  These files are inert: Atmosphère only reads exefs.nsp and
+    # flags/, so nothing about the module's behaviour depends on them.
+    cat > "$dist/README.txt" <<EOF
+$name - part of Nxus-ox (Alpha v$NXUS_VERSION)
+title id : 0x$tid
+role     : $role
+built    : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+Nxus-ox is a headless remote memory scanner / pointer finder / hardware
+debugger for Nintendo Switch (Atmosphère).  There is no on-screen UI: the PC
+client (nxus.exe) talks to this sysmodule over TCP port 7332.
+
+PC client : nxus.exe --host <SWITCH_IP> status
+Project   : https://github.com/Nexy451z/Nxus-ox
+Alpha software, no warranty.  Always run on emuMMC with a NAND/SD backup.
+
+Files here:
+  exefs.nsp     the sysmodule Atmosphère loads
+  flags/        boot2.flag makes it start at boot (empty file)
+  metadata.json machine-readable copy of this information
+EOF
+
+    cat > "$dist/metadata.json" <<EOF
+{
+  "name": "$name",
+  "project": "Nxus-ox",
+  "version": "$NXUS_VERSION",
+  "channel": "alpha",
+  "title_id": "0x$tid",
+  "role": "$role",
+  "description": "$description",
+  "tcp_port": 7332,
+  "repository": "https://github.com/Nexy451z/Nxus-ox",
+  "built_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "warranty": "none - alpha software, use on emuMMC with a backup"
+}
+EOF
     echo
 }
 
 # Sysmodule title ids live in the 0x42... range on a real console; 0x0100... is the
 # homebrew *application* range and is not started at boot2 (Atmosphère 1.12.1 / FW 23).
-build_target switch 4200000000004E58 nxus
-build_target probe  4200000000004E59 probe
+build_target switch 4200000000004E58 nxus \
+    "memory scanner / pointer finder / hardware debugger (sysmodule)" \
+    "Nxus-ox main sysmodule: headless remote memory scanner, pointer chain finder and hardware watchpoint/breakpoint debugger for Nintendo Switch (Atmosphère). No on-screen UI; the PC client nxus.exe connects over TCP port 7332."
+build_target probe  4200000000004E59 probe \
+    "hardware diagnostic probe (sysmodule, optional)" \
+    "Nxus-ox diagnostic probe: answers the hardware bring-up questions (can a custom sysmodule obtain debug privileges, are hardware breakpoints per-core, which debug control words the kernel accepts) and writes the verdict to sdmc:/nxus/probe.txt. Do not run it at the same time as the main nxus sysmodule."
 
 echo "== dist tree =="
 find "$NXUS_ROOT/dist" -type f | sed "s|$NXUS_ROOT/||"
