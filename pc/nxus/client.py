@@ -305,7 +305,7 @@ class NxusClient:
 
     def scan_hits(self, offset: int = 0, count: int = 4096) -> dict:
         _, _, body = self.request(P.CMD['ScanGetHits'], P.GET_HITS_REQUEST.pack(offset, count, 0, 0))
-        session, n, total, value_size, mapping_count, _res = P.HIT_BATCH_HEADER.unpack_from(body, 0)
+        session, n, total, value_size, mapping_count, flags = P.HIT_BATCH_HEADER.unpack_from(body, 0)
         pos = P.HIT_BATCH_HEADER.size
         bases = []
         for _ in range(mapping_count):
@@ -318,14 +318,25 @@ class NxusClient:
             base = bases[map_idx] if map_idx < len(bases) else 0
             hits.append(dict(address=base + off, offset=off, mapping_idx=map_idx, value=value))
         return dict(session=session, count=n, total=total, value_size=value_size,
-                    bases=bases, hits=hits)
+                    bases=bases, hits=hits,
+                    truncated=bool(flags & P.HITBATCH_TRUNCATED))
 
     def scan_all_hits(self, page: int = 4096) -> list[dict]:
+        self.last_scan_truncated = False
         out = []
+        truncated = False
         while True:
             batch = self.scan_hits(len(out), page)
+            truncated = truncated or batch.get('truncated', False)
             out.extend(batch['hits'])
             if len(out) >= batch['total'] or not batch['hits']:
+                # The console reports "hit list full" through the batch flags; keep
+                # it so callers (and users) can tell a complete list from a cut-off
+                # one instead of treating both as final.
+                self.last_scan_truncated = truncated
+                if truncated:
+                    print(f"warning: the console hit its hit-list limit - "
+                          f"{len(out)} hits collected, more may exist")
                 return out
 
     @staticmethod

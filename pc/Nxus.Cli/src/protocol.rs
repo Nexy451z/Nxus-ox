@@ -2332,6 +2332,10 @@ mod tests {
         assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_DebugStopped"),
                    Some(event::DEBUG_STOPPED as u32));
         assert_eq!(header_define(HEADER, "NXUS_ST_DEBUG_STOPPED"), Some(ST_DEBUG_STOPPED));
+        // reserved-flag on the hit batch (added in Round 4/5): a drift here would
+        // silently turn a truncated result back into a "complete" one.
+        assert_eq!(header_define(HEADER, "NXUS_HITBATCH_TRUNCATED"),
+                   Some(NXUS_HITBATCH_TRUNCATED));
         assert_eq!(header_size(HEADER, "NxusDebugStop"), Some(DebugStop::SIZE as u32));
         assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
     }

@@ -690,7 +690,9 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     header.session_id = nxusSessionId();
     /* A list sitting exactly at its capacity may have more hits that were never
        collected: say so instead of letting the client present it as complete. */
-    if (hits->count >= hits->max_capacity) header.reserved |= NXUS_HITBATCH_TRUNCATED;
+    if (hits->max_capacity != 0 && hits->count >= hits->max_capacity) {
+        header.reserved |= NXUS_HITBATCH_TRUNCATED;
+    }
     header.count = count;
     header.total = hits->count;
     header.value_size = hits->value_size;

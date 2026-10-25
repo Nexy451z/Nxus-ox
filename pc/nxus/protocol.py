@@ -33,6 +33,9 @@ SCAN_REQUEST = struct.Struct('<IIIIQQQQII')
 # Optional tail of NxusScanRequest (value type + pattern for string / byte scans)
 SCAN_EXT = struct.Struct('<IIII')
 HIT_BATCH_HEADER = struct.Struct('<IIIIII')
+
+# NxusHitBatchHeader.reserved flags - mirrors NXUS_HITBATCH_* in core/nxus_protocol.h.
+HITBATCH_TRUNCATED = 0x0001   # the console filled its hit list; results may be cut off
 HIT = struct.Struct('<IHHQ')   # offset, mapping_idx, value_type, value
 FROZEN_ENTRY = struct.Struct('<QQII')
 FROZEN_REQUEST = struct.Struct('<QII')

@@ -157,7 +157,11 @@ class MockSwitch:
         self.attached_pid = 0
         self.watch_style = P.WATCH_STYLE_LINK5
         self.breaks: list[dict] = []
-        self.hits: list[dict] = []
+        # Break/watch hits are dicts; the SCAN hit list above is a list of
+        # (mapping_idx, offset, bytes) tuples.  Two very different shapes must not
+        # share one attribute name: the scan reply then tried to unpack dicts and
+        # the debug reply tried to read tuple keys.
+        self.break_hits: list[dict] = []
         self.threads = [0x1001, 0x1002]
         # Two shapes on purpose.  0x1001 is the AArch64 form (SP/LR/FP live in the
         # ThreadContext header fields).  0x1002 is what a 32-bit title reports
@@ -508,6 +512,10 @@ class MockSwitch:
         if cmd == P.CMD['DebugDetach']:
             self.attached = False
             self.breaks = []
+            # The sysmodule drops every hit with the session (nxus_debug.c resets
+            # its table on detach); keep the mock in step or a stale hit is
+            # reported against the next attach.
+            self.break_hits = []
             self.stopped_thread = 0
             return b''
         if cmd == P.CMD['DebugStatus']:
@@ -599,7 +607,7 @@ class MockSwitch:
         if cmd == P.CMD['HitGet']:
             return self._hit_list()
         if cmd == P.CMD['HitClear']:
-            self.hits = []
+            self.break_hits = []
             return b''
         if cmd == P.CMD['PtrScanBegin']:
             return self._ptr_scan(payload)
@@ -760,7 +768,7 @@ class MockSwitch:
 
     def _debug_status(self) -> bytes:
         return P.DEBUG_STATUS.pack(1 if self.attached else 0, self.watch_style,
-                                   len(self.breaks), len(self.hits), len(self.threads),
+                                   len(self.breaks), len(self.break_hits), len(self.threads),
                                    self.last_result, self.auto_continue,
                                    self.stopped_thread & 0xFFFFFFFF)
 
@@ -770,7 +778,7 @@ class MockSwitch:
 
     def _hit_list(self) -> bytes:
         out = b''
-        for h in reversed(self.hits):          # newest first, like the sysmodule
+        for h in reversed(self.break_hits):    # newest first, like the sysmodule
             out += self._pack_hit(h)
         return out
 
@@ -834,10 +842,10 @@ class MockSwitch:
         if value:
             r_vals[3] = value & 0xFFFFFFFF       # r3 held the value being written
 
-        hit = dict(index=len(self.hits), kind=kind, slot=slot, thread_id_low=thread_id,
+        hit = dict(index=len(self.break_hits), kind=kind, slot=slot, thread_id_low=thread_id,
                    address=hit_address, pc=pc, lr=lr, sp=sp, cpsr=cpsr,
                    r=r_vals, tick=12345)
-        self.hits.append(hit)
+        self.break_hits.append(hit)
         self.send_event(P.EVT['BreakHit'], self._pack_hit(hit))
         if self.auto_continue == 0:
             # auto_continue=0: the console holds the thread at the trapping

@@ -17,6 +17,8 @@ build_target() {
     name="$3"       # target name (nso/npdm basename)
     role="${4:-sysmodule}"
     description="${5:-Nxus-ox sysmodule}"
+    tcp_port="${6:-7332}"
+    boot2="${7:-1}"
 
     echo "== $name ($dir) =="
     if ! make -C "$NXUS_ROOT/$dir" > "$NXUS_ROOT/$dir/build.log" 2>&1; then
@@ -89,12 +91,27 @@ PYEOF
         printf '%s - part of Nxus-ox (Alpha v%s)\n' "$name" "$NXUS_VERSION"
         printf 'title id : 0x%s\n' "$tid"
         printf 'role     : %s\n' "$role"
+        if [ "$tcp_port" = "0" ]; then
+            printf 'tcp port : none (diagnostic only - this module does not listen)\n'
+        else
+            printf 'tcp port : %s\n' "$tcp_port"
+        fi
+        if [ "$boot2" = "1" ]; then
+            printf 'boot2    : yes (flags/boot2.flag ships with this folder)\n'
+        else
+            printf 'boot2    : no (this folder must NOT get a flags/boot2.flag)\n'
+        fi
         printf 'built    : %s\n' "$built"
         cat <<'README_EOF'
 
 Nxus-ox is a headless remote memory scanner / pointer finder / hardware
 debugger for Nintendo Switch (Atmosphère).  There is no on-screen UI: the PC
-client (nxus.exe) talks to this sysmodule over TCP port 7332.
+client (nxus.exe) talks to the main sysmodule over TCP port 7332.
+
+This is the main nxus sysmodule and owns port 7332.  The optional diagnostic
+probe (title id 0x4200000000004E59) must never be installed with its own
+flags/boot2.flag at the same time: two custom sysmodules both taking a debug
+handle fight over the same process.
 
 PC client : nxus.exe --host <SWITCH_IP> status
 Project   : https://github.com/Nexy451z/Nxus-ox
@@ -112,11 +129,11 @@ README_EOF
     # quotes, backslashes or newlines and still produce valid JSON.  The result
     # is re-parsed before it replaces the old file.
     meta_tmp="$dist/metadata.json.tmp"
-    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" <<'PYEOF'
+    $PY - "$meta_tmp" "$name" "$NXUS_VERSION" "$tid" "$role" "$description" "$built" "$tcp_port" "$boot2" <<'PYEOF'
 import json
 import sys
 
-out, name, version, tid, role, description, built = sys.argv[1:8]
+out, name, version, tid, role, description, built, tcp_port, boot2 = sys.argv[1:10]
 data = {
     "name": name,
     "project": "Nxus-ox",
@@ -125,7 +142,8 @@ data = {
     "title_id": "0x" + tid,
     "role": role,
     "description": description,
-    "tcp_port": 7332,
+    "tcp_port": int(tcp_port),
+    "boot2_flag": boot2 == "1",
     "repository": "https://github.com/Nexy451z/Nxus-ox",
     "built_utc": built,
     "warranty": "none - alpha software, use on emuMMC with a backup",
@@ -145,8 +163,9 @@ build_target switch 4200000000004E58 nxus \
     "memory scanner / pointer finder / hardware debugger (sysmodule)" \
     "Nxus-ox main sysmodule: headless remote memory scanner, pointer chain finder and hardware watchpoint/breakpoint debugger for Nintendo Switch (Atmosphère). No on-screen UI; the PC client nxus.exe connects over TCP port 7332."
 build_target probe  4200000000004E59 probe \
-    "hardware diagnostic probe (sysmodule, optional)" \
-    "Nxus-ox diagnostic probe: answers the hardware bring-up questions (can a custom sysmodule obtain debug privileges, are hardware breakpoints per-core, which debug control words the kernel accepts) and writes the verdict to sdmc:/nxus/probe.txt. Do not run it at the same time as the main nxus sysmodule."
+    "hardware diagnostic probe (sysmodule, optional - does NOT listen on port 7332)" \
+    "Nxus-ox diagnostic probe: answers the hardware bring-up questions (can a custom sysmodule obtain debug privileges, are hardware breakpoints per-core, which debug control words the kernel accepts) and writes the verdict to sdmc:/nxus/probe.txt. It never opens a TCP port and must not run at the same time as the main nxus sysmodule (0x4200000000004E58), because both would try to own a debug handle." \
+    0 0
 
 echo "== dist tree =="
 find "$NXUS_ROOT/dist" -type f | sed "s|$NXUS_ROOT/||"

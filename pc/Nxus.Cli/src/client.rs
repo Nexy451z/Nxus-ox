@@ -293,6 +293,8 @@ fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
 
 pub struct NxusClient {
     max_read: std::sync::atomic::AtomicU32,
+    /// Set when a hit batch reports NXUS_HITBATCH_TRUNCATED (see scan_all_hits).
+    truncated: std::sync::atomic::AtomicBool,
     stream: Mutex<TcpStream>,
     pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
     events: Mutex<Receiver<Event>>,
@@ -360,6 +362,7 @@ impl NxusClient {
 
         Ok(NxusClient {
             max_read: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_READ),
+            truncated: std::sync::atomic::AtomicBool::new(false),
             stream: Mutex::new(stream),
             pending,
             events: Mutex::new(event_rx),
@@ -709,6 +712,16 @@ impl NxusClient {
     /// arbitrarily large `Vec::with_capacity`.
     pub const MAX_ALL_HITS: usize = crate::pcscan::DEFAULT_MAX_HITS;
 
+    /// True when the last `scan_all_hits()` reply reported a full hit list on the
+    /// console, i.e. the returned set may be missing matches.
+    pub fn last_scan_truncated(&self) -> bool {
+        self.truncated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_last_scan_truncated(&self, value: bool) {
+        self.truncated.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn scan_all_hits(&self, page: u32) -> Result<Vec<Hit>> {
         // Collected hits are only ever appended, so every growth step used to
         // copy everything gathered so far (thousands of pages -> ~15 reallocs and
@@ -716,6 +729,7 @@ impl NxusClient {
         // already carries the final count, so size the vector once from it.
         let mut all: Vec<Hit> = Vec::new();
         let mut sized = false;
+        let mut truncated = false;
         loop {
             let batch = self.scan_hits(all.len() as u32, page)?;
             if !sized {
@@ -725,12 +739,17 @@ impl NxusClient {
                     all.reserve_exact(want - all.capacity());
                 }
             }
+            // The console flags "my hit list filled up" on the batch, so a cut-off
+            // result is not mistaken for the complete set.
+            truncated |= batch.truncated;
             if batch.hits.is_empty() {
+                self.set_last_scan_truncated(truncated);
                 return Ok(all);
             }
             let done = all.len() + batch.hits.len() >= batch.total as usize;
             all.extend(batch.hits);
             if done {
+                self.set_last_scan_truncated(truncated);
                 return Ok(all);
             }
         }
