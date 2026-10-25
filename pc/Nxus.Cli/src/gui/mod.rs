@@ -1729,6 +1729,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        // A console that speaks another protocol version is only detectable in
+        // `NxusClient::status` (worker thread, stderr there is invisible to the
+        // GUI), so the worker parks the text for us: take it once and log it.
+        if let Some(warning) = crate::client::take_protocol_warning() {
+            self.st.log(format!("warning: {}", warning));
+        }
         self.frames += 1;
         let ctx = ui.ctx().clone();
 

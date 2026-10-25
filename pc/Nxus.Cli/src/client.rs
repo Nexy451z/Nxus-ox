@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -163,6 +164,15 @@ pub const MAX_PAYLOAD: u32 = 8 * 1024 * 1024;
 /// still short enough to report "unreachable" promptly.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Deadline for turning the host name into addresses.
+///
+/// [`std::net::ToSocketAddrs`] has no deadline of its own: a DNS server that stops
+/// answering keeps the call inside the resolver for tens of seconds (or forever on
+/// some stacks), and the GUI's worker thread cannot report anything meanwhile.  The
+/// lookup therefore runs on its own (detached) thread and this is how long the
+/// caller waits for the answer before giving up.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Lock a mutex, ignoring poisoning.
 ///
 /// A worker thread that panicked while holding one of these locks must not turn
@@ -176,15 +186,77 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+/// Resolve `host` with a deadline ([`RESOLVE_TIMEOUT`]).
+///
+/// An IP literal is answered without touching the resolver at all: the address is
+/// already known, and a DNS server that hangs would otherwise delay even
+/// `127.0.0.1` by the full timeout.  Everything else is looked up on a detached
+/// thread (its `JoinHandle` is deliberately dropped: the call cannot be cancelled,
+/// and the caller only waits for the channel).
+fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+
+    let bare = host.trim();
+    let bare = bare
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(bare);
+    if let Ok(ip) = IpAddr::from_str(bare) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let (tx, rx) = mpsc::channel::<std::io::Result<Vec<SocketAddr>>>();
+    let name = bare.to_string();
+    thread::spawn(move || {
+        let resolved = (name.as_str(), port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.collect::<Vec<_>>());
+        let _ = tx.send(resolved);
+    });
+
+    match rx.recv_timeout(RESOLVE_TIMEOUT) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(NxusError {
+            message: format!(
+                "cannot resolve {}:{} - {}",
+                host, port, net_error_text(&e)
+            ),
+            result: None,
+        }),
+        Err(RecvTimeoutError::Timeout) => Err(NxusError {
+            message: format!(
+                "cannot resolve {}:{} - the host name lookup did not answer within {} s",
+                host, port, RESOLVE_TIMEOUT.as_secs()
+            ),
+            result: None,
+        }),
+        Err(RecvTimeoutError::Disconnected) => Err(NxusError {
+            message: format!("cannot resolve {}:{} - the host name lookup failed", host, port),
+            result: None,
+        }),
+    }
+}
+
+/// Protocol-version mismatch text waiting to be shown by the GUI.
+///
+/// `NxusClient::status` is the only place that sees the console's version, but it
+/// runs on the worker thread and the GUI has no stderr, so the message is parked
+/// here instead of only printed.  It is written once per process (the `swap` guard
+/// in `status`) and cleared by [`take_protocol_warning`].
+static PROTOCOL_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+/// Take the protocol-version warning, if one was recorded.
+///
+/// Returns `Some` exactly once: the slot is empty afterwards, so a GUI that polls
+/// every frame logs the line a single time.
+pub fn take_protocol_warning() -> Option<String> {
+    lock(&PROTOCOL_WARNING).take()
+}
+
 /// Connect with the overall [`CONNECT_TIMEOUT`] split across the resolved
 /// addresses (a host name can resolve to both IPv4 and IPv6).
 fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
-    use std::net::ToSocketAddrs;
-
-    let addrs = (host, port).to_socket_addrs().map_err(|e| NxusError {
-        message: format!("cannot resolve {}:{} - {}", host, port, net_error_text(&e)),
-        result: None,
-    })?;
+    let addrs = resolve_host(host, port)?;
 
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut last_error: Option<std::io::Error> = None;
@@ -369,11 +441,15 @@ impl NxusClient {
             static PROTO_WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !PROTO_WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "warning: console protocol version {} (this client expects {}); \
+                let message = format!(
+                    "console protocol version {} (this client expects {}); \
                      continuing, replies may decode incorrectly",
                     status.proto_version, PROTO_VERSION
                 );
+                eprintln!("warning: {}", message);
+                // The GUI has no stderr, so park the text for it to pick up (see
+                // `take_protocol_warning`); taking it clears the slot.
+                *lock(&PROTOCOL_WARNING) = Some(message);
             }
         }
         if status.max_read > 0 {

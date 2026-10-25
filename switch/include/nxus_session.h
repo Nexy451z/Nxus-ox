@@ -36,7 +36,14 @@ static inline u32 nxusSessionHitLimit(u32 value_size) {
 #define NXUS_SESSION_BASELINE_DIR  "sdmc:/nxus"
 #define NXUS_SESSION_BASELINE_PATH "sdmc:/nxus/scan_base.bin"
 
+/* Bring the session up.  Idempotent: a second call while the session is live
+   does nothing and keeps the current limits - it must NOT reinitialise, which
+   would leak the mapping snapshot / region list / hit list and leave callers
+   holding freed pointers.  Call nxusSessionExit() first to reinitialise. */
 void nxusSessionInit(u32 chunk_size, u32 max_hits);
+/* Tear the session down: stop the worker, free every owned block and unpublish
+   the mapping/region views.  Safe to call when not initialised (no-op).  Clears
+   the initialised state, so Init() after Exit() starts a fresh session. */
 void nxusSessionExit(void);
 
 /* ---- status ---- */
@@ -106,6 +113,12 @@ Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end);
 const NxusScanRegion *nxusSessionRegions(u32 *out_count);
 
 /* ---- results ---- */
+/* Both views are published as pointer+count pairs behind a seqlock (see
+   nxus_session.c), so a reader observes one consistent snapshot instead of a
+   pointer from one publication and the count from the next.  NULL means "no view
+   right now" (not yet built, dropped by Exit/Reset, or the reader lost the race
+   with an update); callers must always tolerate it.  Walk either view only
+   behind the busy gate: the worker rebuilds these blocks while a scan runs. */
 const NxusHitList      *nxusSessionHits(void);
 const NxusMappingTable *nxusSessionMappings(void);
 

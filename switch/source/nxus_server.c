@@ -949,6 +949,15 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_GetModules: {
+            /* collectModules() walks the mapping table the scan worker rebuilds
+               under it (nxusSessionMappings()), so a running scan must be refused
+               first - the same gate ScanGetHits / SnapshotCapture / PtrScanBegin
+               use.  Without it a GetModules arriving mid-scan reads a table that
+               is being re-published and can report a half-built module list. */
+            if (nxusSessionScanState() == NxusScanState_Running) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
             NxusModuleInfo *modules = (NxusModuleInfo *)calloc(NXUS_MAX_MODULES, sizeof(NxusModuleInfo));
             if (modules == NULL) { replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory)); break; }
             u32 found = collectModules(modules, NXUS_MAX_MODULES);

@@ -527,6 +527,11 @@ impl Hit {
     }
 }
 
+/// `NxusHitBatchHeader.reserved` bit 0: the console filled its hit list, so the
+/// reply may not contain every match.  Mirrors NXUS_HITBATCH_TRUNCATED in
+/// core/nxus_protocol.h.
+pub const NXUS_HITBATCH_TRUNCATED: u32 = 0x0001;
+
 #[derive(Debug, Clone)]
 pub struct HitBatch {
     pub session_id: u32,
@@ -563,7 +568,7 @@ impl HitBatch {
         let total = rd_u32(data, 8);
         let value_size = rd_u32(data, 12);
         // Bit 0 marks "the console filled its hit list, results may be cut off".
-        let truncated = (rd_u32(data, 20) & 1) != 0;
+        let truncated = (rd_u32(data, 20) & NXUS_HITBATCH_TRUNCATED) != 0;
         let mut pos = Self::HEADER_SIZE;
 
         let mapping_count = (rd_u32(data, 16) as usize).min((data.len() - pos) / 8);
@@ -2558,5 +2563,38 @@ mod tests {
         assert_eq!(disasm_arm(0x1000, 0xD61F_0000, false), "br x0");
         assert_eq!(disasm_arm(0x1000, 0xD63F_0020, false), "blr x1");
         assert_eq!(disasm_arm(0x1000, 0xD400_0001, false), "svc #0x0");
+    }
+
+    #[test]
+    fn hit_batch_reports_truncation_and_skips_unknown_bits() {
+        // 24-byte header (session, count, total, value_size, mapping_count,
+        // reserved) + one u64 base + one 16-byte hit, as nxus_server.c sends it.
+        let mut data = Vec::new();
+        data.extend_from_slice(&7u32.to_le_bytes());      // session
+        data.extend_from_slice(&1u32.to_le_bytes());      // count
+        data.extend_from_slice(&9u32.to_le_bytes());      // total
+        data.extend_from_slice(&4u32.to_le_bytes());      // value_size
+        data.extend_from_slice(&1u32.to_le_bytes());      // mapping_count
+        data.extend_from_slice(&NXUS_HITBATCH_TRUNCATED.to_le_bytes()); // reserved
+        data.extend_from_slice(&0x1000_0000u64.to_le_bytes());          // base[0]
+        data.extend_from_slice(&0x24u32.to_le_bytes());   // hit.offset
+        data.extend_from_slice(&0u16.to_le_bytes());      // hit.mapping_idx
+        data.extend_from_slice(&2u16.to_le_bytes());      // hit.value_type (U32)
+        data.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // hit.value
+
+        let batch = HitBatch::parse(&data);
+        assert_eq!(batch.session_id, 7);
+        assert_eq!(batch.total, 9);
+        assert!(batch.truncated, "reserved bit 0 must surface as truncated");
+        assert_eq!(batch.hits.len(), 1);
+        assert_eq!(batch.hits[0].address, 0x1000_0024);
+
+        // Older servers always send 0: nothing may be reported as truncated then.
+        let mut clean = data.clone();
+        clean[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert!(!HitBatch::parse(&clean).truncated);
+        // Unknown reserved bits are ignored rather than misread.
+        clean[20..24].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        assert!(!HitBatch::parse(&clean).truncated);
     }
 }

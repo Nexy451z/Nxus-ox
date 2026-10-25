@@ -96,36 +96,76 @@ static void sessionStateStore(NxusScanState state) {
 /* ---- published views --------------------------------------------------- */
 
 /*
- * Both views below are "published" to other threads (nxusSessionMappings /
- * nxusSessionRegions) but owned by this module.  The rule everywhere is: clear
- * the published pair BEFORE the free, so a reader either obtains the old, still
- * live block or sees an explicitly empty view - never a pointer into freed
- * memory.  (The fields themselves are plain u32/pointer; the release fence keeps
- * the clearing visible ahead of the allocator's reuse of the block.)
+ * g_Session.maps.entries / maps.count and g_Session.regions / region_count are
+ * read by other threads (nxusSessionMappings / nxusSessionRegions) with no lock
+ * held, yet each pair is two plain fields: a reader could load the pointer from
+ * one publication and the count from the next.  Publishing them through a
+ * seqlock makes the pair observable as one unit:
+ *
+ *   g_ViewSeq is even while both pairs are stable, odd while an update is in
+ *   flight.  A writer bumps it to odd (release), stores the pair, and bumps it
+ *   back to even (release).  A reader samples it (acquire), rejects odd values,
+ *   copies the pair, and samples again: an unchanged value means the pair it
+ *   copied was one consistent publication; otherwise it retries.
+ *
+ * The old atomic_thread_fence()s were useless here: a fence only orders atomic
+ * operations, so the plain pointer/count stores stayed free to be observed torn
+ * apart.  The "clear before free" rule stays - the published pair is emptied
+ * before free(), so a reader that loses the race anywhere still sees either the
+ * old live block or an explicitly empty view, never a pointer into freed memory.
+ *
+ * Writers are all on the server thread (publish / drop / buildRegions), so the
+ * two views can share a single counter without a lock of their own.
  */
+#define NXUS_VIEW_RETRY 8u
+
+static atomic_uint g_ViewSeq;
+
+static void viewUpdateBegin(void) {
+    atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* odd */
+}
+
+static void viewUpdateEnd(void) {
+    atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* even */
+}
+
 static void mappingSnapshotDrop(void) {
     NxusMappingEntry *old = g_Session.map_entries;
+    viewUpdateBegin();
     g_Session.maps.entries = NULL;
     g_Session.maps.count = 0;
     g_Session.map_entries = NULL;
-    atomic_thread_fence(memory_order_release);
+    viewUpdateEnd();
     free(old);
 }
 
 static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
     NxusMappingEntry *old = g_Session.map_entries;
+    viewUpdateBegin();
     g_Session.map_entries = entries;
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
-    atomic_thread_fence(memory_order_release);
+    viewUpdateEnd();
     free(old);
 }
 
 static void regionListDrop(void) {
     NxusScanRegion *old = g_Session.regions;
+    viewUpdateBegin();
     g_Session.regions = NULL;
     g_Session.region_count = 0;
-    atomic_thread_fence(memory_order_release);
+    viewUpdateEnd();
+    free(old);
+}
+
+/* Publish a freshly built list (buildRegions) as one pair, never as a pointer
+   without its count. */
+static void regionListPublish(NxusScanRegion *regions, u32 count) {
+    NxusScanRegion *old = g_Session.regions;
+    viewUpdateBegin();
+    g_Session.regions = regions;
+    g_Session.region_count = count;
+    viewUpdateEnd();
     free(old);
 }
 
@@ -256,8 +296,12 @@ static int sessionRead(void *ctx, u64 address, void *buffer, u32 size) {
     /* A whole-region scan issues thousands of reads back to back on one core.
        Yielding every 64 reads keeps the game / system threads scheduled during a
        multi-second scan instead of letting this worker starve them. */
-    static u32 read_tick = 0;
-    if ((++read_tick & 63u) == 0) svcSleepThread(0);
+    /* Atomic: both the scan worker and the connection thread (sessions reads,
+       snapshots, hex view) run through here, so a plain counter is a data race. */
+    static atomic_uint read_tick;
+    if ((atomic_fetch_add_explicit(&read_tick, 1u, memory_order_relaxed) & 63u) == 0) {
+        svcSleepThread(0);
+    }
     /* dmnt rejects oversized single reads; the engine never asks for more than
        one window (<= 32KB) or one chunk, both well within limits.
        In debug mode dmnt is detached, so the debug session serves the reads. */
@@ -274,20 +318,31 @@ static int sessionRead(void *ctx, u64 address, void *buffer, u32 size) {
 
 /* ---- lifecycle --------------------------------------------------------- */
 
+/* Guards double initialisation.  A second nxusSessionInit() must not memset a
+   live session: that would leak the mapping snapshot, the region list, the hit
+   list and the baseline block, and every caller still holding one of those
+   pointers would then read freed memory.  Exit() clears the flag, so an
+   Exit -> Init sequence reinitialises with new limits. */
+static bool g_Inited;
+
 void nxusSessionInit(u32 chunk_size, u32 max_hits) {
+    if (g_Inited) return;      /* already initialised: keep the live session */
     mutexInit(&g_SessionMutex);
     memset(&g_Session, 0, sizeof(g_Session));
     atomic_init(&g_Session.state, NxusScanState_Idle);
+    atomic_init(&g_Session.cancel, 0);
+    atomic_init(&g_ViewSeq, 0);   /* both published views start empty/stable */
     g_Session.chunk_size = chunk_size ? chunk_size : NXUS_SESSION_DEFAULT_CHUNK;
     g_Session.max_hits = max_hits ? max_hits : NXUS_SESSION_DEFAULT_MAXHITS;
     g_Session.window_size = NXUS_SESSION_DEFAULT_WINDOW;
     g_Session.gap_threshold = NXUS_SESSION_DEFAULT_GAP;
     g_Session.watchdog_timeout_ms = 15000;
     g_Session.last_heartbeat_ms = nowMs();
-    atomic_init(&g_Session.cancel, 0);
+    g_Inited = true;
 }
 
 void nxusSessionExit(void) {
+    if (!g_Inited) return;     /* nothing initialised (or already exited) */
     nxusSessionScanCancel();
     if (g_Session.thread_live) {
         threadWaitForExit(&g_Session.thread);
@@ -296,11 +351,13 @@ void nxusSessionExit(void) {
     }
     nxusHitListFree(&g_Session.hits);
     baselineDiscard();
-    /* Unpublish before releasing: nxusSessionMappings() / nxusSessionRegions()
-       must never hand out a view whose backing block is already gone. */
+    /* Unpublish through the seqlock before releasing: nxusSessionMappings() /
+       nxusSessionRegions() must never hand out a view whose backing block is
+       already gone, and must never pair the old pointer with the new count. */
     mappingSnapshotDrop();
     regionListDrop();
     sessionStateStore(NxusScanState_Idle);
+    g_Inited = false;
 }
 
 u32  nxusSessionId(void)            { return g_Session.session_id; }
@@ -355,16 +412,24 @@ const NxusHitList *nxusSessionHits(void) {
     return &g_Session.hits;
 }
 
-/* Never returns a dangling table: mappingSnapshotDrop() clears the published
-   pair before free(), so a torn read can only yield an empty view.  Callers must
-   tolerate NULL (= no snapshot / after Exit) and must run behind the BUSY gate
-   (the pointer scan and module walk read the array the worker is using). */
+/* Never returns a dangling table: the pair is only readable while g_ViewSeq is
+   stable, mappingSnapshotDrop() clears it before free(), and the retry loop
+   rejects a sample that raced with an update - so the caller sees either one
+   consistent snapshot or an empty view.  Callers must tolerate NULL (= no
+   snapshot / after Exit) and must run behind the BUSY gate (the pointer scan and
+   the module walk read the array the worker is using); the returned table is the
+   live one, not a copy. */
 const NxusMappingTable *nxusSessionMappings(void) {
-    NxusMappingEntry *const entries = g_Session.maps.entries;
-    const u32 count = g_Session.maps.count;
-    atomic_thread_fence(memory_order_acquire);
-    if (count == 0 || entries == NULL) return NULL;
-    return &g_Session.maps;
+    for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
+        const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
+        if ((seq & 1u) != 0) continue;              /* update in progress */
+        NxusMappingEntry *const entries = g_Session.maps.entries;
+        const u32 count = g_Session.maps.count;
+        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
+        if (count == 0 || entries == NULL) return NULL;
+        return &g_Session.maps;
+    }
+    return NULL;   /* kept losing the race: report "no table" instead of a torn pair */
 }
 
 void nxusSessionSetPaused(bool paused) {
@@ -534,18 +599,25 @@ Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end) {
 
 /* Same contract as nxusSessionHits(): consumers (the snapshot service) run
    behind the server's BUSY gate, because preparing a new scan rebuilds this list
-   under the running engine.  A cleared list is reported as (NULL, 0) instead of a
-   dangling pointer, and the acquire fence pairs with regionListDrop()'s release. */
+   under the running engine.  The pair is sampled behind the seqlock, so a clear
+   or a rebuild is reported as one consistent (NULL, 0) / (list, count) instead of
+   a pointer from one publication paired with the count of another. */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count) {
-    const NxusScanRegion *regions = g_Session.regions;
-    const u32 count = g_Session.region_count;
-    atomic_thread_fence(memory_order_acquire);
-    if (regions == NULL || count == 0) {
-        if (out_count != NULL) *out_count = 0;
-        return NULL;
+    for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
+        const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
+        if ((seq & 1u) != 0) continue;              /* update in progress */
+        const NxusScanRegion *regions = g_Session.regions;
+        const u32 count = g_Session.region_count;
+        if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
+        if (regions == NULL || count == 0) {
+            if (out_count != NULL) *out_count = 0;
+            return NULL;
+        }
+        if (out_count != NULL) *out_count = count;
+        return regions;
     }
-    if (out_count != NULL) *out_count = count;
-    return regions;
+    if (out_count != NULL) *out_count = 0;
+    return NULL;   /* kept losing the race: report "no list" instead of a torn pair */
 }
 
 Result nxusSessionRefreshMappings(void) {
@@ -648,21 +720,24 @@ static void buildRegions(const NxusScanRequest *req) {
        the mappings and the hit list, squeeze the 8 MB heap. */
     u32 capacity = g_Session.maps.count * (g_Session.range_count ? g_Session.range_count : 1) + 1;
     if (capacity > 4096u) capacity = 4096u;
-    g_Session.regions = (NxusScanRegion *)calloc(capacity, sizeof(NxusScanRegion));
-    if (g_Session.regions == NULL) return;
+    NxusScanRegion *regions = (NxusScanRegion *)calloc(capacity, sizeof(NxusScanRegion));
+    if (regions == NULL) return;
 
+    /* Fill the block privately and publish pointer+count together at the end:
+       the new list is not reachable from another thread until it is complete. */
+    u32 count;
     if (req->scope == NxusScope_Ranges) {
-        g_Session.region_count = nxusBuildRegionsMulti(g_Session.map_entries, g_Session.maps.count,
-                                                       g_Session.main_base, g_Session.main_size,
-                                                       g_Session.ranges, g_Session.range_count,
-                                                       g_Session.regions, capacity);
-        return;
+        count = nxusBuildRegionsMulti(g_Session.map_entries, g_Session.maps.count,
+                                      g_Session.main_base, g_Session.main_size,
+                                      g_Session.ranges, g_Session.range_count,
+                                      regions, capacity);
+    } else {
+        count = nxusBuildRegions(g_Session.map_entries, g_Session.maps.count,
+                                 g_Session.main_base, g_Session.main_size,
+                                 req->scope, req->range_begin, req->range_end,
+                                 regions, capacity);
     }
-
-    g_Session.region_count = nxusBuildRegions(g_Session.map_entries, g_Session.maps.count,
-                                              g_Session.main_base, g_Session.main_size,
-                                              req->scope, req->range_begin, req->range_end,
-                                              g_Session.regions, capacity);
+    regionListPublish(regions, count);
 }
 
 /* ---- worker ------------------------------------------------------------ */
