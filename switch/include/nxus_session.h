@@ -12,23 +12,27 @@
    128 KB, reading the same bytes. */
 #define NXUS_SESSION_DEFAULT_WINDOW  (1024u * 1024u)
 #define NXUS_SESSION_DEFAULT_GAP     (16u * 1024u)
-/* Floor for the hit cap (150k hits = ~2.4 MB with 8 B address + 8 B value each).
-   The real ceiling is derived per scan from NXUS_SESSION_HIT_BUDGET_BYTES below,
-   which raises it to ~192k-341k depending on the value width. */
+/* Floor for the hit cap (150k hits = ~3.6 MB with a 16 B address + an 8 B value
+   each).  The ceiling is derived per scan from NXUS_SESSION_HIT_BUDGET_BYTES below;
+   this constant stays a FLOOR, so a width whose budgeted cap comes out lower (u64)
+   still keeps the old 150k hits and costs ~3.6 MB rather than 3.0 MB. */
 #define NXUS_SESSION_DEFAULT_MAXHITS 150000u
 
 /* Unknown scans cannot discard anything: the first pass stores a baseline of the
    whole scoped range (SD card, RAM fallback) and every match must survive until
    the second pass.  A flat 150k ceiling therefore truncates real candidates, so
    the cap is derived from a byte budget instead:
-       max_hits = BUDGET / (8 B address + value_size B value)
-   3.0 MB yields ~256k hits for u32, ~307k for u16, ~341k for u8, ~192k for u64 -
-   always more than the old 150k default, and never more memory for wider types. */
+       max_hits = BUDGET / (sizeof(NxusHitAddress) B address + value_size B value)
+   NxusHitAddress is 16 bytes since the absolute address was appended to it (the
+   packed prefix is still offset / mapping_idx / value_type), so 3.0 MB yields
+   ~153k hits for u32, ~170k for u16, ~180k for u8 and ~128k for u64.  The stride
+   MUST track sizeof(): with a hard-coded 8 B a u32 list reached 256k hits, i.e.
+   5.1 MB of arrays for a 3.0 MB budget - enough to overrun the 8 MB inner heap. */
 #define NXUS_SESSION_HIT_BUDGET_BYTES (3000u * 1024u)
 
 static inline u32 nxusSessionHitLimit(u32 value_size) {
     if (value_size == 0) value_size = 1;
-    return (u32)(NXUS_SESSION_HIT_BUDGET_BYTES / (8u + value_size));
+    return (u32)(NXUS_SESSION_HIT_BUDGET_BYTES / (sizeof(NxusHitAddress) + value_size));
 }
 
 /* Baseline dump the Unknown scan keeps on the SD card (RAM fallback inside the
@@ -255,8 +259,13 @@ const NxusHitList      *nxusSessionHits(void);
  *     value that is 0 on either side is "unknown", not a mismatch (an explicit
  *     DebugAttach can leave the title unknown, and refusing the session's own list
  *     would break scan-then-attach); with no pid at all the scan generation is the
- *     token, exactly like the chain list.  A generation change, however, is ALWAYS a
- *     mismatch: it invalidates every mapping_idx regardless of the target,
+ *     token, exactly like the chain list,
+ *   - a generation change is NOT automatically a mismatch any more: it means the
+ *     table was rebuilt, and the rebuild may only have moved UNRELATED mappings.
+ *     nxusSessionHitsRevalidate() then checks whether the new table still resolves
+ *     every hit to the absolute address stored with it; if so the hit list stays
+ *     servable (its stamp is re-pointed at the new generation) and a refine keeps
+ *     working.  A single mismatch - or a different target - still discards,
  *   - nxusSessionInvalidateHits() discards hits + mapping snapshot.
  *
  * Detection is the server's job: fillStatus() and sendHits(), plus ScanNext() inside
@@ -265,11 +274,32 @@ const NxusHitList      *nxusSessionHits(void);
  * check below instead.
  */
 /* True while the stored hit list may be served to the current target.  Also false
-   after nxusSessionInvalidateHits() until a new scan stamps a list, and when the
-   mapping table was rebuilt after the list was stamped, so one detection is enough
-   for every later reader.  An empty session (no list ever built) matches: there is
-   nothing that could be stale. */
+   after nxusSessionInvalidateHits() until a new scan stamps a list.  A rebuilt
+   mapping table is not refused on sight: it is first offered to
+   nxusSessionHitsRevalidate() (see below), and the list is served again when every
+   hit still resolves to its recorded address.  An empty session (no list ever
+   built) matches: there is nothing that could be stale. */
 bool nxusSessionHitsMatchTarget(void);
+
+/* Rescue a stamped list across a mapping-table REBUILD (same target, new table
+   generation).  Every hit stores the absolute address it was found at next to its
+   mapping_idx/offset, so the list is still trustworthy exactly when the currently
+   published table resolves each of them back to that address:
+       mapping_base[mapping_idx] + offset == hit.address   (for EVERY hit)
+ *
+ *   - all hits match       -> true, and the owner stamp is re-pointed at the
+ *                             current generation (so later readers/refines do not
+ *                             refuse the list again).  Logs
+ *                             "hits: revalidated %u hit(s) across a mapping rebuild",
+ *   - one mismatch         -> false (the caller discards as before),
+ *   - mapping_idx out of range, or no published table -> false,
+ *   - a pass is Running, or the list was never stamped / is already discarded ->
+ *     false (there is no consistent list to walk).
+ *
+ * Callers: nxusSessionHitsMatchTarget() on a generation mismatch (and through it
+ * scan refine, undo and the hit readers).  Runs on the connection thread, which is
+ * serialized with the table publications. */
+bool nxusSessionHitsRevalidate(void);
 
 /* Identity half of the check above: the same pid / program id / scan-generation
    comparison, WITHOUT the mapping-table generation.  Meant for the 1 Hz identity

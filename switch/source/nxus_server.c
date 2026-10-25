@@ -361,8 +361,19 @@ static void flushFrozenReleased(void) {
     if (total != 0) sendFrozenReleasedEvent(total, addresses);
 }
 
-/* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
-#define NXUS_PTRSCAN_MAX_RESULTS 64
+/* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport.
+ *
+ * This is a compile-time cap on what the client may ask for (a PtrScanBegin
+ * max_results above it is clamped, see handlePtrScanBegin) and the size of the
+ * static list below.  128 (was 64) costs no heap - it is .bss - and fits the
+ * one-reply budget with room to spare:
+ *   g_Chains      = 128 * sizeof(NxusPtrChain)  = 128 * 56 = 7168 B (.bss)
+ *   chain reply   = 20 + 128 * 48 (NxusPtrChainWire) = 6164 B, far below
+ *                   NXUS_NET_BUF_SIZE (1 MiB), which sendChainList() checks
+ *                   anyway before allocating.
+ * The real ceiling for a scan is time/reads, not the number of results, so the
+ * larger cap only decides how much of a good walk survives it. */
+#define NXUS_PTRSCAN_MAX_RESULTS 128
 static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
 static u32              g_ChainCount;
 /* Pointer width the published list was actually walked with (4 or 8), 0 when
@@ -416,6 +427,24 @@ static bool g_ChainsStale;
    returned as a partial list.  The clock starts at the top of the handler, so
    the mapping refresh counts against the budget too. */
 #define NXUS_PTRSCAN_TIME_BUDGET_MS 90000ull
+
+/* Read budget: a runaway guard, not the schedule.  The schedule is
+   NXUS_PTRSCAN_TIME_BUDGET_MS above - the wall clock is what the client's 120 s
+   timeout is measured against, so the walk is meant to end on time, and this
+   counter only has to be large enough that the clock gets there first in the
+   normal case while still bounding a walk whose reads are cheap enough to
+   outrun it.  The old 20000 was far below that: on hardware (MHXX) it tripped
+   after 2.3 s with ~8700 reads/s, so the scan never used the 90 s it was
+   allowed and returned a list truncated by an internal counter.
+   500000 is 25x that, and cheap to reach: the engine only counts a read that
+   actually happened (a budget-starved dereference is skipped, not counted), so
+   hitting it means the walk really did 500k memory reads.
+   Arithmetic for the reported rate: 500000 / 8700 reads/s ~= 57 s, i.e. at that
+   throughput the read budget still fires before the 90 s clock (~783k reads
+   would fit).  Raise this to 1000000 if the clock should always be the stop
+   reason; the wall clock is enforced by ptrScanReadBudgeted() either way, so
+   the only effect of the number is which of the two limits is reported. */
+#define NXUS_PTRSCAN_MAX_READS 1000000u
 
 /* Budget state the engine sees through the cancel flag it polls.  nxusPtrScan()
    takes `int *cancel` and only looks at it between roots and inside the walk,
@@ -555,7 +584,9 @@ static u64 estimateHeapPeak(void) {
     u64 hit_bytes = (u64)NXUS_SESSION_HIT_BUDGET_BYTES;
     const NxusHitList *hits = nxusSessionHits();
     if (hits != NULL) {
-        hit_bytes = (u64)hits->capacity * (8u + (u64)hits->value_size);
+        /* sizeof(NxusHitAddress) is 16 B now that the resolved address travels with every
+           hit; the old constant 8 under-estimated a full list by about 1.2 MiB. */
+        hit_bytes = (u64)hits->capacity * ((u64)sizeof(NxusHitAddress) + (u64)hits->value_size);
         if (hit_bytes > (u64)NXUS_SESSION_HIT_BUDGET_BYTES)
             hit_bytes = (u64)NXUS_SESSION_HIT_BUDGET_BYTES;
     }
@@ -797,12 +828,84 @@ static void refreshMappingsAfterTargetChange(void) {
 /* How long the console waits for a command before it assumes the PC is gone. */
 #define NXUS_DEBUG_IDLE_TIMEOUT_MS 20000u
 
+/* Last-resort identity for Status: ask dmnt:cht for the process metadata itself.
+ *
+ * The cached identity in the session is written by nxusSessionRefreshIdentity()
+ * (called from the 1 Hz tick, ForceOpen and every ScanBegin).  On hardware Status
+ * still reported a zeroed target - "status: target 0000... (pid 0)" while the
+ * metadata command answered "pid 140" - because the tick's refresh is gated on
+ * nxusDmntHasCheatProcess(): while that probe fails, or if no tick has succeeded
+ * yet, the cache stays empty even though GetMetadata() (which re-opens the cheat
+ * process once and retries) has the answer.  Status is the client's only view of
+ * the target, so it must not report 0 while dmnt can name the process.
+ *
+ * Fills the four fields from one dmnt metadata reply and PUBLISHES them into the
+ * session cache with nxusSessionSetProcessIdentityEx() - the same single seqlock
+ * write nxusSessionRefreshIdentity() does on success, so a reader can never pair a
+ * new pid with an old main range.  One Status therefore fixes every later command
+ * (main-relative scopes, hit ownership, chain export), not just this reply.
+ *
+ * Runs on the connection thread, so it takes g_DmntLock like every other dmnt call
+ * and therefore serialises behind the scan/reader thread - which is why it is
+ * throttled: Status is polled every ~20 ms, and the broken-cache case must not turn
+ * into 50 IPCs/s.  A failed attempt backs off to one try per 5 s: with no title
+ * open GetMetadata() fails and its documented auto-reopen retries, and that must
+ * not become a once-per-second dmnt ForceOpen (plus a log line each) on the HOME
+ * menu.  Skipped while a debug session owns the process (dmnt is closed then, and
+ * GetMetadata's auto-reopen would fight with that handle); the attach hand-off has
+ * already published the identity in that case.
+ *
+ * Returns false when dmnt has nothing to say - the caller reports 0, which then is
+ * the honest answer (no target open).
+ */
+static bool statusFillIdentityFromDmnt(void) {
+    static u64 last_ms = 0;
+    static u64 interval_ms = 1000ull;   /* 1 Hz while it works, 5 s after a miss */
+    const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+    if (last_ms != 0 && now_ms - last_ms < interval_ms) return false;
+    last_ms = now_ms;
+
+    if (nxusDebugIsAttached() || nxusDebugIsHandoff()) return false;
+
+    NxusProcessMetadata md;
+    memset(&md, 0, sizeof(md));
+    const Result rc = nxusDmntGetMetadata(&md);
+    /* A zero pid is dmnt's "no cheat process" answer, not an identity. */
+    if (R_FAILED(rc) || md.process_id == 0) {
+        interval_ms = 5000ull;
+        NXUS_LOG_DEBUG("status: dmnt has no target (rc=0x%08X, pid=%llu) - "
+                       "reporting no target",
+                       (unsigned)rc, (unsigned long long)md.process_id);
+        return false;
+    }
+    interval_ms = 1000ull;
+
+    nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
+                                    md.main_nso_base, md.main_nso_size);
+    /* Worth a line at INFO level: reaching here means the cached identity had
+       never been set, i.e. every Status before this one reported pid 0. */
+    NXUS_LOG("status: identity filled from dmnt metadata "
+             "(target=%016llX pid=%llu main=%08llX+%08llX)",
+             (unsigned long long)md.program_id, (unsigned long long)md.process_id,
+             (unsigned long long)md.main_nso_base,
+             (unsigned long long)md.main_nso_size);
+    return true;
+}
+
 static void fillStatus(NxusStatus *st) {
     memset(st, 0, sizeof(*st));
-    /* Results are keyed to the target that produced them.  The 1 Hz tick keeps the
-       cached identity current, so the first status poll after a title switch sees
-       the mismatch here and drops the previous title's list - instead of reporting
-       its hit count as if it described the process the client now sees. */
+    /* Refresh the cached identity BEFORE anything below reads it.
+       The client polls Status far more often than the 1 Hz tick, so a Status that
+       arrives first - or one that follows a failed HasCheatProcess probe - used to
+       hand out pid 0 / main 0 while dmnt already knew the process.  The refresh is
+       throttled to 1 Hz, is a no-op while a debug session owns the process, and is
+       the same call the tick makes (so this changes no ordering, it only makes the
+       status path wait for at most one metadata read). */
+    refreshTargetIdentityThrottled();
+    /* Results are keyed to the target that produced them.  The identity is now
+       current, so the first status poll after a title switch sees the mismatch here
+       and drops the previous title's list - instead of reporting its hit count as if
+       it described the process the client now sees. */
     discardResultsOfEarlierTarget();
     st->proto_version = NXUS_PROTO_VERSION;
     /* Which read path the console is serving, not a build-time constant: while
@@ -821,9 +924,25 @@ static void fillStatus(NxusStatus *st) {
     if (nxusSessionTargetIdentity(&identity)) {
         st->process_id = identity.pid;
         st->program_id = identity.program_id;
+        st->main_base = identity.main_base;
+        st->main_size = identity.main_size;
     } else {
         st->process_id = nxusSessionProcessId();
         st->program_id = nxusSessionProgramId();
+        st->main_base = nxusSessionMainBase();
+        st->main_size = nxusSessionMainSize();
+    }
+    /* Still no pid: the cache was never stamped (see statusFillIdentityFromDmnt -
+       the 1 Hz refresh above is gated on HasCheatProcess, which can fail while
+       GetMetadata still answers).  Ask dmnt once per second and publish what it
+       says, so the reply and every later command carry the real target.  Only when
+       that fails too does Status report 0. */
+    if (st->process_id == 0 && statusFillIdentityFromDmnt() &&
+        nxusSessionTargetIdentity(&identity)) {
+        st->process_id = identity.pid;
+        st->program_id = identity.program_id;
+        st->main_base = identity.main_base;
+        st->main_size = identity.main_size;
     }
     /* The client polls Status far more often than the 1 Hz tick, so a title switch
        that already moved the cached identity is caught here on the first poll after
@@ -832,8 +951,6 @@ static void fillStatus(NxusStatus *st) {
        common case at one load instead of a lock; a stale non-zero value only costs
        the locked re-check, and a missed drop is caught by the next call. */
     if (g_FrozenOwnedCount != 0) (void)frozenOwnedDropEarlierTarget();
-    st->main_base = nxusSessionMainBase();
-    st->main_size = nxusSessionMainSize();
     st->hit_count = nxusSessionHitCount();
     st->progress_permille = nxusSessionProgress();
     st->last_result = nxusSessionLastResult();
@@ -882,6 +999,22 @@ static void fillStatus(NxusStatus *st) {
     if (nxusDebugIsStopped()) flags |= NXUS_ST_PAUSED;
     if (nxusSessionScanState() == NxusScanState_Running) flags |= NXUS_ST_SCANNING;
     st->status_flags = flags;
+
+    /* Debug-level mirror of the reply: the client renders exactly these fields
+       ("target: <program_id> (pid <process_id>)", "main: <base> + <size>", and the
+       dmnt/debug mode it derives from the flags), so this line is what makes the
+       reply verifiable against the real state - it shows whether the identity came
+       from the cache, from the dmnt fallback above, or is really unknown (pid 0),
+       and which mode the flags describe. */
+    NXUS_LOG_DEBUG("status: mode=%s target=%016llX pid=%llu main=%08llX+%08llX "
+                   "flags=0x%04X state=%u hits=%u",
+                   st->mode == NXUS_MODE_DEBUG ? "debug" : "dmnt",
+                   (unsigned long long)st->program_id,
+                   (unsigned long long)st->process_id,
+                   (unsigned long long)st->main_base,
+                   (unsigned long long)st->main_size,
+                   (unsigned)st->status_flags, (unsigned)st->scan_state,
+                   (unsigned)st->hit_count);
 }
 
 /* ---- real pause / resume ----------------------------------------------- */
@@ -1564,10 +1697,44 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
     g_ChainOwner.valid = ok;
     g_ChainsStale = false;
 
-    if (g_PtrJob.budget.budget_hit) {
-        NXUS_LOG("ptrscan: time budget reached after %llu ms (chains=%u) - "
-                 "returning partial results",
+    /* Which limit stopped the walk, in the log.
+     *
+     * All three cases reach the client as the same flag
+     * (NxusPtrChainListHeader.truncated), so a hardware log is the only way to
+     * tell "the 90 s clock ran out" (the normal, expected stop - the reply has to
+     * be produced before the client's 120 s timeout) from "the runaway guard
+     * fired" (NXUS_PTRSCAN_MAX_READS, which should be unreachable in a healthy
+     * walk) from "the result cap was reached" (a good walk with more chains than
+     * the client asked for).  Keep them three distinct strings.
+     *
+     * reads >= max_reads is the engine's own test (see readTarget() in
+     * core/nxus_ptrscan.c): it counts only reads it actually performed, so
+     * equality means the budget really was spent and not merely approached.  A
+     * cancelled walk (client gone / shutdown) is neither of the three - it already
+     * logged its own reason in ptrScanRequestCancel(). */
+    const bool time_cut = g_PtrJob.budget.budget_hit != 0;
+    const bool read_cut = !time_cut && g_PtrJob.opts.max_reads != 0 &&
+                          g_PtrStats.reads >= (u64)g_PtrJob.opts.max_reads;
+    const bool results_cut = !time_cut && !read_cut && src == NXUS_SCAN_OK &&
+                             g_PtrStats.truncated != 0;
+    if (time_cut) {
+        NXUS_LOG("ptrscan: truncated by the time budget after %llu ms "
+                 "(chains=%u, reads=%llu) - returning partial results",
+                 (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
+                 (unsigned long long)g_PtrStats.reads);
+    } else if (read_cut) {
+        NXUS_LOG("ptrscan: truncated by the read budget (%u reads in %llu ms, "
+                 "chains=%u) - returning partial results",
+                 (unsigned)g_PtrJob.opts.max_reads,
                  (unsigned long long)elapsed_ms, (unsigned)g_ChainCount);
+    } else if (results_cut) {
+        /* The cap the walk was actually given (the client's --max, else the
+           server's default), not the compile-time maximum. */
+        NXUS_LOG("ptrscan: truncated by the result cap (%u chains kept in %llu ms) "
+                 "- returning partial results",
+                 (unsigned)(g_PtrJob.opts.max_results ? g_PtrJob.opts.max_results
+                                                      : NXUS_PTRSCAN_MAX_RESULTS),
+                 (unsigned long long)elapsed_ms);
     }
     NXUS_LOG("ptrscan: done in %llu ms, chains=%u, reads=%llu",
              (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
@@ -1894,11 +2061,20 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
        stale mapping table). */
     const u32 walk_width = opts.value_width;
     opts.window_size = 0x400;
-    opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
+    /* The clock (NXUS_PTRSCAN_TIME_BUDGET_MS) is what ends a scan; this counter
+       is only the runaway guard that bounds a walk whose reads are so cheap it
+       could outrun the clock.  See the NXUS_PTRSCAN_MAX_READS comment for the
+       arithmetic and why the old 20000 was wrong. */
+    opts.max_reads = NXUS_PTRSCAN_MAX_READS;
 
-    NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u width=%u regions=%u",
+    /* Log the two limits with the request: without them a hardware log cannot
+       tell what the walk was allowed to reach (and the closing "done" line only
+       reports what it used). */
+    NXUS_LOG("ptrscan: target=%08llX module=%08llX depth=%u width=%u regions=%u "
+             "max_chains=%u max_reads=%u",
              (unsigned long long)req.target_address, (unsigned long long)module_base,
-             (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count);
+             (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count,
+             (unsigned)opts.max_results, (unsigned)opts.max_reads);
 
     /* Everything the walk needs is in place, so hand the job to the worker.  The
        start clock was taken at the top of the handler: the client times the whole

@@ -43,6 +43,7 @@
  * still matches.  Round 10 changed the formula and this file kept the old numbers,
  * which is exactly the drift this comment is here to prevent.
  */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -115,8 +116,16 @@ int main(void) {
     printf("=== Nxus 8 MB heap budget tests ===\n");
 
     printf("[test] element sizes the formula is built from\n");
-    CHECK(sizeof(NxusHitAddress) == 8, "NxusHitAddress is %u B (formula assumes 8)",
+    /* NxusHitAddress keeps its packed 8-byte prefix (offset / mapping_idx /
+       value_type) and appends the u64 absolute address, so one hit now occupies
+       16 B.  nxusSessionHitLimit() derives its stride from sizeof(NxusHitAddress);
+       estimateHeapPeak() in nxus_server.c still charges 8 B per hit, and switching
+       it over has to update the row formula below in the same change. */
+    CHECK(sizeof(NxusHitAddress) == 16, "NxusHitAddress is %u B (8 B prefix + u64 address)",
           (unsigned)sizeof(NxusHitAddress));
+    CHECK(offsetof(NxusHitAddress, address) == 8,
+          "the absolute address must be APPENDED after the 8 B prefix (offset %u)",
+          (unsigned)offsetof(NxusHitAddress, address));
     CHECK(sizeof(NxusChangedBlock) == 16, "NxusChangedBlock is %u B",
           (unsigned)sizeof(NxusChangedBlock));
     CHECK(sizeof(NxusMappingEntry) == 32, "NxusMappingEntry is %u B",

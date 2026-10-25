@@ -79,11 +79,31 @@ typedef struct {
 typedef struct NXUS_PACKED {
     u32 offset;        /* offset from the mapping base */
     u16 mapping_idx;
-    u16 reserved;
+    u16 reserved;      /* NXUS value type of the hit (sendHits() copies it into
+                          NxusHit.value_type; the field keeps its name so the
+                          existing readers do not change) */
+    /* Absolute address the hit was found at: (mapping base at scan time) + offset.
+       APPENDED after the original 8 bytes, which keep both their order and their
+       size - the server's hit batch copies offset/mapping_idx/reserved out of the
+       prefix and the host tests read it as before, and the wire format (NxusHit)
+       never carries this field.
+
+       It exists because mapping_idx is an ORDINAL into the mapping snapshot: a
+       re-snapshot of the SAME process that only inserts or removes an unrelated
+       heap mapping shifts every later index, so the stored index keeps
+       "resolving" - to a different region.  With the address recorded here the
+       session can prove that the rebuilt table still maps mapping_idx + offset to
+       exactly this address (nxusSessionHitsRevalidate(), switch/), which is what
+       lets a refine pass survive such a rebuild instead of discarding the list. */
+    u64 address;
 } NxusHitAddress;
 
+/* The first 8 bytes keep their layout; the absolute address is 8 more.  The
+   packed attribute means there is no padding to account for. */
+NXUS_STATIC_ASSERT(sizeof(NxusHitAddress) == 16, "NxusHitAddress must be 16 bytes");
+
 typedef struct {
-    NxusHitAddress *addresses;  /* capacity * 8 bytes (packed struct) */
+    NxusHitAddress *addresses;  /* capacity * 16 bytes (packed struct) */
     u8             *values;     /* capacity * value_size bytes (SoA) */
     u32             count;
     u32             prev_count; /* count before the last refine pass (for 1-step Undo) */

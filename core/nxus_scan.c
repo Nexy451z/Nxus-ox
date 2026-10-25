@@ -433,7 +433,12 @@ static int hitListGrow(NxusHitList *list) {
     return NXUS_SCAN_OK;
 }
 
-static int hitListPush(NxusHitList *list, u32 mapping_idx, u32 offset,
+/* 'address' is the ABSOLUTE address of the hit (the region's mapping base plus
+   'offset'), not the region start: every caller reads through a region that may be
+   clipped to a scope, and a hit is resolved by the PC as mapping_base + offset.
+   Keeping it next to the index is what lets the session re-validate the list after
+   a mapping rebuild (see NxusHitAddress in nxus_scan.h). */
+static int hitListPush(NxusHitList *list, u32 mapping_idx, u32 offset, u64 address,
                        const u8 *value, u32 value_type) {
     if (list->count >= list->capacity) {
         int rc = hitListGrow(list);
@@ -443,6 +448,7 @@ static int hitListPush(NxusHitList *list, u32 mapping_idx, u32 offset,
     slot->offset      = offset;
     slot->mapping_idx = (u16)mapping_idx;
     slot->reserved    = (u16)value_type;
+    slot->address     = address;
     memset(list->values + (size_t)list->count * list->value_size, 0, list->value_size);
     memcpy(list->values + (size_t)list->count * list->value_size, value, list->value_size);
     list->count++;
@@ -657,7 +663,7 @@ static u64 fuzzyEpsilonBits(u32 value_type, u32 value_size, u32 epsilon_decimals
             memcpy(stored, &cand, (W));                                        \
             int push_rc = hitListPush(hits, region->mapping_idx,               \
                                       (u32)(addr - region_addr_base),          \
-                                      stored, value_type);                     \
+                                      addr, stored, value_type);               \
             if (push_rc != NXUS_SCAN_OK) return push_rc;                       \
         }                                                                      \
     } while (0)
@@ -834,7 +840,8 @@ int nxusScanFirstEx(const NxusScanRegion *regions, u32 region_count,
                         if (!matchPatternAt(cur, pattern)) continue;
                         u8 stored[8];
                         nxusStoreLE(stored, nxusHashBytes(cur, window), 8);
-                        rc = hitListPush(hits, region->mapping_idx, (u32)offset, stored, value_type);
+                        rc = hitListPush(hits, region->mapping_idx, (u32)offset, addr,
+                                         stored, value_type);
                     } else if (all_types) {
                         static const u32 order[6] = {
                             NxusValueType_U8,  NxusValueType_U16, NxusValueType_U32,
@@ -847,14 +854,16 @@ int nxusScanFirstEx(const NxusScanRegion *regions, u32 region_count,
                             u8 stored[8];
                             memset(stored, 0, sizeof(stored));
                             memcpy(stored, cur, size);
-                            rc = hitListPush(hits, region->mapping_idx, (u32)offset, stored, order[t]);
+                            rc = hitListPush(hits, region->mapping_idx, (u32)offset, addr,
+                                             stored, order[t]);
                         }
                     } else {
                         if (!compareTyped(cur, value_type, req, target)) continue;
                         u8 stored[8];
                         memset(stored, 0, sizeof(stored));
                         memcpy(stored, cur, window);
-                        rc = hitListPush(hits, region->mapping_idx, (u32)offset, stored, value_type);
+                        rc = hitListPush(hits, region->mapping_idx, (u32)offset, addr,
+                                         stored, value_type);
                     }
 
                     if (rc != NXUS_SCAN_OK) return rc;      /* hit list full */
@@ -1742,7 +1751,8 @@ int nxusScanNextFromBaseline(NxusBaseline *bl,
                 u8 stored[8];
                 memset(stored, 0, sizeof(stored));
                 memcpy(stored, cur, window);
-                if (hitListPush(hits, br->mapping_idx, (u32)off, stored, value_type) != NXUS_SCAN_OK) {
+                if (hitListPush(hits, br->mapping_idx, (u32)off,
+                                br->addr_base + off, stored, value_type) != NXUS_SCAN_OK) {
                     stop = 1;
                     /* push only fails on FULL (OOM reports NXUS_SCAN_ERR_NOMEM). */
                     break;
