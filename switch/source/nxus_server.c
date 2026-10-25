@@ -485,7 +485,10 @@ static int ptrScanOverBudget(const PtrScanBudget *budget) {
  * against a new process.  Round-robin replacement: the access pattern is mostly
  * sequential within a page and across pages, where LRU keeps nothing extra, and a
  * re-fetched page costs exactly the IPC it would have cost before the cache
- * existed. */
+ * existed.  Like the engine's own 1 KiB window cache (core/nxus_ptrscan.c), a cached
+ * page is the bytes as they were when dmnt returned them - a pointer scan is a
+ * snapshot-like walk over a running game, and re-reading every page would cost the
+ * IPCs the cache exists to save. */
 #define NXUS_PTRSCAN_PAGE_SHIFT 12u
 #define NXUS_PTRSCAN_PAGE_SIZE  (1u << NXUS_PTRSCAN_PAGE_SHIFT)   /* 4 KiB */
 #define NXUS_PTRSCAN_PAGE_MASK  ((u64)NXUS_PTRSCAN_PAGE_SIZE - 1u)
@@ -581,6 +584,16 @@ static int ptrScanReadIpc(u64 address, void *buffer, u32 size) {
     return nxusSessionReadCallback(NULL, address, buffer, size);
 }
 
+/* Page slot holding `page`, or NULL.  Tag is the full page base, so a hit is always
+   that exact page. */
+static NxusPtrScanPage *ptrScanPageFind(u64 page) {
+    for (u32 i = 0; i < NXUS_PTRSCAN_PAGE_SLOTS; i++) {
+        if (g_PtrScanPages[i].valid != 0 && g_PtrScanPages[i].tag == page)
+            return &g_PtrScanPages[i];
+    }
+    return NULL;
+}
+
 /* Serve [address, address + size) through the page cache.
  *
  * Returns 0 on success and -1 when the FIRST byte is not inside a mapping (or when
@@ -594,11 +607,34 @@ static int ptrScanReadIpc(u64 address, void *buffer, u32 size) {
  * (the engine memoizes a failed window as a dead end, so every pointer in the last
  * kilobyte of a mapping stayed unfindable for the rest of the scan).  The next
  * mapping is used when one starts there - only the tail past the last mapped byte
- * of the request is zeroed. */
+ * of the request is zeroed.
+ */
 static int ptrScanReadPaged(u64 address, void *buffer, u32 size) {
     u8 *out = (u8 *)buffer;
     u32 done = 0;
     if (address > UINT64_MAX - (u64)size) return -1;   /* wraps: never mapped */
+
+    /* A request that starts in the second half of a page reaches into the next one.
+       Serving it page by page would cost TWO dmnt reads where the pre-cache code
+       needed one - the wrong trade for the scattered dereferences a walk makes - so
+       such a request is read in a single IPC (and not cached) while NEITHER of the
+       two pages is cached.  If one of them is, the page path below is already down
+       to one IPC and still gets to fill the other page. */
+    if (size > 1u && size <= NXUS_PTRSCAN_PAGE_SIZE) {
+        const u64 first = address & ~NXUS_PTRSCAN_PAGE_MASK;
+        const u64 last = (address + (u64)size - 1u) & ~NXUS_PTRSCAN_PAGE_MASK;
+        if (last != first && ptrScanPageFind(first) == NULL &&
+            ptrScanPageFind(last) == NULL) {
+            u64 map_start = 0;
+            u64 map_end = 0;
+            if (ptrScanMappingFor(address, &map_start, &map_end) &&
+                address < map_end && (u64)size <= map_end - address) {
+                return ptrScanReadIpc(address, buffer, size) == 0 ? 0 : -1;
+            }
+            /* The mapping ends inside the window: fall through, the clamped page
+               path serves the mapped part and zeroes the rest. */
+        }
+    }
 
     while (done < size) {
         const u64 addr = address + (u64)done;
@@ -625,13 +661,7 @@ static int ptrScanReadPaged(u64 address, void *buffer, u32 size) {
         u32 mapped = chunk;
         if ((u64)chunk > map_end - addr) mapped = (u32)(map_end - addr);
 
-        NxusPtrScanPage *slot = NULL;
-        for (u32 i = 0; i < NXUS_PTRSCAN_PAGE_SLOTS; i++) {
-            if (g_PtrScanPages[i].valid != 0 && g_PtrScanPages[i].tag == page) {
-                slot = &g_PtrScanPages[i];
-                break;
-            }
-        }
+        NxusPtrScanPage *slot = ptrScanPageFind(page);
         if (slot != NULL && in_page + mapped <= slot->valid) {
             memcpy(out + done, slot->data + in_page, mapped);
             done += mapped;
