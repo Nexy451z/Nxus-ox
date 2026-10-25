@@ -121,9 +121,32 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
     /* An incomplete slot makes the whole comparison unreliable, even if the diff
        itself does not overflow (otherwise a truncated A looks like a clean A). */
     g_Truncated = (g_SlotTruncated[from_slot] || g_SlotTruncated[to_slot]) ? 1u : 0u;
+
+    /* Both captures have to use the same block size: the addresses are block
+       positions, so a 4 KB A against a 16 KB B cannot be lined up at all.
+       nxusSnapshotDiff() returns ERR_PARAM for that, and swallowing it here turned
+       a comparison that never happened into "0 changed blocks, truncated=0" -
+       which the CLI shows as "nothing changed".  The mock already fails this case,
+       so E2E never saw the regression; refuse it on the console too. */
+    if (g_Snapshots[from_slot].block_size != g_Snapshots[to_slot].block_size) {
+        NXUS_LOG("snapshot diff %c(%u B) -> %c(%u B): block size mismatch - refusing to compare",
+                 from_slot ? 'B' : 'A', (unsigned)g_Snapshots[from_slot].block_size,
+                 to_slot ? 'B' : 'A', (unsigned)g_Snapshots[to_slot].block_size);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+
     int src = nxusSnapshotDiff(&g_Snapshots[from_slot], &g_Snapshots[to_slot],
                                g_Changed, NXUS_SNAPSHOT_MAX_CHANGED, &g_ChangedCount);
-    if (src == NXUS_SNAPSHOT_ERR_FULL) g_Truncated = 1;
+    if (src == NXUS_SNAPSHOT_ERR_FULL) {
+        g_Truncated = 1;
+    } else if (src != NXUS_SNAPSHOT_OK) {
+        /* Any other engine error is a failed comparison, never an empty change
+           list: propagate it instead of returning success with changed_count=0. */
+        NXUS_LOG("snapshot diff %c->%c failed: engine rc=%d - propagation to the client",
+                 from_slot ? 'B' : 'A', to_slot ? 'B' : 'A', src);
+        g_ChangedCount = 0;
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
 
     NXUS_LOG("snapshot diff %c->%c: %u changed blocks%s",
              from_slot ? 'B' : 'A', to_slot ? 'B' : 'A', (unsigned)g_ChangedCount,

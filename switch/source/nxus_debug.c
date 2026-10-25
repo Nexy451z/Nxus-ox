@@ -173,9 +173,31 @@ static Result programSlotsAllCores(const HwSlotWrite *writes, u32 count) {
     Result mrc = svcGetThreadCoreMask(&orig_core, &orig_mask, CUR_THREAD_HANDLE);
     Result first_err = 0;
 
+    /* A failed migration must never be silent.  Every write then lands on the core
+       the caller is already running on, so the same registers are overwritten four
+       times while the cores that actually run the game keep unarmed slots - and
+       the caller would still see success and report the breakpoint as armed.
+       Whether the mask is even readable decides whether per-core arming can happen
+       at all, so failing to read it is a failure of the batch too. */
+    if (R_FAILED(mrc)) {
+        NXUS_LOG("hw bp: GetThreadCoreMask rc=0x%08X - cannot migrate, per-core arming unverified",
+                 (unsigned)mrc);
+        first_err = mrc;
+    }
+
     for (s32 core = 0; core < 4; core++) {
         if (R_SUCCEEDED(mrc)) {
-            svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (1ull << core));
+            Result crc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (1ull << core));
+            if (R_FAILED(crc)) {
+                /* Skip this core instead of writing anyway: the write would hit
+                   whatever core the thread is still on, duplicating the previous
+                   core's registers and leaving `core` unarmed.  The batch is no
+                   longer complete, so say so through first_err. */
+                NXUS_LOG("hw bp: migration to core %d failed rc=0x%08X - skipping that core",
+                         (int)core, (unsigned)crc);
+                if (R_SUCCEEDED(first_err)) first_err = crc;
+                continue;
+            }
         }
         for (u32 i = 0; i < count; i++) {
             Result rc = svcSetHardwareBreakPoint(writes[i].slot, writes[i].ctrl, writes[i].value);
@@ -185,7 +207,13 @@ static Result programSlotsAllCores(const HwSlotWrite *writes, u32 count) {
         }
     }
     if (R_SUCCEEDED(mrc)) {
-        svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
+        Result rrc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
+        if (R_FAILED(rrc)) {
+            /* Not part of the arming verdict: the registers were written per core.
+               But the calling thread now stays pinned, which is worth a log line. */
+            NXUS_LOG("hw bp: could not restore the original core mask (core %d) rc=0x%08X",
+                     (int)orig_core, (unsigned)rrc);
+        }
     }
     return first_err;
 }

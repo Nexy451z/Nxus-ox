@@ -279,8 +279,7 @@ class NxusClient:
         _, _, body = self.request(P.CMD['CheatExport'], payload)
         return body.decode('utf-8')
 
-    @staticmethod
-    def _parse_chains(body: bytes) -> list[dict]:
+    def _parse_chains(self, body: bytes) -> list[dict]:
         count, total, truncated, _res = P.PTR_CHAIN_LIST_HEADER.unpack_from(body, 0)
         pos = P.PTR_CHAIN_LIST_HEADER.size
         out = []
@@ -289,6 +288,12 @@ class NxusClient:
             pos += P.PTR_CHAIN.size
             out.append(dict(root_offset=root, final_offset=final,
                             step_count=step_count, steps=steps[:step_count]))
+        # The console sets this when it stopped on max_results or on the read
+        # budget: the chains below are valid but the list is not exhaustive.
+        self.last_chains_truncated = bool(truncated)
+        if truncated:
+            print(f"warning: pointer scan stopped early - {count} of {total} chains "
+                  f"returned, more may exist")
         return out
 
     def scan_wait(self, timeout: float = 10.0, poll: float = 0.02) -> dict:

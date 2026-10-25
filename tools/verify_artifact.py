@@ -85,6 +85,16 @@ def check(nsp_path, verbose=True, expect_tid=None, dist_dir=None):
                    f"(EnableDebug={bool(flags & 2)}, ForceDebugProd={bool(flags & 4)}, ForceDebug={bool(flags & 8)})"
                    f"{'' if bin(bits).count('1') == 1 else ' <- must be exactly ONE bit'}")
 
+        # META header fields the loader actually honours.  Offsets confirmed
+        # against a built artifact: flags @0x0C, stack size @0x1C, name @0x20.
+        meta_flags = struct.unpack_from('<I', npdm, 0x0C)[0]
+        stack_size = struct.unpack_from('<I', npdm, 0x1C)[0]
+        name = npdm[0x20:0x30].split(b'\x00')[0]
+        report(bool(meta_flags & 1), f"META flags 0x{meta_flags:08X}: 64-bit program")
+        report(stack_size >= 0x4000,
+               f"META stack size 0x{stack_size:X} (>= 0x4000 for a sysmodule)")
+        report(len(name) > 0, f"META process name {name!r}")
+
         tid = aci0_title_id(npdm)
         if expect_tid is not None:
             report(tid == int(expect_tid, 16),

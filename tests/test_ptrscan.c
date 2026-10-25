@@ -428,6 +428,118 @@ static void testWindowIsolation(void) {
     gFree(&m);
 }
 
+/*
+ * Read-budget regression.
+ *
+ * A scan that runs out of reads must:
+ *   (a) keep the chains it already found (not throw the result away),
+ *   (b) report stats.truncated, so the PC cannot read "no chains" as a verdict,
+ *   (c) NOT memoize a budget-starved node as a dead end.  The second root that
+ *       reaches the same node must try again - which shows up as reads_blocked
+ *       growing - instead of being pruned by the dead-end set.
+ *
+ * The old code returned the same value for "unmapped" and "out of budget" and
+ * memoized both, so on a big title a truncated scan buried live subtrees
+ * silently: no chains, no truncated flag.
+ *
+ * Layout (static roots are visited in offset order):
+ *   root+0x00 -> A -> B            both dead, explored before the budget ends
+ *   root+0x04 -> LIVE              holds target-4: the chain we must keep
+ *   root+0x08 -> X                 reached after the budget is gone
+ *   root+0x0C -> X                 same node, must be attempted again
+ */
+static void testReadBudget(void) {
+    printf("[test] read budget: keep results, set truncated, never memoize a skip\n");
+    GMem m;
+    memset(&m, 0, sizeof(m));
+
+    const u64 mod_base = 0x00A00000ull;
+    const u64 static_base = 0x00A50000ull;
+    const u64 a = 0x36000000ull;        /* dead: A -> B, B zeroed */
+    const u64 b = 0x36001000ull;
+    const u64 live = 0x36002000ull;     /* live: LIVE+0 -> target-4 */
+    const u64 x = 0x36003000ull;        /* only reached once the budget is spent */
+    const u64 tbase = 0x37000000ull;
+    const u64 target = tbase + 0x100ull;
+
+    gAdd(&m, static_base, 0x00001000u);
+    gAdd(&m, a, 0x00001000u);
+    gAdd(&m, b, 0x00001000u);
+    gAdd(&m, live, 0x00001000u);
+    gAdd(&m, x, 0x00001000u);
+    gAdd(&m, tbase, 0x00001000u);
+
+    gPoke(&m, static_base + 0x00, (u32)a);
+    gPoke(&m, static_base + 0x04, (u32)live);
+    gPoke(&m, static_base + 0x08, (u32)x);
+    gPoke(&m, static_base + 0x0C, (u32)x);
+
+    gPoke(&m, a + 0x00, (u32)b);                  /* A dead-ends at B */
+    gPoke(&m, live + 0x00, (u32)(target - 4));    /* the live chain */
+
+    gWatch(&m, 0, x);                             /* X must never be read */
+
+    const NxusPtrRegion regions[] = {
+        { static_base, 0x00001000u, NXUS_PTRREGION_STATIC, 0 },
+        { a, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { b, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { live, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { x, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+        { tbase, 0x00001000u, NXUS_PTRREGION_TRAVERSABLE, 0 },
+    };
+
+    NxusPtrScanOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = 3;
+    opts.max_offset = 0x1000;
+    opts.max_results = 16;
+    opts.value_width = 4;
+    opts.window_size = 0x400;
+    /* chunk + A + B + LIVE = 4: X (visited twice) is left without budget. */
+    opts.max_reads = 4;
+
+    NxusPtrChain chains[16];
+    NxusPtrScanStats st;
+    u32 count = 0;
+    u8 *scratch = (u8 *)malloc(64 * 1024);
+
+    int rc = nxusPtrScan(regions, 6, target, mod_base, &opts,
+                         chains, 16, &count, gRead, &m, scratch, 64 * 1024, &st, NULL);
+
+    CHECK(rc == NXUS_SCAN_OK, "budget scan rc=%d", rc);
+    CHECK(count == 1, "budget-starved scan dropped the chains it found: count=%u", count);
+    {
+        const u32 steps[] = { 0x0 };
+        CHECK(findChain(chains, count, (u32)(static_base - mod_base) + 0x04, steps, 1, 4),
+              "the chain through the live node was lost to the read budget");
+    }
+    CHECK(st.truncated == 1, "read budget exhaustion did not raise stats.truncated");
+    CHECK(st.reads == 4, "expected exactly 4 reads, got %llu",
+          (unsigned long long)st.reads);
+    /* Two roots point at X: with X memoized as dead the second root would be
+       pruned before it ever tried to read, leaving 1 instead of 2. */
+    CHECK(st.reads_blocked >= 2,
+          "budget-starved node was memoized as a dead end: blocked=%llu",
+          (unsigned long long)st.reads_blocked);
+    CHECK(m.seen[0] == 0, "X was read %llu times despite the exhausted budget",
+          (unsigned long long)m.seen[0]);
+
+    /* A budget too small to reach anything still must not look like a clean
+       "there are no chains" answer: empty list + truncated. */
+    opts.max_reads = 2;
+    count = 0;
+    memset(&st, 0, sizeof(st));
+    rc = nxusPtrScan(regions, 6, target, mod_base, &opts,
+                     chains, 16, &count, gRead, &m, scratch, 64 * 1024, &st, NULL);
+    CHECK(rc == NXUS_SCAN_OK, "tiny-budget scan rc=%d", rc);
+    CHECK(count == 0, "tiny-budget scan should find nothing, got %u", count);
+    CHECK(st.truncated == 1, "an unusable read budget reported a complete scan");
+    CHECK(st.reads_blocked > 0, "no read was reported as skipped");
+
+    free(scratch);
+    gFree(&m);
+}
+
 int main(void) {
     printf("=== Nxus pointer scan / cheat generator tests ===\n");
     Fake f;
@@ -538,10 +650,15 @@ int main(void) {
     opts.max_reads = 4;
     cancel = 0;
     count = 0;
+    memset(&stats, 0, sizeof(stats));
     rc = nxusPtrScan(g_Regions, 3, TARGET_MONEY, MODULE_BASE, &opts,
                      chains, 64, &count, fakeRead, &f, scratch, 64 * 1024, &stats, NULL);
     CHECK(rc == NXUS_SCAN_OK, "budget run rc=%d", rc);
     CHECK(stats.reads <= 8, "read budget not honoured: %llu", (unsigned long long)stats.reads);
+    /* Running out of reads is "incomplete", not "nothing here": the chains found
+       before the budget ended are still returned. */
+    CHECK(stats.truncated == 1, "exhausted read budget did not raise truncated");
+    CHECK(count >= 3, "budget run dropped its chains: count=%u", count);
 
     free(scratch);
 
@@ -549,6 +666,7 @@ int main(void) {
     testDeadEndMemo();
     testDeadDepthClass();
     testWindowIsolation();
+    testReadBudget();
 
     teardown(&f);
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);

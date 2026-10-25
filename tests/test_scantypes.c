@@ -435,6 +435,21 @@ static void testEqualFastPaths(void) {
     check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "u32 equal scan completes");
     check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x300, "u32 equal hit");
 
+    /* The 4-byte refine fast compare: Equal / NotEqual / Unchanged / Changed. */
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "u32 equal rescan completes");
+    NxusScanRequest u32next = baseRequest(NxusCmp_NotEqual, 0xCAFEBAB0ull, 0);
+    u32next.value_size = 4;
+    check(runNext(&u32next, &pattern) == NXUS_SCAN_OK, "u32 not-equal refine completes");
+    check(g_hits.count == 1, "u32 not-equal keeps the hit");
+    u32next.cmp_mode = NxusCmp_Unchanged;
+    check(runNext(&u32next, &pattern) == NXUS_SCAN_OK, "u32 unchanged refine completes");
+    check(g_hits.count == 1, "u32 unchanged keeps the hit");
+    u32next.cmp_mode = NxusCmp_Equal;
+    u32next.target = 0xCAFEBABEull;
+    check(runNext(&u32next, &pattern) == NXUS_SCAN_OK, "u32 equal refine completes");
+    check(g_hits.count == 1, "u32 equal keeps the hit");
+
     /* u64, then refine it through the u64 fast compare */
     putU64(0x400, 5000, 8);
     pattern.value_type = NxusValueType_U64;
@@ -922,6 +937,432 @@ static void testGeLeAndDifferent(void) {
     check(nxusHitListUndo(&g_hits) == NXUS_SCAN_ERR_PARAM, "second undo without refine is rejected");
 }
 
+/* ---- comparison branches -------------------------------------------- */
+
+/* Call nxusCompareBytes() directly with little-endian operands: has_prev == 0
+   passes NULL, exactly like a first pass that has no previous value. */
+static int cmpOperands(u64 cur, u64 prev, int has_prev, u64 target, u32 size,
+                       u32 cmp_mode, u64 target2, u32 flags) {
+    u8 cur_bytes[8], prev_bytes[8], target_bytes[8];
+    nxusStoreLE(cur_bytes, cur, size);
+    nxusStoreLE(prev_bytes, prev, size);
+    nxusStoreLE(target_bytes, target, size);
+    return nxusCompareBytes(cur_bytes, has_prev ? prev_bytes : NULL, target_bytes, size,
+                            cmp_mode, target2, flags);
+}
+
+static u64 f32Bits(float value) {
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    return (u64)bits;
+}
+
+static u64 f64Bits(double value) {
+    u64 bits;
+    memcpy(&bits, &value, 8);
+    return bits;
+}
+
+/* The signed branch of nxusCompareBytes() loads through loadSignedLE(), whose
+   1/2/4/8 byte cases were never executed: every existing numeric test scanned
+   unsigned values, so -42 was just a large unsigned number. */
+static void testSignedCompare(void) {
+    printf("- signed compares on every width\n");
+
+    const u64 neg42  = (u64)(s64)-42;
+    const u64 neg43  = (u64)(s64)-43;
+    const u64 neg7   = (u64)(s64)-7;
+    const u64 neg100 = (u64)(s64)-100;
+    const u64 neg35  = (u64)(s64)-35;
+    int equal_ok = 1, order_ok = 1, delta_ok = 1, change_ok = 1;
+
+    for (u32 size = 1; size <= 8; size *= 2) {
+        equal_ok &= cmpOperands(neg7, 0, 0, neg7, size, NxusCmp_Equal, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        equal_ok &= cmpOperands(neg7, 0, 0, neg42, size, NxusCmp_NotEqual, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+
+        order_ok &= cmpOperands(neg42, 0, 0, neg7, size, NxusCmp_Less, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        order_ok &= cmpOperands(neg7, 0, 0, neg42, size, NxusCmp_Less, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+        order_ok &= cmpOperands(neg7, 0, 0, neg42, size, NxusCmp_Greater, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        order_ok &= cmpOperands(neg42, 0, 0, neg7, size, NxusCmp_Greater, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+        order_ok &= cmpOperands(neg7, 0, 0, neg7, size, NxusCmp_GreaterOrEqual, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        order_ok &= cmpOperands(neg42, 0, 0, neg7, size, NxusCmp_GreaterOrEqual, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+        order_ok &= cmpOperands(neg42, 0, 0, neg42, size, NxusCmp_LessOrEqual, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        order_ok &= cmpOperands(neg7, 0, 0, neg42, size, NxusCmp_LessOrEqual, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+        order_ok &= cmpOperands(neg42, 0, 0, neg100, size, NxusCmp_Between, neg7,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        order_ok &= cmpOperands(neg42, 0, 0, neg7, size, NxusCmp_Between, neg7,
+                                NXUS_SCAN_F_SIGNED) == 0;
+
+        /* Different: |cur - prev| must be sign-correct (both directions) and a
+           negative target means the same distance. */
+        delta_ok &= cmpOperands(neg42, neg7, 1, 35, size, NxusCmp_Different, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        delta_ok &= cmpOperands(neg42, neg7, 1, neg35, size, NxusCmp_Different, 0,
+                                NXUS_SCAN_F_SIGNED) == 1;
+        delta_ok &= cmpOperands(neg42, neg7, 1, 34, size, NxusCmp_Different, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+        delta_ok &= cmpOperands(neg42, 0, 0, 35, size, NxusCmp_Different, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+
+        change_ok &= cmpOperands(neg42, neg43, 1, 0, size, NxusCmp_Increased, 0,
+                                 NXUS_SCAN_F_SIGNED) == 1;
+        change_ok &= cmpOperands(neg42, neg43, 1, 0, size, NxusCmp_Decreased, 0,
+                                 NXUS_SCAN_F_SIGNED) == 0;
+        change_ok &= cmpOperands(neg7, neg7, 1, 0, size, NxusCmp_Unchanged, 0,
+                                 NXUS_SCAN_F_SIGNED) == 1;
+        change_ok &= cmpOperands(neg42, neg7, 1, 0, size, NxusCmp_Changed, 0,
+                                 NXUS_SCAN_F_SIGNED) == 1;
+        change_ok &= cmpOperands(neg42, 0, 0, 0, size, NxusCmp_Unknown, 0,
+                                 NXUS_SCAN_F_SIGNED) == 1;
+        equal_ok &= cmpOperands(neg42, 0, 0, neg7, size, 99, 0,
+                                NXUS_SCAN_F_SIGNED) == 0;
+    }
+
+    check(equal_ok, "signed equal / not-equal on 1/2/4/8 byte values");
+    check(order_ok, "signed less / greater / between sign-extend every width");
+    check(delta_ok, "signed different handles both directions and a negative target");
+    check(change_ok, "signed increased / unchanged / changed / unknown");
+}
+
+/* Float compare modes other than Equal / FuzzyEqual-with-1-digit were never
+   executed (the type-flag branch, all widths). */
+static void testFloatCompareBranches(void) {
+    printf("- float compares on 4 and 8 byte values\n");
+    int equal_ok = 1, order_ok = 1, fuzzy_ok = 1, delta_ok = 1, change_ok = 1;
+
+    for (u32 size = 4; size <= 8; size *= 2) {
+        const int f64 = (size == 8);
+        const u64 one     = f64 ? f64Bits(1.0)  : f32Bits(1.0f);
+        const u64 one5    = f64 ? f64Bits(1.5)  : f32Bits(1.5f);
+        const u64 one25   = f64 ? f64Bits(1.25) : f32Bits(1.25f);
+        const u64 eps     = f64 ? f64Bits(0.25) : f32Bits(0.25f);
+        const u64 tiny    = f64 ? f64Bits(0.01) : f32Bits(0.01f);
+        const u64 half    = f64 ? f64Bits(0.5)  : f32Bits(0.5f);
+        const u64 quarter = f64 ? f64Bits(0.25) : f32Bits(0.25f);
+
+        equal_ok &= cmpOperands(one, 0, 0, one, size, NxusCmp_Equal, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        equal_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_Equal, 0,
+                                NXUS_SCAN_F_FLOAT) == 0;
+        equal_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_NotEqual, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        equal_ok &= cmpOperands(one, 0, 0, one, size, NxusCmp_NotEqual, 0,
+                                NXUS_SCAN_F_FLOAT) == 0;
+
+        order_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_Greater, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        order_ok &= cmpOperands(one, 0, 0, one5, size, NxusCmp_Greater, 0,
+                                NXUS_SCAN_F_FLOAT) == 0;
+        order_ok &= cmpOperands(one, 0, 0, one5, size, NxusCmp_Less, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        order_ok &= cmpOperands(one, 0, 0, one, size, NxusCmp_GreaterOrEqual, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        order_ok &= cmpOperands(one, 0, 0, one, size, NxusCmp_LessOrEqual, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        order_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_LessOrEqual, 0,
+                                NXUS_SCAN_F_FLOAT) == 0;
+        /* Between takes target2 as the upper bound, not as an epsilon. */
+        order_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_Between, one5,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        order_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_Between, one,
+                                NXUS_SCAN_F_FLOAT) == 0;
+
+        fuzzy_ok &= cmpOperands(one5, 0, 0, one25, size, NxusCmp_FuzzyEqual, eps,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        fuzzy_ok &= cmpOperands(one5, 0, 0, one, size, NxusCmp_FuzzyEqual, tiny,
+                                NXUS_SCAN_F_FLOAT) == 0;
+
+        delta_ok &= cmpOperands(one5, one, 1, half, size, NxusCmp_Different, tiny,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        delta_ok &= cmpOperands(one5, one, 1, quarter, size, NxusCmp_Different, tiny,
+                                NXUS_SCAN_F_FLOAT) == 0;
+        delta_ok &= cmpOperands(one5, 0, 0, half, size, NxusCmp_Different, tiny,
+                                NXUS_SCAN_F_FLOAT) == 0;
+
+        change_ok &= cmpOperands(one5, one, 1, 0, size, NxusCmp_Increased, 0,
+                                 NXUS_SCAN_F_FLOAT) == 1;
+        change_ok &= cmpOperands(one, one5, 1, 0, size, NxusCmp_Decreased, 0,
+                                 NXUS_SCAN_F_FLOAT) == 1;
+        change_ok &= cmpOperands(one, one, 1, 0, size, NxusCmp_Unchanged, 0,
+                                 NXUS_SCAN_F_FLOAT) == 1;
+        change_ok &= cmpOperands(one5, one, 1, 0, size, NxusCmp_Changed, 0,
+                                 NXUS_SCAN_F_FLOAT) == 1;
+        change_ok &= cmpOperands(one, 0, 0, 0, size, NxusCmp_Increased, 0,
+                                 NXUS_SCAN_F_FLOAT) == 0;
+        change_ok &= cmpOperands(one, 0, 0, 0, size, NxusCmp_Changed, 0,
+                                 NXUS_SCAN_F_FLOAT) == 0;
+        equal_ok &= cmpOperands(one, 0, 0, 0, size, NxusCmp_Unknown, 0,
+                                NXUS_SCAN_F_FLOAT) == 1;
+        equal_ok &= cmpOperands(one, 0, 0, one, size, 99, 0, NXUS_SCAN_F_FLOAT) == 0;
+    }
+
+    check(equal_ok, "float equal / not-equal / unknown / bad mode on 4 and 8 byte values");
+    check(order_ok, "float less / greater / between");
+    check(fuzzy_ok, "float fuzzy-equal honours the epsilon bits");
+    check(delta_ok, "float different needs the epsilon and a previous value");
+    check(change_ok, "float increased / decreased / unchanged / changed");
+
+    /* unsigned side: the modes the scan fast paths skip, plus the guards */
+    check(cmpOperands(5, 0, 0, 3, 4, NxusCmp_NotEqual, 0, 0) == 1,
+          "unsigned not-equal");
+    check(cmpOperands(5, 0, 0, 3, 4, NxusCmp_Greater, 0, 0) == 1 &&
+          cmpOperands(3, 0, 0, 5, 4, NxusCmp_Less, 0, 0) == 1,
+          "unsigned greater / less");
+    check(cmpOperands(5, 3, 1, 0, 4, NxusCmp_Increased, 0, 0) == 1 &&
+          cmpOperands(3, 5, 1, 0, 4, NxusCmp_Decreased, 0, 0) == 1 &&
+          cmpOperands(5, 5, 1, 0, 4, NxusCmp_Unchanged, 0, 0) == 1 &&
+          cmpOperands(5, 3, 1, 0, 4, NxusCmp_Changed, 0, 0) == 1,
+          "unsigned increased / decreased / unchanged / changed");
+    check(cmpOperands(5, 3, 1, 2, 4, NxusCmp_Different, 0, 0) == 1 &&
+          cmpOperands(5, 3, 1, 3, 4, NxusCmp_Different, 0, 0) == 0 &&
+          cmpOperands(5, 0, 0, 2, 4, NxusCmp_Different, 0, 0) == 0,
+          "unsigned different needs the exact distance and a previous value");
+    check(cmpOperands(5, 0, 0, 5, 4, NxusCmp_Between, 9, 0) == 1,
+          "unsigned between is inclusive");
+    check(cmpOperands(5, 0, 0, 5, 4, NxusCmp_Unknown, 0, 0) == 1,
+          "unsigned unknown matches every candidate");
+
+    u8 wide[16];
+    memset(wide, 0, sizeof(wide));
+    check(nxusCompareBytes(NULL, NULL, wide, 4, NxusCmp_Equal, 0, 0) == 0,
+          "a NULL value is rejected");
+    check(nxusCompareBytes(wide, NULL, wide, 0, NxusCmp_Equal, 0, 0) == 0,
+          "size 0 is rejected");
+    check(nxusCompareBytes(wide, NULL, wide, 9, NxusCmp_Equal, 0, 0) == 0,
+          "sizes above 8 are rejected");
+    check(nxusCompareBytes(wide, NULL, wide, 4, 99, 0, 0) == 0,
+          "an unknown compare mode is a non-match");
+}
+
+/* A signed first pass must go through the signed compare (Unknown included),
+   and the refine pass must keep the sign when it computes a difference. */
+static void testSignedScan(void) {
+    printf("- signed scans\n");
+    setup();
+
+    /* One 1-byte region per value: a wide U8 scan would also hit every zero byte
+       for a "greater than a negative" compare, which is not what we want to
+       check here. */
+    const u64 signed_bytes[5] = { 0xF6, 0xFF, 0x05, 0x7F, 0x80 };  /* -10 -1 5 127 -128 */
+    NxusScanRegion regions[5];
+    memset(regions, 0, sizeof(regions));
+    for (u32 i = 0; i < 5; i++) {
+        const u64 offset = 0x100 + (u64)i * 0x10u;
+        putU64(offset, signed_bytes[i], 1);
+        regions[i].base = g_base + offset;
+        regions[i].addr_base = g_base;
+        regions[i].size = 1;
+        regions[i].perm = NXUS_PERM_R;
+    }
+
+    NxusScanPattern pattern;
+    memset(&pattern, 0, sizeof(pattern));
+    pattern.value_type = NxusValueType_U8;
+    pattern.flags = NXUS_SCAN_F_SIGNED;
+
+    NxusScanRequest req = baseRequest(NxusCmp_Less, (u64)(s64)-1, 0);
+    req.value_size = 1;
+    req.flags = NXUS_SCAN_F_SIGNED;
+
+    NxusScanStats stats;
+    hitListInit(1);
+    check(nxusScanFirstEx(regions, 5, &req, &pattern, &g_hits, fakeRead, NULL,
+                          g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "signed less scan completes");
+    check(g_hits.count == 2, "signed less than -1 keeps -10 and -128");
+    if (g_hits.count == 2) {
+        check(g_hits.addresses[0].offset == 0x100 && g_hits.addresses[1].offset == 0x140,
+              "signed less hit offsets");
+    }
+
+    req.cmp_mode = NxusCmp_Greater;
+    req.target = (u64)(s64)-10;
+    hitListInit(1);
+    check(nxusScanFirstEx(regions, 5, &req, &pattern, &g_hits, fakeRead, NULL,
+                          g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "signed greater scan completes");
+    check(g_hits.count == 3, "signed greater than -10 keeps -1 / 5 / 127");
+    if (g_hits.count == 3) {
+        check(g_hits.addresses[0].offset == 0x110 && g_hits.addresses[2].offset == 0x130,
+              "signed greater hit offsets");
+    }
+
+    req.cmp_mode = NxusCmp_Between;
+    req.target = (u64)(s64)-10;
+    req.target2 = (u64)(s64)5;
+    hitListInit(1);
+    check(nxusScanFirstEx(regions, 5, &req, &pattern, &g_hits, fakeRead, NULL,
+                          g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "signed between scan completes");
+    check(g_hits.count == 3, "signed between -10 and 5 keeps three values");
+
+    /* Unknown: every candidate is recorded, also through the signed branch. */
+    NxusScanRegion small;
+    memset(&small, 0, sizeof(small));
+    small.base = g_base;
+    small.size = 0x100;
+    small.perm = NXUS_PERM_R | NXUS_PERM_W;
+    req = baseRequest(NxusCmp_Unknown, 0, 0);
+    req.value_size = 1;
+    req.flags = NXUS_SCAN_F_SIGNED;
+    hitListInit(1);
+    check(nxusScanFirstEx(&small, 1, &req, &pattern, &g_hits, fakeRead, NULL,
+                          g_chunk, (u32)sizeof(g_chunk), &stats, NULL) == NXUS_SCAN_OK,
+          "signed unknown scan completes");
+    check(g_hits.count == 0x100u, "signed unknown records every candidate");
+
+    /* Different on signed u32: keep the two values whose distance is 25. */
+    setup();
+    putU64(0x200, (u64)(s64)-100, 4);
+    putU64(0x300, (u64)(s64)-100, 4);
+    putU64(0x400, (u64)(s64)-100, 4);
+
+    memset(&pattern, 0, sizeof(pattern));
+    pattern.value_type = NxusValueType_U32;
+    pattern.flags = NXUS_SCAN_F_SIGNED;
+
+    req = baseRequest(NxusCmp_Equal, (u64)(s64)-100, 0);
+    req.value_size = 4;
+    req.flags = NXUS_SCAN_F_SIGNED;
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "signed equal scan completes");
+    check(g_hits.count == 3, "three values start at -100");
+
+    putU64(0x200, (u64)(s64)-125, 4);           /* -25 */
+    putU64(0x300, (u64)(s64)-75, 4);            /* +25 */
+    putU64(0x400, (u64)(s64)-110, 4);           /* -10 */
+
+    req.cmp_mode = NxusCmp_Different;
+    req.target = 25;
+    check(runNext(&req, &pattern) == NXUS_SCAN_OK, "signed different refine completes");
+    check(g_hits.count == 2, "signed different 25 keeps two hits");
+    if (g_hits.count == 2) {
+        check(g_hits.addresses[0].offset == 0x200 && g_hits.addresses[1].offset == 0x300,
+              "signed different keeps both -25 and +25");
+    }
+}
+
+/* FuzzyEqual with the default epsilon and with an explicit number of digits, plus
+   Different on floats (the refine compares the previous float). */
+static void testFloatCompareModes(void) {
+    printf("- float fuzzy / different modes\n");
+    setup();
+    put(0x1000, &(float){ 1.0f }, 4);
+    put(0x1010, &(float){ 1.005f }, 4);
+    put(0x1020, &(float){ 1.02f }, 4);
+
+    NxusScanPattern pattern;
+    memset(&pattern, 0, sizeof(pattern));
+    pattern.value_type = NxusValueType_F32;
+    pattern.flags = NXUS_SCAN_F_FLOAT;
+
+    NxusScanRequest req = baseRequest(NxusCmp_Equal, f32Bits(1.0f), 0);
+    req.value_size = 4;
+    req.flags = NXUS_SCAN_F_FLOAT;
+
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "float equal scan completes");
+    check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x1000,
+          "float equal matches only 1.0");
+
+    /* target2 == 0: the engine derives the epsilon from epsilon_decimals.
+       0 means the 2-digit default, i.e. 0.01. */
+    req.cmp_mode = NxusCmp_FuzzyEqual;
+    req.target2 = 0;
+    pattern.epsilon_decimals = 0;
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "default fuzzy float scan completes");
+    check(g_hits.count == 2, "default epsilon (10^-2) also matches 1.005");
+
+    pattern.epsilon_decimals = 3;
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "3-digit fuzzy float scan completes");
+    check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x1000,
+          "epsilon 10^-3 is too tight for 1.005");
+
+    /* Different: two values start at 10.0, one moves by 0.5, the other by 0.2. */
+    setup();
+    put(0x2000, &(float){ 10.0f }, 4);
+    put(0x2100, &(float){ 10.0f }, 4);
+    req = baseRequest(NxusCmp_Equal, f32Bits(10.0f), 0);
+    req.value_size = 4;
+    req.flags = NXUS_SCAN_F_FLOAT;
+    hitListInit(4);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "float different setup completes");
+    check(g_hits.count == 2, "two values start at 10.0");
+
+    put(0x2000, &(float){ 10.5f }, 4);
+    put(0x2100, &(float){ 10.2f }, 4);
+    req.cmp_mode = NxusCmp_Different;
+    req.target = f32Bits(0.5f);
+    req.target2 = f32Bits(0.01f);
+    check(runNext(&req, &pattern) == NXUS_SCAN_OK, "float different refine completes");
+    check(g_hits.count == 1 && g_hits.addresses[0].offset == 0x2000,
+          "float different keeps only the 0.5 change");
+}
+
+/* UTF-16 + case-insensitive together (each flag was tested alone), and the
+   ASCII-only rule of a UTF-16 window (a non-zero high byte must not match). */
+static void testStringFlagCombos(void) {
+    printf("- string flags: UTF-16 + case-insensitive\n");
+    setup();
+
+    for (u32 i = 0; i < 4; i++) {                /* "gold" in UTF-16LE */
+        g_memory[0x1000 + i * 2]     = (u8)"gold"[i];
+        g_memory[0x1000 + i * 2 + 1] = 0;
+    }
+    for (u32 i = 0; i < 4; i++) {                /* "gxld": same shape, no match */
+        g_memory[0x1100 + i * 2]     = (u8)"gxld"[i];
+        g_memory[0x1100 + i * 2 + 1] = 0;
+    }
+    /* Low bytes spell "GOLD", but the second byte of 'L' is 0x30: the ASCII-only
+       rule must reject this window. */
+    for (u32 i = 0; i < 4; i++) {
+        g_memory[0x1200 + i * 2]     = (u8)"GOLD"[i];
+        g_memory[0x1200 + i * 2 + 1] = 0;
+    }
+    g_memory[0x1205] = 0x30;
+
+    NxusScanPattern pattern;
+    memset(&pattern, 0, sizeof(pattern));
+    pattern.value_type = NxusValueType_String;
+    pattern.pattern = (const u8 *)"GoLd";
+    pattern.pattern_len = 4;
+    pattern.flags = NXUS_SCAN_F_UTF16 | NXUS_SCAN_F_CASE_INSENS;
+
+    NxusScanRequest req = baseRequest(NxusCmp_Equal, 0, 0);
+    req.value_size = 4;
+    req.flags = NXUS_SCAN_F_UTF16 | NXUS_SCAN_F_CASE_INSENS;
+
+    hitListInit(8);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "utf16 case-insensitive scan completes");
+    check(g_hits.count == 1, "utf16 case-insensitive finds only the lowercase spelling");
+    if (g_hits.count == 1) {
+        check(g_hits.addresses[0].offset == 0x1000, "utf16 case-insensitive hit offset");
+    }
+    check(runNext(&req, &pattern) == NXUS_SCAN_OK,
+          "utf16 case-insensitive refine completes");
+    check(g_hits.count == 1, "utf16 case-insensitive hit survives the refine");
+
+    /* Without case folding, "GOLD" must still not match the non-ASCII window. */
+    pattern.pattern = (const u8 *)"GOLD";
+    pattern.flags = NXUS_SCAN_F_UTF16;
+    req.flags = NXUS_SCAN_F_UTF16;
+    hitListInit(8);
+    check(runFirst(&req, &pattern) == NXUS_SCAN_OK, "utf16 ASCII-only scan completes");
+    check(g_hits.count == 0, "a UTF-16 code unit above 0xFF is not matched");
+}
+
 /* ---- dense baseline -------------------------------------------------- */
 
 /* A memory "store" (an SD file on the console): the first pass writes every
@@ -1299,6 +1740,11 @@ int main(void) {
     testUnknownInitial();
     testAlignmentAndSizes();
     testGeLeAndDifferent();
+    testSignedCompare();
+    testFloatCompareBranches();
+    testSignedScan();
+    testFloatCompareModes();
+    testStringFlagCombos();
     testDenseBaseline();
     testBaselineZeroBlocks();
     testBaselineBlockSizing();

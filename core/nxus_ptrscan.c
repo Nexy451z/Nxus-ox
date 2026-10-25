@@ -54,6 +54,13 @@ typedef struct {
     NxusPtrScanStats stats;
     int *cancel;
 
+    /* Hard stop: max_results was reached, nothing more can be stored.  This is
+       deliberately *not* the same as stats.truncated: an exhausted read budget
+       also makes the results incomplete (truncated) but the walk keeps going so
+       that chains which need no further read still surface. */
+    int stop;
+    int budget_hit;                       /* budget exhaustion logged once */
+
     u64 current_root;                     /* root the current walk started from */
     u32 stack[NXUS_PTRSCAN_MAX_DEPTH];
     u32 stack_depth;
@@ -105,16 +112,48 @@ static u64 loadValue(const u8 *p, u32 width) {
     return v;
 }
 
+/* Outcome of one read through the caller's callback.  "the bytes are not
+   mapped" and "we were not allowed to read" must never be conflated: the first
+   is a permanent fact about the address (safe to memoize as a dead end), the
+   second says nothing at all about it, so treating it as unmapped used to make
+   a budget-starved scan silently miss live chains. */
+#define NXUS_PTR_READ_OK      0
+#define NXUS_PTR_READ_FAULT (-1)
+#define NXUS_PTR_READ_BUDGET (-2)
+
+/* The read budget just ran out: the chain list becomes incomplete, and the PC
+   has to be able to tell "the scan gave up" apart from "there are no chains".
+   stats.truncated is what the server forwards in its PtrScan reply, so raising
+   it here is enough for the host tool to see it.  Log exactly one line. */
+static void noteReadBudget(PtrScan *scan) {
+    if (scan->budget_hit) return;
+    scan->budget_hit = 1;
+    scan->stats.truncated = 1;
+    fprintf(stderr,
+            "nxus ptrscan: read budget exhausted after %llu reads "
+            "(max_reads=%u, roots=%llu, chains=%u, blocked=%llu): results are incomplete\n",
+            (unsigned long long)scan->stats.reads,
+            (unsigned)scan->opts->max_reads,
+            (unsigned long long)scan->stats.roots_examined,
+            (unsigned)scan->count,
+            (unsigned long long)scan->stats.reads_blocked);
+}
+
 static int readTarget(PtrScan *scan, u64 address, void *buffer, u32 size) {
-    if (scan->opts->max_reads != 0 && scan->stats.reads >= scan->opts->max_reads) return -1;
+    if (scan->opts->max_reads != 0 && scan->stats.reads >= scan->opts->max_reads) {
+        scan->stats.reads_blocked++;
+        noteReadBudget(scan);
+        return NXUS_PTR_READ_BUDGET;
+    }
     int rc = scan->read(scan->read_ctx, address, buffer, size);
     scan->stats.reads++;
-    if (rc == 0) scan->stats.bytes_read += size;
-    return rc;
+    if (rc != 0) return NXUS_PTR_READ_FAULT;
+    scan->stats.bytes_read += size;
+    return NXUS_PTR_READ_OK;
 }
 
 static void emitChain(PtrScan *scan, u64 root_address, u32 final_offset) {
-    if (scan->count >= scan->max_out) { scan->stats.truncated = 1; return; }
+    if (scan->count >= scan->max_out) { scan->stats.truncated = 1; scan->stop = 1; return; }
     NxusPtrChain *chain = &scan->out[scan->count++];
     memset(chain, 0, sizeof(*chain));
     chain->root_address = root_address;
@@ -219,26 +258,32 @@ static u8 *windowFor(const PtrScan *scan, u32 depth) {
    read once and stored.  The tag is the full register value, so a hit is always
    the same address.  A hit is copied into this depth's buffer (cheap) instead of
    handing out the cache slot, which a deeper level could evict mid-loop.
-   Returns NULL when the read failed (negative results are cached too, because
-   re-reading a dead address just burns IPC budget). */
-static const u8 *fetchWindow(PtrScan *scan, u64 reg, u32 depth) {
+   Returns NXUS_PTR_READ_OK and stores the buffer in *out on success,
+   NXUS_PTR_READ_FAULT when the address is not readable, NXUS_PTR_READ_BUDGET
+   when max_reads stopped us.  Negative results are cached only for a real
+   fault (re-reading a dead address just burns IPC budget); a budget miss is not
+   cached, because it is not a property of the address. */
+static int fetchWindow(PtrScan *scan, u64 reg, u32 depth, const u8 **out) {
+    *out = NULL;
     u8 *dst = windowFor(scan, depth);
     if (scan->wcache_slots != 0) {
         const u32 idx = wcacheIndex(scan, reg);
         if (scan->wcache_tag[idx] == reg) {
-            if (!scan->wcache_ok[idx]) return NULL;
+            if (!scan->wcache_ok[idx]) return NXUS_PTR_READ_FAULT;
             memcpy(dst, scan->wcache_data + (size_t)idx * scan->window, scan->window);
-            return dst;
+            *out = dst;
+            return NXUS_PTR_READ_OK;
         }
     }
 
-    if (readTarget(scan, reg, dst, scan->window) != 0) {
-        if (scan->wcache_slots != 0) {
+    const int rc = readTarget(scan, reg, dst, scan->window);
+    if (rc != NXUS_PTR_READ_OK) {
+        if (rc == NXUS_PTR_READ_FAULT && scan->wcache_slots != 0) {
             const u32 idx = wcacheIndex(scan, reg);
             scan->wcache_tag[idx] = reg;
             scan->wcache_ok[idx] = 0;
         }
-        return NULL;
+        return rc;
     }
 
     if (scan->wcache_slots != 0) {
@@ -247,13 +292,14 @@ static const u8 *fetchWindow(PtrScan *scan, u64 reg, u32 depth) {
         scan->wcache_tag[idx] = reg;
         scan->wcache_ok[idx] = 1;
     }
-    return dst;
+    *out = dst;
+    return NXUS_PTR_READ_OK;
 }
 
 static void walkFrom(PtrScan *scan, u64 reg, u32 depth) {
     if (scan->cancel != NULL && *scan->cancel) return;
-    if (scan->stats.truncated) return;
-    if (scan->count >= scan->max_out) { scan->stats.truncated = 1; return; }
+    if (scan->stop) return;
+    if (scan->count >= scan->max_out) { scan->stats.truncated = 1; scan->stop = 1; return; }
 
     if (reg <= scan->target && scan->target - reg <= scan->opts->max_offset) {
         emitChain(scan, scan->current_root, (u32)(scan->target - reg));
@@ -270,10 +316,16 @@ static void walkFrom(PtrScan *scan, u64 reg, u32 depth) {
     if (memo && deadContains(scan, key, depth)) return;
 
     const u32 count_before = scan->count;
-    const u8 *window_data = fetchWindow(scan, reg, depth);
-    if (window_data == NULL) {
-        /* Unreadable: nothing can hang off this node, now or later. */
-        if (memo) deadInsert(scan, key, depth);
+    const u64 blocked_before = scan->stats.reads_blocked;
+    const u8 *window_data = NULL;
+    const int read_rc = fetchWindow(scan, reg, depth, &window_data);
+    if (read_rc != NXUS_PTR_READ_OK) {
+        /* Unreadable: nothing can hang off this node, now or later.
+           Out of budget: we simply were not allowed to look.  That proves
+           nothing about the address, so it must NOT be memoized - otherwise a
+           scan that runs out of reads silently buries live subtrees (and the
+           retry from a later root would never happen). */
+        if (read_rc == NXUS_PTR_READ_FAULT && memo) deadInsert(scan, key, depth);
         return;
     }
 
@@ -289,13 +341,16 @@ static void walkFrom(PtrScan *scan, u64 reg, u32 depth) {
         scan->stack[scan->stack_depth++] = off;
         walkFrom(scan, w, depth + 1);
         scan->stack_depth--;
-        if (scan->stats.truncated) return;
+        if (scan->stop) return;
     }
 
     /* This whole subtree was fully explored and produced no chain: remember it
        so the next root that reaches the same node stops here in O(1).  The
-       check is strict so that a truncated or cancelled walk is never memoized. */
-    if (memo && scan->count == count_before && !scan->stats.truncated &&
+       check is strict so that a truncated or cancelled walk is never memoized,
+       and a subtree that ran into the read budget is not one: its blocked nodes
+       were skipped, not proven empty. */
+    if (memo && scan->count == count_before && !scan->stop &&
+        scan->stats.reads_blocked == blocked_before &&
         (scan->cancel == NULL || !*scan->cancel))
         deadInsert(scan, key, depth);
 }
@@ -396,16 +451,24 @@ int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
     const u32 width = options->value_width;
     const u32 chunk = scan.chunk_size;
 
-    for (u32 r = 0; r < region_count && !scan.stats.truncated; r++) {
+    /* The static regions are read in chunks; every aligned word is a root
+       candidate.  Loop only on the hard stop (output full): an exhausted read
+       budget sets stats.truncated but must not abandon the remaining roots,
+       because a root that needs no further read (value already within
+       max_offset of the target) is still a real hit. */
+    for (u32 r = 0; r < region_count && !scan.stop; r++) {
         if (regions[r].kind != NXUS_PTRREGION_STATIC) continue;
         u64 pos = regions[r].base;
         const u64 end = regions[r].base + regions[r].size;
 
-        while (pos < end && !scan.stats.truncated) {
+        while (pos < end && !scan.stop) {
             if (cancel != NULL && *cancel) break;
             u64 remaining = end - pos;
             u32 todo = (remaining > (u64)chunk) ? chunk : (u32)remaining;
-            if (readTarget(&scan, pos, scan.chunk_buf, todo) != 0) { pos += todo; continue; }
+            /* A chunk read that cannot happen (unmapped static data, or the
+               read budget already spent) just skips that chunk.  Budget
+               exhaustion has already raised stats.truncated and logged. */
+            if (readTarget(&scan, pos, scan.chunk_buf, todo) != NXUS_PTR_READ_OK) { pos += todo; continue; }
 
             for (u32 off = 0; off + width <= todo; off += width) {
                 u64 value = loadValue(scan.chunk_buf + off, width);
@@ -417,7 +480,7 @@ int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
                 scan.current_root = root_address;
                 scan.stack_depth = 0;
                 walkFrom(&scan, value, 1);
-                if (scan.stats.truncated) break;
+                if (scan.stop) break;
             }
             pos += todo;
         }

@@ -96,20 +96,58 @@ static u64   g_WatchTarget = 0;
    slot has to be written once per core.  Migrate the caller through cores 0-3 and
    restore its original affinity afterwards, like Atmosphère's
    dmnt2_hardware_breakpoint.cpp. */
+
+/* Declared here because setHwBpAllCores() has to report a failed migration to
+   probe.txt, and the reporter itself is defined further down. */
+static void out(const char *fmt, ...);
+
+/* Core migrations that failed anywhere in this run.  A failed migration leaves the
+   caller on the previous core, so the same registers are written again and the
+   cores that matter stay untouched: every core would then have been measured with
+   the same value, which makes the "are breakpoints per-core?" verdict below a lie
+   unless this stays 0. */
+static u32    g_PerCoreFailures;
+static Result g_LastCoreMigrateRc;
+
 static Result setHwBpAllCores(u32 slot, u64 ctrl, u64 value) {
     s32 orig_core = 0;
     u64 orig_mask = 0;
     Result mrc = svcGetThreadCoreMask(&orig_core, &orig_mask, CUR_THREAD_HANDLE);
     Result first_err = 0;
+
+    /* Without the mask nothing can be migrated, so all four writes would land on
+       one core.  Report that instead of pretending the write was per-core. */
+    if (R_FAILED(mrc)) {
+        out("  svcGetThreadCoreMask rc=0x%08X - cannot migrate, per-core arming unverified",
+            (unsigned)mrc);
+        g_PerCoreFailures++;
+        g_LastCoreMigrateRc = mrc;
+        first_err = mrc;
+    }
+
     for (s32 core = 0; core < 4; core++) {
         if (R_SUCCEEDED(mrc)) {
-            svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (1ull << core));
+            Result crc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, (1ull << core));
+            if (R_FAILED(crc)) {
+                /* Do not write on the wrong core: skip it and remember the result,
+                   so the caller sees a failure instead of a partially armed set. */
+                out("  core %d への移行に失敗 rc=0x%08X (このコアへの書き込みはスキップ)",
+                    (int)core, (unsigned)crc);
+                g_PerCoreFailures++;
+                g_LastCoreMigrateRc = crc;
+                if (R_SUCCEEDED(first_err)) first_err = crc;
+                continue;
+            }
         }
         Result rc = svcSetHardwareBreakPoint(slot, ctrl, value);
         if (R_FAILED(rc) && R_SUCCEEDED(first_err)) first_err = rc;
     }
     if (R_SUCCEEDED(mrc)) {
-        svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
+        Result rrc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, orig_core, orig_mask);
+        if (R_FAILED(rrc)) {
+            out("  could not restore the original core mask (core %d) rc=0x%08X",
+                (int)orig_core, (unsigned)rrc);
+        }
     }
     return first_err;
 }
@@ -307,13 +345,33 @@ static void probePerCore(void) {
         Result rc = threadCreate(&t, coreThread, &g_CoreResults[core], stacks[core],
                                  sizeof(stacks[core]), 0x2C, core);
         if (R_FAILED(rc)) {
+            /* The per-core question was not measured on this core at all, so the
+               verdict below must not claim it was. */
             rec("per-core thread create", rc, (u64)core, 0);
+            g_PerCoreFailures++;
+            g_LastCoreMigrateRc = rc;
             continue;
         }
         threadStart(&t);
         threadWaitForExit(&t);
         threadClose(&t);
         rec("svcSetHardwareBreakPoint", g_CoreResults[core].rc, (u64)core, 0);
+    }
+}
+
+/* The "are breakpoints per-core?" answer is ONLY meaningful if the four core
+   migrations actually happened: a failed svcSetThreadCoreMask leaves the caller on
+   the previous core, so all four writes land in the same registers and every core
+   reports the same value.  Saying "confirmed" then would be a lie that the day-1
+   hardware decision is based on, so the verdict is downgraded instead. */
+static void reportPerCoreVerdict(void) {
+    if (g_PerCoreFailures == 0) {
+        out("コア別BP=確認済み (all 4 core migrations and per-core writes succeeded)");
+    } else {
+        out("コア別BP=未確認（移行失敗） (%u core test(s) failed, last rc=0x%08X)",
+            (unsigned)g_PerCoreFailures, (unsigned)g_LastCoreMigrateRc);
+        out("  -> the per-core results above are NOT evidence: some writes went to the "
+            "wrong core");
     }
 }
 
@@ -412,6 +470,7 @@ static void probeDebugSession(void) {
     /* now that threads are running, try the breakpoint matrix */
     probeHardwareBreakpoints();
     probePerCore();
+    reportPerCoreVerdict();
 
     /* closing the debug handle detaches and resumes the target */
     svcCloseHandle(dbg);

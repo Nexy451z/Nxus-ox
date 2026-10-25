@@ -56,13 +56,32 @@ typedef struct {
     u64 reads;
     u64 bytes_read;
     u64 roots_examined;
-    u32 truncated;      /* hit max_results / max_reads */
+    /* Dereferences skipped because max_reads was reached.  Exposed so callers
+       (and tests) can tell "budget exhausted, tried again, still skipped" apart
+       from "the address is genuinely unmapped": a skipped read is never
+       memoized as a dead end. */
+    u64 reads_blocked;
+    /* Set when the chain list is not exhaustive:
+       - max_results was hit (chains were found but could not be stored), or
+       - max_reads ran out (some subtrees were skipped unread, so chains behind
+         them may exist and were not found).
+       Chains that were stored are always valid; `truncated` only says that more
+       may exist.  It is the flag the server forwards to the PC
+       (nxus_server.c: NxusPtrChainListHeader.truncated), so a client must not
+       present an empty list as a definite answer when it is set. */
+    u32 truncated;
 } NxusPtrScanStats;
 
 /*
  * Find pointer chains that reach target_address.  Reads go through the same
  * callback the scan engine uses, so this runs on the host (tests) and on the
  * Switch (dmnt:cht) unchanged.
+ *
+ * Contract for the read budget (options->max_reads): when the budget runs out
+ * the scan keeps going but skips the unread subtrees as if they were unmapped,
+ * returns every chain it already found, and reports stats->truncated = 1.  A
+ * budget-starved dereference is never memoized as a dead end, so a later scan
+ * (or a later visit in the same scan) can still read that address.
  */
 int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
                 u64 target_address, u64 module_base,

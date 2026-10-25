@@ -16,7 +16,7 @@ sys.path.insert(0, PC)
 from nxus import protocol as P                      # noqa: E402
 from nxus.client import NxusClient, NxusError       # noqa: E402
 from nxus.mock_switch import (MockSwitch, MONEY_ADDRESS, MAIN_BASE, DATA_BASE,  # noqa: E402
-                               HEAP_BASE,
+                               HEAP_BASE, REC_OFFSET,
                               BUILD_ID)
 
 
@@ -312,6 +312,248 @@ class MockE2E(unittest.TestCase):
         self.assertEqual(len(modules), 1)
         self.assertEqual(modules[0]['base'], MAIN_BASE)
         self.assertTrue(modules[0]['build_id'].startswith(BUILD_ID[:8].hex()))
+
+
+class ScanBreakHitIsolation(unittest.TestCase):
+    """Round 5 regression guard: scan hits and break hits must stay two lists.
+
+    They are different shapes on the wire - a scan hit is (mapping, offset, value)
+    and a break hit is an 11-field register snapshot - but the mock used one
+    ``self.hits`` attribute for both.  As soon as a watchpoint fired inside a scan
+    session, the scan reply tried to unpack hit dicts and the debug reply tried to
+    read tuple keys, so "scan, attach, break hit, scan again" was broken.  Each
+    test gets its own console so both call orders are checked in isolation.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    # ---- helpers ----
+
+    def scan_money(self, value: int = 6440) -> dict:
+        """First-pass scan that finds exactly the money address."""
+        self.server.target.set_money(value)
+        self.client.scan_reset()
+        st = self.client.scan_begin(value, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(st['hits'], 1)
+        return self.client.scan_hits(0, 16)
+
+    def fire_watchpoint(self, value: int = 3940) -> dict:
+        """Attach, arm a write watchpoint on the money and let it fire."""
+        st = self.client.debug_attach()
+        self.assertTrue(st['attached'])
+        breaks = self.client.break_set(MONEY_ADDRESS, kind=P.BREAK_KIND['NxusBp_Write'],
+                                       size=4, slot=0x10)
+        self.assertEqual([b['slot'] for b in breaks], [0x10])
+        return self.server.simulate_watch_hit(MONEY_ADDRESS, MAIN_BASE + 0x12345, value=value)
+
+    def assert_scan_hits_readable(self, expected_value: int) -> dict:
+        """The scan reply must still decode with a break-hit list alongside it."""
+        batch = self.client.scan_hits(0, 16)
+        self.assertEqual(batch['count'], 1)
+        self.assertEqual(batch['total'], 1)
+        hit = batch['hits'][0]
+        self.assertEqual(hit['address'], MONEY_ADDRESS)
+        self.assertEqual(hit['offset'], REC_OFFSET + 4)      # mapping-relative
+        self.assertEqual(hit['value'], expected_value)
+        self.assertEqual(self.client.scan_status()['hits'], 1)
+        return batch
+
+    def assert_break_hits_readable(self, value: int) -> list:
+        """The debug reply must still decode with a scan hit list alongside it."""
+        hits = self.client.hit_get(8)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]['address'], MONEY_ADDRESS)
+        self.assertEqual(hits[0]['pc'], MAIN_BASE + 0x12345)
+        self.assertEqual(hits[0]['r'][3], value)
+        # hit_count is the break-hit table, never the scan list
+        self.assertEqual(self.client.debug_status()['hit_count'], 1)
+        return hits
+
+    # ---- the two orders ----
+
+    def test_scan_then_break_hit_then_scan(self):
+        """scan -> attach -> break hit -> scan: the order a GUI session uses."""
+        self.scan_money(6440)
+        self.fire_watchpoint(3940)
+
+        self.assert_break_hits_readable(3940)
+        self.assert_scan_hits_readable(6440)
+
+        # a refine walks the scan list, not the break-hit dicts
+        self.server.target.set_money(3940)
+        st = self.client.scan_next(cmp_mode=P.CMP['NxusCmp_Decreased'])
+        self.assertEqual(st['hits'], 1)
+        self.assert_scan_hits_readable(3940)
+        self.assert_break_hits_readable(3940)
+
+    def test_break_hit_then_scan_then_break_hit(self):
+        """Reverse order: a watchpoint session followed by a fresh scan."""
+        self.fire_watchpoint(1234)
+        self.assert_break_hits_readable(1234)
+
+        self.scan_money(6440)
+        self.assert_scan_hits_readable(6440)
+        self.assert_break_hits_readable(1234)      # survived the scan
+
+        self.server.target.set_money(9999999)
+        st = self.client.scan_next(cmp_mode=P.CMP['NxusCmp_Increased'])
+        self.assertEqual(st['hits'], 1)
+        self.assert_scan_hits_readable(9999999)
+        self.assert_break_hits_readable(1234)
+
+        # the console drops break hits with the session, and only those
+        self.client.debug_detach()
+        self.assertEqual(self.client.hit_get(8), [])
+        self.assert_scan_hits_readable(9999999)
+
+
+class HitListCapMockSwitch(MockSwitch):
+    """A console that reached its hit-list limit.
+
+    The firmware stops recording at NXUS_MAX_HITS and sets NXUS_HITBATCH_TRUNCATED
+    in the reply header (core/nxus_protocol.h:349) so the PC can warn instead of
+    presenting a cut-off list as final.  The stock mock never fills a list - its
+    ``_get_hits()`` always packs flags=0 - and mock_switch.py is out of scope for
+    this change, so this subclass reproduces the console's reply at the wire
+    level: same header layout, capped list, flag set.
+    """
+
+    hit_list_limit = 8              # 0 = unlimited, the stock mock's behaviour
+
+    def _get_hits(self, payload):
+        offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
+        if not self.hit_list_limit or len(self.hits) <= self.hit_list_limit:
+            return super()._get_hits(payload)
+        first = min(offset, self.hit_list_limit)
+        shown = max(0, min(count, self.hit_list_limit - first))
+        bases = [m['base'] for m in self.target.mappings]
+        body = P.HIT_BATCH_HEADER.pack(self.session_id, shown, self.hit_list_limit,
+                                       self.value_size, len(bases), P.HITBATCH_TRUNCATED)
+        body += b''.join(struct.pack('<Q', b) for b in bases)
+        for idx, off, value in self.hits[first:first + shown]:
+            body += P.HIT.pack(off, idx, self.value_type, int.from_bytes(value, 'little'))
+        return body
+
+
+class ScanTruncation(unittest.TestCase):
+    """NXUS_HITBATCH_TRUNCATED has to survive the wire and reach client.scan_hits().
+
+    Without it a full hit list is indistinguishable from a complete one, which is
+    the "no hits for 9999999" class of bug: the user sees a short list and believes
+    the search finished.
+    """
+
+    def setUp(self):
+        self.server = HitListCapMockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def test_hit_list_full_sets_the_truncated_flag(self):
+        # the mock target's zero window between MOD0 and BUILD_ID: every aligned
+        # 4-byte slot holds 0, so an Equal scan of 0 finds more than the cap.
+        window_begin, window_end = MAIN_BASE + 0x0C, MAIN_BASE + 0x40
+        expected = len(range(window_begin, window_end, 4))
+        self.assertGreater(expected, HitListCapMockSwitch.hit_list_limit)
+
+        self.client.scan_reset()
+        st = self.client.scan_begin(0, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_Custom'],
+                                    range_begin=window_begin, range_end=window_end)
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(st['hits'], expected,
+                         "the mock target's zero window changed size")
+
+        batch = self.client.scan_hits(0, 4096)
+        self.assertTrue(batch['truncated'], 'the hit-list limit was not reported')
+        self.assertEqual(batch['count'], HitListCapMockSwitch.hit_list_limit)
+        self.assertEqual(batch['total'], HitListCapMockSwitch.hit_list_limit)
+
+        # scan_all_hits() must surface it too instead of pretending it is final
+        hits = self.client.scan_all_hits()
+        self.assertEqual(len(hits), HitListCapMockSwitch.hit_list_limit)
+        self.assertTrue(self.client.last_scan_truncated)
+
+    def test_normal_scan_is_not_truncated(self):
+        self.server.target.set_money(6440)
+        self.client.scan_reset()
+        st = self.client.scan_begin(6440, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['hits'], 1)
+
+        batch = self.client.scan_hits(0, 4096)
+        self.assertFalse(batch['truncated'])
+        self.assertEqual(batch['count'], 1)
+        self.assertEqual(batch['total'], 1)
+
+        self.assertEqual(len(self.client.scan_all_hits()), 1)
+        self.assertFalse(self.client.last_scan_truncated)
+
+
+class AsyncScanE2E(unittest.TestCase):
+    """MockSwitch(scan_async=True): the console scans on a worker thread.
+
+    ScanBegin answers NxusScanState_Running with hit_count 0, ScanGetHits /
+    ScanNext answer BUSY until the worker publishes Done, and only then are the
+    results readable (nxus_session.c:891-919).  This path was only reached from
+    the Rust CLI, which needs a built exe, so a client regression here had no
+    Python-level guard.
+    """
+
+    def setUp(self):
+        self.server = MockSwitch(scan_async=True, watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def test_begin_runs_then_busy_then_done(self):
+        self.server.target.set_money(6440)
+        self.client.scan_reset()
+        st = self.client.scan_begin(6440, value_size=4, cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Running'])
+        self.assertTrue(st['flags'] & P.ST['NXUS_ST_SCANNING'])
+        self.assertEqual(st['hits'], 0, 'results leaked before the worker published them')
+
+        # the worker owns the hit arrays: both readers have to answer BUSY
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_hits(0, 16)
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BUSY))
+
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_next(cmp_mode=P.CMP['NxusCmp_Decreased'])
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BUSY))
+
+        # poll the way scan_wait()/the GUI does: progress climbs, then Done
+        progress = [st['progress']]
+        state = self.client.scan_status()
+        deadline = time.time() + 5.0
+        while (state['scan_state'] == P.SCAN_STATE['NxusScanState_Running']
+               and time.time() < deadline):
+            progress.append(state['progress'])
+            state = self.client.scan_status()
+        self.assertEqual(state['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        self.assertEqual(state['hits'], 1)
+        self.assertEqual(progress, sorted(progress), 'progress_permille went backwards')
+        self.assertLess(progress[0], state['progress'])
+
+        hits = self.client.scan_hits(0, 16)
+        self.assertEqual(batch_total(hits), 1)
+        self.assertEqual(hits['hits'][0]['address'], MONEY_ADDRESS)
+        self.assertEqual(hits['hits'][0]['value'], 6440)
+        self.assertFalse(hits['truncated'])
 
 
 def batch_total(batch):

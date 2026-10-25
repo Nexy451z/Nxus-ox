@@ -69,6 +69,74 @@ static int hasChange(const NxusChangedBlock *blocks, u32 count, u64 address) {
     return 0;
 }
 
+/* ---- coalesced (16 blocks per read) path ----------------------------- */
+
+#define COV_ENTRIES 1024u
+/* The gate in nxus_snapshot.c: a chunk of this many blocks enables coalescing. */
+#define COALESCE_CHUNK_BLOCKS 16u
+
+static u64 g_ch1[COV_ENTRIES], g_ca1[COV_ENTRIES];
+static u64 g_ch2[COV_ENTRIES], g_ca2[COV_ENTRIES];
+
+/* Capture with an explicit chunk size (in blocks), so the same data can be read
+   through the coalesced (chunk >= 16 blocks) and the one-block-per-read path.
+   The output arrays are pre-filled with a sentinel: any entry the capture did
+   not write shows up as a difference instead of a stale match. */
+static int captureWithRead(NxusReadFn read, void *read_ctx,
+                           const NxusScanRegion *regions, u32 region_count,
+                           u32 chunk_blocks, u32 capacity,
+                           u64 *hashes, u64 *addresses,
+                           NxusSnapshot *snapshot, NxusScanStats *stats) {
+    memset(hashes, 0xEE, (size_t)capacity * sizeof(u64));
+    memset(addresses, 0xEE, (size_t)capacity * sizeof(u64));
+    memset(stats, 0, sizeof(*stats));
+    nxusSnapshotInit(snapshot, hashes, addresses, capacity, BLOCK_SIZE);
+
+    u8 *chunk = (u8 *)malloc((size_t)chunk_blocks * BLOCK_SIZE);
+    int rc = nxusSnapshotCapture(snapshot, regions, region_count, read, read_ctx,
+                                 chunk, chunk_blocks * BLOCK_SIZE, stats, NULL);
+    free(chunk);
+    return rc;
+}
+
+static int sameEntries(const NxusSnapshot *a, const u64 *ha, const u64 *aa,
+                       const NxusSnapshot *b, const u64 *hb, const u64 *ab, u32 n) {
+    if (a->count != b->count) return 0;
+    if (n > a->count) n = a->count;
+    for (u32 i = 0; i < n; i++) {
+        if (ha[i] != hb[i]) return 0;
+        if (aa[i] != ab[i]) return 0;
+    }
+    return 1;
+}
+
+/* A target with an unmapped hole in the middle: [HOLE_BASE, +0x4000) and
+   [HOLE_BASE + 0x8000, +0x4000) are readable, the 0x4000 bytes between them are
+   not.  A coalesced read that crosses the hole must be refused and fall back to
+   the per-block sequence. */
+#define HOLE_BASE 0x51000000ull
+#define HOLE_READ 0x4000u
+#define HOLE_SIZE 0xC000u
+
+typedef struct {
+    u8 *low;       /* HOLE_READ bytes at HOLE_BASE */
+    u8 *high;      /* HOLE_READ bytes at HOLE_BASE + 0x8000 */
+} HoleFake;
+
+static int holeRead(void *ctx, u64 address, void *buffer, u32 size) {
+    HoleFake *h = (HoleFake *)ctx;
+    if (address >= HOLE_BASE && address + size <= HOLE_BASE + HOLE_READ) {
+        memcpy(buffer, h->low + (address - HOLE_BASE), size);
+        return 0;
+    }
+    if (address >= HOLE_BASE + 0x8000u &&
+        address + size <= HOLE_BASE + 0x8000u + HOLE_READ) {
+        memcpy(buffer, h->high + (address - (HOLE_BASE + 0x8000u)), size);
+        return 0;
+    }
+    return -1;
+}
+
 int main(void) {
     printf("=== Nxus snapshot / diff tests ===\n");
 
@@ -181,6 +249,122 @@ int main(void) {
     rc = nxusSnapshotDiff(&s4, &s5, changes, 4, &changed);
     CHECK(rc == NXUS_SNAPSHOT_ERR_FULL, "expected FULL, got %d", rc);
     CHECK(changed == 4, "expected 4 reported, got %u", changed);
+
+    /*
+     * The sysmodule reads with a 256 KB chunk, i.e. 16 blocks per read: that
+     * coalesced branch is the path the console always takes, and until now every
+     * test used a 4-block chunk and only ever hit the one-read-per-block code.
+     */
+    printf("[test] coalesced 16-block reads match the one-block path\n");
+    NxusScanStats cs1, cs2, cs3;
+    NxusSnapshot c1, c2, c3;
+
+    f.reads = 0;
+    int crc = captureWithRead(fakeRead, &f, g_Regions, 2, COALESCE_CHUNK_BLOCKS,
+                              COV_ENTRIES, g_ch1, g_ca1, &c1, &cs1);
+    const u64 coalesced_reads = f.reads;
+    CHECK(crc == NXUS_SNAPSHOT_OK, "coalesced capture rc=%d", crc);
+    CHECK(c1.count == expected_blocks, "coalesced block count %u (expected %u)",
+          c1.count, expected_blocks);
+    CHECK(cs1.reads == expected_blocks / COALESCE_CHUNK_BLOCKS,
+          "expected %u coalesced reads, got %llu", expected_blocks / COALESCE_CHUNK_BLOCKS,
+          (unsigned long long)cs1.reads);
+    CHECK(cs1.reads < expected_blocks, "coalescing did not reduce the read count (%llu)",
+          (unsigned long long)cs1.reads);
+    CHECK(coalesced_reads == cs1.reads, "the reader saw %llu reads, stats say %llu",
+          (unsigned long long)coalesced_reads, (unsigned long long)cs1.reads);
+
+    f.reads = 0;
+    int src = captureWithRead(fakeRead, &f, g_Regions, 2, 1,
+                              COV_ENTRIES, g_ch2, g_ca2, &c2, &cs2);
+    CHECK(src == NXUS_SNAPSHOT_OK, "one-block capture rc=%d", src);
+    CHECK(cs2.reads == expected_blocks, "expected one read per block, got %llu",
+          (unsigned long long)cs2.reads);
+    CHECK(sameEntries(&c1, g_ch1, g_ca1, &c2, g_ch2, g_ca2, COV_ENTRIES),
+          "coalesced hashes/addresses differ from the one-block path");
+
+    /* A 32-block chunk is still clamped to 16 blocks per read. */
+    f.reads = 0;
+    int brc = captureWithRead(fakeRead, &f, g_Regions, 2, 2 * COALESCE_CHUNK_BLOCKS,
+                              COV_ENTRIES, g_ch1, g_ca1, &c3, &cs3);
+    CHECK(brc == NXUS_SNAPSHOT_OK, "32-block chunk capture rc=%d", brc);
+    CHECK(cs3.reads == expected_blocks / COALESCE_CHUNK_BLOCKS,
+          "a 32-block chunk must still coalesce 16 blocks per read, got %llu",
+          (unsigned long long)cs3.reads);
+    CHECK(sameEntries(&c3, g_ch1, g_ca1, &c2, g_ch2, g_ca2, COV_ENTRIES),
+          "a 32-block chunk changes the hashes/addresses");
+
+    /* Region starts at +0x800 (inside block 0) and ends at -0x400 (inside the
+       last block): the partial edge blocks must not be coalesced, and the full
+       blocks between them must hash exactly like the one-block path. */
+    printf("[test] coalesced reads with an unaligned start and a ragged end\n");
+    NxusScanRegion ragged[1];
+    memset(ragged, 0, sizeof(ragged));
+    ragged[0].base = REG_A_BASE + 0x800;
+    ragged[0].size = REG_A_SIZE - 0x800 - 0x400;
+    ragged[0].perm = NXUS_PERM_R;
+
+    int rrc1 = captureWithRead(fakeRead, &f, ragged, 1, COALESCE_CHUNK_BLOCKS,
+                               COV_ENTRIES, g_ch1, g_ca1, &c1, &cs1);
+    CHECK(rrc1 == NXUS_SNAPSHOT_OK, "unaligned coalesced capture rc=%d", rrc1);
+    int rrc2 = captureWithRead(fakeRead, &f, ragged, 1, 1,
+                               COV_ENTRIES, g_ch2, g_ca2, &c2, &cs2);
+    CHECK(rrc2 == NXUS_SNAPSHOT_OK, "unaligned one-block capture rc=%d", rrc2);
+    CHECK(c1.count == 256u, "expected 256 blocks for the ragged region, got %u", c1.count);
+    CHECK(c1.addresses[0] == REG_A_BASE, "first address %llx (rounded down to the block grid)",
+          (unsigned long long)c1.addresses[0]);
+    CHECK(c1.count > 0 && c1.addresses[c1.count - 1] == REG_A_BASE + 0xFF000ull,
+          "last address %llx", (unsigned long long)c1.addresses[c1.count - 1]);
+    CHECK(cs1.reads < cs2.reads, "coalescing was not used for the ragged region (%llu vs %llu)",
+          (unsigned long long)cs1.reads, (unsigned long long)cs2.reads);
+    CHECK(sameEntries(&c1, g_ch1, g_ca1, &c2, g_ch2, g_ca2, COV_ENTRIES),
+          "the partial first/last blocks differ between the two paths");
+
+    printf("[test] coalesced capture reports FULL and keeps the leading blocks\n");
+    const u32 small_cap = 20u;
+    int frc1 = captureWithRead(fakeRead, &f, g_Regions, 2, COALESCE_CHUNK_BLOCKS,
+                               small_cap, g_ch1, g_ca1, &c1, &cs1);
+    CHECK(frc1 == NXUS_SNAPSHOT_ERR_FULL, "expected FULL, got %d", frc1);
+    CHECK(c1.count == small_cap, "expected %u captured blocks, got %u", small_cap, c1.count);
+    int frc2 = captureWithRead(fakeRead, &f, g_Regions, 2, 1,
+                               small_cap, g_ch2, g_ca2, &c2, &cs2);
+    CHECK(frc2 == NXUS_SNAPSHOT_ERR_FULL, "one-block capture expected FULL, got %d", frc2);
+    CHECK(c2.count == small_cap, "one-block count %u", c2.count);
+    CHECK(sameEntries(&c1, g_ch1, g_ca1, &c2, g_ch2, g_ca2, small_cap),
+          "the blocks kept before FULL differ between the two paths");
+
+    /* A hole between two readable spans: the coalesced read is refused, the
+       fallback drops exactly the same blocks as the one-block path. */
+    printf("[test] an unmapped hole drops the same blocks in both paths\n");
+    HoleFake hf;
+    hf.low  = (u8 *)calloc(1, HOLE_READ);
+    hf.high = (u8 *)calloc(1, HOLE_READ);
+    for (u32 i = 0; i < HOLE_READ; i++) {
+        hf.low[i]  = (u8)(i * 3u + 1u);
+        hf.high[i] = (u8)(i * 5u + 7u);
+    }
+
+    NxusScanRegion hole_region[1];
+    memset(hole_region, 0, sizeof(hole_region));
+    hole_region[0].base = HOLE_BASE;
+    hole_region[0].size = HOLE_SIZE;
+    hole_region[0].perm = NXUS_PERM_R;
+
+    int hrc1 = captureWithRead(holeRead, &hf, hole_region, 1, COALESCE_CHUNK_BLOCKS,
+                               COV_ENTRIES, g_ch1, g_ca1, &c1, &cs1);
+    CHECK(hrc1 == NXUS_SNAPSHOT_OK, "hole capture rc=%d", hrc1);
+    int hrc2 = captureWithRead(holeRead, &hf, hole_region, 1, 1,
+                               COV_ENTRIES, g_ch2, g_ca2, &c2, &cs2);
+    CHECK(hrc2 == NXUS_SNAPSHOT_OK, "hole one-block capture rc=%d", hrc2);
+    CHECK(c1.count == 8u && c2.count == 8u, "captured %u / %u blocks around the hole",
+          c1.count, c2.count);
+    CHECK(cs1.dropped == 4u && cs2.dropped == 4u, "dropped %u / %u blocks",
+          cs1.dropped, cs2.dropped);
+    CHECK(cs1.reads < cs2.reads, "the readable spans still coalesced (%llu vs %llu reads)",
+          (unsigned long long)cs1.reads, (unsigned long long)cs2.reads);
+    CHECK(sameEntries(&c1, g_ch1, g_ca1, &c2, g_ch2, g_ca2, COV_ENTRIES),
+          "hashes/addresses around the hole differ between the two paths");
+    free(hf.low); free(hf.high);
 
     free(h1); free(a1); free(h2); free(a2); free(changes);
     free(f.a); free(f.b);
