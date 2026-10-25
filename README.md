@@ -2,7 +2,7 @@
 
 **Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)**.
 
-Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`, `< 6 MiB` peak heap) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
+Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.30 MiB` plus the `32 KiB` stack, and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
 
 ---
 
@@ -50,7 +50,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   - Instead of pushing every address into the hit list on Pass 1 (which would truncate at 150k hits), `Unknown` scans use a **2-stage Dense Baseline → Lazy Hit Materialization** pipeline on both the Switch (`sdmc:/nxus/scan_base.bin` + RAM hybrid) and the PC (`pcscan.rs`).
   - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
   - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `341k` hits for `u8`, `307k` for `u16`, `256k` for `u32`).
-- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps peak RAM usage well within the Switch `System` pool partition.
+- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.30 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.33 MiB` in total, inside the Switch `System` pool partition.
 - **Incomplete results are never silent**: three independent limits can cut a result
   short, and each one is reported instead of being presented as complete —
   - hit list full → `NxusHitBatchHeader.reserved & NXUS_HITBATCH_TRUNCATED` on every
@@ -88,10 +88,10 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   | PC disappears in the middle of a scan | The scan keeps running for a minute so a quick reconnect can still read it, then it is **cancelled automatically** (previously it held the worker and the SCANNING flag until the process restarted). |
   | Wi-Fi drops / console sleeps | The listener is rebuilt automatically, and a boot-time network failure is retried every 3 s instead of parking the module. |
   | Hit list fills up | The reply is flagged `NXUS_HITBATCH_TRUNCATED`; refine further or raise the limit. |
-  | Pointer scan is huge | The console stops it after 90 s and returns the partial chains flagged as truncated, so the PC never waits past its own timeout. |
+  | Pointer scan is huge | It now runs on a worker thread: `PtrScanBegin` answers immediately, the client polls `PtrScanGet` (250 ms) while the console keeps serving other commands, and the walk stops after 90 s returning the partial chains flagged as truncated. |
   | SD card missing or full | The module still starts and serves over TCP (RAM only); the log lives in the RAM ring, readable with `nxus log`. A stale `scan_base.bin` from a previous boot is deleted at startup. |
   | Something is genuinely stuck | Hold `POWER` to force-off, then boot hekate and remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` to stop the module from starting. |
- `nxus status` also refreshes `pid` / `title id` / `main NSO base` once per second (and right after `forceopen`), so the reported target identity no longer stays at zero after the game is (re)started.
+ The console refreshes the cached `pid` / `title id` / `main NSO base` from `dmnt:cht` at most once per second (and right after `forceopen`), and `nxus status` reports that cache, so the target identity no longer stays at zero after the game is (re)started.
 
 ### 3. GDB-Style Disassembler & Live Code Patcher (CLI + GUI)
 - **Built-in Multi-Architecture Decoder (`protocol.rs`)**: Decodes **AArch64**, **AArch32 (ARM32)**, and **Thumb (T16 / T32)** instructions with zero external DLL dependencies.
@@ -99,7 +99,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 - **Live RX Code Patching**: Write directly to executable `.text` (`RX`) pages via `svcWriteDebugProcessMemory` (which performs full-system instruction cache invalidation across all cores). Includes 1-click **[NOP]** patching in the GUI (`00 00 A0 E1` for ARM32, `00 BF` / `AF F3 00 80` for Thumb, `1F 20 03 D5` for AArch64).
 
 ### 4. Pointer Scanner, Cross-Tool Dump Compatibility (`Jnoexs` & `EdiZon-SE`), & Snapshot Diff
-- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, **8-way set-associative Dead-End Subtree Memoization (`dead_set`) + 64-slot direct-mapped dereference window cache** (up to **132× fewer IPC reads** on shared heap graphs with zero false negatives), automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
+- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, **8-way set-associative Dead-End Subtree Memoization (`dead_set`) + 64-slot direct-mapped dereference window cache** (**~26× fewer IPC reads** (host diamond-graph test: 100 duplicate dereferences collapse to 4 reads) on shared heap graphs with zero false negatives), automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
 - **Full Jnoexs (`NDMP`) & EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN`) Dump Interoperability**:
   - **Jnoexs (`NDMP` `.dmp`)**: 100% byte-for-byte compatible with Jnoexs (`MemoryDump.java`) and Takumi4685's PointerSearcher.
   - **EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN` / `FDZN` / `fFZN` `.dmp*`)**: Directly loads and decompresses (LZ8) EdiZon-SE pointer dumps (`nxus dump info <file>`, `nxus ptrscan auto --dump <file>`, or via the GUI **Scan dump...** button), and can export/convert any `NDMP` dump into a PointerSearcher-SE compatible `EDZN` dump (`nxus dump export-edizon <in.dmp> <out.dmp1> --target <ADDR>`).
@@ -116,7 +116,7 @@ In the **[GitHub Releases](https://github.com/Nexy451z/Nxus-ox/releases)** page,
 | **`Nxus-ox-v0.1.0-alpha-atmosphere.zip`** | **Switch Sysmodule Package**. Extract directly to the root of your Switch SD card (`SD:/atmosphere/contents/4200000000004E58/exefs.nsp` + `flags/boot2.flag`). |
 | **`Nxus-ox-v0.1.0-alpha-windows-x64.zip`** | **Windows x64 PC Client Bundle**. Contains `nxus.exe` (unified GUI + CLI executable), `nxus-gui.bat` launcher, and documentation. |
 | **`nxus.exe`** | Standalone Windows x64 executable (identical to the binary inside the Windows zip). Runs **GUI mode** when launched without subcommands, or **CLI mode** when invoked with subcommands. |
-| **`Nxus-ox-v0.1.0-alpha-probe-atmosphere.zip`** | *(Optional)* Hardware diagnostic probe sysmodule (`0x4200000000004E59`). Do **not** enable `boot2.flag` on both `nxus` and `probe` simultaneously. |
+| **`Nxus-ox-v0.1.0-alpha-probe-atmosphere.zip`** | *(Optional)* Hardware diagnostic probe sysmodule (`0x4200000000004E59`). It ships **no** `flags/boot2.flag`; enable it only for a probe run, never together with `nxus` (see [Measuring the Diagnostic Probe](#3-measuring-the-diagnostic-probe-optional)). |
 
 ### 1. Switch Setup (Atmosphère / hekate)
 1. Extract **`Nxus-ox-v0.1.0-alpha-atmosphere.zip`** to the root of your SD card so that the following files exist:
@@ -198,6 +198,46 @@ nxus write <CODE_ADDR> "00 00 A0 E1"
 nxus detach
 ```
 
+### 3. Measuring the Diagnostic Probe (optional)
+
+`Nxus-ox-v0.1.0-alpha-probe-atmosphere.zip` contains the optional diagnostic probe
+(`0x4200000000004E59`). It opens **no TCP port** and appends its verdict to
+`sdmc:/nxus/probe.txt`; the PC client is not involved. It must **never** run at the
+same time as the main module: both take the single `dmnt:cht` cheat process, so the
+probe would report a wrong verdict instead of "unavailable" (the probe folder ships
+`DO_NOT_BOOT_TOGETHER.txt` with the same warning).
+
+```text
+The probe folder ships NO flags/boot2.flag by default.  The release zip
+deliberately contains none, so the two modules cannot both boot by accident.
+To measure the probe, move the main module's flag aside and create this folder's
+flag by hand:
+
+  1. rename the main module's flag (do not delete it):
+       sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+         -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
+  2. create an EMPTY file:
+       sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag
+  3. boot/reboot the console and start a game within 30 s (boot2 modules only
+     run on boot, and the probe waits at most 30 s for a title)
+  4. wait for a new "===== Nxus probe run ..." block at the end of
+     sdmc:/nxus/probe.txt (each run is appended, never truncated; past 512 KiB
+     the previous block is rotated to sdmc:/nxus/probe.txt.1), then delete the
+     probe flag again and rename the main module's flag back:
+       sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag   must not exist
+       sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
+         -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+
+tools/build.sh stages the same split automatically:
+  NXUS_STAGE_PROBE=1 tools/build.sh   probe gets boot2.flag, nxus does not
+  tools/build.sh                      nxus gets boot2.flag, probe does not
+```
+
+`sdmc:/nxus/probe_started.txt` is rewritten on every probe run (the previous file
+becomes `probe_started.txt.1`), so it proves the sysmodule actually started. If the
+preferred report path is not writable, the report falls back to `sdmc:/probe.txt`
+and then `sdmc:/switch/probe.txt`, and the block records the path it used.
+
 ## Repository Structure
 
 ```text
@@ -209,7 +249,7 @@ Nxus-ox/
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (75 tests)
+    tests/    Cross-language protocol parity & end-to-end test suite (93 tests)
   tests/      Host C unit test suite (1,394 checks across 7 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
@@ -233,12 +273,12 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,394 checks: scanner, dense baseline, fast paths, chunk boundaries, ptrscan memoization, snapshot, session views, heap budget, hotkey)
+# 1. Host C Core Tests (1,394 checks / 7 binaries: scan 797, ptrscan 45, snapshot 63, budget 39, scantypes 275, hotkey 11, session_view 164)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (42 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (69 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (75 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (93 tests)
 cd pc && python -m unittest discover -s tests
 ```

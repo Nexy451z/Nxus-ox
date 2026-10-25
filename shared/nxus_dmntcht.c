@@ -437,8 +437,11 @@ Result nxusDmntRead(u64 address, void *buffer, size_t size) {
     Result rc = dmntRunCommand(opRead, &ctx, true, "Read");
     if (R_FAILED(rc)) {
         if (dmntShouldLogFailure(&g_ReadFailLogs)) {
-            NXUS_LOG("dmnt: Read(%08llX,%u) rc=0x%08X (repeats suppressed)",
-                     (unsigned long long)address, (unsigned)size, (unsigned)rc);
+            /* level 2 only: fires per I/O - a hex view over an unmapped page fails
+               hundreds of times per second, and every line is an SD write.  The
+               rate limiter above only thins it out; the line itself is debug. */
+            NXUS_LOG_DEBUG("dmnt: Read(%08llX,%u) rc=0x%08X (repeats suppressed)",
+                           (unsigned long long)address, (unsigned)size, (unsigned)rc);
         }
     }
     return rc;
@@ -462,8 +465,10 @@ Result nxusDmntWrite(u64 address, const void *buffer, size_t size) {
     Result rc = dmntRunCommand(opWrite, &ctx, true, "Write");
     if (R_FAILED(rc)) {
         if (dmntShouldLogFailure(&g_WriteFailLogs)) {
-            NXUS_LOG("dmnt: Write(%08llX,%u) rc=0x%08X (repeats suppressed)",
-                     (unsigned long long)address, (unsigned)size, (unsigned)rc);
+            /* level 2 only: fires per I/O - same flood risk as Read: a failing
+               write loop would otherwise put one SD append per attempt on the card. */
+            NXUS_LOG_DEBUG("dmnt: Write(%08llX,%u) rc=0x%08X (repeats suppressed)",
+                           (unsigned long long)address, (unsigned)size, (unsigned)rc);
         }
     }
     return rc;

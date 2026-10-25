@@ -265,13 +265,48 @@ class NxusClient:
 
     # ---- pointer scan / cheat export ----
 
+    # switch/include/nxus_server.h: NXUS_ERR_PTRSCAN_STARTED (desc 8 of the Nxus
+    # result module).  PtrScanBegin answers with it when the console handed the
+    # walk to a worker thread instead of blocking the connection for up to 90 s;
+    # the chain list then arrives through PtrScanGet, which answers BUSY until the
+    # walk has published it.
+    PTRSCAN_STARTED = P.make_result(8)
+
     def ptr_scan_begin(self, target_address: int, module_base: int = 0, max_depth: int = 3,
                        max_offset: int = 0x1000, max_results: int = 64,
-                       value_width: int = 4) -> list[dict]:
+                       value_width: int = 4, timeout: float = 150.0) -> list[dict]:
         payload = P.PTRSCAN_REQUEST.pack(target_address, module_base, max_depth, max_offset,
                                          max_results, value_width)
-        _, _, body = self.request(P.CMD['PtrScanBegin'], payload, timeout=30.0)
+        # 150 s: the console aborts its own walk after 90 s (NXUS_PTRSCAN_TIME_BUDGET_MS
+        # in nxus_server.c) and replies with the partial chains, so a synchronous
+        # console still fits, and the same budget bounds the poll loop below.
+        try:
+            _, _, body = self.request(P.CMD['PtrScanBegin'], payload, timeout=timeout)
+        except NxusError as exc:
+            # Accepted by a worker-thread console: collect the chains by polling.
+            if exc.result != self.PTRSCAN_STARTED:
+                raise
+            return self._ptr_scan_wait(timeout)
         return self._parse_chains(body)
+
+    def _ptr_scan_wait(self, timeout: float = 150.0, poll: float = 0.25) -> list[dict]:
+        """Poll PtrScanGet until the console's pointer-scan worker is done.
+
+        BUSY means the walk still owns the chain array: an empty list would read
+        as "no chains found", so it must never be reported as a result.
+        """
+        deadline = time.time() + timeout
+        while True:
+            try:
+                _, _, body = self.request(P.CMD['PtrScanGet'])
+            except NxusError as exc:
+                if exc.result != P.make_result(P.ERR_BUSY):
+                    raise
+                if time.time() >= deadline:
+                    raise TimeoutError('pointer scan did not finish on the console')
+                time.sleep(poll)
+                continue
+            return self._parse_chains(body)
 
     def ptr_scan_get(self) -> list[dict]:
         _, _, body = self.request(P.CMD['PtrScanGet'])

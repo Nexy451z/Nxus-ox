@@ -11,6 +11,40 @@ BLDPFS0=/opt/devkitpro/tools/bin/build_pfs0
 # other agents can tell what 4200000000004E58 actually is.
 NXUS_VERSION=0.1.0-alpha
 
+# The probe/boot2 rule, printed identically in the probe's README.txt and in
+# DO_NOT_BOOT_TOGETHER.txt.  These two generated files used to disagree: README.txt
+# said the probe "must NOT get a flags/boot2.flag" while its "Files here" block
+# still listed the shared `flags/ boot2.flag makes it start at boot` line (the
+# branch only added the probe file, it never replaced that line).  README.md now
+# carries the same text; keep the three copies in sync.
+print_probe_flag_rule() {
+    cat <<'PROBE_FLAG_EOF'
+The probe folder ships NO flags/boot2.flag by default.  The release zip
+deliberately contains none, so the two modules cannot both boot by accident.
+To measure the probe, move the main module's flag aside and create this folder's
+flag by hand:
+
+  1. rename the main module's flag (do not delete it):
+       sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+         -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
+  2. create an EMPTY file:
+       sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag
+  3. boot/reboot the console and start a game within 30 s (boot2 modules only
+     run on boot, and the probe waits at most 30 s for a title)
+  4. wait for a new "===== Nxus probe run ..." block at the end of
+     sdmc:/nxus/probe.txt (each run is appended, never truncated; past 512 KiB
+     the previous block is rotated to sdmc:/nxus/probe.txt.1), then delete the
+     probe flag again and rename the main module's flag back:
+       sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag   must not exist
+       sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
+         -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
+
+tools/build.sh stages the same split automatically:
+  NXUS_STAGE_PROBE=1 tools/build.sh   probe gets boot2.flag, nxus does not
+  tools/build.sh                      nxus gets boot2.flag, probe does not
+PROBE_FLAG_EOF
+}
+
 build_target() {
     dir="$1"        # switch | probe
     tid="$2"        # title id used for the SD path
@@ -120,6 +154,10 @@ PYEOF
         fi
         if [ "$boot2" = "1" ]; then
             printf 'boot2    : yes (flags/boot2.flag ships with this folder)\n'
+        elif [ "$name" = "probe" ]; then
+            # Not "must NOT get a flag": the probe is measured with a flag that is
+            # created by hand for one run, then deleted again (see below).
+            printf 'boot2    : no flag by default (manual flag only while measuring - see below)\n'
         else
             printf 'boot2    : no (this folder must NOT get a flags/boot2.flag)\n'
         fi
@@ -139,7 +177,7 @@ client (nxus.exe) talks to the main sysmodule over TCP port 7332.
 
 Two custom sysmodules must never boot at the same time: 0x4200000000004E58 is
 the main module (owns TCP port 7332) and 0x4200000000004E59 is the optional
-diagnostic probe (opens no port, writes sdmc:/nxus/probe.txt).  Both take the
+diagnostic probe (opens no port, appends sdmc:/nxus/probe.txt).  Both take the
 single dmnt:cht cheat process, so whichever loses the race reports a wrong
 verdict instead of "not available".  Give at most ONE of them a
 flags/boot2.flag; metadata.json names the other title id in "conflicts_with".
@@ -154,13 +192,24 @@ sdmc:/nxus/boot_fail.txt instead, with the failing step and its result code.
 
 Files here:
   exefs.nsp     the sysmodule Atmosphère loads
-  flags/        boot2.flag makes it start at boot (empty file)
-  metadata.json machine-readable copy of this information
 README_EOF
-        # The probe folder gets an extra file, so list it in the same "Files here"
-        # block (the shared body above is deliberately identical for both folders).
+        # "Files here" is where the probe folder contradicted itself: the shared
+        # body listed `flags/ boot2.flag makes it start at boot` even though the
+        # probe is staged without a flag on purpose.  The probe gets the
+        # manual-flag rule instead of that line; nxus keeps the old line.  The
+        # exact procedure follows (same text as DO_NOT_BOOT_TOGETHER.txt and
+        # README.md).
+        if [ "$name" = "probe" ]; then
+            printf '  flags/        NO flag by default; create an empty flags/boot2.flag by hand\n'
+            printf '                only to measure the probe, then delete it (procedure below)\n'
+        else
+            printf '  flags/        boot2.flag makes it start at boot (empty file)\n'
+        fi
+        printf '  metadata.json machine-readable copy of this information\n'
         if [ "$name" = "probe" ]; then
             printf '  DO_NOT_BOOT_TOGETHER.txt  read before giving this folder a boot2.flag\n'
+            printf '\n'
+            print_probe_flag_rule
         fi
     } > "$readme_tmp"
     mv "$readme_tmp" "$dist/README.txt"
@@ -216,7 +265,7 @@ DO NOT BOOT THIS SYS MODULE TOGETHER WITH THE MAIN NXUS SYSMODULE
 =================================================================
 
 This folder is the optional diagnostic probe (title id 0x4200000000004E59).
-It opens no TCP port; it writes its verdict to sdmc:/nxus/probe.txt.
+It opens no TCP port; it appends its verdict to sdmc:/nxus/probe.txt.
 
 WHY
   Both nxus sysmodules take the single dmnt:cht cheat process at boot.  If both
@@ -226,28 +275,12 @@ WHY
   probe.txt are WRONG, not merely missing.
 
 HOW
-  Before this folder's exefs.nsp is allowed to run, move the main module's
-  boot2 flag out of the way (rename it, do not delete it):
-
-    sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag
-      -> sdmc:/atmosphere/contents/4200000000004E58/flags/boot2.flag.off
-
-  ALTERNATIVE without a build: create this folder's flag BY HAND (an empty file)
-
-    sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag
-
-  after moving the main module's flag away, then reboot.  Delete it again once
-  probe.txt exists.  The release zip deliberately ships no flag so the two
-  modules cannot both boot by accident.
-
-  Reboot, wait for probe.txt, then restore that flag and make sure THIS folder
-  has no flag at all:
-
-    sdmc:/atmosphere/contents/4200000000004E59/flags/boot2.flag   must not exist
-
-  tools/build.sh stages exactly that split automatically:
-    NXUS_STAGE_PROBE=1 tools/build.sh    probe gets boot2.flag, nxus does not
-    tools/build.sh                       nxus gets boot2.flag, probe does not
+WARN_EOF
+            printf '\n'
+            # One procedure, three copies: the same text is in the probe's
+            # README.txt (via print_probe_flag_rule) and in README.md.
+            print_probe_flag_rule
+            cat <<'WARN_EOF'
 
 metadata.json in this folder states the same rule machine-readably:
   "conflicts_with": ["0x4200000000004E58"]

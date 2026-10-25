@@ -532,8 +532,11 @@ static void recordHit(const DebugEventInfo *event) {
     mutexUnlock(&g_Mutex);
 
     if (auto_disarmed) {
-        NXUS_LOG("debug: auto-disarmed hot break slot=%u after %u hits at %08llX",
-                 (unsigned)auto_slot, (unsigned)auto_hits, (unsigned long long)auto_addr);
+        /* level 2 only: fires per hit/second - a hot slot that gets re-armed after
+           the burst reaches this again on the next burst, i.e. up to one line per
+           second per hot breakpoint in the middle of a hit storm. */
+        NXUS_LOG_DEBUG("debug: auto-disarmed hot break slot=%u after %u hits at %08llX",
+                       (unsigned)auto_slot, (unsigned)auto_hits, (unsigned long long)auto_addr);
     }
 
     /* A hot watchpoint fires hundreds of times per second.  One SD-card append
@@ -549,9 +552,11 @@ static void recordHit(const DebugEventInfo *event) {
 
     log_hits++;
     if (log_window == 0 || armTicksToNs(now - log_window) > 1000000000ull) {
-        NXUS_LOG("debug: %u hit(s) in the last second (last %s addr=%08llX pc=%08llX)",
-                 (unsigned)log_hits, (hit.kind == NxusBp_Execute) ? "exec" : "watch",
-                 (unsigned long long)hit.address, (unsigned long long)hit.pc);
+        /* level 2 only: fires per second - this is the per-second hit aggregate of
+           the hottest path (one line for a whole burst of hits). */
+        NXUS_LOG_DEBUG("debug: %u hit(s) in the last second (last %s addr=%08llX pc=%08llX)",
+                       (unsigned)log_hits, (hit.kind == NxusBp_Execute) ? "exec" : "watch",
+                       (unsigned long long)hit.address, (unsigned long long)hit.pc);
         log_window = now;
         log_hits = 0;
     }
@@ -836,7 +841,13 @@ static void eventThread(void *arg) {
             }
             had_break = had_break || extra_break;
         }
-        if (!continued && R_FAILED(crc)) NXUS_RESULT("ContinueDebugEvent", crc);
+        /* Level 0: nothing below resumes the target from this loop (only a fresh
+           debug event would), so the title stays frozen and the session is unusable
+           until the PC detaches.  This must survive level=0. */
+        if (!continued && R_FAILED(crc)) {
+            NXUS_LOG_ERROR("debug: ContinueDebugEvent failed rc=0x%08X - target left stopped",
+                           (unsigned)crc);
+        }
 
         /* Step past the trapping instruction: give the core 1 ms to retire it,
            then re-arm what the PC still has enabled.  Skipped when the hit was a
@@ -982,6 +993,10 @@ Result nxusDebugAttach(u64 pid) {
     alignas(0x1000) static u8 eventStack[0x8000];
     rc = threadCreate(&g_EventThread, eventThread, NULL, eventStack, sizeof(eventStack), 0x2A, -2);
     if (R_FAILED(rc)) {
+        /* Level 0: the session could not be started at all and dmnt has to be
+           handed back, so this must be visible even with logging at errors only. */
+        NXUS_LOG_ERROR("debug attach: threadCreate rc=0x%08X - session aborted, dmnt restored",
+                       (unsigned)rc);
         atomic_store_explicit(&g_StopLoop, true, memory_order_relaxed);
         svcCloseHandle(g_Debug);
         g_Debug = INVALID_HANDLE;
@@ -1069,9 +1084,21 @@ Result nxusDebugDetach(void) {
         /* Wait for in-flight svcRead/Write/QueryDebugProcessMemory calls: the
            handle number is reusable the moment it is closed. */
         atomic_store_explicit(&g_DebugClosing, true, memory_order_release);
+        bool drained = false;
         for (int wait = 0; wait < 500; wait++) {
-            if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) break;
+            if (atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire) == 0) {
+                drained = true;
+                break;
+            }
             svcSleepThread(1000000ull);
+        }
+        if (!drained) {
+            /* Level 0: closing the handle below can let a still-running read/write
+               land on a recycled handle (a different kernel object).  Nothing else
+               in the log records this, so keep it at level 0. */
+            NXUS_LOG_ERROR("debug detach: %d debug op(s) still in flight after 500 ms - "
+                           "closing the debug handle anyway",
+                           (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire));
         }
         svcCloseHandle(g_Debug);   /* detaches and resumes the target */
         atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
@@ -1088,7 +1115,14 @@ Result nxusDebugDetach(void) {
         svcSleepThread(100000000ull);
         rc = nxusDmntForceOpen();
     }
-    NXUS_RESULT("dmnt ForceOpenCheatProcess (restore)", rc);
+    /* Level 0: without dmnt the cheat manager stays dead for the whole session and
+       every later Read/Write/Freeze fails, so a failed restore is an error. */
+    if (R_FAILED(rc)) {
+        NXUS_LOG_ERROR("dmnt ForceOpenCheatProcess failed after detach rc=0x%08X - "
+                       "cheat session left closed", (unsigned)rc);
+    } else {
+        NXUS_LOG("dmnt ForceOpenCheatProcess restored (rc=0x%08X)", (unsigned)rc);
+    }
     nxusDmntSetAutoReopen(true);
     atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
     NXUS_LOG("debug mode released");

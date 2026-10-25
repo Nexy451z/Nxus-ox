@@ -42,6 +42,20 @@ pub type Result<T> = std::result::Result<T, NxusError>;
 /// alone"; the full `NxusConfig` (32 bytes, +16 with a debug tail) rewrites them.
 pub const DEBUG_CONFIG_LEN: usize = 16;
 
+/// `NXUS_MAKE_RESULT(NXUS_ERR_BUSY)` (core/nxus_protocol.h).  PtrScanGet answers
+/// with it while the console's pointer-scan worker is still walking.
+pub const RESULT_BUSY: u32 = 0x8003_C803;
+
+/// `NXUS_RESULT_PTRSCAN_STARTED` (switch/include/nxus_server.h): PtrScanBegin
+/// accepted the walk and handed it to a worker thread.  The chain list is then
+/// collected by polling PtrScanGet until it stops answering [`RESULT_BUSY`].
+pub const RESULT_PTRSCAN_STARTED: u32 = 0x8003_C808;
+
+/// PtrScanGet poll period while the console walks.  Short enough that the poll
+/// loop itself keeps the console's pause watchdog fed (any traffic does), long
+/// enough not to spin a core in the console's single connection thread.
+const PTRSCAN_POLL: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: u16,
@@ -872,16 +886,48 @@ impl NxusClient {
         put_u32(&mut payload, max_offset);
         put_u32(&mut payload, max_results);
         put_u32(&mut payload, value_width);
+        // The console walks the chain graph on a worker thread, so the command
+        // answers at once: either with the chain list (a build that still walks
+        // inside the command) or with NXUS_RESULT_PTRSCAN_STARTED, and then the
+        // results come from polling PtrScanGet (see the loop below).
+        //
         // The console aborts its own pointer scan after 90 s and answers with
         // whatever it has (NXUS_PTRSCAN_TIME_BUDGET_MS in nxus_server.c), so the
-        // deadline has to sit clearly above that: 150 s leaves room for the
-        // reply to travel and for a slow tick on the console side.  The old
-        // 120 s was already above 90 s, but a scan that only just missed the
-        // budget could lose the reply to a stalled Wi-Fi link.
-        let (_, body) = self.request_timeout(cmd::PTRSCAN_BEGIN, &payload, Duration::from_secs(150))?;
-        Ok(parse_chains(&body))
+        // deadline has to sit clearly above that: 150 s leaves room for the reply
+        // to travel and for a slow tick on the console side.  It still applies to
+        // the synchronous shape, and it is the total budget for the poll loop too.
+        match self.request_timeout(cmd::PTRSCAN_BEGIN, &payload, Duration::from_secs(150)) {
+            Ok((_, body)) => return Ok(parse_chains(&body)),
+            Err(e) if e.result == Some(RESULT_PTRSCAN_STARTED) => { /* poll below */ }
+            Err(e) => return Err(e),
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            match self.request_timeout(cmd::PTRSCAN_GET, &[], Duration::from_secs(30)) {
+                Ok((_, body)) => return Ok(parse_chains(&body)),
+                // Still walking: the console owns the chain array, so an empty
+                // answer here would falsely read as "no chains found".
+                Err(e) if e.result == Some(RESULT_BUSY) => {
+                    if Instant::now() >= deadline {
+                        return Err(NxusError {
+                            message: "pointer scan did not finish on the console".into(),
+                            result: None,
+                        });
+                    }
+                    thread::sleep(PTRSCAN_POLL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
+    /// The last chain list the console published.
+    ///
+    /// Answers [`RESULT_BUSY`] while a `ptrscan_begin` walk is still running;
+    /// [`ptrscan_begin`](Self::ptrscan_begin) already polls around that, so this
+    /// is the direct accessor (and the way to fetch a list a previous session
+    /// left behind).
     pub fn ptrscan_get(&self) -> Result<(Vec<PtrChain>, bool)> {
         let (_, body) = self.request(cmd::PTRSCAN_GET, &[])?;
         Ok(parse_chains(&body))

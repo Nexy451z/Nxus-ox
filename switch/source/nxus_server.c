@@ -374,6 +374,9 @@ static void onHotkeyFired(void *user) {
     }
 }
 
+/* Defined with the pointer scan worker, further down. */
+static void ptrScanInit(void);
+
 void nxusServerInit(void) {
     memset(&g_Config, 0, sizeof(g_Config));
     g_Config.hotkey_enabled = 0;
@@ -397,6 +400,9 @@ void nxusServerInit(void) {
 
     nxusHidInit();
     nxusHidSetCallback(onHotkeyFired, NULL);
+
+    /* Pointer scan worker state (defined with the worker, further down). */
+    ptrScanInit();
 }
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -829,6 +835,143 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
     return n;
 }
 
+/* ---- pointer scan worker -----------------------------------------------
+ *
+ * The walk used to run inside handlePtrScanBegin(), i.e. on the connection
+ * thread.  A pointer scan is the one command that may run for the whole
+ * NXUS_PTRSCAN_TIME_BUDGET_MS (90 s), and for that long nothing was read: the
+ * listen socket was not polled either, so a reconnecting client completed the
+ * TCP handshake (backlog 8) and then got no reply at all, and the PC's heartbeats
+ * stopped feeding the pause watchdog.  Fixing that in the transport (accept and
+ * handler on separate threads) would require every handler to be reachable from
+ * two threads plus a lock around all session state; moving the one long walk off
+ * the connection thread has the same effect for a fraction of the risk.
+ *
+ * The walk now runs on its own thread - the pattern the scan worker in
+ * nxus_session.c already uses - and PtrScanBegin answers immediately with
+ * NXUS_RESULT_PTRSCAN_STARTED (switch/include/nxus_server.h).  The client polls
+ * PtrScanGet every few hundred ms; the poll is also what keeps the watchdog
+ * alive, and between two polls the connection thread is back in recvExact(),
+ * whose listener watch preempts the session for a new connection as usual.
+ *
+ * Concurrency this introduces, and why it is safe:
+ *   - core/nxus_ptrscan.c keeps its ~38 KB engine state in a static (documented
+ *     non-reentrant), so exactly ONE worker may run at a time: g_PtrJobState is
+ *     that gate and a second PtrScanBegin is refused with BUSY.
+ *   - g_Chains / g_PtrStats / g_ChainCount / g_PtrTarget / g_PtrModuleBase are
+ *     written by the worker and read by PtrScanGet.  The worker publishes them
+ *     BEFORE its release store that marks the job Done/Failed, and every reader
+ *     acquire-loads the state first, so no reader ever sees a half-written list.
+ *   - CheatExport indexes g_Chains and is refused while the worker runs.
+ *   - SnapshotCapture and ScanBegin/ScanNext are refused while the worker runs:
+ *     their buffers (capture chunk, scan chunk/window) would land on top of the
+ *     pointer scan's scratch, region array and chain reply, which estimateHeapPeak
+ *     counts but those extra buffers do not.  They already answer BUSY while a
+ *     scan runs, so this is the same rule read the other way round.
+ */
+typedef enum {
+    NxusPtrJob_Idle = 0,   /* no worker: PtrScanGet serves the previous list    */
+    NxusPtrJob_Running,    /* the worker owns g_Chains and the job buffers      */
+    NxusPtrJob_Done,       /* results published; PtrScanGet serves them         */
+    NxusPtrJob_Failed,     /* the walk failed; PtrScanGet reports it once       */
+} NxusPtrJobState;
+
+/* Filled in on the connection thread before the worker starts, so every failure
+   that can be detected up front (bad request, heap budget, OOM, no mappings) is
+   still answered synchronously by PtrScanBegin. */
+typedef struct {
+    NxusPtrScanRequest  req;
+    NxusPtrRegion      *regions;
+    u8                 *scratch;
+    u32                 scratch_size;
+    u32                 region_count;
+    NxusPtrScanOptions  opts;
+    u64                 module_base;
+    PtrScanBudget       budget;
+} PtrScanJob;
+
+static PtrScanJob  g_PtrJob;
+static atomic_int  g_PtrJobState;
+static Result      g_PtrJobResult;   /* the failure NxusPtrJob_Failed carries */
+static Thread      g_PtrThread;
+static bool        g_PtrThreadLive;
+
+static bool ptrScanBusy(void) {
+    return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
+}
+
+/* No walk has run yet, and none can be running while init runs (it is part of the
+   boot chain, before the listener is up). */
+static void ptrScanInit(void) {
+    atomic_init(&g_PtrJobState, NxusPtrJob_Idle);
+    g_PtrJobResult = 0;
+}
+
+/* Publish the walk's outcome and hand the state over to the readers.  Runs on the
+   worker thread, or on the connection thread when no thread could be created. */
+static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
+    /* A cancelled walk is a partial result, not a failure: the chains already
+       stored are real, so they are published, flagged as incomplete.  Anything
+       else keeps the old all-or-nothing rule. */
+    if (g_PtrJob.budget.budget_hit || src == NXUS_SCAN_ERR_CANCELLED) g_PtrStats.truncated = 1;
+    const bool ok = (src == NXUS_SCAN_OK || src == NXUS_SCAN_ERR_CANCELLED);
+    g_ChainCount = ok ? count : 0;
+    g_PtrTarget = g_PtrJob.req.target_address;
+    g_PtrModuleBase = g_PtrJob.module_base;
+
+    if (g_PtrJob.budget.budget_hit) {
+        NXUS_LOG("ptrscan: time budget reached after %llu ms (chains=%u) - "
+                 "returning partial results",
+                 (unsigned long long)elapsed_ms, (unsigned)g_ChainCount);
+    }
+    NXUS_LOG("ptrscan: done in %llu ms, chains=%u, reads=%llu",
+             (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
+             (unsigned long long)g_PtrStats.reads);
+
+    free(g_PtrJob.regions);
+    free(g_PtrJob.scratch);
+    g_PtrJob.regions = NULL;
+    g_PtrJob.scratch = NULL;
+
+    g_PtrJobResult = ok ? 0 : (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    atomic_store_explicit(&g_PtrJobState, ok ? NxusPtrJob_Done : NxusPtrJob_Failed,
+                          memory_order_release);
+}
+
+/* The walk itself.  Only touches the job, the engine and the result globals. */
+static void ptrScanJobRun(void) {
+    const u64 start_ms = g_PtrJob.budget.start_ms;
+    u32 count = 0;
+
+    /* Start from a clean slate: a previous run's stats must not be published
+       together with a failed/empty result (that reads as "0 chains, complete"). */
+    memset(&g_PtrStats, 0, sizeof(g_PtrStats));
+    /* Honour the client's --max: the engine stops at max_results and reports
+       truncated, which is exactly the advice the CLI gives when it fires. */
+    const u32 out_cap = g_PtrJob.opts.max_results ? g_PtrJob.opts.max_results
+                                                  : NXUS_PTRSCAN_MAX_RESULTS;
+    /* The last argument is the cancel flag the engine polls; ptrScanReadBudgeted
+       raises it once the time budget is spent, so the walk always returns. */
+    const int src = nxusPtrScan(g_PtrJob.regions, g_PtrJob.region_count,
+                                g_PtrJob.req.target_address, g_PtrJob.module_base,
+                                &g_PtrJob.opts, g_Chains, out_cap, &count,
+                                ptrScanReadBudgeted, &g_PtrJob.budget,
+                                g_PtrJob.scratch, g_PtrJob.scratch_size,
+                                &g_PtrStats, &g_PtrJob.budget.cancel);
+
+    const u64 elapsed_ms = (armTicksToNs(armGetSystemTick()) / 1000000ull) - start_ms;
+    ptrScanPublish(src, count, elapsed_ms);
+}
+
+static void ptrScanThread(void *arg) {
+    (void)arg;
+    /* Acquire load: pairs with the release store that publishes g_PtrJob and the
+       Running state before threadStart(), so the job fields are visible here even
+       if threadStart() itself is not a synchronisation point the compiler knows. */
+    (void)atomic_load_explicit(&g_PtrJobState, memory_order_acquire);
+    ptrScanJobRun();
+}
+
 static void sendChainList(int fd, u32 seq, u16 type) {
     /* header + one wire record per chain, sized in u64: a wrapped u32 product
        would look small enough to pass the buffer check and then be written past
@@ -876,6 +1019,17 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
                          NXUS_REASON_BAD_LENGTH);
         return;
     }
+
+    /* One walk at a time: the engine's 38 KB state is a static (see the worker
+       comment above), so a second job would overwrite the first.  Refusing here
+       also keeps this gate identical for the polled and the synchronous path. */
+    if (ptrScanBusy()) {
+        NXUS_LOG("ptrscan: a walk is already running - refusing the new request");
+        replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
+                         NXUS_REASON_BUSY_STATE);
+        return;
+    }
+
     NxusPtrScanRequest req;
     memcpy(&req, payload, sizeof(req));
 
@@ -971,51 +1125,73 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
              (unsigned long long)req.target_address, (unsigned long long)module_base,
              (unsigned)opts.max_depth, (unsigned)opts.value_width, (unsigned)region_count);
 
-    u32 count = 0;
-    /* Start from a clean slate: a previous run's stats must not be published
-       together with a failed/empty result (that reads as "0 chains, complete"). */
-    memset(&g_PtrStats, 0, sizeof(g_PtrStats));
-    /* Honour the client's --max: the engine stops at max_results and reports
-       truncated, which is exactly the advice the CLI gives when it fires. */
-    const u32 out_cap = opts.max_results ? opts.max_results : NXUS_PTRSCAN_MAX_RESULTS;
-    /* The last argument is the cancel flag the engine polls; ptrScanReadBudgeted
-       raises it once the time budget is spent, so the walk always returns. */
-    int src = nxusPtrScan(regions, region_count, req.target_address, module_base, &opts,
-                          g_Chains, out_cap, &count,
-                          ptrScanReadBudgeted, &budget, scratch, 256 * 1024, &g_PtrStats,
-                          &budget.cancel);
+    /* Everything the walk needs is in place, so hand the job to the worker.  The
+       start clock was taken at the top of the handler: the client times the whole
+       command from its request, and the mapping refresh is part of it. */
+    g_PtrJob.req = req;
+    g_PtrJob.regions = regions;
+    g_PtrJob.scratch = scratch;
+    g_PtrJob.scratch_size = 256 * 1024;
+    g_PtrJob.region_count = region_count;
+    g_PtrJob.opts = opts;
+    g_PtrJob.module_base = module_base;
+    g_PtrJob.budget = budget;
 
-    const u64 elapsed_ms = (armTicksToNs(armGetSystemTick()) / 1000000ull)
-                           - budget.start_ms;
-
-    /* A cancelled walk is a partial result, not a failure: the chains already
-       stored are real, so they are published, flagged as incomplete.  Anything
-       else keeps the old all-or-nothing rule. */
-    if (budget.budget_hit || src == NXUS_SCAN_ERR_CANCELLED) g_PtrStats.truncated = 1;
-    g_ChainCount = (src == NXUS_SCAN_OK || src == NXUS_SCAN_ERR_CANCELLED) ? count : 0;
-    g_PtrTarget = req.target_address;
-    g_PtrModuleBase = module_base;
-
-    if (budget.budget_hit) {
-        NXUS_LOG("ptrscan: time budget reached after %llu ms (chains=%u) - "
-                 "returning partial results",
-                 (unsigned long long)elapsed_ms, (unsigned)g_ChainCount);
+    /* Reap the previous worker before reusing its Thread slot (threadCreate()
+       overwrites it).  It has finished, or the BUSY gate above would have
+       refused this request. */
+    if (g_PtrThreadLive) {
+        threadWaitForExit(&g_PtrThread);
+        threadClose(&g_PtrThread);
+        g_PtrThreadLive = false;
     }
-    NXUS_LOG("ptrscan: done in %llu ms, chains=%u, reads=%llu",
-             (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
-             (unsigned long long)g_PtrStats.reads);
 
-    free(regions);
-    free(scratch);
+    /* 16 KB: the engine's ~38 KB state is static and the deepest measured frame in
+       this module is under 2 KB (the scan worker keeps an even larger engine on
+       64 KB).  The stack lives in .bss next to the server/scan/event/HID stacks. */
+    alignas(0x1000) static u8 ptrScanStack[0x4000];
+    Result trc = threadCreate(&g_PtrThread, ptrScanThread, NULL, ptrScanStack,
+                              sizeof(ptrScanStack), 0x2C, -2);
+    if (R_SUCCEEDED(trc)) {
+        g_PtrThreadLive = true;
+        /* Running BEFORE threadStart(): a PtrScanGet that lands while the worker
+           is writing g_Chains must see BUSY, never a half-written list.  The
+           release store pairs with the acquire load in the PtrScanGet case. */
+        atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Running, memory_order_release);
+        threadStart(&g_PtrThread);
+        NXUS_LOG("ptrscan: started on the worker thread (target=%08llX regions=%u) - "
+                 "answering PTRSCAN_STARTED, the client polls PtrScanGet",
+                 (unsigned long long)req.target_address, (unsigned)region_count);
+        replyError(fd, type, seq, NXUS_RESULT_PTRSCAN_STARTED);
+        return;
+    }
 
-    if (src != NXUS_SCAN_OK && src != NXUS_SCAN_ERR_CANCELLED) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+    /* No thread available (kernel quota, low memory): walk here instead of failing
+       a scan the console can still perform.  That is the old behaviour, so the
+       reply is the old one - the chain list (or the walk's own error). */
+    NXUS_RESULT("threadCreate(ptrscan)", trc);
+    NXUS_LOG("ptrscan: no worker thread - walking on the connection thread");
+    ptrScanJobRun();
+    const int state = atomic_load_explicit(&g_PtrJobState, memory_order_acquire);
+    const Result walk_rc = g_PtrJobResult;
+    /* Leave the state as Get() knew it (no pending result to report): the reply
+       below carries the outcome, exactly as before this change. */
+    atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Idle, memory_order_release);
+    if (state != NxusPtrJob_Done) {
+        replyError(fd, type, seq, walk_rc);
         return;
     }
     sendChainList(fd, seq, type);
 }
 
 static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
+    /* g_Chains belongs to the pointer scan worker while it runs: indexing the
+       array below would race with the walk rewriting it.  BUSY is also what the
+       client's own scan gate reports, so a retry after the poll loop is natural. */
+    if (ptrScanBusy()) {
+        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+        return;
+    }
     if (length < sizeof(NxusCheatExportRequest)) {
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                          NXUS_REASON_BAD_LENGTH);
@@ -1149,9 +1325,12 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
        which only sends polls. */
     nxusSessionHeartbeat();
 
-    /* Pointer scans and snapshots run synchronously here, so while they work the
-       connection thread cannot read the client's heartbeats either.  Tell the
-       watchdog to stay quiet instead of resuming the target mid-operation. */
+    /* Snapshots still run synchronously here, and a pointer scan does too when its
+       worker thread could not be created, so while they work the connection thread
+       cannot read the client's heartbeats either.  Tell the watchdog to stay quiet
+       instead of resuming the target mid-operation.  A pointer scan that DID get a
+       worker answers at once, so this flag only covers its setup: the polled
+       PtrScanGet then feeds the watchdog like any other traffic. */
     g_CommandActive = true;
     g_CommandStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
 
@@ -1430,6 +1609,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_ScanBegin:
         case NxusCmd_ScanNext: {
+            /* A pointer scan worker is holding its scratch, region array and chain
+               reply (up to ~1.25 MB).  A new scan would add its chunk/window
+               buffers on top of that; the pair was never resident at once while
+               the walk owned the connection thread.  Refuse instead of risking the
+               8 MB inner heap - the mirror image of the "a running scan refuses
+               PtrScanBegin" gate. */
+            if (ptrScanBusy()) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
             if (length < sizeof(NxusScanRequest)) {
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                                  NXUS_REASON_BAD_LENGTH);
@@ -1563,6 +1752,15 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
                 break;
             }
+            /* Same rule for the pointer scan worker: its 256 KiB scratch, region
+               array and (soon) chain reply are already on the heap, and
+               estimateHeapPeak() cannot see the capture's own 256 KiB chunk on top
+               of them.  Two of those buffers never coexisted before, because the
+               walk owned the connection thread. */
+            if (ptrScanBusy()) {
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                break;
+            }
             if (length < sizeof(NxusSnapshotRequest)) {
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                                  NXUS_REASON_BAD_LENGTH);
@@ -1673,9 +1871,29 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             handlePtrScanBegin(fd, type, seq, payload, length);
             break;
 
-        case NxusCmd_PtrScanGet:
+        case NxusCmd_PtrScanGet: {
+            /* The walk runs on a worker thread (see the pointer scan worker
+               comment): while it owns g_Chains the only honest answer is BUSY, so
+               a polling client can tell "still running" from "this is the result".
+               An empty list would read as "no chains found" and hide the walk. */
+            const int ptr_state = atomic_load_explicit(&g_PtrJobState, memory_order_acquire);
+            if (ptr_state == NxusPtrJob_Running) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
+                                 NXUS_REASON_BUSY_STATE);
+                break;
+            }
+            if (ptr_state == NxusPtrJob_Failed) {
+                /* Report the failure once: the next Get answers from the (empty)
+                   list the failed walk left behind, as a synchronous Begin did. */
+                const Result walk_rc = g_PtrJobResult;
+                atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Idle, memory_order_release);
+                replyError(fd, type, seq, walk_rc);
+                break;
+            }
+            /* Idle (never started / after a failure) or Done: the list is stable. */
             sendChainList(fd, seq, type);
             break;
+        }
 
         case NxusCmd_CheatExport:
             handleCheatExport(fd, type, seq, payload, length);
