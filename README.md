@@ -280,7 +280,7 @@ Nxus-ox/
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (110 tests)
+    tests/    Cross-language protocol parity & end-to-end test suite (116 tests)
   tests/      Host C unit test suite (1,406 checks across 7 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
@@ -304,12 +304,12 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,406 checks / 7 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 164)
+# 1. Host C Core Tests (1,633 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 189)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (112 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (110 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (116 tests)
 cd pc && python -m unittest discover -s tests
 ```

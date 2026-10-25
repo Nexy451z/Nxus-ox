@@ -91,9 +91,23 @@ static void refreshTargetIdentityThrottled(void);
 /* Frozen addresses Nxus itself enabled.  dmnt keeps writing them forever, so if
    the PC disappears while some are frozen the only way out is a console reboot -
    unless we remember what we froze and release it ourselves.  The dmnt frozen
-   table is capped at 0x80 entries, which is what this array mirrors. */
+   table is capped at 0x80 entries, which is what this array mirrors.
+ *
+ * An entry also carries the target it was frozen in (pid + program id).  The
+ * address alone is not an identity: the next title can map something else at the
+ * same address, so a table of bare addresses would (a) disable a freeze in the
+ * new title because an earlier one froze that address, (b) keep retrying a
+ * release for memory that disappeared with the old process, and (c) treat a
+ * same-address freeze of the new title as "ours" although this session never
+ * asked for it.  The stamp is taken from the session when the freeze is enabled
+ * and compared again before anything is released. */
 #define NXUS_FROZEN_OWNED_MAX 128
-static u64 g_FrozenOwned[NXUS_FROZEN_OWNED_MAX];
+typedef struct {
+    u64 address;
+    u64 pid;          /* target the freeze was requested in (0 = unknown) */
+    u64 program_id;   /* its title id (0 = unknown)                       */
+} NxusFrozenOwner;
+static NxusFrozenOwner g_FrozenOwned[NXUS_FROZEN_OWNED_MAX];
 static u32 g_FrozenOwnedCount;
 
 /* g_FrozenOwned is written by the connection thread (FrozenEnable/Disable) and by
@@ -112,10 +126,44 @@ static u64 g_FrozenReleasedPending[NXUS_FROZEN_RELEASE_ADDR_MAX];
 static u32 g_FrozenReleasedPendingCount;
 static u32 g_FrozenReleasedTotal;
 
+/* Does this entry describe a freeze of the target the session is on now?
+ *
+ * Same rule as hitsOwnerIdentityMatches() / ptrChainOwnerCheck(), so the frozen
+ * table cannot disagree with the hit list about what "the same target" means: the
+ * pid is the identity, and a program id that is 0 on either side is "unknown"
+ * (dmnt metadata unavailable), not a mismatch.  A pid known on only one side is a
+ * mismatch: an entry stamped when dmnt had no metadata cannot be proven to belong
+ * to the process running now, and releasing on a guess would write into whatever
+ * the new title has mapped at that address. */
+static bool frozenOwnerIsCurrent(const NxusFrozenOwner *owned, u64 pid, u64 program_id) {
+    if (owned->pid != pid) return false;
+    return owned->program_id == 0 || program_id == 0 || owned->program_id == program_id;
+}
+
 static void frozenOwnedAdd(u64 address) {
+    /* Stamp the target the freeze was just applied to.  Both values come from the
+       session, i.e. the same identity Status reports and the chain/pointer-scan
+       owners use, so the table means "Nxus froze this address in THIS title". */
+    const u64 pid = nxusSessionProcessId();
+    const u64 program_id = nxusSessionProgramId();
     frozenLock();
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
-        if (g_FrozenOwned[i] == address) { frozenUnlock(); return; }
+        if (g_FrozenOwned[i].address == address) {
+            /* Already tracked, but possibly for an earlier target: dmnt just froze
+               the address in the current one, so the entry belongs to it now. */
+            if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
+                NXUS_LOG("frozen: %016llX re-owned by pid=%llu title=%016llX "
+                         "(was pid=%llu title=%016llX)",
+                         (unsigned long long)address,
+                         (unsigned long long)pid, (unsigned long long)program_id,
+                         (unsigned long long)g_FrozenOwned[i].pid,
+                         (unsigned long long)g_FrozenOwned[i].program_id);
+                g_FrozenOwned[i].pid = pid;
+                g_FrozenOwned[i].program_id = program_id;
+            }
+            frozenUnlock();
+            return;
+        }
     }
     if (g_FrozenOwnedCount >= NXUS_FROZEN_OWNED_MAX) {
         NXUS_LOG("frozen: ownership table full - cannot track %016llX for cleanup",
@@ -123,20 +171,61 @@ static void frozenOwnedAdd(u64 address) {
         frozenUnlock();
         return;
     }
-    g_FrozenOwned[g_FrozenOwnedCount++] = address;
+    g_FrozenOwned[g_FrozenOwnedCount].address = address;
+    g_FrozenOwned[g_FrozenOwnedCount].pid = pid;
+    g_FrozenOwned[g_FrozenOwnedCount].program_id = program_id;
+    g_FrozenOwnedCount++;
     frozenUnlock();
 }
 
 static void frozenOwnedRemove(u64 address) {
     frozenLock();
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
-        if (g_FrozenOwned[i] == address) {
+        /* Keyed by address alone: dmnt's frozen table holds at most one freeze per
+           address, and FrozenDisable disabled exactly that one - whichever target
+           the entry was stamped for.  An entry left behind would make a later
+           release act on a freeze that no longer exists. */
+        if (g_FrozenOwned[i].address == address) {
             g_FrozenOwned[i] = g_FrozenOwned[--g_FrozenOwnedCount];
             frozenUnlock();
             return;
         }
     }
     frozenUnlock();
+}
+
+/* Forget the entries that were stamped for a target other than the current one
+   and return how many were dropped.  Only the bookkeeping is dropped: the
+   addresses are NOT released here, because an earlier title's memory is gone (or
+   has been reused by whatever runs now), so disabling a freeze through dmnt would
+   act on memory this session never asked about. */
+static u32 frozenOwnedDropEarlierTarget(void) {
+    const u64 pid = nxusSessionProcessId();
+    const u64 program_id = nxusSessionProgramId();
+    u32 dropped = 0;
+    u64 dropped_pid = 0;
+
+    frozenLock();
+    if (g_FrozenOwnedCount == 0) { frozenUnlock(); return 0; }
+    for (u32 i = 0; i < g_FrozenOwnedCount; ) {
+        if (frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
+            i++;
+            continue;
+        }
+        /* Swap-remove: the table's order carries no meaning. */
+        if (dropped == 0) dropped_pid = g_FrozenOwned[i].pid;
+        g_FrozenOwned[i] = g_FrozenOwned[--g_FrozenOwnedCount];
+        dropped++;
+    }
+    frozenUnlock();
+
+    if (dropped != 0) {
+        NXUS_LOG("frozen: dropping %u address(es) from an earlier target "
+                 "(pid %llu -> %llu)",
+                 (unsigned)dropped, (unsigned long long)dropped_pid,
+                 (unsigned long long)pid);
+    }
+    return dropped;
 }
 
 /* Frozen addresses released by the switch itself are reported with
@@ -172,16 +261,48 @@ static void releaseOwnedFrozen(void) {
     u64 released_addresses[NXUS_FROZEN_RELEASE_ADDR_MAX];
     u32 released = 0;
     u32 snapshot = 0;
+    u32 dropped = 0;
+    u64 dropped_pid = 0;
+    const u64 pid = nxusSessionProcessId();
+    const u64 program_id = nxusSessionProgramId();
 
     frozenLock();
     if (g_FrozenOwnedCount == 0) { frozenUnlock(); return; }
     if (nxusDebugIsAttached()) { frozenUnlock(); return; }
-    released = g_FrozenOwnedCount;
+    /* Only freezes of the current target are ours to undo.  An entry stamped for an
+       earlier title is dropped instead of released: its address either belonged to
+       a process that no longer exists or was reused by the title that runs now, and
+       writing that address through dmnt would touch memory this session never
+       froze.  The table is cleared either way - these entries cannot become
+       meaningful again. */
+    for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
+        if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
+            if (dropped == 0) dropped_pid = g_FrozenOwned[i].pid;
+            dropped++;
+            continue;
+        }
+        if (released < NXUS_FROZEN_RELEASE_ADDR_MAX) {
+            released_addresses[released] = g_FrozenOwned[i].address;
+        }
+        released++;
+    }
     snapshot = (released < NXUS_FROZEN_RELEASE_ADDR_MAX)
                    ? released : (u32)NXUS_FROZEN_RELEASE_ADDR_MAX;
-    for (u32 i = 0; i < snapshot; i++) released_addresses[i] = g_FrozenOwned[i];
     g_FrozenOwnedCount = 0;
     frozenUnlock();
+
+    if (dropped != 0) {
+        /* Same wording as frozenOwnedDropEarlierTarget(): one event, one meaning. */
+        NXUS_LOG("frozen: dropping %u address(es) from an earlier target "
+                 "(pid %llu -> %llu)",
+                 (unsigned)dropped, (unsigned long long)dropped_pid,
+                 (unsigned long long)pid);
+    }
+    if (released == 0) {
+        /* Only leftovers of an earlier target were in the table, so there is
+           nothing to release and nothing to report to the next client. */
+        return;
+    }
 
     NXUS_LOG("frozen: releasing %u address(es) - the client is gone", (unsigned)released);
     for (u32 i = 0; i < snapshot; i++) {
@@ -567,7 +688,7 @@ static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
  * causes fired.
  *
  * Runs on the connection thread (status path) and in the 1 Hz identity tick:
- * nxusSessionInvalidateHits() is safe from both (it never frees the arrays a handler
+ * nxusSessionInvalidateHitsEx(drop_tables) is safe from both (it never frees the arrays a handler
  * may be walking).  The log line is emitted once per mismatch: a client that keeps
  * polling after the refusal must not flood the log ring.
  *
@@ -579,7 +700,8 @@ static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
  * still building - a sporadic BAD_INPUT for a scan.  A generation-only mismatch is
  * picked up by the next status / hits request on the connection thread instead, which
  * is serialized with the publication. */
-static void discardHitsOfEarlierTarget(bool compare_mapping_generation) {
+static void discardHitsOfEarlierTarget(bool compare_mapping_generation,
+                                         bool drop_tables) {
     static atomic_int logged;
     const bool matches = compare_mapping_generation
                              ? nxusSessionHitsMatchTarget()
@@ -602,12 +724,12 @@ static void discardHitsOfEarlierTarget(bool compare_mapping_generation) {
             NXUS_LOG("hits: the hit list belongs to an earlier target - discarding");
         }
     }
-    nxusSessionInvalidateHits();
+    nxusSessionInvalidateHitsEx(drop_tables);
 }
 
 /* Connection-thread entry point: identity AND mapping generation. */
 static void discardResultsOfEarlierTarget(void) {
-    discardHitsOfEarlierTarget(true);
+    discardHitsOfEarlierTarget(true, true);
 }
 
 /* Same rule for the mapping snapshot: the PC resolves every address it received
@@ -649,8 +771,23 @@ static void fillStatus(NxusStatus *st) {
     const bool debug_attached = nxusDebugIsAttached();
     st->mode = debug_attached ? NXUS_MODE_DEBUG : NXUS_MODE_DMNT;
     st->scan_state = nxusSessionScanState();
-    st->process_id = nxusSessionProcessId();
-    st->program_id = nxusSessionProgramId();
+    /* One snapshot for the whole identity: four separate reads could straddle a
+       publication and report a new pid with the previous title's base. */
+    NxusTargetIdentity identity;
+    if (nxusSessionTargetIdentity(&identity)) {
+        st->process_id = identity.pid;
+        st->program_id = identity.program_id;
+    } else {
+        st->process_id = nxusSessionProcessId();
+        st->program_id = nxusSessionProgramId();
+    }
+    /* The client polls Status far more often than the 1 Hz tick, so a title switch
+       that already moved the cached identity is caught here on the first poll after
+       it: the frozen entries of the title that went away are forgotten (never
+       released - see frozenOwnedDropEarlierTarget).  The count check keeps the
+       common case at one load instead of a lock; a stale non-zero value only costs
+       the locked re-check, and a missed drop is caught by the next call. */
+    if (g_FrozenOwnedCount != 0) (void)frozenOwnedDropEarlierTarget();
     st->main_base = nxusSessionMainBase();
     st->main_size = nxusSessionMainSize();
     st->hit_count = nxusSessionHitCount();
@@ -3060,7 +3197,14 @@ static void refreshTargetIdentityThrottled(void) {
        generation change could race a ScanBegin between its table publication and its
        owner stamp (see discardHitsOfEarlierTarget).  A rebuilt table is detected by
        the next status / hits request on the connection thread. */
-    discardHitsOfEarlierTarget(false);
+    discardHitsOfEarlierTarget(false, false);
+    /* Same reason, for the frozen table: a freeze stamped for the title that just
+       went away cannot be released any more, and keeping it would let the release
+       that runs once the client is gone touch the same address in the title that
+       runs now.  Dropping is all that happens here (see
+       frozenOwnedDropEarlierTarget) - this runs on the main thread too, where
+       calling into dmnt to release would be an unasked-for write. */
+    (void)frozenOwnedDropEarlierTarget();
 }
 
 /* The debugee exited while we were attached.  The event thread has already

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::NxusClient;
 use crate::protocol::{self as P, break_kind, event, scan_state, BreakHit, ChangedBlock, Compare,
-                      Hit, Metadata, ModuleInfo, PtrChain, Scope, Status, ValueType};
+                      Hit, MemoryInfo, Metadata, ModuleInfo, PtrChain, Scope, Status, ValueType};
 
 // ---------------------------------------------------------------- worker
 
@@ -327,6 +327,50 @@ fn try_reconnect(host: &str, port: u16) -> Option<(NxusClient, Status)> {
     }
 }
 
+/// One `GET_MAPPINGS` page request size.
+///
+/// The console clamps `max_count` to 1024 (`NxusCmd_GetMappings`,
+/// switch/source/nxus_server.c), so asking for more than it will ever answer would
+/// make the first full reply look like a short page and end the walk after one
+/// request.  256 is the size the GUI always used, and it stays well under that cap.
+const MAPPING_PAGE: u32 = 256;
+
+/// Hard stop for the mapping walk.
+///
+/// The console's own table cannot be larger than this (its snapshot arrays are
+/// sized by `NXUS_HEAP_MAX_MAPPINGS` = 4096), so the bound is pure belt-and-braces
+/// against a peer that ignores `offset`: without it the worker thread would spin in
+/// this loop for ever and the UI would stop answering.
+const MAX_MAPPINGS: usize = 65536;
+
+/// Read the WHOLE mapping table, one `GET_MAPPINGS` page at a time.
+///
+/// The GUI used to ask for a single 256-entry page, so a title with a bigger
+/// address space showed only its first 256 mappings while the CLI paged through
+/// all of them (the review flagged the mismatch as Med).  Keep asking from the
+/// next offset until the console answers an empty or short page - the same rule
+/// the CLI's scan/dump paths use - and stop at [`MAX_MAPPINGS`] whatever the peer
+/// does.  The fetch is a closure so the paging rule itself is unit-testable
+/// without a console.
+fn page_mappings<F>(mut fetch: F) -> Result<Vec<MemoryInfo>, String>
+where
+    F: FnMut(u64, u32) -> Result<Vec<MemoryInfo>, String>,
+{
+    let mut all: Vec<MemoryInfo> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let page = fetch(offset, MAPPING_PAGE)?;
+        let got = page.len();
+        all.extend(page);
+        offset += got as u64;
+        if got == 0 || got < MAPPING_PAGE as usize || all.len() >= MAX_MAPPINGS {
+            break;
+        }
+    }
+    all.truncate(MAX_MAPPINGS);
+    Ok(all)
+}
+
 fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let mut client: Option<NxusClient> = None;
     let mut pc_scan: Option<crate::pcscan::PcScan> = None;
@@ -576,7 +620,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             }
                         }
                         Cmd::FetchMappings => {
-                            let maps = c.mappings(0, 256).map_err(|e| e.to_string())?;
+                            // Page through the whole table: a single request only
+                            // ever returned the first 256 mappings, so the GUI
+                            // disagreed with the CLI about the same title's address
+                            // space (and a scan-range picker only saw that prefix).
+                            let maps = page_mappings(|offset, count| {
+                                c.mappings(offset, count).map_err(|e| e.to_string())
+                            })?;
                             let _ = tx.send(Ev::Mappings(maps));
                         }
                         Cmd::ScanBegin { spec } => {
@@ -1730,6 +1780,83 @@ mod font_tests {
                 "stop marker {marker} would render as a box"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use crate::protocol::MemoryInfo;
+
+    /// `n` mappings whose `base` encodes their index, so the test can prove the
+    /// pages were appended in offset order instead of re-reading the first one.
+    fn page(start: u64, n: usize) -> Vec<MemoryInfo> {
+        (0..n)
+            .map(|i| MemoryInfo { base: (start + i as u64) * 0x1000, size: 0x1000,
+                                  ..Default::default() })
+            .collect()
+    }
+
+    /// A table larger than one page must arrive complete: this is the bug the
+    /// review flagged (the GUI showed exactly 256 mappings and stopped).
+    #[test]
+    fn every_page_of_a_large_table_is_collected() {
+        let mut calls = 0;
+        let all = page_mappings(|offset, count| {
+            calls += 1;
+            assert_eq!(count, MAPPING_PAGE, "the console clamps max_count to 1024");
+            let start = offset as usize;
+            Ok(page(offset, (700 - start).min(count as usize)))
+        })
+        .unwrap();
+
+        assert_eq!(all.len(), 700);
+        assert_eq!(calls, 3, "700 entries are three pages (256 + 256 + 188)");
+        assert_eq!(all.first().unwrap().base, 0);
+        assert_eq!(all.last().unwrap().base, 699 * 0x1000, "the last page was dropped");
+    }
+
+    /// A table that is an exact multiple of the page size must not stop early and
+    /// must not loop for ever: the empty page after it terminates the walk.
+    #[test]
+    fn an_exact_multiple_ends_on_the_empty_page() {
+        let mut calls = 0;
+        let all = page_mappings(|offset, count| {
+            calls += 1;
+            let start = offset as usize;
+            Ok(page(offset, if start < 512 { count as usize } else { 0 }))
+        })
+        .unwrap();
+        assert_eq!(all.len(), 512);
+        assert_eq!(calls, 3);
+    }
+
+    /// An empty mapping table is a legitimate answer (`get_mapping_count() == 0`):
+    /// the GUI must show nothing rather than treat it as an error.
+    #[test]
+    fn an_empty_table_stays_empty() {
+        let all = page_mappings(|_, _| Ok(Vec::new())).unwrap();
+        assert!(all.is_empty());
+    }
+
+    /// A peer that ignores `offset` (or a table that keeps growing) must be cut off
+    /// at [`MAX_MAPPINGS`] instead of making the worker thread spin for ever.
+    #[test]
+    fn an_endless_table_is_cut_off() {
+        let all = page_mappings(|_offset, count| Ok(page(0, count as usize))).unwrap();
+        assert_eq!(all.len(), MAX_MAPPINGS);
+    }
+
+    /// An error from any page aborts the walk: handing back the prefix would look
+    /// like a complete - but shrunken - address space, which is the bug again.
+    #[test]
+    fn a_failed_page_is_an_error_not_a_prefix() {
+        let err = page_mappings(|offset, _| {
+            if offset == 0 { Ok(page(0, MAPPING_PAGE as usize)) }
+            else { Err("link lost".to_string()) }
+        })
+        .unwrap_err();
+        assert_eq!(err, "link lost");
     }
 }
 

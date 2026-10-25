@@ -8,6 +8,7 @@ import struct
 import sys
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PC = os.path.dirname(HERE)
@@ -1296,6 +1297,147 @@ class ClientAutoDefaults(unittest.TestCase):
         self.server.ptr_scan_width = 8
         self.client.ptr_scan_begin(MONEY_ADDRESS, module_base=MAIN_BASE, value_width=8)
         self.assertEqual(self.client.last_ptr_scan_width, 8)
+
+
+class ProtoVersionGuard(unittest.TestCase):
+    """The console announces its wire version in every NxusStatus reply.
+
+    The client decoded `proto_version` and never looked at it, so a console
+    speaking another version produced plausible-looking garbage (a wrong title, a
+    wrong hit count) with no hint at all.  The mismatch is a ONE-SHOT warning, not
+    an exception: the fields read so far keep their offsets, and refusing the
+    connection would turn a mostly usable console into a dead one.
+    """
+
+    def setUp(self):
+        self.client = NxusClient('127.0.0.1', 1, timeout=0.5)
+
+    def tearDown(self):
+        self.client.close()
+
+    @staticmethod
+    def status_body(proto):
+        """A complete NxusStatus with `proto` in the version word."""
+        return P.STATUS.pack(proto, P.MODE['NXUS_MODE_DMNT'], 0,
+                             P.SCAN_STATE['NxusScanState_Idle'], 0x1234, 0x0100C3800049C000,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0x10000)
+
+    def status_reply(self, proto):
+        return (P.CMD['GetStatus'], 0, self.status_body(proto))
+
+    def test_a_mismatched_version_warns_exactly_once(self):
+        with mock.patch.object(self.client, 'request',
+                               return_value=self.status_reply(P.PROTO_VERSION + 1)):
+            with mock.patch('builtins.print') as printer:
+                self.assertEqual(self.client.get_status()['proto'], P.PROTO_VERSION + 1)
+                self.client.get_status()          # every poll re-reads the same status
+                self.client.scan_status()
+                self.client.scan_begin(0)
+
+        warnings = [str(call.args[0]) for call in printer.call_args_list
+                    if call.args and 'protocol version' in str(call.args[0])]
+        self.assertEqual(len(warnings), 1, f'expected one protocol warning, got: {warnings}')
+        self.assertIn(str(P.PROTO_VERSION), warnings[0])
+        self.assertIn(str(P.PROTO_VERSION + 1), warnings[0])
+        self.assertTrue(self.client._proto_warned)
+
+    def test_a_matching_version_is_silent(self):
+        with mock.patch.object(self.client, 'request',
+                               return_value=self.status_reply(P.PROTO_VERSION)):
+            with mock.patch('builtins.print') as printer:
+                self.assertEqual(self.client.get_status()['proto'], P.PROTO_VERSION)
+                self.client.get_status()
+
+        warnings = [c for c in printer.call_args_list
+                    if c.args and 'protocol version' in str(c.args[0])]
+        self.assertEqual(warnings, [], 'the matching version must not warn')
+        self.assertFalse(self.client._proto_warned)
+
+
+class ScanSessionGuard(unittest.TestCase):
+    """A hit batch is mapping-relative: once the console rebuilds the mapping table
+    it bumps NxusHitBatchHeader.session_id, and every offset in the old list now
+    names a different region.  The client must refuse the batch instead of handing
+    out addresses that silently point somewhere else.
+    """
+
+    VALUE = 6440
+
+    def setUp(self):
+        self.server = MockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+        self.server.target.set_money(self.VALUE)
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    def scan(self):
+        self.client.scan_reset()
+        st = self.client.scan_begin(self.VALUE, value_size=4,
+                                    cmp_mode=P.CMP['NxusCmp_Equal'],
+                                    scope=P.SCOPE['NxusScope_All'])
+        self.assertEqual(st['scan_state'], P.SCAN_STATE['NxusScanState_Done'])
+        return st
+
+    def test_a_rebuilt_mapping_table_refuses_the_hit_list(self):
+        self.scan()
+        first = self.client.scan_hits(0, 16)
+        self.assertEqual(first['session'], self.server.session_id)
+        self.assertEqual(self.client.last_session_id, first['session'],
+                         'the first batch has to establish the baseline')
+
+        # the console rebuilt its mapping table (target change / cut scene): the
+        # hit list is invalidated and the session id moves with the table
+        self.server.session_id += 1
+        started = time.time()
+        with self.assertRaises(NxusError) as ctx:
+            self.client.scan_hits(0, 16)
+        self.assertLess(time.time() - started, 2.0, 'the guard blocked instead of raising')
+        self.assertIn('invalidated the hit list', str(ctx.exception))
+        self.assertIn('mapping table rebuilt', str(ctx.exception))
+        self.assertIn('scan again', str(ctx.exception))
+        self.assertEqual(self.client.last_session_id, first['session'],
+                         'a refused batch must not move the baseline')
+
+        # and it stays refused: a retry cannot "adopt" the rebuilt session
+        with self.assertRaises(NxusError):
+            self.client.scan_hits(0, 16)
+
+        # scanning again adopts the new session and works
+        self.scan()
+        again = self.client.scan_hits(0, 16)
+        self.assertEqual(again['session'], self.server.session_id)
+        self.assertEqual(self.client.last_session_id, again['session'])
+
+    def test_scan_begin_starts_a_fresh_baseline(self):
+        self.scan()
+        self.client.scan_hits(0, 16)
+        first_session = self.client.last_session_id
+
+        # a second ScanBegin (no ScanReset in between) owns a NEW session id
+        self.client.scan_begin(self.VALUE, value_size=4,
+                               cmp_mode=P.CMP['NxusCmp_Equal'],
+                               scope=P.SCOPE['NxusScope_All'])
+        self.assertIsNone(self.client.last_session_id,
+                          'a new scan must not inherit the previous baseline')
+        batch = self.client.scan_hits(0, 16)
+        self.assertNotEqual(batch['session'], first_session)
+        self.assertEqual(self.client.last_session_id, batch['session'])
+
+    def test_scan_reset_forgets_the_baseline(self):
+        self.scan()
+        self.client.scan_hits(0, 16)
+        self.assertIsNotNone(self.client.last_session_id)
+        self.client.scan_reset()
+        self.assertIsNone(self.client.last_session_id)
+
+    def test_paging_one_scan_is_unaffected(self):
+        self.scan()
+        batch = self.client.scan_hits(0, 1)
+        if batch['total'] > 1:
+            self.assertEqual(self.client.scan_hits(1, 1)['session'], batch['session'])
+        self.assertEqual(self.client.last_session_id, batch['session'])
 
 
 def batch_total(batch):

@@ -85,12 +85,52 @@ bool nxusSessionBaselineDegraded(void);
    ScanGetHits refuses to serve. */
 u32  nxusSessionHitCount(void);
 u32  nxusSessionMappingCount(void);
+
+/* ---- target identity (published as ONE snapshot) ------------------------
+ * pid / program_id / main_base / main_size describe the one process every address
+ * in this session is resolved against, so they are not four independent values:
+ * "new pid + old main range" is a target that does not exist.  They used to be
+ * four plain fields written one after another, which let any reader - Status, the
+ * 1 Hz identity tick, an address normaliser - copy part of one write and part of
+ * the next.  With a reused pid such a blend can even pass an ownership check
+ * against a process the session is no longer on.
+ *
+ * They are therefore published as a single snapshot behind a dedicated seqlock
+ * (see nxus_session.c): a reader observes exactly one write, never a blend.
+ *
+ * `generation` counts publications.  It is bumped on EVERY identity write and is
+ * 0 until the first one (fresh session / no target yet), so two samples with the
+ * same generation describe the same target while a changed generation says the
+ * identity was rewritten in between - "same target?" can then be answered without
+ * comparing fields across two separate reads.
+ *
+ * Returns false only when a writer kept the seqlock busy for the whole retry
+ * budget; no torn value is ever returned.  Callers that must answer anyway (the
+ * in-module ownership checks) retry, everybody else can wait for the next tick.
+ * `out` may be NULL when only the successful-sample question matters.
+ */
+typedef struct {
+    u64 pid;
+    u64 program_id;
+    u64 main_base;
+    u64 main_size;
+    u32 generation;    /* publication counter: bumped on every identity write */
+} NxusTargetIdentity;
+
+bool nxusSessionTargetIdentity(NxusTargetIdentity *out);
+
+/* Compat accessors: one field each, sampled from the consistent snapshot above.
+   KEEP THEM FOR EXISTING CALLERS ONLY - four separate calls are four samples and
+   can still straddle a write, so new code that needs more than one field calls
+   nxusSessionTargetIdentity() and reads its local copy. */
 u64  nxusSessionProcessId(void);
 u64  nxusSessionProgramId(void);
 u64  nxusSessionMainBase(void);
 u64  nxusSessionMainSize(void);
+
 /* Replace the cached process identity (used when attaching to an explicit pid, where
-   dmnt's metadata no longer describes the process we hold). */
+   dmnt's metadata no longer describes the process we hold).  One seqlock write of
+   all four fields, so concurrent readers see either the old or the new target. */
 void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size);
 /* Same, but carries the program id too: DebugAttach preserves the metadata it
    read from dmnt just before taking the process. */
@@ -263,6 +303,9 @@ bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current
  *   - the worker is only asked to cancel (no join), so this can never stall the tick.
  */
 void nxusSessionInvalidateHits(void);
+/* false = only refuse the results (safe from the main-thread tick, which cannot
+   see a scan preparing its mapping snapshot); true = also free the tables. */
+void nxusSessionInvalidateHitsEx(bool drop_tables);
 
 /* Identified view pin: `id` 0 means "no pin" - it is never handed out and unpin
    clears it.  `generation` names the view publication the pin was taken in, so a

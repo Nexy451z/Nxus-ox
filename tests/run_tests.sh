@@ -39,6 +39,16 @@ run_test test_hotkey test_hotkey.c ../core/nxus_hotkey.c
 TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
     run_test test_session_view test_session_view.c ../core/nxus_scan.c
 
+# The snapshot service is a Switch unit as well: stubs/switch.h supplies libnx and
+# stubs/nxus_session_stub.c supplies the session surface (controllable target
+# identity, one region, reads, logging), so the test compiles the SHIPPED
+# switch/source/nxus_snapshot_srv.c by including it - that is what makes the
+# static per-slot / cached-diff owner stamps observable.  The core diff engine it
+# calls is linked as usual.
+TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
+    run_test test_snapshot_owner test_snapshot_owner.c \
+    ../core/nxus_snapshot.c ./stubs/nxus_session_stub.c
+
 echo
 if [ $fail -eq 0 ]; then echo "ALL HOST TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail

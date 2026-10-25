@@ -14,17 +14,31 @@ from . import protocol as P
 
 
 class NxusError(RuntimeError):
-    """Raised when the Switch returns an error Result."""
+    """Raised when the Switch returns an error Result.
 
-    def __init__(self, cmd: int, result: int):
+    ``message`` lets a PC-side guard (e.g. the scan-session check) explain itself
+    instead of printing a result code the console never sent.
+    """
+
+    def __init__(self, cmd: int, result: int, message: str | None = None):
         self.cmd = cmd
         self.result = result & 0xFFFFFFFF
-        name = next((k for k, v in P.CMD.items() if v == cmd), hex(cmd))
-        super().__init__(f"{name} failed: result=0x{self.result:08X}")
+        if message is None:
+            name = next((k for k, v in P.CMD.items() if v == cmd), hex(cmd))
+            message = f"{name} failed: result=0x{self.result:08X}"
+        super().__init__(message)
 
 
 class NxusDisconnected(RuntimeError):
     pass
+
+
+# A hit batch is only meaningful against the mapping table it was collected on.
+# The console rebuilds that table (and bumps NxusHitBatchHeader.session_id) when the
+# target changes, so a batch whose session differs from the current scan's must not
+# be resolved into addresses at all.
+SESSION_INVALIDATED = ('the console invalidated the hit list (mapping table rebuilt) '
+                       '- scan again')
 
 
 class NxusClient:
@@ -36,6 +50,14 @@ class NxusClient:
         # Pointer width the last chain list reported it walked with (0 = the reply
         # predates NxusPtrChainListHeader.pointer_width).
         self.last_ptr_scan_width = 0
+        # Scan-session guard: NxusHitBatchHeader.session_id names the hit list a
+        # batch belongs to.  None = no batch read yet for the current scan (the
+        # console names the id only in a batch, never in NxusStatus), so the first
+        # batch establishes it and later pages are checked against it.
+        self.last_session_id: int | None = None
+        # One-shot protocol-version notice (see _check_proto_version): the client
+        # keeps working against another version, but says so exactly once.
+        self._proto_warned = False
         self._sock: socket.socket | None = None
         self._rx_thread: threading.Thread | None = None
         self._running = False
@@ -167,6 +189,7 @@ class NxusClient:
         _, _, body = self.request(P.CMD['GetStatus'])
         (proto, mode, flags, scan_state, pid, title, main_base, main_size,
          hits, progress, last_result, uptime, heap_used, heap_total, max_read) = P.STATUS.unpack(body)
+        self._check_proto_version(proto)
         if max_read:
             self.max_read = max_read        # read() uses this to split big requests
         return dict(proto=proto, mode=mode, flags=flags, scan_state=scan_state, pid=pid,
@@ -177,6 +200,12 @@ class NxusClient:
                     scanning=bool(flags & P.ST['NXUS_ST_SCANNING']))
 
     def get_metadata(self) -> dict:
+        """The target's identity.
+
+        NxusProcessMetadata has no version field (core/nxus_protocol.h), so the
+        protocol check lives on the status reply this client reads right after
+        connecting; a metadata reply is never used to decide the wire layout.
+        """
         _, _, body = self.request(P.CMD['GetMetadata'])
         values = P.PROCESS_METADATA.unpack(body)
         keys = ['pid', 'title', 'main_base', 'main_size', 'heap_base', 'heap_size',
@@ -184,6 +213,20 @@ class NxusClient:
         out = dict(zip(keys, values))
         out['build_id'] = out['build_id'].hex()
         return out
+
+    def _check_proto_version(self, proto: int) -> None:
+        """Warn exactly once when the console speaks another protocol version.
+
+        A mismatch is NOT an exception: every field this client reads has kept its
+        offset so far, and refusing the session would turn a mostly usable console
+        into a dead connection.  Warning once (instead of on every poll) keeps the
+        output readable while still explaining a reply that decodes to nonsense.
+        """
+        if proto == P.PROTO_VERSION or self._proto_warned:
+            return
+        self._proto_warned = True
+        print(f"warning: the console speaks protocol version {proto}, "
+              f"this client expects {P.PROTO_VERSION} - replies may be misread")
 
     def get_mapping_count(self) -> int:
         _, _, body = self.request(P.CMD['GetMappingCount'])
@@ -249,6 +292,11 @@ class NxusClient:
         payload = P.SCAN_REQUEST.pack(0, value_size, cmp_mode, scope, range_begin, range_end,
                                       value & 0xFFFFFFFFFFFFFFFF, target2, chunk_size, flags)
         _, _, body = self.request(P.CMD['ScanBegin'], payload)
+        # A new scan owns a NEW hit-list session.  The console assigns its id and
+        # only reports it inside a hit batch (NxusStatus has no field for it), so
+        # drop the previous baseline here: the first batch of this scan records it
+        # and later pages are compared against that, not against the old scan's.
+        self.last_session_id = None
         return self._status_from(body)
 
     def scan_next(self, value: int = 0, cmp_mode: int = 0, target2: int = 0, flags: int = 0) -> dict:
@@ -265,6 +313,7 @@ class NxusClient:
 
     def scan_reset(self):
         self.request(P.CMD['ScanReset'])
+        self.last_session_id = None         # no hit list left to page
 
     # ---- pointer scan / cheat export ----
 
@@ -395,6 +444,11 @@ class NxusClient:
     def scan_hits(self, offset: int = 0, count: int = 4096) -> dict:
         _, _, body = self.request(P.CMD['ScanGetHits'], P.GET_HITS_REQUEST.pack(offset, count, 0, 0))
         session, n, total, value_size, mapping_count, flags = P.HIT_BATCH_HEADER.unpack_from(body, 0)
+        # Resolve NOTHING before the session matches: the offsets in the batch are
+        # mapping-relative, so after the console rebuilt its mapping table (a cut
+        # scene, a new title, `nxus mappings` after a target change) the same
+        # offset names a different region - addresses would be silently wrong.
+        self._check_scan_session(session)
         pos = P.HIT_BATCH_HEADER.size
         bases = []
         for _ in range(mapping_count):
@@ -409,6 +463,21 @@ class NxusClient:
         return dict(session=session, count=n, total=total, value_size=value_size,
                     bases=bases, hits=hits,
                     truncated=bool(flags & P.HITBATCH_TRUNCATED))
+
+    def _check_scan_session(self, session: int) -> None:
+        """Keep one scan's hit pages in one session; refuse a rebuilt table.
+
+        The first batch read after `scan_begin()` establishes the baseline.  If a
+        later page names a different `NxusHitBatchHeader.session_id`, the console
+        invalidated the list in between (it bumps the id when it rebuilds the
+        mapping table), and the old hit list can no longer be resolved.
+        """
+        if self.last_session_id is None:
+            self.last_session_id = session
+            return
+        if session != self.last_session_id:
+            raise NxusError(P.CMD['ScanGetHits'], P.make_result(P.ERR_BAD_STATE),
+                            SESSION_INVALIDATED)
 
     def scan_all_hits(self, page: int = 4096) -> list[dict]:
         self.last_scan_truncated = False
@@ -428,10 +497,13 @@ class NxusClient:
                           f"{len(out)} hits collected, more may exist")
                 return out
 
-    @staticmethod
-    def _status_from(body: bytes) -> dict:
+    def _status_from(self, body: bytes) -> dict:
         (proto, mode, flags, scan_state, pid, title, main_base, main_size,
          hits, progress, last_result, uptime, heap_used, heap_total, _res) = P.STATUS.unpack(body)
+        # ScanBegin/ScanNext/ScanStatus all answer NxusStatus, so every one of them
+        # is a chance to notice a console speaking a different version (warned once
+        # per client, see _check_proto_version).
+        self._check_proto_version(proto)
         return dict(proto=proto, mode=mode, flags=flags, scan_state=scan_state, pid=pid,
                     title=title, main_base=main_base, main_size=main_size, hits=hits,
                     progress=progress, last_result=last_result, uptime=uptime)

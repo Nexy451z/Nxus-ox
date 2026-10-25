@@ -67,7 +67,9 @@ typedef struct {
     u64 last_heartbeat_ms;
     u32 watchdog_timeout_ms;
 
-    u64 process_id, program_id, main_base, main_size;
+    /* pid / program_id / main_base / main_size live in the published
+       NxusTargetIdentity above, NOT here: they are one snapshot and must never be
+       read or written as four independent fields (see the target-identity block). */
 
     /* Which target the stored results belong to (see the ownership block below):
        stamped by ScanBegin from the identity its mapping snapshot was taken with,
@@ -84,6 +86,91 @@ typedef struct {
 
 static Session g_Session;
 static Mutex   g_SessionMutex;
+
+/* ---- target identity ---------------------------------------------------
+ *
+ * pid / program_id / main_base / main_size describe ONE process: every
+ * main-relative scope, hit address and cheat export is derived from them, and
+ * "new pid + old main range" is a target that does not exist.  They used to be
+ * four plain fields in g_Session, written one after another, so a reader on
+ * another thread (Status, the 1 Hz identity tick, an address normaliser) could
+ * copy the pid from one write and the main range from the next.  With a reused
+ * pid such a blend can even pass an ownership check that should fail.
+ *
+ * g_IdentitySeq is a dedicated seqlock for these four fields (same shape as
+ * g_ViewSeq, but its own counter: the identity is written far more often than the
+ * views and must not make a view sample retry):
+ *
+ *   - even  => g_Identity is a complete, stable publication,
+ *   - odd   => a write is in flight; readers retry.
+ *
+ * The writer bumps the counter (release), stores all four fields + generation,
+ * then bumps it again (release).  The reader samples it (acquire), rejects odd
+ * values, copies the struct, puts an ACQUIRE FENCE between the copy and the
+ * re-check (an acquire load only keeps LATER accesses after itself, so without
+ * the fence the copy could be moved past the re-check and a torn snapshot would
+ * be accepted), and compares: an unchanged even value means the copy is one
+ * publication.
+ *
+ * Writers serialize on g_IdentityWriting, because nxusSessionRefreshIdentity()
+ * runs both on the main-thread tick and on the connection thread (ForceOpen,
+ * revalidate).  Two writers inside the odd/even sequence would interleave it back
+ * into an apparently stable state in the middle of a write.  It is an
+ * atomic_flag (statically initialised, works even before nxusSessionInit) rather
+ * than a Mutex, because an identity write is allowed before/without a live
+ * session; the holder only ever does a handful of stores, and the waiter yields
+ * so it cannot starve a lower-priority holder.
+ */
+#define NXUS_IDENTITY_RETRY 8u
+
+static NxusTargetIdentity g_Identity;          /* published copy (seqlock) */
+static atomic_uint        g_IdentitySeq;       /* even = stable, odd = writing */
+static atomic_flag        g_IdentityWriting = ATOMIC_FLAG_INIT;
+
+/* Publish a complete identity as one seqlock write.  The generation inside the
+   snapshot is bumped here, so every publication is distinguishable and a reader
+   can tell "same target" from "two different targets sharing a field". */
+static void identityPublish(u64 pid, u64 program_id, u64 main_base, u64 main_size) {
+    while (atomic_flag_test_and_set_explicit(&g_IdentityWriting, memory_order_acquire)) {
+        svcSleepThread(0);   /* let the (possibly lower priority) writer finish */
+    }
+    (void)atomic_fetch_add_explicit(&g_IdentitySeq, 1u, memory_order_release);  /* odd */
+    g_Identity.pid = pid;
+    g_Identity.program_id = program_id;
+    g_Identity.main_base = main_base;
+    g_Identity.main_size = main_size;
+    g_Identity.generation = g_Identity.generation + 1u;
+    (void)atomic_fetch_add_explicit(&g_IdentitySeq, 1u, memory_order_release);  /* even */
+    atomic_flag_clear_explicit(&g_IdentityWriting, memory_order_release);
+}
+
+bool nxusSessionTargetIdentity(NxusTargetIdentity *out) {
+    for (u32 attempt = 0; attempt < NXUS_IDENTITY_RETRY; attempt++) {
+        const u32 seq = atomic_load_explicit(&g_IdentitySeq, memory_order_acquire);
+        if ((seq & 1u) != 0) continue;              /* write in flight */
+
+        NxusTargetIdentity snap = g_Identity;       /* plain field copies */
+
+        /* Load/load barrier: without it the copy above could be reordered past the
+           re-check below and a torn snapshot accepted (see the block above). */
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_IdentitySeq, memory_order_acquire) != seq) continue;
+
+        if (out != NULL) *out = snap;
+        return true;
+    }
+    return false;   /* kept losing the race: no torn value, the caller decides */
+}
+
+/* Blocking sample for the in-module readers: the ownership checks are boolean and
+   must not turn "a writer was mid-publish" into "different target".  The writer
+   never waits on a reader and only holds the seqlock for a few stores, so this
+   cannot livelock; the yield keeps a preempted writer runnable. */
+static NxusTargetIdentity identitySample(void) {
+    NxusTargetIdentity id;
+    while (!nxusSessionTargetIdentity(&id)) svcSleepThread(0);
+    return id;
+}
 
 /* ---- result ownership --------------------------------------------------
  *
@@ -161,10 +248,13 @@ u32 nxusSessionMappingGeneration(void) {
    the mapping snapshot immediately before stamping, so all three describe the same
    read of the target.  The mapping generation is read HERE, after ScanBegin's
    snapshotMappings() published the table the worker will scan with and before
-   startJob() runs it - i.e. it names that table, not one published mid-scan. */
+   startJob() runs it - i.e. it names that table, not one published mid-scan.
+   pid and program_id are taken from ONE identity snapshot: two separate accessor
+   calls could stamp the pid of one write with the title of the next. */
 static void hitsOwnerStamp(void) {
-    g_Session.hits_owner_pid = g_Session.process_id;
-    g_Session.hits_owner_program_id = g_Session.program_id;
+    const NxusTargetIdentity id = identitySample();
+    g_Session.hits_owner_pid = id.pid;
+    g_Session.hits_owner_program_id = id.program_id;
     g_Session.hits_owner_session_id = g_Session.session_id;
     g_Session.hits_owner_mapping_generation = mappingGenerationLoad();
     g_Session.hits_owner_valid = true;
@@ -598,18 +688,36 @@ static void mappingSnapshotDrop(void) {
     viewRetire(old, "mappings");
 }
 
+/* Cheap fingerprint of a mapping table: count plus an order-independent mix of
+   every (base, size).  Re-snapshotting an unchanged process (ptrscan and
+   SnapshotCapture both refresh the table) must NOT invalidate the hits: their
+   mapping_idx still resolves to the very same regions. */
+static u64 mappingFingerprint(const NxusMappingEntry *entries, u32 count) {
+    u64 mix = 0x9E3779B97F4A7C15ull ^ (u64)count;
+    for (u32 i = 0; i < count; i++) {
+        const u64 v = entries[i].base ^ (entries[i].size << 1);
+        mix ^= v + 0x9E3779B97F4A7C15ull + (mix << 6) + (mix >> 2);
+    }
+    return mix;
+}
+
+static atomic_ullong g_MappingFingerprint;
+
 static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
     NxusMappingEntry *old = g_Session.map_entries;
+    const u64 fingerprint = mappingFingerprint(entries, count);
+    const u64 previous =
+        atomic_load_explicit(&g_MappingFingerprint, memory_order_acquire);
     viewUpdateBegin();
     g_Session.map_entries = entries;
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
     viewUpdateEnd();
-    /* New indices: every hit stamped with the previous generation must be refused
-       from here on (nxusSessionHitsMatchTarget compares this, the server logs the
-       two generations and discards).  After viewUpdateEnd, so the bump cannot be
-       observed before the new table is. */
-    mappingGenerationBump();
+    /* Only a CONTENT change invalidates stored mapping_idx values.  Bumping on every
+       re-snapshot made a plain ptrscan or snapshot capture discard a perfectly good
+       hit list (the server answered BAD_STATE for work that had not changed). */
+    atomic_store_explicit(&g_MappingFingerprint, fingerprint, memory_order_release);
+    if (fingerprint != previous) mappingGenerationBump();
     viewRetire(old, "mappings");
 }
 
@@ -896,6 +1004,12 @@ void nxusSessionInit(u32 chunk_size, u32 max_hits) {
     atomic_init(&g_Session.cancel, 0);
     atomic_init(&g_ViewSeq, 0);   /* both published views start empty/stable */
     atomic_init(&g_HitsStale, 0); /* no results to discard in a fresh session */
+    /* A fresh session has no target: publish the empty identity (generation 0) as one
+       seqlock write so no reader can pair "zero pid" with a previous session's main
+       range.  Init runs before the server / identity tick exist, so this cannot race
+       a writer; g_IdentityWriting is left as-is (it is statically cleared). */
+    memset(&g_Identity, 0, sizeof(g_Identity));
+    atomic_init(&g_IdentitySeq, 0);
     /* A fresh session starts with no pins and an empty retire ring: Exit() freed
        every block it knew about and invalidated every token, and the published
        views are gone with the memset above (see the view contract in
@@ -975,7 +1089,15 @@ u32  nxusSessionHitCount(void)      {
     return g_Session.hits.count;
 }
 u32  nxusSessionMappingCount(void)  { return g_Session.maps.count; }
-u64  nxusSessionProcessId(void)     { return g_Session.process_id; }
+
+/* Compat accessors: each one samples the published identity snapshot, so it can
+   never pair a value from one write with a value from another.  A caller that needs
+   more than one field must use nxusSessionTargetIdentity() - four calls are four
+   samples and may straddle a write. */
+u64  nxusSessionProcessId(void)     { return identitySample().pid; }
+u64  nxusSessionProgramId(void)     { return identitySample().program_id; }
+u64  nxusSessionMainBase(void)      { return identitySample().main_base; }
+u64  nxusSessionMainSize(void)      { return identitySample().main_size; }
 
 /* Range list for NxusScope_Ranges; copied, truncated to the protocol maximum. */
 void nxusSessionSetScanRanges(const NxusRangeEntry *ranges, u32 count) {
@@ -987,20 +1109,18 @@ void nxusSessionSetScanRanges(const NxusRangeEntry *ranges, u32 count) {
 }
 
 /* Attaching to another process invalidates the identity cached from dmnt: keeping the
-   old main base would make every main-relative scan read the wrong process. */
+   old main base would make every main-relative scan read the wrong process.  All four
+   fields are published in ONE seqlock write (generation bumped), so a reader either
+   sees the old identity or the new one - never a mixture such as the new pid with the
+   old main range. */
 void nxusSessionSetProcessIdentityEx(u64 pid, u64 program_id, u64 main_base, u64 main_size) {
-    g_Session.process_id = pid;
-    g_Session.program_id = program_id;
-    g_Session.main_base = main_base;
-    g_Session.main_size = main_size;
+    identityPublish(pid, program_id, main_base, main_size);
 }
 
 void nxusSessionSetProcessIdentity(u64 pid, u64 main_base, u64 main_size) {
     nxusSessionSetProcessIdentityEx(pid, 0, main_base, main_size);
 }
-u64  nxusSessionProgramId(void)     { return g_Session.program_id; }
-u64  nxusSessionMainBase(void)      { return g_Session.main_base; }
-u64  nxusSessionMainSize(void)      { return g_Session.main_size; }
+
 /* The hit list is embedded in the session, so the address itself never dangles -
    but its arrays are realloc'd by the worker while a scan runs.  Callers must
    therefore only walk it BEHIND THE BUSY GATE (the server rejects ScanGetHits
@@ -1016,15 +1136,19 @@ const NxusHitList *nxusSessionHits(void) {
    by the full match and by the identity-only variant the main-thread tick uses.  The
    caller has already checked hitsStale() and hits_owner_valid. */
 static bool hitsOwnerIdentityMatches(void) {
+    /* ONE identity snapshot for both compared fields: sampling the pid and the
+       program id separately could compare the stamp against the pid of one write
+       and the title of the next (the stamp itself is written from one snapshot). */
+    const NxusTargetIdentity id = identitySample();
     if (g_Session.hits_owner_pid != 0) {
         /* Both sides know a pid, so that is the identity.  The program id is only
            compared when BOTH sides have one: an explicit DebugAttach can leave it 0
            (dmnt metadata unavailable then), and refusing the session's own list for
            a missing title would break the scan-then-attach flow - the same rule
            ptrChainOwnerCheck() uses for the chain list. */
-        if (g_Session.hits_owner_pid != g_Session.process_id) return false;
+        if (g_Session.hits_owner_pid != id.pid) return false;
         const u64 saved_title = g_Session.hits_owner_program_id;
-        const u64 now_title = g_Session.program_id;
+        const u64 now_title = id.program_id;
         return saved_title == 0 || now_title == 0 || saved_title == now_title;
     }
 
@@ -1084,7 +1208,30 @@ bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current
     return owner != current;
 }
 
-void nxusSessionInvalidateHits(void) {
+/* Set from the moment ScanBegin/ScanNext starts preparing its mapping snapshot
+   until the worker is actually running.  The state still reads Idle in that
+   window, so "not Running" alone does not prove the tables are free: the 100 ms
+   tick could free them under prepare (use-after-free) or make the scan fail with a
+   spurious BAD_INPUT. */
+static atomic_bool g_ScanPreparing;
+
+static void scanPreparingBegin(void) {
+    atomic_store_explicit(&g_ScanPreparing, true, memory_order_release);
+}
+
+static void scanPreparingEnd(void) {
+    atomic_store_explicit(&g_ScanPreparing, false, memory_order_release);
+}
+
+static bool scanPreparing(void) {
+    return atomic_load_explicit(&g_ScanPreparing, memory_order_acquire);
+}
+
+/* The main-thread tick cannot see a scan inside ScanBegin's prepare window (the
+   state still reads Idle), so it passes drop_tables = false and only refuses the
+   results.  Connection-thread callers are serialized with the prepare and may
+   free the tables. */
+void nxusSessionInvalidateHitsEx(bool drop_tables) {
     /* Publish "unservable" first, so any reader that arrives while the rest of this
        runs already sees the discard. */
     atomic_store_explicit(&g_HitsStale, 1, memory_order_release);
@@ -1102,6 +1249,10 @@ void nxusSessionInvalidateHits(void) {
        status path and the tick) drops them then.  Nothing stale is served in the
        meantime: the hits are already refused above. */
     if (sessionStateLoad() == NxusScanState_Running) return;
+    /* Same reason as Running: a scan between "snapshot published" and "worker
+       started" owns these tables while the state still reads Idle. */
+    if (scanPreparing()) return;
+    if (!drop_tables) return;
 
     /* Readers of these views are pin-protected (see the view contract in
        nxus_session.h), so dropping them is safe from any thread. */
@@ -1113,6 +1264,10 @@ void nxusSessionInvalidateHits(void) {
     g_Session.progress = 0;
     g_Session.last_result = 0;
     sessionStateStore(NxusScanState_Idle);
+}
+
+void nxusSessionInvalidateHits(void) {
+    nxusSessionInvalidateHitsEx(true);
 }
 
 /* Never returns a dangling table: the pair is only readable while g_ViewSeq is
@@ -1475,16 +1630,19 @@ static void buildRegions(const NxusScanRequest *req) {
     if (regions == NULL) return;
 
     /* Fill the block privately and publish pointer+count together at the end:
-       the new list is not reachable from another thread until it is complete. */
+       the new list is not reachable from another thread until it is complete.
+       main_base/main_size come from ONE identity snapshot: reading the two
+       accessors separately could build "new base + old size" regions. */
+    const NxusTargetIdentity id = identitySample();
     u32 count;
     if (req->scope == NxusScope_Ranges) {
         count = nxusBuildRegionsMulti(g_Session.map_entries, g_Session.maps.count,
-                                      g_Session.main_base, g_Session.main_size,
+                                      id.main_base, id.main_size,
                                       g_Session.ranges, g_Session.range_count,
                                       regions, capacity);
     } else {
         count = nxusBuildRegions(g_Session.map_entries, g_Session.maps.count,
-                                 g_Session.main_base, g_Session.main_size,
+                                 id.main_base, id.main_size,
                                  req->scope, req->range_begin, req->range_end,
                                  regions, capacity);
     }

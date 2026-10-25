@@ -612,6 +612,189 @@ static void testConcurrentReaders(void) {
           readers());
 }
 
+/* ---- target identity ---------------------------------------------------- */
+
+/* The identity is ONE snapshot since the four fields are written through a seqlock.
+   The regression was a reader pairing "new pid" with "old main range" (or the title
+   of one write with the pid of the next); the flip stress below detects exactly that
+   by tying the fields of every publication to the generation it was published with:
+   odd generation => target A, even generation => target B.  A reader that copies two
+   different publications therefore sees a tuple that matches neither. */
+#define ID_PID_A    0x1000ull
+#define ID_PROG_A   0xA000ull
+#define ID_BASE_A   0x00100000ull
+#define ID_SIZE_A   0x00200000ull
+#define ID_PID_B    0x2000ull
+#define ID_PROG_B   0xB000ull
+#define ID_BASE_B   0x00300000ull
+#define ID_SIZE_B   0x00400000ull
+
+static void testTargetIdentitySnapshot(void) {
+    printf("- target identity is one consistent snapshot\n");
+    freshSession();
+
+    NxusTargetIdentity id;
+    CHECK(nxusSessionTargetIdentity(&id), "an empty session still samples an identity");
+    CHECK(id.pid == 0 && id.program_id == 0 && id.main_base == 0 && id.main_size == 0 &&
+          id.generation == 0u,
+          "fresh session publishes the empty identity (gen=%u, pid=0x%llX)",
+          (unsigned)id.generation, (unsigned long long)id.pid);
+    CHECK(nxusSessionTargetIdentity(NULL), "out=NULL only asks whether a sample succeeded");
+
+    nxusSessionSetProcessIdentityEx(ID_PID_A, ID_PROG_A, ID_BASE_A, ID_SIZE_A);
+    CHECK(nxusSessionTargetIdentity(&id), "identity sampled after the first write");
+    CHECK(id.pid == ID_PID_A && id.program_id == ID_PROG_A &&
+          id.main_base == ID_BASE_A && id.main_size == ID_SIZE_A,
+          "all four fields describe the same write (pid=0x%llX base=0x%llX)",
+          (unsigned long long)id.pid, (unsigned long long)id.main_base);
+    CHECK(id.generation == 1u, "the write bumps the generation (%u)", (unsigned)id.generation);
+
+    /* The compat accessors sample the same snapshot. */
+    CHECK(nxusSessionProcessId() == ID_PID_A, "ProcessId() agrees with the snapshot");
+    CHECK(nxusSessionProgramId() == ID_PROG_A, "ProgramId() agrees with the snapshot");
+    CHECK(nxusSessionMainBase() == ID_BASE_A, "MainBase() agrees with the snapshot");
+    CHECK(nxusSessionMainSize() == ID_SIZE_A, "MainSize() agrees with the snapshot");
+
+    /* A copy the caller already holds keeps its values: it is a snapshot, not a
+       view onto the live fields. */
+    const NxusTargetIdentity held = id;
+    nxusSessionSetProcessIdentityEx(ID_PID_B, ID_PROG_B, ID_BASE_B, ID_SIZE_B);
+    CHECK(held.pid == ID_PID_A && held.main_base == ID_BASE_A,
+          "a held snapshot is not rewritten by a later publication");
+
+    CHECK(nxusSessionTargetIdentity(&id), "identity sampled after the second write");
+    CHECK(id.pid == ID_PID_B && id.program_id == ID_PROG_B &&
+          id.main_base == ID_BASE_B && id.main_size == ID_SIZE_B,
+          "the second write is published as one unit too");
+    CHECK(id.generation == 2u, "the generation counts publications (%u)", (unsigned)id.generation);
+
+    /* SetProcessIdentity() carries no program id: it must publish 0 for it, in the
+       same write as the new pid / main range (not leave the old title behind). */
+    nxusSessionSetProcessIdentity(ID_PID_A, ID_BASE_A, ID_SIZE_A);
+    CHECK(nxusSessionTargetIdentity(&id), "identity sampled after a SetProcessIdentity()");
+    CHECK(id.pid == ID_PID_A && id.program_id == 0 &&
+          id.main_base == ID_BASE_A && id.main_size == ID_SIZE_A,
+          "the pid-only write replaces the title with 0 atomically");
+    CHECK(id.generation == 3u, "every write bumps the generation once (%u)",
+          (unsigned)id.generation);
+
+    nxusSessionExit();
+}
+
+/* Concurrent reader/writer: no sample may blend two publications. */
+#define ID_FLIP_WRITES  5000u
+#define ID_FLIP_READERS 2
+
+static atomic_int  g_IdStop;
+static atomic_uint g_IdWrites;
+static atomic_uint g_IdSamples;
+static atomic_uint g_IdMixed;
+static atomic_uint g_IdNoSample;
+
+static void *identityFlipWriter(void *arg) {
+    (void)arg;
+    while (atomic_load_explicit(&g_IdStop, memory_order_acquire) == 0) {
+        const u32 n = atomic_fetch_add_explicit(&g_IdWrites, 1u, memory_order_relaxed) + 1u;
+        if ((n & 1u) != 0u) {
+            nxusSessionSetProcessIdentityEx(ID_PID_A, ID_PROG_A, ID_BASE_A, ID_SIZE_A);
+        } else {
+            nxusSessionSetProcessIdentityEx(ID_PID_B, ID_PROG_B, ID_BASE_B, ID_SIZE_B);
+        }
+    }
+    return NULL;
+}
+
+static void *identityFlipReader(void *arg) {
+    (void)arg;
+    while (atomic_load_explicit(&g_IdStop, memory_order_acquire) == 0) {
+        NxusTargetIdentity id;
+        if (!nxusSessionTargetIdentity(&id)) {
+            /* Allowed by the contract ("writer kept the seqlock busy"); no torn value
+               is returned, so counting it separately keeps the test meaningful. */
+            atomic_fetch_add_explicit(&g_IdNoSample, 1u, memory_order_relaxed);
+            continue;
+        }
+        atomic_fetch_add_explicit(&g_IdSamples, 1u, memory_order_relaxed);
+
+        bool mixed;
+        if (id.generation == 0u) {
+            /* Before the writer's first publication. */
+            mixed = id.pid != 0 || id.program_id != 0 || id.main_base != 0 || id.main_size != 0;
+        } else if ((id.generation & 1u) != 0u) {
+            mixed = id.pid != ID_PID_A || id.program_id != ID_PROG_A ||
+                    id.main_base != ID_BASE_A || id.main_size != ID_SIZE_A;
+        } else {
+            mixed = id.pid != ID_PID_B || id.program_id != ID_PROG_B ||
+                    id.main_base != ID_BASE_B || id.main_size != ID_SIZE_B;
+        }
+        if (mixed) atomic_fetch_add_explicit(&g_IdMixed, 1u, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+static void testTargetIdentityNoTornRead(void) {
+    printf("- identity writes are atomic for concurrent readers\n");
+    freshSession();
+
+    atomic_store(&g_IdStop, 0);
+    atomic_store(&g_IdWrites, 0);
+    atomic_store(&g_IdSamples, 0);
+    atomic_store(&g_IdMixed, 0);
+    atomic_store(&g_IdNoSample, 0);
+
+    pthread_t readers[ID_FLIP_READERS];
+    int started = 0;
+    for (int i = 0; i < ID_FLIP_READERS; i++) {
+        if (pthread_create(&readers[i], NULL, identityFlipReader, NULL) != 0) break;
+        started++;
+    }
+    CHECK(started == ID_FLIP_READERS, "started %d/%d identity readers", started,
+          ID_FLIP_READERS);
+
+    pthread_t writer;
+    const bool writer_started = pthread_create(&writer, NULL, identityFlipWriter, NULL) == 0;
+    CHECK(writer_started, "started the identity writer");
+
+    if (writer_started) {
+        /* Let the writer run; readers sample concurrently.  Yielding keeps the
+           writer (and the readers) scheduled without a fixed wall-clock sleep. */
+        while (atomic_load_explicit(&g_IdWrites, memory_order_acquire) < ID_FLIP_WRITES) {
+            svcSleepThread(0);
+        }
+    }
+    atomic_store(&g_IdStop, 1);
+    if (writer_started) pthread_join(writer, NULL);
+    for (int i = 0; i < started; i++) pthread_join(readers[i], NULL);
+
+    CHECK(atomic_load(&g_IdMixed) == 0u,
+          "%u identity sample(s) mixed two publications (new pid + old main range)",
+          atomic_load(&g_IdMixed));
+    CHECK(atomic_load(&g_IdSamples) > 0u, "readers actually sampled the identity (%u)",
+          atomic_load(&g_IdSamples));
+
+    /* Everything settled: the last publication is visible as one target, and the
+       generation counts exactly the writes performed. */
+    NxusTargetIdentity id;
+    CHECK(nxusSessionTargetIdentity(&id), "identity sampled after the writer stopped");
+    CHECK(id.generation == atomic_load(&g_IdWrites),
+          "generation counts every publication (%u/%u)", (unsigned)id.generation,
+          atomic_load(&g_IdWrites));
+    const bool is_a = (id.generation & 1u) != 0u;
+    CHECK(is_a ? (id.pid == ID_PID_A && id.program_id == ID_PROG_A &&
+                  id.main_base == ID_BASE_A && id.main_size == ID_SIZE_A)
+               : (id.pid == ID_PID_B && id.program_id == ID_PROG_B &&
+                  id.main_base == ID_BASE_B && id.main_size == ID_SIZE_B),
+          "the final identity is one complete publication (gen=%u pid=0x%llX)",
+          (unsigned)id.generation, (unsigned long long)id.pid);
+    CHECK(nxusSessionProcessId() == id.pid &&
+          nxusSessionProgramId() == id.program_id &&
+          nxusSessionMainBase() == id.main_base &&
+          nxusSessionMainSize() == id.main_size,
+          "the compat accessors report the same final target");
+
+    nxusSessionExit();
+}
+
 /* ---- libnx / service stand-ins (only what nxus_session.c calls) --------- */
 
 void nxusLogWrite(const char *fmt, ...) {
@@ -681,6 +864,8 @@ int main(void) {
     testRegionsHoldAcrossRebuild();
     testExitIsTerminal();
     testConcurrentReaders();
+    testTargetIdentitySnapshot();
+    testTargetIdentityNoTornRead();
 
     /* Leave the module in the state the console leaves it in at shutdown. */
     nxusSessionExit();
