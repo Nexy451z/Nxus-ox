@@ -419,6 +419,9 @@ class MockSwitch:
         }
         # A/B block-hash snapshots (mirrors switch/source/nxus_snapshot_srv.c)
         self.snapshots: list = [None, None]
+        # Address-space window reported in GetMetadata (0 = not reported).
+        self.aslr_base = 0
+        self.aslr_size = 0
         self.changed: list = []
         self.changed_truncated = 0
         self.hotkey = dict(mask=0, hold_ms=0, enabled=0)
@@ -760,7 +763,11 @@ class MockSwitch:
         if cmd == P.CMD['GetMetadata']:
             return P.PROCESS_METADATA.pack(0x1234, 0x0100C3800049C000,
                                            MAIN_BASE, MAIN_SIZE, HEAP_BASE, HEAP_SIZE,
-                                           0, 0, 0, 0, BUILD_ID)
+                                           # alias_base, alias_size, then the
+                                           # address-space window dmnt reports
+                                           # (0/0 = an older console).
+                                           0, 0, self.aslr_base, self.aslr_size,
+                                           BUILD_ID)
         if cmd == P.CMD['GetMappingCount']:
             return struct.pack('<Q', 0 if self.empty_mappings else len(self.target.mappings))
         if cmd == P.CMD['GetMappings']:

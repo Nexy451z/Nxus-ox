@@ -2608,9 +2608,23 @@ fn estimate_width_from_mappings(main_base: u64, mappings: &[MemoryInfo]) -> Widt
 /// CLI needs the same answer to explain it and to pick the matching cheat form,
 /// so it mirrors the rule instead of guessing locally.
 fn estimate_width(client: &NxusClient, main_base: u64) -> WidthEstimate {
+    // The console's first evidence is the process address space (dmnt reports the
+    // ASLR window), so use the real metadata when the console answers: a low-placed
+    // 64-bit title would otherwise be shown as 32-bit here.
+    let metadata = match client.metadata() {
+        Ok(meta) if meta.aslr_size != 0 => meta,
+        _ => main_base_metadata(main_base),
+    };
     match all_mappings(client) {
-        Some(mappings) => estimate_width_from_mappings(main_base, &mappings),
-        None => estimate_width_from_main_base(main_base),
+        Some(mappings) => {
+            let from_mappings = mappings.iter().any(|m| m.size != 0 && m.perm & PERM_R != 0);
+            let (width, _reason) = crate::client::pointer_width_with_reason(&metadata, Some(&mappings));
+            WidthEstimate { width, from_mappings }
+        }
+        None => {
+            let (width, _reason) = crate::client::pointer_width_with_reason(&metadata, None);
+            WidthEstimate { width, from_mappings: false }
+        }
     }
 }
 
