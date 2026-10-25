@@ -499,12 +499,26 @@ class NxusClient:
 
     @staticmethod
     def _debug_status_from(body: bytes) -> dict:
-        (attached, style, breaks, hits, threads, last_result, auto_continue,
-         stopped_thread_low) = P.DEBUG_STATUS.unpack(body)
+        """Decode NxusDebugStatus, tolerating a pre-Round-15 32-byte reply.
+
+        A current console appends the full 64-bit thread id to the legacy prefix;
+        below that size the reply is the old 32-byte layout (the MockSwitch still
+        sends it) and only `stopped_thread_low` exists.  The full id must win when
+        present: the low half alone truncates a thread id above 4 GiB onto a
+        different thread.
+        """
+        if len(body) >= P.DEBUG_STATUS_FULL.size:
+            (attached, style, breaks, hits, threads, last_result, auto_continue,
+             stopped_thread_low, stopped_thread) = P.DEBUG_STATUS_FULL.unpack_from(body)
+        else:
+            (attached, style, breaks, hits, threads, last_result, auto_continue,
+             stopped_thread_low) = P.DEBUG_STATUS.unpack_from(body)
+            stopped_thread = 0
+        full = stopped_thread or stopped_thread_low
         return dict(attached=bool(attached), watch_style=style, break_count=breaks,
                     hit_count=hits, thread_count=threads, last_result=last_result,
                     auto_continue=auto_continue,
-                    stopped_thread=stopped_thread_low or None,
+                    stopped_thread=full or None,
                     stopped_thread_low=stopped_thread_low)
 
     def break_set(self, address: int, kind: int, size: int = 4, slot: int = 0,

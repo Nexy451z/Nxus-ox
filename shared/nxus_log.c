@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define NXUS_LOG_RING_SIZE 16384
+/* The ring size now lives in nxus_log.h: the LOG command pages through exactly
+   this much, and the server needs the number to size its reply window. */
+#define NXUS_LOG_RING_SIZE NXUS_LOG_RING_CAPACITY
 /* One assembled line: the uptime prefix plus the caller's message.  The old 512
    bytes were sized for the message alone; the prefix eats up to ~16 of them and
    the longest existing format (the debug "set break" line) is already ~200. */
@@ -134,6 +136,14 @@ static void ringAppend(const char *text, size_t len) {
     }
     if (g_RingLen + len >= NXUS_LOG_RING_SIZE) {
         size_t drop = g_RingLen + len - (NXUS_LOG_RING_SIZE - 1);
+        /* Evict WHOLE lines: the bytes to give up are rounded forward to the next
+           line start, so the ring begins on a line boundary at all times.  A tail
+           dump then never starts with half a line, and nxusLogWindow() can treat
+           the ring's first byte as a line start (which is what makes the oldest
+           page of a backwards walk usable).  At most one extra line (~200 B) is
+           given up, and the scan is bounded by the longest line. */
+        while (drop < g_RingLen && g_Ring[drop] != '\n') drop++;
+        if (drop < g_RingLen) drop++;          /* also drop that newline */
         memmove(g_Ring, g_Ring + drop, g_RingLen - drop);
         g_RingLen -= drop;
     }
@@ -227,6 +237,91 @@ size_t nxusLogTail(char *out, size_t capacity) {
     out[len] = 0;
     mutexUnlock(&g_LogMutex);
     return len;
+}
+
+size_t nxusLogWindow(char *out, size_t capacity, u32 offset, u32 length) {
+    if (out == NULL || capacity == 0) return 0;
+
+    mutexLock(&g_LogMutex);
+    const size_t ring_len = g_RingLen;
+    if (ring_len == 0 || (size_t)offset >= ring_len) {
+        mutexUnlock(&g_LogMutex);
+        out[0] = 0;
+        return 0;
+    }
+
+    /* Newest byte of the window: `offset` bytes back from the end, i.e. the client
+       already has everything after it. */
+    const size_t end = ring_len - (size_t)offset;
+    /* What a complete reply for this poll would carry: the requested length, or
+       everything older than the newest byte the client already holds. */
+    size_t wanted = length ? (size_t)length : end;
+    if (wanted > end) wanted = end;
+
+    /* Reserve room for the truncation note up front, so it can always be prepended
+       without pushing the body past `capacity`. */
+    size_t span = wanted;
+    const size_t note_reserve = (capacity > NXUS_LOG_NOTE_MAX) ? NXUS_LOG_NOTE_MAX : 0;
+    const size_t limit = capacity - 1 - note_reserve;
+    if (span > limit) span = limit;
+    if (span == 0) {
+        mutexUnlock(&g_LogMutex);
+        out[0] = 0;
+        return 0;
+    }
+
+    const size_t start = end - span;
+    const char *begin = g_Ring + start;
+
+    /* Drop a leading partial line.  ringAppend() keeps the ring line aligned, so
+       byte 0 is a line start; any later offset is only a line start when the byte
+       before it is the previous line's '\n'. */
+    size_t head = 0;
+    if (start > 0 && g_Ring[start - 1] != '\n') {
+        while (head < span && begin[head] != '\n') head++;
+        if (head < span) head++;      /* also leave the partial line's newline out */
+        else head = span;             /* no complete line in this window */
+    }
+
+    const char *body = begin + head;
+    size_t body_len = span - head;
+    /* End the reply at the last newline: a trailing half line continues into the
+       bytes the client already has, so it belongs to the newer page, not this one. */
+    if (body_len > 0 && body[body_len - 1] != '\n') {
+        size_t cut = body_len;
+        while (cut > 0 && body[cut - 1] != '\n') cut--;
+        body_len = cut;
+    }
+    if (body_len == 0) {
+        /* Nothing but fragments: an empty reply is the honest answer, and the caller
+           can retry with a bigger window instead of advancing past whole lines. */
+        mutexUnlock(&g_LogMutex);
+        out[0] = 0;
+        return 0;
+    }
+
+    size_t pos = 0;
+    if (wanted > body_len) {
+        const int n = snprintf(out, capacity, "... (truncated %llu bytes)\n",
+                               (unsigned long long)(wanted - body_len));
+        if (n < 0) {
+            mutexUnlock(&g_LogMutex);
+            out[0] = 0;
+            return 0;
+        }
+        pos = ((size_t)n >= capacity) ? capacity - 1 : (size_t)n;
+    }
+    if (pos < capacity - 1) {
+        /* The reserve above guarantees this always fits; the clamp only keeps the
+           memcpy honest if a caller passes a smaller buffer than documented. */
+        const size_t room = capacity - 1 - pos;
+        if (body_len > room) body_len = room;
+        memcpy(out + pos, body, body_len);
+        pos += body_len;
+    }
+    out[pos] = 0;
+    mutexUnlock(&g_LogMutex);
+    return pos;
 }
 
 void nxusLogFlush(void) {

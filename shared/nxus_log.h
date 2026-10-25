@@ -31,8 +31,43 @@ void nxusLogEvent(u32 event_id, const char *fmt, ...) __attribute__((format(prin
 void nxusLogSetLevel(u32 level);
 u32  nxusLogGetLevel(void);
 
+/* Bytes of history the ring keeps.  Exposed because the LOG command pages through
+   exactly this much: a client that reads it all needs ceil(capacity / length) polls. */
+#define NXUS_LOG_RING_CAPACITY 16384u
+/* Worst-case length of the generated "... (truncated N bytes)\n" line, so a caller
+   can size its buffer for `length` bytes of log PLUS this much. */
+#define NXUS_LOG_NOTE_MAX 48u
+
 /* Copy the tail of the ring buffer into out (NUL terminated). Returns bytes written. */
 size_t nxusLogTail(char *out, size_t capacity);
+
+/* Copy a window of the ring for the LOG command, cut on line boundaries.
+ *
+ * The window is addressed BACKWARDS from the newest byte, so one number reaches
+ * the whole ring no matter how full it is:
+ *
+ *   offset  bytes to skip from the END of the ring (0 = newest page)
+ *   length  bytes wanted for this poll (0 = the whole remaining window)
+ *
+ * Only whole lines are returned: a leading partial line (its beginning lies
+ * before `offset`) is dropped, and the window ends at the last newline so the
+ * reply never stops mid-line.  `capacity` must be at least
+ * `length + NXUS_LOG_NOTE_MAX + 1` to get the full window.
+ *
+ * When anything had to be dropped the reply STARTS with one generated line
+ *
+ *     ... (truncated N bytes)
+ *
+ * where N counts the bytes of the requested window the reply does not carry (the
+ * partial lines at either end plus anything the caller's buffer could not hold).
+ * That note is NOT ring content, which is the paging rule for a client: advance
+ * `offset` by (reply length - the note line) to fetch the next older page; the
+ * note always ends at the first '\n'.
+ *
+ * Returns the bytes written (NUL terminated), 0 when the ring is empty, `offset`
+ * points past it, or the window holds no complete line.
+ */
+size_t nxusLogWindow(char *out, size_t capacity, u32 offset, u32 length);
 
 /* Flush the SD file (no-op when SD logging is disabled). */
 void nxusLogFlush(void);

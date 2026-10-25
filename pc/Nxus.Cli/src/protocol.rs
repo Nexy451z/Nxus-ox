@@ -431,8 +431,8 @@ impl Status {
         self.status_flags & ST_DEBUG_ATTACHED != 0
     }
     /// A breakpoint hit is holding the target (the thread itself is reported by
-    /// NxusDebugStatus.stopped_thread_low, which `Client::debug_stopped_thread`
-    /// reads).
+    /// `NxusDebugStatus.stopped_thread`, whose low half has its own field; see
+    /// `Client::debug_stopped_thread`).
     pub fn debug_stopped(&self) -> bool {
         self.status_flags & ST_DEBUG_STOPPED != 0
     }
@@ -717,14 +717,26 @@ pub struct DebugStatus {
     pub thread_count: u32,
     pub last_result: i32,
     pub auto_continue: u32,
-    /// Low 32 bits of the thread held at a breakpoint (0 = nothing held).  The
-    /// C header calls this `stopped_thread_low`; the thread id is a u64, so the
-    /// wire status only carries the half that fits.
+    /// Legacy low 32 bits of the thread held at a breakpoint (0 = nothing held).
+    /// Kept because an old console only sends this prefix.
     pub stopped_thread_low: u32,
+    /// Full 64-bit id of the same thread (0 = nothing held).  Appended to the C
+    /// struct (`NxusDebugStatus.stopped_thread`), so it is only present when the
+    /// reply is at least [`DebugStatus::SIZE`] bytes: an old console answers with
+    /// the 32-byte prefix and this stays 0, leaving `stopped_thread_low` as the
+    /// only (truncated) source.  Use [`DebugStatus::stopped_thread`] to pick.
+    pub stopped_thread: u64,
 }
 
 impl DebugStatus {
-    pub const SIZE: usize = 32;
+    /// Wire size of a current console's reply (`sizeof(NxusDebugStatus)`).
+    pub const SIZE: usize = 40;
+    /// Wire size before `stopped_thread` was appended: a console this old still
+    /// answers DebugStatus/DebugAttach, and only the prefix may be read.
+    pub const LEGACY_SIZE: usize = 32;
+    /// Byte offset of `stopped_thread` in the current layout.
+    pub const FULL_THREAD_OFFSET: usize = 32;
+
     pub fn parse(data: &[u8]) -> DebugStatus {
         let mut status = DebugStatus {
             attached: rd_u32(data, 0) != 0,
@@ -740,14 +752,26 @@ impl DebugStatus {
         if data.len() >= 28 {
             status.auto_continue = rd_u32(data, 24);
         }
-        if data.len() >= Self::SIZE {
+        if data.len() >= Self::LEGACY_SIZE {
             status.stopped_thread_low = rd_u32(data, 28);
+        }
+        // Appended tail: absent on a pre-Round-15 console, whose 32-byte reply
+        // must keep decoding through `stopped_thread_low` alone.
+        if data.len() >= Self::SIZE {
+            status.stopped_thread = rd_u64(data, Self::FULL_THREAD_OFFSET);
         }
         status
     }
 
     /// Thread currently held at a breakpoint, or None when the target runs.
+    ///
+    /// The full id wins; a console that predates the appended field only sends the
+    /// low half, which is the best it can do (see [`NxusClient::debug_stopped_thread`]
+    /// for the event-assisted variant that recovers the full id there).
     pub fn stopped_thread(&self) -> Option<u64> {
+        if self.stopped_thread != 0 {
+            return Some(self.stopped_thread);
+        }
         match self.stopped_thread_low {
             0 => None,
             low => Some(low as u64),
@@ -2436,6 +2460,58 @@ mod tests {
         raw.strip_prefix("0x").and_then(|h| u32::from_str_radix(h, 16).ok())
     }
 
+    /// `(field, byte offset)` of a flat packed struct, in declaration order.
+    ///
+    /// Sizes come from the C type name, so this is only for the member list this
+    /// header actually uses; comments (including multi-line ones) are stripped
+    /// first, exactly like pc/tests/test_protocol_parity.py does.
+    fn header_fields(text: &str, name: &str) -> Vec<(String, usize)> {
+        let close = text.find(&format!("}} {};", name)).expect("struct not found");
+        let head = text[..close].rfind("typedef struct").expect("typedef struct not found");
+        let body = &text[head + text[head..].find('{').expect("opening brace") + 1..close];
+
+        let mut stripped = String::new();
+        let mut rest = body;
+        loop {
+            match rest.find("/*") {
+                Some(start) => {
+                    stripped.push_str(&rest[..start]);
+                    match rest[start + 2..].find("*/") {
+                        Some(end) => rest = &rest[start + 2 + end + 2..],
+                        None => break,
+                    }
+                }
+                None => {
+                    stripped.push_str(rest);
+                    break;
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        for raw in stripped.split(';') {
+            let decl = raw.trim();
+            if decl.is_empty() {
+                continue;
+            }
+            let mut parts = decl.split_whitespace();
+            let ty = parts.next().unwrap_or("");
+            let field = parts.next().unwrap_or_else(|| panic!("no name in `{}`", decl));
+            assert!(parts.next().is_none(), "unsupported field declaration `{}`", decl);
+            let size = match ty {
+                "u8" => 1,
+                "u16" => 2,
+                "u32" | "s32" | "f32" => 4,
+                "u64" | "s64" | "f64" => 8,
+                other => panic!("unsupported field type `{}` in {}", other, name),
+            };
+            out.push((field.to_string(), offset));
+            offset += size;
+        }
+        out
+    }
+
     #[test]
     fn sizes_match_the_c_header() {
         assert_eq!(header_size(HEADER, "NxusStatus"), Some(Status::SIZE as u32));
@@ -2524,6 +2600,30 @@ mod tests {
     }
 
     #[test]
+    fn the_full_stopped_thread_is_appended_after_the_legacy_prefix() {
+        // The u64 was APPENDED, never inserted: every pre-existing field keeps its
+        // offset, which is what lets an old client read the 32-byte prefix while a
+        // current console sends 40 bytes.  A nested layout change here would make
+        // an old PC decode the stopped thread as another field.
+        let fields = header_fields(HEADER, "NxusDebugStatus");
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["attached", "watch_style", "break_count", "hit_count", "thread_count",
+             "last_result", "auto_continue", "stopped_thread_low", "stopped_thread"]
+        );
+        assert_eq!(fields[7], ("stopped_thread_low".to_string(), 28));
+        assert_eq!(fields[8], ("stopped_thread".to_string(), 32));
+        assert_eq!(DebugStatus::LEGACY_SIZE, 32, "the legacy prefix must not move");
+        assert_eq!(DebugStatus::FULL_THREAD_OFFSET, fields[8].1);
+        assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
+        // The header spells the compatibility boundary out as a macro so the C
+        // side can reason about an old console's reply; pin it here too.
+        assert!(HEADER.contains(&format!("#define NXUS_DEBUG_STATUS_LEGACY_SIZE {}u",
+                                         DebugStatus::LEGACY_SIZE)));
+    }
+
+    #[test]
     fn debug_status_decodes_the_stopped_thread_at_offset_28() {
         let mut data = vec![0u8; DebugStatus::SIZE];
         data[0..4].copy_from_slice(&1u32.to_le_bytes());          // attached
@@ -2536,6 +2636,36 @@ mod tests {
         // a running target reports 0 there, and a short reply must not panic
         assert_eq!(DebugStatus::parse(&vec![0u8; DebugStatus::SIZE]).stopped_thread(), None);
         assert_eq!(DebugStatus::parse(&[0u8; 20]).stopped_thread(), None);
+    }
+
+    #[test]
+    fn debug_status_appends_the_full_stopped_thread_at_offset_32() {
+        // A thread id above 4 GiB is the whole point: the low half alone names a
+        // DIFFERENT thread, so `stopped_thread()` must return the appended id.
+        let tid = 0x1_0000_2A3Bu64;
+        let mut data = vec![0u8; DebugStatus::SIZE];
+        data[28..32].copy_from_slice(&((tid & 0xFFFF_FFFF) as u32).to_le_bytes());
+        data[DebugStatus::FULL_THREAD_OFFSET..DebugStatus::SIZE]
+            .copy_from_slice(&tid.to_le_bytes());
+        let status = DebugStatus::parse(&data);
+        assert_eq!(status.stopped_thread_low, 0x2A3B, "legacy half stays truncated");
+        assert_eq!(status.stopped_thread, tid);
+        assert_eq!(status.stopped_thread(), Some(tid));
+    }
+
+    #[test]
+    fn an_old_console_reply_stops_at_the_legacy_prefix() {
+        // 32 bytes is the pre-Round-15 reply: the appended id is absent, so the
+        // truncated half is all there is and must still be reported.
+        let mut data = vec![0u8; DebugStatus::LEGACY_SIZE];
+        data[28..32].copy_from_slice(&0x1001u32.to_le_bytes());
+        let status = DebugStatus::parse(&data);
+        assert_eq!(status.stopped_thread, 0);
+        assert_eq!(status.stopped_thread(), Some(0x1001));
+        // A current console with nothing held is None even at full length.
+        let idle = DebugStatus::parse(&vec![0u8; DebugStatus::SIZE]);
+        assert_eq!((idle.stopped_thread, idle.stopped_thread_low), (0, 0));
+        assert_eq!(idle.stopped_thread(), None);
     }
 
     #[test]

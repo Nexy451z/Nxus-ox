@@ -85,8 +85,15 @@ PTR_CHAIN = struct.Struct('<IIII8I')
 CHEAT_EXPORT_REQUEST = struct.Struct('<IIIIQ')
 THREAD_CONTEXT = struct.Struct('<QQQQQ I 13I I 29Q')
 # attached, watch_style, break_count, hit_count, thread_count, last_result,
-# auto_continue, stopped_thread_low (C: stopped_thread_low, 0 = nothing held)
+# auto_continue, stopped_thread_low (C: stopped_thread_low, 0 = nothing held).
+# This is the wire layout of a pre-Round-15 console; DEBUG_STATUS_FULL below is the
+# current one and is what STRUCTS maps NxusDebugStatus to.  Both are kept because
+# the MockSwitch still speaks this prefix and an old console really sends it.
 DEBUG_STATUS = struct.Struct('<IIIIIiII')
+# ... plus the full 64-bit stopped_thread the C header appends after
+# stopped_thread_low (Round 15).  0 = nothing held; use this id, the low half alone
+# truncates a thread id above 4 GiB onto a different thread.
+DEBUG_STATUS_FULL = struct.Struct('<IIIIIiIIQ')
 DEBUG_CONFIG = struct.Struct('<IIII')
 # NxusEvent_DebugStopped payload: thread_id, pc, address, kind, slot (32 bytes)
 DEBUG_STOP = struct.Struct('<QQQII')
@@ -131,7 +138,7 @@ STRUCTS = {
     'NxusPtrChainWire': PTR_CHAIN,
     'NxusCheatExportRequest': CHEAT_EXPORT_REQUEST,
     'NxusThreadContext': THREAD_CONTEXT,
-    'NxusDebugStatus': DEBUG_STATUS,
+    'NxusDebugStatus': DEBUG_STATUS_FULL,
     'NxusDebugConfig': DEBUG_CONFIG,
     'NxusDebugStop': DEBUG_STOP,
 }

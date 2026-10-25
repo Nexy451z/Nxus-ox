@@ -979,6 +979,146 @@ class AsyncScanProgressE2E(unittest.TestCase):
                             'a new scan reused the previous session id')
 
 
+class AsyncPtrScanE2E(unittest.TestCase):
+    """MockSwitch(async_ptrscan=True): the console walks the chain graph on a
+    worker thread instead of inside PtrScanBegin.
+
+    switch/include/nxus_server.h: PtrScanBegin does not return the chain list any
+    more, it acknowledges with NXUS_ERR_PTRSCAN_STARTED (NXUS_MAKE_RESULT(8) =
+    0x8003C808), and PtrScanGet answers NXUS_ERR_BUSY until the walk published its
+    result.  So the client has to poll: treating the acknowledgement as a failure
+    drops every chain, and reporting the BUSY as "no chains found" turns a
+    perfectly good walk into an empty answer - both are silent data loss.  The
+    walk also has to be bounded: a worker that never finishes must end in a clear
+    exception, not in a client stuck polling forever.
+
+    This path was only reachable from the Rust CLI (needs a built exe), so no
+    Python-level guard existed for it.
+    """
+
+    # generous: the client polls PtrScanGet every 250 ms, two BUSY replies = ~0.5 s
+    CHAIN_TIMEOUT = 5.0
+
+    def setUp(self):
+        self.server = MockSwitch(watchdog_ms=100000).start()
+        self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
+
+    def tearDown(self):
+        self.client.close()
+        self.server.stop()
+
+    # ---- helpers ----
+
+    def begin(self, timeout: float = None, **kwargs) -> list:
+        """PtrScanBegin for the planted static chain (the one test_16 finds)."""
+        if timeout is None:
+            timeout = self.CHAIN_TIMEOUT
+        return self.client.ptr_scan_begin(MONEY_ADDRESS, module_base=MAIN_BASE,
+                                          max_depth=3, max_offset=0x1000,
+                                          value_width=4, timeout=timeout, **kwargs)
+
+    @staticmethod
+    def planted(chains: list) -> list:
+        """The chain the mock target plants: .data+0x1000 -> heap+0x120 -> record+4."""
+        want_root = (DATA_BASE - MAIN_BASE) + 0x1000
+        return [c for c in chains if c['root_offset'] == want_root
+                and c['steps'] == [0x20] and c['final_offset'] == 4]
+
+    def poll_chains(self, timeout: float = 5.0) -> list:
+        """Collect the list the way a raw PtrScanGet caller has to: BUSY is not an
+        error, it means "keep polling"."""
+        deadline = time.time() + timeout
+        while True:
+            try:
+                return self.client.ptr_scan_get()
+            except NxusError as exc:
+                self.assertEqual(exc.result, P.make_result(P.ERR_BUSY),
+                                 'PtrScanGet answered something other than BUSY/chains')
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.02)
+
+    # ---- 1. the acknowledgement and the polled result ----
+
+    def test_begin_acknowledges_with_ptrscan_started_and_polls(self):
+        self.server.async_ptrscan = True
+        self.server.async_ptrscan_polls = 2
+
+        # the command itself answers NXUS_RESULT_PTRSCAN_STARTED, not the chains
+        payload = P.PTRSCAN_REQUEST.pack(MONEY_ADDRESS, MAIN_BASE, 3, 0x1000, 64, 4)
+        with self.assertRaises(NxusError) as ctx:
+            self.client.request(P.CMD['PtrScanBegin'], payload)
+        self.assertEqual(ctx.exception.result, 0x8003C808,
+                         'PtrScanBegin has to acknowledge with NXUS_RESULT_PTRSCAN_STARTED')
+        self.assertEqual(self.server.chains, [],
+                         'chains were published before the worker finished')
+
+        # ... and the walk it accepted arrives through PtrScanGet after the BUSY
+        # replies are spent.  Reporting an empty list instead would look like
+        # "no chains found" - exactly the bug this guard is for.
+        chains = self.poll_chains()
+        self.assertEqual(self.server.ptrscan_busy_replies, 2,
+                         'PtrScanGet answered BUSY the wrong number of times')
+        self.assertEqual(len(self.planted(chains)), 1,
+                         f'expected the planted chain, got {chains}')
+
+    def test_client_ptr_scan_begin_returns_the_polled_chains(self):
+        """The end-to-end path: one client call, chains come back anyway."""
+        self.server.async_ptrscan = True
+        self.server.async_ptrscan_polls = 2
+        chains = self.begin()
+        self.assertGreaterEqual(len(chains), 1, 'no pointer chain found')
+        self.assertEqual(len(self.planted(chains)), 1,
+                         f'expected the planted chain, got {chains}')
+        self.assertEqual(self.server.ptrscan_busy_replies, 2,
+                         'the client did not poll PtrScanGet for the worker result')
+
+        # the published list stays readable, and reading it costs no BUSY again
+        self.assertEqual(self.client.ptr_scan_get(), chains)
+        self.assertEqual(self.server.ptrscan_busy_replies, 2)
+
+    # ---- 2. a worker that never finishes must not hang the client ----
+
+    def test_a_walk_that_never_finishes_raises_instead_of_looping(self):
+        self.server.async_ptrscan = True
+        self.server.async_ptrscan_polls = -1        # the worker never publishes
+
+        started = time.time()
+        with self.assertRaises(TimeoutError):
+            self.begin(timeout=0.6)
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 5.0, 'the poll loop ran past its deadline')
+        self.assertGreater(self.server.ptrscan_busy_replies, 0,
+                           'the walk was never polled at all')
+        self.assertEqual(self.server.chains, [],
+                         'a walk that never finished published chains')
+
+        # a second Begin while the worker still owns the array is refused
+        with self.assertRaises(NxusError) as ctx:
+            self.begin(timeout=0.2)
+        self.assertEqual(ctx.exception.result, P.make_result(P.ERR_BUSY))
+
+        # the link itself is fine: a console that answers synchronously still does
+        self.server.async_ptrscan = False
+        self.assertEqual(len(self.planted(self.begin())), 1,
+                         'the session did not recover from the abandoned walk')
+
+    # ---- 3. the default stays synchronous (regression) ----
+
+    def test_sync_mode_still_returns_the_chains_immediately(self):
+        """The stock mock is the old behaviour: every other test relies on it."""
+        self.assertFalse(self.server.async_ptrscan,
+                         'async_ptrscan must default to off')
+        self.assertEqual(self.server.async_ptrscan_polls, 2,
+                         'async_ptrscan_polls must default to two BUSY replies')
+        chains = self.begin()
+        self.assertEqual(self.server.ptrscan_busy_replies, 0,
+                         'a synchronous begin cost a BUSY poll')
+        self.assertEqual(len(self.planted(chains)), 1,
+                         f'expected the planted chain, got {chains}')
+        self.assertEqual(self.client.ptr_scan_get(), chains)
+
+
 class FrozenRelease(unittest.TestCase):
     """The console drops frozen addresses on its own (`releaseOwnedFrozen()`, 30 s
     after the last client disappears) and only logs that locally, so the PC has to

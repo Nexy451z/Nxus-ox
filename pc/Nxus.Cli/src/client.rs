@@ -331,6 +331,13 @@ pub struct NxusClient {
     /// Addresses that were in `last_frozen` and are missing from the newest
     /// `frozen_list()` reply - the console (or another dmnt user) released them.
     released_frozen: Mutex<Vec<u64>>,
+    /// Full thread id of the newest `NxusEvent_DebugStopped` this client has seen
+    /// through [`NxusClient::poll_event`], or None when that event was not observed
+    /// (or the target has been resumed since).  The event carries the complete 64-bit
+    /// id, so it recovers the id an old console could only report truncated in
+    /// `NxusDebugStatus.stopped_thread_low`; the low half is compared before it is
+    /// trusted (see [`select_stopped_thread`]).
+    last_stop: Mutex<Option<u64>>,
 }
 
 /// Text for an I/O error that is safe to show in the GUI.
@@ -403,6 +410,41 @@ fn error_from_reply(cmd: u16, body: &[u8]) -> NxusError {
     NxusError { message, result: Some(rc) }
 }
 
+/// Thread id to use for `regs_get` on a held target.
+///
+/// Three sources, best first:
+/// 1. `event` - the full 64-bit id from the `NxusEvent_DebugStopped` this client
+///    observed.  It is only trusted when its low 32 bits match the status reply:
+///    a client that has not drained events since the previous hit still holds an
+///    older id, and that must never be handed to `regs_get` for the current stop.
+/// 2. `status.stopped_thread` - the id appended to `NxusDebugStatus`, present from
+///    Round 15 consoles on (the same full id, without needing the event).
+/// 3. `status.stopped_thread_low` - the legacy half; correct only for ids below
+///    4 GiB, which is all an old console can express.
+///
+/// None means the target is running and there is nothing to read registers from.
+fn select_stopped_thread(status: &DebugStatus, event: Option<u64>) -> Option<u64> {
+    let low = status.stopped_thread_low;
+    if let Some(id) = event {
+        // `id == 0` never reaches here (an all-zero event clears the cache), and
+        // requiring the low half to match keeps a stale event out of the answer:
+        // a console that moved on to another thread reports a different half.
+        if low != 0 && (id as u32) == low {
+            return Some(id);
+        }
+    }
+    // The status reply is authoritative for "is anything held": a stop appended
+    // id (new firmware) wins over the legacy half, and when neither is set the
+    // target runs - a cached event must not resurrect an old hit.
+    if status.stopped_thread != 0 {
+        return Some(status.stopped_thread);
+    }
+    match low {
+        0 => None,
+        low => Some(low as u64),
+    }
+}
+
 impl NxusClient {
     pub fn connect(host: &str, port: u16) -> Result<NxusClient> {
         let stream = connect_with_timeout(host, port)?;
@@ -440,6 +482,7 @@ impl NxusClient {
             running,
             last_frozen: Mutex::new(Vec::new()),
             released_frozen: Mutex::new(Vec::new()),
+            last_stop: Mutex::new(None),
         })
     }
 
@@ -499,8 +542,17 @@ impl NxusClient {
     }
 
     /// Wait for the next asynchronous event (Switch-initiated).
+    ///
+    /// A `NxusEvent_DebugStopped` is remembered on the way through: its payload
+    /// carries the full 64-bit thread id, which an old console's DebugStatus reply
+    /// can only report truncated.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
-        lock(&self.events).recv_timeout(timeout).ok()
+        let event = lock(&self.events).recv_timeout(timeout).ok()?;
+        if event.kind == event::DEBUG_STOPPED && event.payload.len() >= 8 {
+            let thread_id = rd_u64(&event.payload, 0);
+            *lock(&self.last_stop) = if thread_id != 0 { Some(thread_id) } else { None };
+        }
+        Some(event)
     }
 
     // ---- session ----
@@ -1122,6 +1174,7 @@ impl NxusClient {
     }
 
     pub fn debug_detach(&self) -> Result<()> {
+        *lock(&self.last_stop) = None;
         self.request_timeout(cmd::DEBUG_DETACH, &[], Duration::from_secs(60)).map(|_| ())
     }
 
@@ -1132,6 +1185,9 @@ impl NxusClient {
 
     /// Resume a target the console is holding at a breakpoint.
     pub fn debug_continue(&self) -> Result<()> {
+        // The remembered stop belongs to the hit just acknowledged: dropping it
+        // keeps it from naming a thread after the target is running again.
+        *lock(&self.last_stop) = None;
         self.request_timeout(cmd::DEBUG_CONTINUE, &[], Duration::from_secs(60)).map(|_| ())
     }
 
@@ -1143,8 +1199,16 @@ impl NxusClient {
     }
 
     /// Thread the console is holding at a breakpoint (None = the target runs).
+    ///
+    /// This is the id to hand to [`NxusClient::regs_get`]: the full 64-bit value,
+    /// never the truncated low half.  It comes from the `DebugStopped` event seen
+    /// through [`NxusClient::poll_event`] when that event described this stop,
+    /// else from the field the console appended to `NxusDebugStatus`, else (an old
+    /// console whose event was never polled) from the legacy 32-bit field.
     pub fn debug_stopped_thread(&self) -> Result<Option<u64>> {
-        Ok(self.debug_status()?.stopped_thread())
+        let status = self.debug_status()?;
+        let event = *lock(&self.last_stop);
+        Ok(select_stopped_thread(&status, event))
     }
 
     /// Push ONLY the debug block (a bare `NxusDebugConfig`, 16 bytes): the
@@ -1381,8 +1445,8 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text, released_addresses};
-    use crate::protocol::put_u32;
+    use super::{error_from_reply, error_reason_text, released_addresses, select_stopped_thread};
+    use crate::protocol::{put_u32, DebugStatus};
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
         let mut body = Vec::new();
@@ -1465,5 +1529,47 @@ mod tests {
         // a new address is not a release, and a duplicate must not print twice
         assert!(released_addresses(&[0x1000], &[0x1000, 0x5000]).is_empty());
         assert_eq!(released_addresses(&[0x1000, 0x1000], &[]), vec![0x1000]);
+    }
+
+    fn stopped(low: u32, full: u64) -> DebugStatus {
+        DebugStatus { stopped_thread_low: low, stopped_thread: full, ..Default::default() }
+    }
+
+    #[test]
+    fn the_event_id_wins_when_it_describes_the_current_stop() {
+        // Old console: only the low half is in the status, the event has the whole
+        // id.  This is the case the truncation bug was about.
+        let full = 0x1_0000_2A3Bu64;
+        let status = stopped(full as u32, 0);
+        assert_eq!(select_stopped_thread(&status, Some(full)), Some(full));
+    }
+
+    #[test]
+    fn a_stale_event_is_never_handed_to_regs_get() {
+        // The client did not drain events since an older hit on another thread.
+        let status = stopped(0x2A3B, 0);
+        assert_eq!(select_stopped_thread(&status, Some(0x1_0000_1F00)),
+                   Some(0x2A3B), "the truncated half beats the wrong thread");
+        // A new-firmware status names the real thread even with a stale event.
+        let status = stopped(0x2A3B, 0x1_0000_2A3B);
+        assert_eq!(select_stopped_thread(&status, Some(0x1_0000_1F00)),
+                   Some(0x1_0000_2A3B));
+    }
+
+    #[test]
+    fn the_appended_status_field_works_without_any_event() {
+        let full = 0x1_0000_2A3Bu64;
+        assert_eq!(select_stopped_thread(&stopped(full as u32, full), None), Some(full));
+    }
+
+    #[test]
+    fn a_running_target_is_none_even_with_a_cached_event() {
+        assert_eq!(select_stopped_thread(&stopped(0, 0), Some(0x1001)), None);
+    }
+
+    #[test]
+    fn without_the_new_field_the_truncated_half_is_the_last_resort() {
+        // Old console whose event was never polled: still the legacy behaviour.
+        assert_eq!(select_stopped_thread(&stopped(0x1001, 0), None), Some(0x1001));
     }
 }

@@ -9,6 +9,9 @@ switch/source/nxus_server.c and core/nxus_scan.c, including:
     Unknown, change modes, UTF-16 / case-insensitive patterns, aligned walks)
   * the asynchronous scan worker: Running + progress_permille, BUSY while it
     runs, Cancel/Reset (opt in with MockSwitch(scan_async=True))
+  * the asynchronous pointer scan: PtrScanBegin answers NXUS_ERR_PTRSCAN_STARTED
+    (0x8003C808), PtrScanGet answers BUSY for async_ptrscan_polls reads and then
+    publishes the chain list (opt in with mock.async_ptrscan = True)
   * pause + heartbeat + watchdog auto-resume (emitting NxusEvent_AutoResume)
   * error Results encoded as NXUS_MAKE_RESULT(...)
   * a hit-list cap (hit_list_limit) that ends the published list the way
@@ -318,6 +321,16 @@ def _compare(cur: bytes, prev: bytes | None, target: int, size: int, mode: int,
 
 # --- server --------------------------------------------------------------
 
+# switch/include/nxus_server.h: NXUS_ERR_PTRSCAN_STARTED (desc 8 of the Nxus
+# result module) = NXUS_MAKE_RESULT(8) = 0x8003C808.  PtrScanBegin answers it
+# when the console handed the walk to a worker thread instead of blocking the
+# connection for up to 90 s; the chain list then arrives through PtrScanGet,
+# which answers NXUS_ERR_BUSY until the worker published it.  Computed from the
+# protocol module so it cannot drift from the shared result encoding; the parity
+# test pins the numeric value against the C header, the Rust CLI and the Python
+# client.
+PTRSCAN_STARTED = P.make_result(8)
+
 # dmnt:cheat's "no cheat process" Result (shared/nxus_dmntcht.c:95).  It is a
 # dmnt Result word, so it must go on the wire verbatim - NXUS_MAKE_RESULT() would
 # turn it into a different code and the PC's repair/retry path keys on the real
@@ -364,6 +377,22 @@ class MockSwitch:
         self.watchdog_ms = watchdog_ms
         self.hits: list[tuple[int, int, bytes]] = []   # (mapping_idx, offset, value bytes)
         self.chains: list[dict] = []
+        # Pointer scan: the console walks the chain graph on a worker thread
+        # (nxus_server.c: ptrScanThread) and answers PtrScanBegin with
+        # NXUS_ERR_PTRSCAN_STARTED; PtrScanGet then answers NXUS_ERR_BUSY until the
+        # walk publishes the list.  The stock mock still completes inside the
+        # command - the shape the Python client tests assume - so the worker
+        # behaviour is opt in: mock.async_ptrscan = True.
+        self.async_ptrscan = False
+        # How many PtrScanGet reads answer BUSY before the chain list appears.  A
+        # negative value emulates a walk that never finishes, which is what the
+        # client's poll timeout exists for.
+        self.async_ptrscan_polls = 2
+        self._ptrscan_busy_left = 0
+        self._ptrscan_stuck = False
+        self._pending_chains = None       # computed, not yet published
+        self._pending_truncated = False
+        self.ptrscan_busy_replies = 0     # observable: BUSY replies PtrScanGet served
         self.reads = 0
         # emulated kernel debug session
         self.attached = False
@@ -910,8 +939,18 @@ class MockSwitch:
             # nxus_server.c:1168-1175)
             if self._scan_running():
                 return self._error(P.ERR_BUSY)
+            if self.async_ptrscan:
+                return self._ptr_scan_start(payload)
             return self._ptr_scan(payload)
         if cmd == P.CMD['PtrScanGet']:
+            # The walk owns the chain array until it publishes: reporting an empty
+            # list here would read as "no chains found" (nxus_server.c:1177-1189).
+            if self._ptr_scan_busy():
+                if not self._ptrscan_stuck:
+                    self._ptrscan_busy_left -= 1
+                self.ptrscan_busy_replies += 1
+                return self._error(P.ERR_BUSY)
+            self._publish_chains()
             return self._chain_list()
         if cmd == P.CMD['CheatExport']:
             index, value_width, flags, _res, value = P.CHEAT_EXPORT_REQUEST.unpack(payload)
@@ -1242,6 +1281,56 @@ class MockSwitch:
         return self.target.read(address, size)
 
     def _ptr_scan(self, payload: bytes):
+        """Synchronous shape: walk and publish inside the command."""
+        chains, truncated = self._walk_chains(payload)
+        self.chains = chains
+        self.ptr_truncated = truncated
+        # a synchronous walk supersedes any emulated worker still in flight
+        self._pending_chains = None
+        self._pending_truncated = False
+        self._ptrscan_busy_left = 0
+        self._ptrscan_stuck = False
+        return self._chain_list()
+
+    def _ptr_scan_start(self, payload: bytes):
+        """Asynchronous shape: accept the walk, let PtrScanGet carry the list.
+
+        PtrScanBegin answers NXUS_ERR_PTRSCAN_STARTED instead of the chain list
+        (switch/include/nxus_server.h); the chains are computed here but stay
+        unpublished until the emulated worker's BUSY polls are spent, so a reader
+        can never see a half-owned chain array.  A second Begin while the walk is
+        still running is refused with BUSY, exactly like the console.
+        """
+        if self._ptr_scan_busy():
+            return self._error(P.ERR_BUSY)
+        chains, truncated = self._walk_chains(payload)
+        self._pending_chains = chains
+        self._pending_truncated = truncated
+        self.ptrscan_busy_replies = 0
+        self._ptrscan_stuck = self.async_ptrscan_polls < 0
+        self._ptrscan_busy_left = 0 if self._ptrscan_stuck else int(self.async_ptrscan_polls)
+        return self._error_code(PTRSCAN_STARTED)
+
+    def _ptr_scan_busy(self) -> bool:
+        """Is the emulated pointer-scan worker still owning the chain array?"""
+        return bool(self.async_ptrscan) and (self._ptrscan_stuck or self._ptrscan_busy_left > 0)
+
+    def _publish_chains(self):
+        """Install the list the walk computed, once the worker is done."""
+        if self._pending_chains is None:
+            return
+        self.chains = self._pending_chains
+        self.ptr_truncated = self._pending_truncated
+        self._pending_chains = None
+        self._pending_truncated = False
+
+    def _walk_chains(self, payload: bytes):
+        """The chain walk itself; returns (chains, truncated).
+
+        Kept apart from the publishing paths so the asynchronous mode can compute
+        the list at Begin time and publish it only after the emulated worker
+        finished (the ordering the console guarantees).
+        """
         target, module_base, max_depth, max_offset, max_results, value_width = \
             P.PTRSCAN_REQUEST.unpack(payload)
         max_depth = max_depth or 3
@@ -1286,11 +1375,9 @@ class MockSwitch:
                 self.reads += 1
                 walk(v, 1, [], m['base'] - module_base + off)
 
-        self.chains = chains
         # Mirrors NxusPtrChainListHeader.truncated: the walk stops at max_results,
         # so a full list means "there may be more" rather than "that is all".
-        self.ptr_truncated = bool(max_results) and len(chains) >= max_results
-        return self._chain_list()
+        return chains, bool(max_results) and len(chains) >= max_results
 
     def _chain_list(self) -> bytes:
         truncated = 1 if getattr(self, 'ptr_truncated', False) else 0

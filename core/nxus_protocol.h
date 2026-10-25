@@ -621,11 +621,23 @@ typedef struct NXUS_PACKED {
     s32 last_result;
     u32 auto_continue;
     /* Low 32 bits of the thread the current stop belongs to (0 = not stopped).
-       The full id is in the NxusEvent_DebugStopped payload.  The field used to be
-       `reserved`; the size and offsets are unchanged. */
+       Kept for compatibility: PC clients that predate `stopped_thread` below read
+       only this prefix.  The field used to be `reserved`, so the offsets of the
+       fields above never moved. */
     u32 stopped_thread_low;
+    /* Full 64-bit id of the SAME thread (0 = not stopped), appended in Round 15.
+       The thread id is a u64, so the legacy field above only names a thread below
+       4 GiB.  Always read this one when the payload is long enough; the trailing
+       field was appended (not inserted) exactly so an older PC that reads 32 bytes
+       keeps decoding the prefix.  NxusEvent_DebugStopped carries the same id for
+       the instant a hit happens. */
+    u64 stopped_thread;
 } NxusDebugStatus;
-NXUS_STATIC_ASSERT(sizeof(NxusDebugStatus) == 32, "NxusDebugStatus must be 32 bytes");
+NXUS_STATIC_ASSERT(sizeof(NxusDebugStatus) == 40, "NxusDebugStatus must be 40 bytes");
+/* Size of the pre-Round-15 prefix: an old console answers DebugStatus/DebugAttach
+   with this many bytes, so a reader must treat `stopped_thread` as absent below
+   the full sizeof(NxusDebugStatus). */
+#define NXUS_DEBUG_STATUS_LEGACY_SIZE 32u
 
 typedef struct NXUS_PACKED {
     u32 style;            /* NxusWatchStyle */

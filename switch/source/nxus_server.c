@@ -82,6 +82,11 @@ static void pauseLeave(void);
 static bool pauseIsHotkeyHold(void);
 static void pauseNoteHotkeyHold(void);
 static void pauseClearHotkeyHold(void);
+/* Defined with the tick; the pointer-scan chain check refreshes the cached target
+   identity through it before comparing (throttled to 1 Hz, a no-op while a debug
+   session owns the process), so the check does not rest on a value the tick has
+   not updated yet. */
+static void refreshTargetIdentityThrottled(void);
 
 /* Frozen addresses Nxus itself enabled.  dmnt keeps writing them forever, so if
    the PC disappears while some are frozen the only way out is a console reboot -
@@ -219,8 +224,40 @@ static void flushFrozenReleased(void) {
 static NxusPtrChain     g_Chains[NXUS_PTRSCAN_MAX_RESULTS];
 static u32              g_ChainCount;
 static NxusPtrScanStats g_PtrStats;
-static u64              g_PtrTarget;
-static u64              g_PtrModuleBase;
+
+/* Which target g_Chains was found for.
+ *
+ * The list outlives the process it describes: Begin is its only writer, and a
+ * title change (or a new scan after ForceOpen) does not touch it.  A client that
+ * quits game A, starts game B and then exports chain #N would therefore get a
+ * cheat code built from A's addresses - and because a chain is a module-relative
+ * root plus offsets, the code still looks plausible for B while pointing at
+ * whatever now lives there.  Coding a wrong address into a running game is worse
+ * than an error, so the list carries this stamp and every reader compares it with
+ * the session's current identity first (ptrChainOwnerCheck()).
+ *
+ * Identity is (strongest first):
+ *   pid + program id            - what dmnt reports for the cheat process; both
+ *                                 change when another title is launched.
+ *   session id + target address - the fallback when dmnt had no metadata (no
+ *                                 pid): the scan generation and the address the
+ *                                 walk rooted at are then the only tokens that
+ *                                 separate one target from the next.
+ */
+typedef struct {
+    bool valid;           /* the fields below were stamped for g_Chains       */
+    u64  pid;             /* process the walk ran in (0 = dmnt had no metadata) */
+    u64  program_id;      /* title id of that process (0 = unknown)            */
+    u32  session_id;      /* nxusSessionId() at Begin (fallback identity)      */
+    u64  target_address;  /* the address the walk rooted at (Begin request)   */
+} NxusChainOwner;
+
+static NxusChainOwner g_ChainOwner;
+/* Set when a reader found that the list belongs to an earlier target and dropped
+   it.  PtrScanGet then keeps answering BAD_STATE until a new walk publishes a
+   list: an empty list would read as "no chains found (complete)", i.e. the client
+   would believe the title simply has none. */
+static bool g_ChainsStale;
 
 /* A PtrScanBegin may not run longer than this.  The PC gives up on the reply
    after 120 s, but the console used to keep walking roots, so a scan the client
@@ -933,11 +970,13 @@ static u32 buildPtrRegions(NxusPtrRegion *out, u32 max_regions, u64 *out_module_
  *   - core/nxus_ptrscan.c keeps its ~38 KB engine state in a static (documented
  *     non-reentrant), so exactly ONE worker may run at a time: g_PtrJobState is
  *     that gate and a second PtrScanBegin is refused with BUSY.
- *   - g_Chains / g_PtrStats / g_ChainCount / g_PtrTarget / g_PtrModuleBase are
+ *   - g_Chains / g_PtrStats / g_ChainCount / g_ChainOwner / g_ChainsStale are
  *     written by the worker and read by PtrScanGet.  The worker publishes them
  *     BEFORE its release store that marks the job Done/Failed, and every reader
  *     acquire-loads the state first, so no reader ever sees a half-written list.
- *   - CheatExport indexes g_Chains and is refused while the worker runs.
+ *   - CheatExport indexes g_Chains and is refused while the worker runs.  Both it
+ *     and PtrScanGet first check that the list still belongs to the current target
+ *     (ptrChainOwnerCheck) - the chains may be one title old.
  *   - SnapshotCapture and ScanBegin/ScanNext are refused while the worker runs:
  *     their buffers (capture chunk, scan chunk/window) would land on top of the
  *     pointer scan's scratch, region array and chain reply, which estimateHeapPeak
@@ -963,6 +1002,10 @@ typedef struct {
     NxusPtrScanOptions  opts;
     u64                 module_base;
     PtrScanBudget       budget;
+    /* Target identity captured at Begin (published with the chains, see
+       NxusChainOwner): the walk may take up to 90 s, so the stamp has to describe
+       the process the request was made against, not whatever runs when it ends. */
+    NxusChainOwner      owner;
 } PtrScanJob;
 
 static PtrScanJob  g_PtrJob;
@@ -1004,8 +1047,13 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
     if (g_PtrJob.budget.budget_hit || src == NXUS_SCAN_ERR_CANCELLED) g_PtrStats.truncated = 1;
     const bool ok = (src == NXUS_SCAN_OK || src == NXUS_SCAN_ERR_CANCELLED);
     g_ChainCount = ok ? count : 0;
-    g_PtrTarget = g_PtrJob.req.target_address;
-    g_PtrModuleBase = g_PtrJob.module_base;
+    /* Stamp the list with the target it was walked in (captured at Begin).  Done
+       here, before the release store that publishes Done/Failed, like every other
+       field a reader consumes.  A new publication also clears the stale marker of
+       an earlier discard - a fresh walk has just replaced what it referred to. */
+    g_ChainOwner = g_PtrJob.owner;
+    g_ChainOwner.valid = ok;
+    g_ChainsStale = false;
 
     if (g_PtrJob.budget.budget_hit) {
         NXUS_LOG("ptrscan: time budget reached after %llu ms (chains=%u) - "
@@ -1099,6 +1147,79 @@ static void sendChainList(int fd, u32 seq, u16 type) {
     }
     reply(fd, type, seq, buffer, offset);
     free(buffer);
+}
+
+/* May this chain list be served to the client that is asking now?
+ *
+ * g_Chains is only written by a walk, so the list survives whatever happens to the
+ * process it was found in: the PC can quit game A, start game B and then export
+ * chain #N.  That export would code A's addresses - a module-relative root plus
+ * offsets, so it looks valid for B - and writing such a code into a running game
+ * is worse than refusing it.  Every reader therefore compares the stamp taken at
+ * Begin with the session's current identity before handing chains out.
+ *
+ * Callers run on the connection thread and have already refused BUSY while the
+ * worker owns g_Chains (CheatExport checks that at its top, PtrScanGet by state),
+ * so the plain reads/writes below cannot race with ptrScanPublish().
+ *
+ * Returns 0 when the list may be served, NXUS_ERR_BAD_STATE once it has been
+ * discarded.  An empty list needs no protection.
+ */
+static Result ptrChainOwnerCheck(void) {
+    /* A list an earlier read already dropped stays refused until the next walk
+       publishes a new one: an empty list would read as "no chains (complete)". */
+    if (g_ChainsStale) return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    if (g_ChainCount == 0 || !g_ChainOwner.valid) return 0;
+
+    /* The tick refreshes the cached identity once a second; asking here makes the
+       answer deterministic for a client that exports right after a title change
+       instead of waiting for the next tick.  Throttled, and a no-op returning 0
+       while a debug session owns the process (dmnt is closed then), so it is cheap
+       and cannot fight the debug session. */
+    refreshTargetIdentityThrottled();
+
+    const u64 now_pid = nxusSessionProcessId();
+    const u64 now_title = nxusSessionProgramId();
+    bool same;
+    if (g_ChainOwner.pid != 0) {
+        /* Both sides know a pid, so that is the identity.  A program id that is 0
+           on either side (dmnt metadata unavailable at Begin or at an explicit
+           attach) is treated as unknown, not as a mismatch: refusing a list that
+           cannot be proven stale would break scan-then-attach flows. */
+        same = (g_ChainOwner.pid == now_pid) &&
+               (g_ChainOwner.program_id == 0 || now_title == 0 ||
+                g_ChainOwner.program_id == now_title);
+        if (!same) {
+            NXUS_LOG("ptrscan: chain list belongs to an earlier target "
+                     "(saved pid=%llu, current pid=%llu) - discarding",
+                     (unsigned long long)g_ChainOwner.pid, (unsigned long long)now_pid);
+            if (g_ChainOwner.pid == now_pid) {
+                /* Same pid, different title: the pid was reused after a restart. */
+                NXUS_LOG("ptrscan: chain list title changed (saved title=%016llX, "
+                         "current title=%016llX)",
+                         (unsigned long long)g_ChainOwner.program_id,
+                         (unsigned long long)now_title);
+            }
+        }
+    } else {
+        /* No pid when the walk ran, so dmnt had no metadata: the scan generation is
+           the only per-target token the session publishes (nxusSessionId() changes
+           on every ScanBegin/Reset). */
+        same = (g_ChainOwner.session_id == nxusSessionId());
+        if (!same) {
+            NXUS_LOG("ptrscan: chain list belongs to an earlier scan generation "
+                     "(saved session=%u, current session=%u) - discarding",
+                     (unsigned)g_ChainOwner.session_id, (unsigned)nxusSessionId());
+        }
+    }
+    if (same) return 0;
+
+    /* Invalidate instead of leaving the bytes around: a later reader must not be
+       able to serve them, and the next Begin replaces them anyway. */
+    g_ChainCount = 0;
+    g_ChainOwner.valid = false;
+    g_ChainsStale = true;
+    return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
 }
 
 static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32 length) {
@@ -1228,6 +1349,29 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     g_PtrJob.module_base = module_base;
     g_PtrJob.budget = budget;
 
+    /* Identity the resulting chains will be stamped with (NxusChainOwner).  Taken
+       HERE, not at publish time: the walk may run for 90 s, and if the title is
+       closed meanwhile the list must still be attributed to the process it was
+       actually walked in.  The mapping refresh above has just re-read dmnt's
+       metadata, so pid / title are as current as they can be.  Without a pid the
+       scan generation and the rooted address are the only identity available. */
+    {
+        NxusChainOwner owner;
+        memset(&owner, 0, sizeof(owner));
+        owner.valid = true;
+        owner.pid = nxusSessionProcessId();
+        owner.program_id = nxusSessionProgramId();
+        owner.session_id = nxusSessionId();
+        owner.target_address = req.target_address;
+        g_PtrJob.owner = owner;
+        NXUS_LOG_DEBUG("ptrscan: stamping the chain list with pid=%llu title=%016llX "
+                       "session=%u target=%08llX",
+                       (unsigned long long)owner.pid,
+                       (unsigned long long)owner.program_id,
+                       (unsigned)owner.session_id,
+                       (unsigned long long)owner.target_address);
+    }
+
     /* Reap the previous worker before reusing its Thread slot (threadCreate()
        overwrites it).  It has finished, or the BUSY gate above would have
        refused this request. */
@@ -1291,6 +1435,16 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
     }
     NxusCheatExportRequest req;
     memcpy(&req, payload, sizeof(req));
+
+    /* The list may have been found in a title that is no longer running: exporting
+       it would code that title's addresses into the game that runs now (see
+       ptrChainOwnerCheck).  Checked before the index so a stale list answers
+       "wrong target" instead of "no such chain". */
+    const Result owner_rc = ptrChainOwnerCheck();
+    if (R_FAILED(owner_rc)) {
+        replyError(fd, type, seq, owner_rc);
+        return;
+    }
     if (req.index >= g_ChainCount) {
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                          NXUS_REASON_BAD_INDEX);
@@ -1406,6 +1560,33 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     free(buffer);
     nxusSessionViewUnpin(&pin);
 }
+
+/* ---- LOG request (server-side protocol extension) -----------------------
+ *
+ * core/nxus_protocol.h is the shared wire contract and is frozen for this change,
+ * so the shape of the OPTIONAL LogGet payload is declared here, with the spec the
+ * PC client has to implement later.  The server is backward compatible either way:
+ *
+ *   NxusCmd_LogGet payload (8 bytes, optional, two little-endian u32)
+ *     offset  bytes to skip from the END of the ring (0 = newest page)
+ *     length  bytes wanted for this poll (0 = the default 8 KiB window)
+ *
+ * The ring keeps NXUS_LOG_RING_CAPACITY (16 KiB) of whole lines, so the whole
+ * history is reachable in 2-3 polls: request a window, then advance `offset` by
+ * (reply length - the "... (truncated N bytes)" line), because that note is
+ * generated by the server and is not ring content (see nxus_log.h).  The reply
+ * only ever carries whole lines: a partial line at either end of the window is
+ * dropped and counted in the note.
+ *
+ * No payload - or one shorter than this struct - keeps the old behaviour: the
+ * last 8 KiB of the ring, now cut on line boundaries instead of mid-line.
+ */
+#define NXUS_LOG_DEFAULT_WINDOW 8192u
+typedef struct {
+    u32 offset;
+    u32 length;
+} NxusLogRequest;
+NXUS_STATIC_ASSERT(sizeof(NxusLogRequest) == 8, "NxusLogRequest must be 8 bytes");
 
 /* ---- main dispatch ----------------------------------------------------- */
 
@@ -2002,7 +2183,15 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 replyError(fd, type, seq, g_PtrJobResult);
                 break;
             }
-            /* Idle (never started / after a failure) or Done: the list is stable. */
+            /* Idle (never started / after a failure) or Done: the list is stable.
+               Stable is not the same as CURRENT, though: the PC can start another
+               game and then poll the result, and those chains belong to the title
+               that was scanned.  Serve them only while the stamp still matches. */
+            const Result owner_rc = ptrChainOwnerCheck();
+            if (R_FAILED(owner_rc)) {
+                replyError(fd, type, seq, owner_rc);
+                break;
+            }
             sendChainList(fd, seq, type);
             break;
         }
@@ -2207,8 +2396,23 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_LogGet: {
-            static char log[8192];
-            size_t n = nxusLogTail(log, sizeof(log));
+            /* Used to answer a fixed last 8 KiB, so the older half of the 16 KiB ring
+               was unreachable and every reply started in the middle of a line.  The
+               optional NxusLogRequest (see above) pages backwards through the whole
+               ring; nxusLogWindow() cuts on line boundaries and reports what it had
+               to drop.  A client that sends nothing gets the same 8 KiB window it
+               always got, now made of whole lines. */
+            NxusLogRequest req;
+            req.offset = 0;
+            req.length = NXUS_LOG_DEFAULT_WINDOW;
+            if (length >= sizeof(req)) memcpy(&req, payload, sizeof(req));
+            /* Clamp the request to what the ring and the reply buffer can hold: the
+               fields come straight off the wire. */
+            if (req.length == 0) req.length = NXUS_LOG_DEFAULT_WINDOW;
+            if (req.length > NXUS_LOG_RING_CAPACITY) req.length = NXUS_LOG_RING_CAPACITY;
+
+            static char log[NXUS_LOG_RING_CAPACITY + NXUS_LOG_NOTE_MAX + 1];
+            size_t n = nxusLogWindow(log, sizeof(log), req.offset, req.length);
             reply(fd, type, seq, log, (u32)n);
             break;
         }

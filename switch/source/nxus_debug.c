@@ -1138,9 +1138,14 @@ void nxusDebugGetStatus(NxusDebugStatus *out) {
     out->thread_count = g_ThreadCount;
     out->auto_continue = g_Config.auto_continue;
     out->last_result = g_LastResult;
-    /* The wire layout only carries the low half here; the full id travels in the
-       NxusEvent_DebugStopped payload. */
-    out->stopped_thread_low = (u32)(nxusDebugStoppedThread() & 0xFFFFFFFFull);
+    /* Publish the SAME stop record twice: the legacy low half first (old PC
+       clients read a 32-byte prefix) and then the full 64-bit id that a modern
+       client must use for regs_get - a thread id above 4 GiB would otherwise be
+       truncated and name a different thread.  One atomic load keeps the two
+       fields describing the same stop. */
+    const u64 stopped_thread = nxusDebugStoppedThread();
+    out->stopped_thread_low = (u32)(stopped_thread & 0xFFFFFFFFull);
+    out->stopped_thread = stopped_thread;
     mutexLock(&g_Mutex);
     out->hit_count = g_HitTotal;
     mutexUnlock(&g_Mutex);

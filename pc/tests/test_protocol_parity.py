@@ -14,12 +14,28 @@ PC = os.path.dirname(HERE)
 ROOT = os.path.dirname(PC)
 HEADER_PATH = os.path.join(ROOT, 'core', 'nxus_protocol.h')
 
+# The server-side Result that is not part of the shared wire header: it is
+# declared in switch/include/nxus_server.h and mirrored by hand in the two PC
+# clients.  All three are read here so a rename/re-number on one side fails
+# loudly instead of leaving one client permanently mistaking the pointer-scan
+# acknowledgement for an error.
+SERVER_HEADER_PATH = os.path.join(ROOT, 'switch', 'include', 'nxus_server.h')
+CLIENT_PY_PATH = os.path.join(PC, 'nxus', 'client.py')
+CLIENT_RS_PATH = os.path.join(PC, 'Nxus.Cli', 'src', 'client.rs')
+
 sys.path.insert(0, PC)
 from nxus import protocol  # noqa: E402
+from nxus import mock_switch  # noqa: E402
+from nxus.client import NxusClient  # noqa: E402
 
 
 def read_header():
     with open(HEADER_PATH, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def read_text(path):
+    with open(path, 'r', encoding='utf-8') as f:
         return f.read()
 
 
@@ -312,6 +328,76 @@ class ProtocolParity(unittest.TestCase):
             got.append((o, mi, v))
             off += protocol.HIT.size
         self.assertEqual(got, [(0x1000, 0, 0xDEADBEEF), (0x2000, 0, 0xCAFEBABE)])
+
+
+class AsyncPtrScanResultParity(unittest.TestCase):
+    """NXUS_RESULT_PTRSCAN_STARTED has to mean the same thing everywhere.
+
+    PtrScanBegin no longer answers with the chain list: it acknowledges with
+    ``NXUS_RESULT_PTRSCAN_STARTED`` (``NXUS_MAKE_RESULT(NXUS_ERR_PTRSCAN_STARTED)``,
+    desc 8) and the client polls PtrScanGet, which answers ``NXUS_ERR_BUSY`` until
+    the walk publishes its result.
+
+    The value lives in switch/include/nxus_server.h - a *server* status, not part
+    of the shared wire format in core/nxus_protocol.h - so the Rust CLI
+    (``RESULT_PTRSCAN_STARTED``) and the Python client (``PTRSCAN_STARTED``) each
+    mirror it by hand.  If one of them drifts, that client either prints the
+    acknowledgement as a failure and drops every chain, or fails to recognise the
+    BUSY reply and reports an empty chain list.  Both are silent data loss, so
+    the three definitions are read from the sources and compared against the
+    encoding the protocol module implements.
+    """
+
+    # NXUS_MAKE_RESULT(8) with the Nxus result module (484 = 0x1E4):
+    # 0x8003C808.  Spelled out here so the test fails if the encoding itself
+    # changes under all three call sites at once.
+    RESULT = 0x8003C808
+    DESC = 8
+
+    def test_the_value_is_the_shared_result_encoding(self):
+        self.assertEqual(self.RESULT, protocol.make_result(self.DESC))
+        self.assertEqual(self.RESULT, 0x80000000 | (protocol.RESULT_MODULE << 9) | self.DESC)
+        self.assertEqual(protocol.RESULT_MODULE, 484)
+
+    def test_c_header_defines_the_descriptor_and_wraps_it(self):
+        text = read_text(SERVER_HEADER_PATH)
+        match = re.search(r'#define\s+NXUS_ERR_PTRSCAN_STARTED\s+(\d+)u?\b', text)
+        self.assertIsNotNone(match, 'NXUS_ERR_PTRSCAN_STARTED missing from nxus_server.h')
+        desc = int(match.group(1), 0)
+        self.assertEqual(desc, self.DESC,
+                         f'nxus_server.h: descriptor {desc} != {self.DESC}')
+        # the header must build the Result from the descriptor, not hard-code a word
+        self.assertIn('NXUS_MAKE_RESULT(NXUS_ERR_PTRSCAN_STARTED)', text,
+                      'nxus_server.h no longer encodes the Result from its descriptor')
+        self.assertEqual(protocol.make_result(desc), self.RESULT)
+
+    def test_rust_cli_constant(self):
+        text = read_text(CLIENT_RS_PATH)
+        match = re.search(r'pub\s+const\s+RESULT_PTRSCAN_STARTED\s*:\s*u32\s*=\s*'
+                          r'(0x[0-9A-Fa-f_]+|\d+)\s*;', text)
+        self.assertIsNotNone(match, 'RESULT_PTRSCAN_STARTED missing from Nxus.Cli/src/client.rs')
+        value = int(match.group(1).replace('_', ''), 0)
+        self.assertEqual(value, self.RESULT,
+                         f'Rust RESULT_PTRSCAN_STARTED is {value:#010X}, C says {self.RESULT:#010X}')
+        self.assertEqual(value, protocol.make_result(self.DESC))
+
+    def test_python_client_constant(self):
+        self.assertEqual(NxusClient.PTRSCAN_STARTED, self.RESULT,
+                         'Python PTRSCAN_STARTED drifted from the C header')
+        self.assertEqual(NxusClient.PTRSCAN_STARTED, protocol.make_result(self.DESC))
+        # the mock speaks the same acknowledgement on the wire
+        self.assertEqual(mock_switch.PTRSCAN_STARTED, self.RESULT,
+                         'the mock acknowledges with a different Result')
+
+    def test_busy_result_matches_too(self):
+        """The other half of the poll contract: BUSY is what "keep polling" means."""
+        text = read_text(CLIENT_RS_PATH)
+        match = re.search(r'pub\s+const\s+RESULT_BUSY\s*:\s*u32\s*=\s*'
+                          r'(0x[0-9A-Fa-f_]+|\d+)\s*;', text)
+        self.assertIsNotNone(match, 'RESULT_BUSY missing from Nxus.Cli/src/client.rs')
+        value = int(match.group(1).replace('_', ''), 0)
+        self.assertEqual(value, protocol.make_result(protocol.ERR_BUSY),
+                         'Rust RESULT_BUSY drifted from the Python protocol module')
 
 
 if __name__ == '__main__':
