@@ -781,27 +781,46 @@ Result nxusDebugAttach(u64 pid) {
        on detach. */
     nxusDmntSetAutoReopen(false);
 
-    /* Only one debugger may own the process: ask dmnt to detach first. */
-    Result rc = nxusDmntForceClose();
-    NXUS_RESULT("dmnt ForceCloseCheatProcess", rc);
-    svcSleepThread(200000000ull);
-
-    /* The kernel does not reset the breakpoint/watchpoint registers when a
-       previous debug handle is closed.  A breakpoint left over from an earlier
-       attach would trap into
-       this title (or make svcDebugActiveProcess itself fail), so wipe all ten
-       slots before asking for the process. */
-    clearAllHardwareSlots();
-
+    /* Ask for the process FIRST.
+     *
+     * The old order (ForceClose dmnt -> sleep -> DebugActiveProcess) destroyed
+     * dmnt's cheat session, frozen values and toggles *before* finding out
+     * whether we could take the process at all: when another debugger already
+     * holds it the kernel refuses DebugActiveProcess, so the only thing that
+     * attach achieved was breaking the other tool.  dmnt:cht is a single shared
+     * cheat process, so asking the kernel first costs one failed call in the
+     * "dmnt owns it" case and touches nothing in the "someone else owns it"
+     * case. */
     Handle debug = INVALID_HANDLE;
-    rc = svcDebugActiveProcess(&debug, pid);
+    Result rc = svcDebugActiveProcess(&debug, pid);
+    if (R_FAILED(rc)) {
+        bool has_cheat_process = false;
+        if (R_SUCCEEDED(nxusDmntHasCheatProcess(&has_cheat_process)) && has_cheat_process) {
+            /* dmnt itself is the holder (it opens the debug handle for its cheat
+               VM), so closing it is the documented hand-off and nobody else is
+               debugging this process. */
+            Result crc = nxusDmntForceClose();
+            NXUS_RESULT("dmnt ForceCloseCheatProcess", crc);
+            svcSleepThread(200000000ull);
+            rc = svcDebugActiveProcess(&debug, pid);
+        }
+    }
     g_LastResult = (s32)rc;
     NXUS_RESULT("svcDebugActiveProcess", rc);
     if (R_FAILED(rc)) {
+        /* dmnt was never closed unless it owned the process, so there is nothing
+           to restore in the common failure case; ForceOpen is cheap and makes the
+           "dmnt owned it and the retry still failed" path recover. */
         nxusDmntForceOpen();
         nxusDmntSetAutoReopen(true);
         return rc;
     }
+
+    /* The kernel does not reset the breakpoint/watchpoint registers when a
+       previous debug handle is closed.  We are the owner now, so leftover slots
+       from an earlier session (or from a previously released debugger) can be
+       wiped without harming anyone else. */
+    clearAllHardwareSlots();
 
     g_Debug = debug;
     g_Attached = true;

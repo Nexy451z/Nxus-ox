@@ -79,11 +79,11 @@ static bool dmntResultIsCheatNotAttached(Result rc) {
 
     const u32 raw = (u32)rc;
     if (raw == NXUS_DMNT_RESULT_CHEAT_NOT_ATTACHED) return true;
-    /* The same description under another packing: Atmosphère puts the dmnt module
-       (0x164) in bits 9..17 and the description (0x0D) in bits 0..8, while a
-       few paths print a module-qualified variant.  Both spellings must trigger
-       the repair, so the low half is accepted as well. */
-    if ((raw & 0xFFFFu) == 0xC80Du) return true;
+    /* The same description under Atmosphère's packing: module 0x164 in bits 9..17,
+       description 0x0D in bits 0..8.  A looser "low half == 0xC80D" test also
+       matches unrelated modules whose description happens to be 0x0D; a false
+       positive there would re-open the cheat process (a takeover) for an error
+       that has nothing to do with dmnt, so only the exact forms are accepted. */
     return (raw & 0x1FFu) == 0x0Du && ((raw >> 9) & 0x1FFu) == 0x164u;
 }
 

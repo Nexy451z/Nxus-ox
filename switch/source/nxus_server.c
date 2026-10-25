@@ -47,6 +47,7 @@ static Mutex g_PauseLock;
 static bool   g_PauseLockReady = false;
 
 static Result serverPause(void);
+static Result serverPauseEx(bool allow_attach);
 static Result serverResume(void);
 
 /* Pointer scan results kept between PtrScanBegin and PtrScanGet/CheatExport. */
@@ -66,7 +67,7 @@ static void onHotkeyFired(void *user) {
     if (g_CommandActive) {
         NXUS_LOG("hotkey: a command is running - in-flight reads may be dropped by the pause");
     }
-    Result rc = serverPause();
+    Result rc = serverPauseEx(false);   /* hotkey: never hijack the process */
     NXUS_RESULT("hotkey pause", rc);
     if (R_SUCCEEDED(rc)) {
         nxusNetSendEvent(NxusEvent_HotkeyPaused, NULL, 0);
@@ -177,7 +178,7 @@ static void pauseUnlock(void) {
  * took the process over, ...), take the process over with Nxus's own debug
  * session and break it there.  That closes dmnt for the duration of the pause,
  * which is why it is only the second choice. */
-static Result pauseTargetLocked(void) {
+static Result pauseTargetLocked(bool allow_attach) {
     if (nxusDebugIsAttached()) {
         /* Our session already owns the process (DebugAttach, or a repeated
            Pause): one kernel call is enough. */
@@ -200,6 +201,18 @@ static Result pauseTargetLocked(void) {
         return 0;
     }
 
+    /* The own-debug-session fallback CLOSES dmnt's cheat process: frozen values,
+       toggles and the cheat VM of every tool sharing it go away, and the ten
+       hardware BP/WP slots are wiped.  That is acceptable when the user asked for
+       it from the PC ("nxus pause"), but not when a controller hotkey did it, so
+       only the explicit path may take the process over. */
+    if (!allow_attach) {
+        NXUS_LOG("pause: dmnt stop failed rc=0x%08X; debug-attach fallback is disabled "
+                 "for this path (use `nxus pause` / DebugAttach to force it)",
+                 (unsigned)dmnt_rc);
+        return dmnt_rc;
+    }
+
     NXUS_LOG("pause: dmnt stop failed rc=0x%08X - falling back to an own debug session",
              (unsigned)dmnt_rc);
 
@@ -217,6 +230,22 @@ static Result pauseTargetLocked(void) {
                  (unsigned)rc, (unsigned long long)md.process_id, (unsigned)dmnt_rc);
         if (R_FAILED(rc)) return dmnt_rc;
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+    }
+
+    /* Stopping the wrong process is worse than not pausing: after the game quits,
+       dmnt's metadata can describe whatever still runs (the home menu).  Require a
+       real program id and, when the session already knows its target, the same
+       pid. */
+    {
+        const u64 known_pid = nxusSessionProcessId();
+        if (md.program_id == 0 || (known_pid != 0 && md.process_id != known_pid)) {
+            NXUS_LOG("pause: refusing to stop pid=%llu (title=%016llX, known pid=%llu) - "
+                     "not the target this session was using",
+                     (unsigned long long)md.process_id,
+                     (unsigned long long)md.program_id,
+                     (unsigned long long)known_pid);
+            return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NO_PROCESS);
+        }
     }
 
     rc = nxusDebugAttach(md.process_id);
@@ -301,11 +330,19 @@ static Result resumeTargetLocked(void) {
     return rc;
 }
 
-static Result serverPause(void) {
+/* allow_attach == true is the explicit PC request ("nxus pause"): it may take the
+   process over with an own debug session when dmnt cannot stop it.  The controller
+   hotkey must not, because closing dmnt destroys cheat/frozen state shared with
+   other tools and wipes the hardware BP slots. */
+static Result serverPauseEx(bool allow_attach) {
     pauseLock();
-    Result rc = pauseTargetLocked();
+    Result rc = pauseTargetLocked(allow_attach);
     pauseUnlock();
     return rc;
+}
+
+static Result serverPause(void) {
+    return serverPauseEx(true);
 }
 
 static Result serverResume(void) {
