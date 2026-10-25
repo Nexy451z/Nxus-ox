@@ -984,6 +984,12 @@ class MockSwitch:
                 self.progress = 0
                 self.scan_last_result = 0
             return b''
+        if cmd == P.CMD['SnapshotRelease']:
+            # both capture slots dropped: the console answers with an empty reply
+            self.snapshots = [None, None]
+            self.changed = []
+            return b""
+
         if cmd == P.CMD['ScanReset']:
             self.hits = []
             self.prev_scan_hits = []

@@ -357,6 +357,54 @@ static void walkFrom(PtrScan *scan, u64 reg, u32 depth) {
 
 /* ---- main entry -------------------------------------------------------- */
 
+/* Highest address a 4-byte pointer can describe: the end of the 32-bit address
+   space.  A mapping that ends exactly here still holds only 32-bit-addressable
+   bytes, so it does not by itself prove 64-bit pointers. */
+#define NXUS_PTRSCAN_32BIT_LIMIT 0x100000000ull
+
+u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
+                         u64 main_base, u64 *out_max_end) {
+    u64 max_end = 0;
+    int have_mapping = 0;
+    int wide = 0;
+
+    for (u32 i = 0; (regions != NULL) && i < region_count; i++) {
+        const u64 base = regions[i].base;
+        const u64 size = regions[i].size;
+        if (size == 0) continue;
+
+        /* base + size wrapping means the region covers the top of the address
+           space, which no 32-bit pointer could reach.  Treat it as wide instead of
+           comparing a wrapped (small) end. */
+        if (base > UINT64_MAX - size) {
+            wide = 1;
+            have_mapping = 1;
+            if (max_end < UINT64_MAX) max_end = UINT64_MAX;
+            continue;
+        }
+
+        const u64 end = base + size;
+        if (end > max_end) max_end = end;
+        have_mapping = 1;
+        if (end > NXUS_PTRSCAN_32BIT_LIMIT) wide = 1;
+    }
+
+    if (out_max_end != NULL) *out_max_end = max_end;
+    if (have_mapping) return wide ? 8u : 4u;
+
+    /* No mapping to look at (a scope that produced no region): the module base is
+       the only evidence left.  It is auxiliary, and 0 means "unknown" - falling
+       back to 4 here is exactly the mismatch this function exists to remove.  A
+       base at 4 GiB is already outside the 32-bit address space, so compare the
+       base itself, not a hypothetical end. */
+    if (main_base != 0) return (main_base >= NXUS_PTRSCAN_32BIT_LIMIT) ? 8u : 4u;
+
+    /* Nothing known at all: AArch64 is the common case, and a wide load on a
+       32-bit title costs nothing but a failed scan, while a narrow load on a
+       64-bit title silently loses every chain. */
+    return 8u;
+}
+
 int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
                 u64 target_address, u64 module_base,
                 const NxusPtrScanOptions *options,
@@ -367,6 +415,22 @@ int nxusPtrScan(const NxusPtrRegion *regions, u32 region_count,
     if (regions == NULL || options == NULL || read == NULL || scratch == NULL ||
         out == NULL || out_count == NULL || scratch_size < 0x1000) {
         return NXUS_SCAN_ERR_PARAM;
+    }
+    /* value_width 0 = "infer it from the regions", the same rule the server uses
+       for NxusPtrScanRequest.value_width 0.  The copy is local and lives for the
+       whole call, so the caller's struct is never written and scan.opts (which
+       points at it) stays valid.  module_base is only the fallback hint here. */
+    NxusPtrScanOptions auto_opts;
+    u64 auto_max_end = 0;
+    if (options->value_width == 0) {
+        auto_opts = *options;
+        auto_opts.value_width = nxusPtrScanAutoWidth(regions, region_count,
+                                                    module_base, &auto_max_end);
+        options = &auto_opts;
+        fprintf(stderr,
+                "ptrscan: pointer width auto = %u (main=%08llX, max mapping end=%08llX)\n",
+                (unsigned)options->value_width, (unsigned long long)module_base,
+                (unsigned long long)auto_max_end);
     }
     if (options->value_width != 4 && options->value_width != 8) return NXUS_SCAN_ERR_PARAM;
     if (options->max_depth == 0 || options->max_depth > NXUS_PTRSCAN_MAX_DEPTH) return NXUS_SCAN_ERR_PARAM;

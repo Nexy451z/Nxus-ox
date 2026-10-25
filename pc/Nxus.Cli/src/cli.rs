@@ -11,6 +11,23 @@ use crate::protocol::*;
 
 type Result<T> = std::result::Result<T, NxusError>;
 
+/// `NxusCmd_SnapshotRelease` (core/nxus_protocol.h, 0x0072).
+///
+/// The command frees both snapshot slots on the console again, which is the only
+/// way to get the 8 MiB heap budget back without dropping the whole scan session.
+/// `pc/Nxus.Cli/src/protocol.rs` does not mirror this id yet (this change is
+/// confined to cli.rs), so the value is repeated here using the next free command
+/// id: 0x0071 (`ProbeGet`) is the highest one, so 0x0072 is the first unused
+/// value - the same one the header now defines.  It must stay in step with it.
+const CMD_SNAPSHOT_RELEASE: u16 = 0x0072;
+
+/// 4 GiB - the boundary between an AArch32 and an AArch64 address space.  Both
+/// the console and this client use it to pick the pointer width.
+const WIDTH_32BIT_LIMIT: u64 = 0x1_0000_0000;
+
+/// Page size for reading the mapping table when estimating the pointer width.
+const MAPPING_PAGE: u32 = 1024;
+
 const USAGE: &str = "nxus - PC client for the Nxus Switch sysmodule
 
 usage: nxus [--host HOST] [--port PORT] <command> [args]
@@ -77,6 +94,8 @@ scanning
                       scan begin 100 --cmp between --to 200
   scan hits [--limit N] [--csv FILE]
   scan status | cancel | reset | undo [--load FILE] [--save FILE]
+                                  reset also releases both snapshot slots on the
+                                  console side, so their heap budget frees up too
   scan unknown --size 4 [--scope main|custom] [--range A..B] [--max N] [--save FILE]
                  PC-side unknown-value scan: the candidate list lives in PC memory,
                  so the console's small heap is not a limit. Then:
@@ -89,18 +108,21 @@ snapshots (dump-free diffing)
   snapshot capture --slot a|b [--scope all] [--block 16384]
   snapshot diff [--from a] [--to b]
   snapshot changed [--limit N] [--csv FILE]
+  snapshot release                release both slots: capture/diff keep them on the
+                                  console's 8 MiB heap, release gives that budget back
 
 analysis
   ptrscan <address|auto> [--depth 3] [--max-offset 0x1000] [--module BASE]
                     [--width 4|8] [--pc] [--dump FILE] [--save-dump FILE]
                     [--cheat-value N]
-                    --width is the pointer width; omitted = automatic from the
-                    title (4 for a 32-bit title, 8 for a 64-bit one)
+                    --width is the pointer width; omitted = the server decides
+                    automatically (the highest mapping end decides: above
+                    4 GiB -> 8, otherwise 4)
                     auto (or no address) with --dump FILE uses the target saved in
                     an EdiZon-SE (EDZN/eFZN) dump
   cheat <index> --value N [--width 4|8] [--64bit] [--out FILE]
                     --width 8 emits the 64-bit (580F) load form, 4 the 32-bit
-                    (540F) one; omitted = automatic from the title, like ptrscan
+                    (540F) one; omitted = automatic, the same way as ptrscan
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
                   [--count N] [--seconds N] [--keep] [--stop]
                   on every hit: pc / lr / sp / r0-r3, then a disassembly window
@@ -335,6 +357,12 @@ fn execute(opts: &Opts) -> Result<()> {
                     })?
                 };
                 let width = pointer_width(opts)?;
+                // Offline: no console mapping table to consult, so the estimate
+                // comes from the dump's main module base alone - and says so.
+                let estimate = estimate_width_from_main_base(module_base);
+                if width == 0 {
+                    print_width_estimate(estimate);
+                }
                 let res = crate::edizon::ptrscan_edizon(
                     &dump,
                     &crate::dump::PtrScanOptions {
@@ -348,7 +376,7 @@ fn execute(opts: &Opts) -> Result<()> {
                     },
                     &cancel,
                 );
-                print_ptrscan_chains(&res.chains, res.truncated, "EdiZon dump", module_base, opts)?;
+                print_ptrscan_chains(&res.chains, res.truncated, "EdiZon dump", estimate, opts)?;
                 return Ok(());
             }
 
@@ -367,6 +395,10 @@ fn execute(opts: &Opts) -> Result<()> {
                 })?
             };
             let width = pointer_width(opts)?;
+            let estimate = estimate_width_from_main_base(module_base);
+            if width == 0 {
+                print_width_estimate(estimate);
+            }
             let res = crate::dump::ptrscan_dump(
                 &dump,
                 &crate::dump::PtrScanOptions {
@@ -380,7 +412,7 @@ fn execute(opts: &Opts) -> Result<()> {
                 },
                 &cancel,
             );
-            print_ptrscan_chains(&res.chains, res.truncated, "PC dump", module_base, opts)?;
+            print_ptrscan_chains(&res.chains, res.truncated, "PC dump", estimate, opts)?;
             return Ok(());
         }
     }
@@ -1069,7 +1101,10 @@ fn execute(opts: &Opts) -> Result<()> {
                 }
                 "reset" => {
                     client.scan_reset()?;
-                    println!("scan session reset");
+                    // The console's ScanReset also empties both snapshot slots
+                    // (no extra command from here), so say so instead of leaving
+                    // the released heap budget invisible.
+                    println!("scan session reset (snapshot slots released)");
                 }
                 "undo" => {
                     if let Some(path) = opts.flag("load") {
@@ -1123,6 +1158,13 @@ fn execute(opts: &Opts) -> Result<()> {
             let max_results = opts.num("max").unwrap_or(64) as usize;
 
             if opts.has("pc") || opts.flag("save-dump").is_some() {
+                // A PC-side scan walks a dump and infers the width from the
+                // module base alone (see dump::ptrscan_dump), so the display
+                // says that the mapping table was not consulted.
+                let estimate = estimate_width_from_main_base(module_base);
+                if width == 0 {
+                    print_width_estimate(estimate);
+                }
                 let cancel = std::sync::atomic::AtomicBool::new(false);
                 let mut last = Instant::now();
                 let dump = crate::dump::MemoryDump::capture(
@@ -1150,10 +1192,21 @@ fn execute(opts: &Opts) -> Result<()> {
                     },
                     &cancel,
                 );
-                print_ptrscan_chains(&res.chains, res.truncated, "PC", module_base, opts)?;
+                print_ptrscan_chains(&res.chains, res.truncated, "PC", estimate, opts)?;
             } else {
+                // The console owns the automatic choice, so 0 still goes on the
+                // wire.  This is only what it is expected to answer: 8 bytes
+                // when any traversable mapping ends above 4 GiB, otherwise 4 -
+                // the same rule as nxusPtrScanAutoWidth().
+                let estimate = if width == 0 {
+                    let estimate = estimate_width(&client, module_base);
+                    print_width_estimate(estimate);
+                    estimate
+                } else {
+                    estimate_width_from_main_base(module_base)
+                };
                 let (chains, truncated) = client.ptrscan_begin(target, module_base, depth, max_offset, max_results as u32, width)?;
-                print_ptrscan_chains(&chains, truncated, "the console", module_base, opts)?;
+                print_ptrscan_chains(&chains, truncated, "the console", estimate, opts)?;
             }
         }
 
@@ -1167,7 +1220,19 @@ fn execute(opts: &Opts) -> Result<()> {
                 .filter(|base| *base != 0)
                 .or_else(|| client.metadata().ok().map(|md| md.main_base))
                 .unwrap_or(0);
-            let is_32bit = cheat_is_32bit(opts, module_base);
+            // Same estimate as ptrscan, so the 540F/580F load form cannot drift
+            // from the width the chain was walked with.  The mapping table is
+            // consulted when the console can provide it; otherwise the main base
+            // alone decides (what the estimate says in its display form).  A
+            // pinned --width/--64bit needs no mapping round trip at all.
+            let estimate = if opts.has("64bit")
+                || matches!(opts.num("width"), Some(4) | Some(8))
+            {
+                estimate_width_from_main_base(module_base)
+            } else {
+                estimate_width(&client, module_base)
+            };
+            let is_32bit = cheat_is_32bit(opts, estimate);
             let text = client.cheat_export(index, value, width, is_32bit)?;
             match opts.flag("out") {
                 Some(path) => {
@@ -1227,7 +1292,16 @@ fn execute(opts: &Opts) -> Result<()> {
                         println!("wrote {}", path);
                     }
                 }
-                _ => return Err(usage("snapshot capture|diff|changed")),
+                "release" => {
+                    // Both slots hold their hash/address arrays (256 KiB each)
+                    // on the console's 8 MiB heap; this is the explicit way to
+                    // give that memory back without resetting the scan session
+                    // (ScanReset now releases them too, on the console side).
+                    // The reply carries no summary, so success is the message.
+                    client.request(CMD_SNAPSHOT_RELEASE, &[])?;
+                    println!("snapshot: both slots released");
+                }
+                _ => return Err(usage("snapshot capture|diff|changed|release")),
             }
         }
 
@@ -2383,17 +2457,114 @@ fn break_kind_name(kind: u32) -> &'static str {
 /// Pointer width a pointer scan should ask the console for.
 ///
 /// `--width 4|8` pins it.  Without the option (or with an explicit 0) the answer
-/// is 0: the console's automatic choice, which infers the width from the title
-/// (a main module below 4 GiB is a 32-bit title and needs 4-byte pointers,
-/// everything else 8).  Any other value is rejected instead of silently turning
-/// into "automatic" on the console, which treats every non-4/8 value that way.
+/// is 0: the console's automatic choice, which decides from the mappings the walk
+/// traverses (8-byte pointers when any mapping ends above 4 GiB, otherwise 4; the
+/// main module base is only the fallback hint when no mapping was collected).
+/// Any other value is rejected instead of silently turning into "automatic" on
+/// the console, which treats every non-4/8 value that way.
 fn pointer_width(opts: &Opts) -> Result<u32> {
     match opts.num("width") {
         Some(0) => Ok(0),
         Some(4) => Ok(4),
         Some(8) => Ok(8),
         None if !opts.has("width") => Ok(0),
-        _ => Err(usage("--width 4|8 (omitted = automatic from the title: 4 for 32-bit, 8 for 64-bit)")),
+        _ => Err(usage("--width 4|8 (omitted = the server decides automatically from the highest mapping end: above 4 GiB -> 8, otherwise 4)")),
+    }
+}
+
+/// What the console's automatic pointer-width choice is expected to be.
+///
+/// The console owns that decision (the client keeps sending `value_width = 0`),
+/// but the CLI still has to explain the number and to pick the matching
+/// 540F/580F cheat form, so it mirrors the rule here.
+///
+/// `from_mappings` records whether the mapping table was available: without it
+/// the estimate falls back to the main module base alone, and the display says
+/// so rather than pretending the mappings were part of the decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WidthEstimate {
+    width: u32,
+    from_mappings: bool,
+}
+
+/// Estimate from the main module base alone: offline dumps have no console
+/// mapping table, and a closed dmnt cannot answer for one either.  This is the
+/// console's own fallback (a base at or above 4 GiB means 64-bit; 0 is unknown
+/// and defaults to the wide AArch64 case).
+fn estimate_width_from_main_base(main_base: u64) -> WidthEstimate {
+    WidthEstimate {
+        width: if main_base != 0 && main_base < WIDTH_32BIT_LIMIT { 4 } else { 8 },
+        from_mappings: false,
+    }
+}
+
+/// The rule `nxusPtrScanAutoWidth()` (core/nxus_ptrscan.c) applies on the console.
+///
+/// A mapping whose end lies above 4 GiB proves the address space is 64-bit; when
+/// every mapping ends at or below 4 GiB, 4-byte pointers are enough (an end
+/// exactly at 4 GiB still addresses only bytes a 32-bit pointer can reach).  The
+/// main module base is only the fallback hint when no mapping was collected -
+/// deciding from it alone mis-read a 64-bit title as 32-bit whenever ASLR placed
+/// its main module below 4 GiB while its heap was randomised above it, and the
+/// 4-byte loads then folded adjacent fields into the pointer and found no chains.
+fn width_from_mapping_end(main_base: u64, max_mapping_end: Option<u64>) -> WidthEstimate {
+    match max_mapping_end {
+        Some(max_end) => WidthEstimate {
+            width: if max_end > WIDTH_32BIT_LIMIT { 8 } else { 4 },
+            from_mappings: true,
+        },
+        None => estimate_width_from_main_base(main_base),
+    }
+}
+
+/// Estimate what the console's automatic pointer-width choice will be.
+///
+/// The client still sends `value_width = 0`: the console owns the decision.  The
+/// CLI needs the same answer to explain it and to pick the matching 540F/580F
+/// cheat form, so it mirrors the rule instead of guessing locally.
+fn estimate_width(client: &NxusClient, main_base: u64) -> WidthEstimate {
+    width_from_mapping_end(main_base, mapping_max_end(client))
+}
+
+/// Highest end address across the mappings a pointer scan may traverse.
+///
+/// `None` means "cannot tell" (dmnt closed, no mappings yet, a scan owning the
+/// table, ...) - never "no mappings", which would silently look like a 32-bit
+/// address space.  The table is paged with the same `NxusMappingsRequest` the
+/// `mappings` command uses, so a large table still yields every entry.  Only
+/// readable mappings count, which is the set `buildPtrRegions()` walks on the
+/// console.
+fn mapping_max_end(client: &NxusClient) -> Option<u64> {
+    let count = client.mapping_count().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let mut max_end = 0u64;
+    let mut offset = 0u64;
+    while offset < count {
+        let page = client.mappings(offset, MAPPING_PAGE).ok()?;
+        if page.is_empty() {
+            break;
+        }
+        for mapping in &page {
+            if mapping.size == 0 || mapping.perm & PERM_R == 0 {
+                continue;
+            }
+            max_end = max_end.max(mapping.base.saturating_add(mapping.size));
+        }
+        offset += page.len() as u64;
+    }
+    if max_end == 0 { None } else { Some(max_end) }
+}
+
+/// One line saying which width the console is expected to pick, and whether the
+/// mapping table backed that estimate.
+fn print_width_estimate(estimate: WidthEstimate) {
+    let bits = estimate.width * 8;
+    if estimate.from_mappings {
+        println!("width: auto (assumed {}-bit from main base and mappings)", bits);
+    } else {
+        println!("width: auto (assumed {}-bit from main base)", bits);
     }
 }
 
@@ -2402,22 +2573,22 @@ fn pointer_width(opts: &Opts) -> Result<u32> {
 /// The export used to be hard-coded at 32 bits, which produced 4-byte loads even
 /// for a chain walked with 8-byte pointers.  `--width 8` selects the 64-bit
 /// (580F) form and `--width 4` the 32-bit one, so the export follows the pointer
-/// width the scan ran with.  With no explicit width it is inferred from the
-/// title exactly like the console's pointer scan: a main module below 4 GiB is a
-/// 32-bit title.  `--64bit` still forces the wide form.
-fn cheat_is_32bit(opts: &Opts, module_base: u64) -> bool {
+/// width the scan ran with.  With no explicit width it follows the same
+/// [`WidthEstimate`] as the pointer scan, so the two can never disagree.
+/// `--64bit` still forces the wide form.
+fn cheat_is_32bit(opts: &Opts, estimate: WidthEstimate) -> bool {
     if opts.has("64bit") {
         return false;
     }
     match opts.num("width") {
         Some(8) => false,
         Some(4) => true,
-        _ => module_base == 0 || module_base < 0x1_0000_0000,
+        _ => estimate.width == 4,
     }
 }
 
-fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, module_base: u64,
-                        opts: &Opts) -> Result<()> {
+fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str,
+                        estimate: WidthEstimate, opts: &Opts) -> Result<()> {
     if chains.is_empty() {
         /* An empty list is only "no chain exists" when the console also says it
            finished.  It reports truncated=1 when it stopped on max_results or on
@@ -2441,9 +2612,10 @@ fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, modu
     }
     if let Some(value) = opts.num("cheat-value") {
         // The write keeps its 4-byte default (the console also falls back to 4
-        // for value_width 0); the 540F/580F pointer load form follows --width.
+        // for value_width 0); the 540F/580F pointer load form follows the same
+        // width estimate the pointer scan used.
         let width = opts.num("width").filter(|w| *w == 4 || *w == 8).unwrap_or(4) as u32;
-        let is_32bit = cheat_is_32bit(opts, module_base);
+        let is_32bit = cheat_is_32bit(opts, estimate);
         let text = crate::dump::format_cheat(&chains[0], value, width, is_32bit, "Nxus pointer chain");
         if let Some(path) = opts.flag("out") {
             std::fs::write(path, &text).map_err(|e| NxusError { message: e.to_string(), result: None })?;
@@ -2464,6 +2636,28 @@ mod tests {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
+    }
+
+    /// The automatic width the CLI displays must be the console's rule: any
+    /// traversable mapping ending above 4 GiB means 8-byte pointers, an end at or
+    /// below it does not.  The main module base only decides when nothing is
+    /// mapped (offline dumps), and 0 there is unknown -> the wide default.
+    #[test]
+    fn pointer_width_follows_the_console_auto_rule() {
+        let low = 0x0070_0000u64;              // MockSwitch's main module base
+        // A 32-bit title: every mapping ends below 4 GiB.
+        assert_eq!(width_from_mapping_end(low, Some(0x42CA_2000)),
+                   WidthEstimate { width: 4, from_mappings: true });
+        // A 64-bit title whose main module ASLR'd below 4 GiB: the high mapping
+        // is the evidence that the address space is wide.
+        assert_eq!(width_from_mapping_end(low, Some(0x7F_0000_0000)).width, 8);
+        // An end exactly at 4 GiB still addresses only 32-bit-reachable bytes.
+        assert_eq!(width_from_mapping_end(low, Some(WIDTH_32BIT_LIMIT)).width, 4);
+        // No mapping at all: the main base is the fallback hint, and 0 is unknown.
+        assert_eq!(width_from_mapping_end(low, None),
+                   WidthEstimate { width: 4, from_mappings: false });
+        assert_eq!(width_from_mapping_end(WIDTH_32BIT_LIMIT, None).width, 8);
+        assert_eq!(width_from_mapping_end(0, None).width, 8);
     }
 
     /// The 32-bit ASLR window that Atmosphère gives an AArch32 title.

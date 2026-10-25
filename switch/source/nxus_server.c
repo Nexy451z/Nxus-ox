@@ -351,10 +351,17 @@ static int ptrScanReadBudgeted(void *ctx, u64 address, void *buffer, u32 size) {
 /* nxus_server.c: handlePtrScanBegin() allocates this scan scratch. */
 #define NXUS_HEAP_PTRSCAN_SCRATCH_BYTES (256u * 1024u)
 
-/* Bit n set: snapshot slot n has its hash/address arrays allocated.  The
-   service allocates the slot on first use (before it validates the request)
-   and never frees it, so any SnapshotCapture for slot 0/1 can leave 256 KiB
-   resident even when the capture itself failed. */
+/* Bit n set: snapshot slot n has its hash/address arrays allocated and is charged
+   against the heap budget.  Set by SnapshotCapture (before the capture, because the
+   service allocates the arrays before validating the request) and cleared by
+   snapshotReleaseSlots() / ScanReset.
+
+   A release does NOT hand the arrays back to the allocator: nxus_snapshot_srv.c
+   allocates them on first use and never frees them (freeing would fragment an 8 MB
+   heap and the next capture would need them again), so after a release the bytes are
+   still resident but no longer counted.  That is the deliberate trade the release
+   makes: it is the only way a client can lift the HEAP_BUDGET refusal of
+   PtrScanBegin, and the capture path re-claims the slot on its next use. */
 static u32 g_HeldSnapshotSlots;
 
 static u64 estimateHeapPeak(void) {
@@ -404,6 +411,41 @@ static u64 estimateHeapPeak(void) {
                               : (u64)NXUS_SESSION_DEFAULT_WINDOW;
 
     return persistent + held + hit_bytes + scan_work + ptr_peak;
+}
+
+/* ---- releasing the snapshot slots -------------------------------------- */
+
+/*
+ * Drop both A/B captures and the heap-budget claim they hold.
+ *
+ * Why this is a server-side function rather than one line in the handler: the
+ * service (nxus_snapshot_srv.c) exposes only Take / Compare / GetChanged /
+ * GetSummary, so its own invalidate path (snapshotSlotInvalidate(), the same reset a
+ * failed capture performs) is not reachable from here.  nxusSnapshotTake() clears
+ * the slot BEFORE it validates the request - so a request it must reject still
+ * invalidates - and the one scope it always rejects is NxusScope_Ranges, because a
+ * capture request carries no region list ("NxusScope_Ranges has no list of its
+ * own here" in nxusSessionPrepareRegions()).  That rejection happens before any
+ * read, view pin, malloc or IPC, and for a held slot the hash arrays were already
+ * allocated by the capture that set the bit, so nothing is allocated either.  (The
+ * one exception is a slot whose capture failed to allocate them: Ensure runs - and
+ * fails the same way - before the invalidate, and the slot is uncaptured already,
+ * so the release simply leaves it that way.)  The postcondition is verified below
+ * instead of being assumed: if a future refactor moves the invalidate behind the
+ * validation, the log says so rather than the release silently keeping a stale
+ * capture.
+ *
+ * The PC's HEAP_BUDGET advice is "release the snapshots (or reset)"; this is the
+ * release, and NxusCmd_ScanReset calls it too.
+ */
+static void snapshotReleaseSlots(const char *why) {
+    /* The service owns the validity marker: ask it to drop both slots instead of
+       driving nxusSnapshotTake() with a request that is meant to be rejected. */
+    const u32 held = g_HeldSnapshotSlots;
+    nxusSnapshotReleaseAll();
+    g_HeldSnapshotSlots = 0;
+    NXUS_LOG("snapshot: released both slots (held=0x%X)", (unsigned)held);
+    if (why != NULL) NXUS_LOG_DEBUG("snapshot: release reason: %s", why);
 }
 
 /* Fired from the HID thread: freeze the target without touching the PC.
@@ -1319,16 +1361,25 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     opts.max_offset = req.max_offset ? req.max_offset : 0x1000;
     opts.max_results = req.max_results ? req.max_results : NXUS_PTRSCAN_MAX_RESULTS;
     if (opts.max_results > NXUS_PTRSCAN_MAX_RESULTS) opts.max_results = NXUS_PTRSCAN_MAX_RESULTS;
-    /* Pointer width.  An explicit 4/8 request always wins; when the client lets
-       us decide (0), infer it from the module base: a 32-bit title (MHXX and
-       friends) maps its main module below 4 GB and must be walked with 4-byte
-       loads, because an 8-byte load would fold the neighbouring field into the
-       pointer and find no chains at all.  Anything above 4 GB (or unknown) is a
-       64-bit title and needs the wide loads. */
+    /* Pointer width.  An explicit 4/8 request always wins.  When the client lets
+       the console decide (0 - and for any other value, as this handler has always
+       treated "not 4/8" as "infer it"), the width comes from the mappings the walk
+       is about to traverse, not from the module base: on AArch64 ASLR puts the main
+       module below 4 GiB for roughly 1.6% of launches while the heap is randomised
+       independently, and the old "module_base < 4 GiB means 32-bit" rule then walked
+       a 64-bit title with 4-byte loads and silently returned zero chains.  The rule
+       lives in nxusPtrScanAutoWidth() (core/nxus_ptrscan.c), which the engine's own
+       value_width == 0 path uses too, so the console and a host caller cannot drift
+       apart.  module_base is only the fallback hint when no mapping was collected. */
     if (req.value_width == 4 || req.value_width == 8) {
         opts.value_width = req.value_width;
     } else {
-        opts.value_width = (module_base != 0 && module_base < 0x100000000ull) ? 4u : 8u;
+        u64 max_mapping_end = 0;
+        opts.value_width = nxusPtrScanAutoWidth(regions, region_count,
+                                               module_base, &max_mapping_end);
+        NXUS_LOG("ptrscan: pointer width auto = %u (main=%08llX, max mapping end=%08llX)",
+                 (unsigned)opts.value_width, (unsigned long long)module_base,
+                 (unsigned long long)max_mapping_end);
     }
     opts.window_size = 0x400;
     opts.max_reads = 20000;      /* bounded so the console cannot be held hostage */
@@ -2005,6 +2056,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
         case NxusCmd_ScanReset:
             nxusSessionReset();
+            /* The PC's HEAP_BUDGET advice is "release the snapshots (or reset)", so a
+               reset has to do the same thing the release command does: the scan
+               results it drops are what a pointer scan was competing with, and the
+               captures it leaves behind would keep the next PtrScanBegin refused. */
+            snapshotReleaseSlots("ScanReset");
             reply(fd, type, seq, NULL, 0);
             break;
 
@@ -2153,6 +2209,16 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             free(blocks);
             break;
         }
+
+        case NxusCmd_SnapshotRelease:
+            /* No payload and no process needed: invalidating the two slots never
+               touches target memory (see snapshotReleaseSlots()).  It is allowed
+               while a scan or a pointer scan runs - it only drops what the heap
+               estimate charges for, and nothing here reads either engine's arrays,
+               which is what lets the NEXT PtrScanBegin pass the budget guard. */
+            snapshotReleaseSlots("SnapshotRelease command");
+            reply(fd, type, seq, NULL, 0);
+            break;
 
         case NxusCmd_PtrScanBegin:
             /* Same reason as SnapshotCapture: the pointer scan walks the mapping

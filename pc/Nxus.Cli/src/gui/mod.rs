@@ -59,7 +59,10 @@ pub enum Cmd {
     Freeze { address: u64, width: u32 },
     Unfreeze { address: u64 },
     RefreshWatchlist { entries: Vec<(u64, u32)> },
-    PtrScan { target: u64, module_base: u64, depth: u32, max_offset: u32 },
+    /// Console-side pointer scan.  `width` is the pointer width to walk with:
+    /// 0 = automatic, i.e. the console infers it from the title (the GUI always
+    /// sends 0 - a hard-coded 4 made every 64-bit title unaddressable).
+    PtrScan { target: u64, module_base: u64, depth: u32, max_offset: u32, width: u32 },
     PtrScanPc { target: u64, module_base: u64, depth: u32, max_offset: u32, dump_path: Option<String> },
     SaveDump { path: String, scope: u32, begin: u64, end: u64 },
     Cheat { index: u32, value: u64 },
@@ -171,6 +174,27 @@ fn console_scan_stats(c: &NxusClient) -> String {
 /// silently treated as final.  The count is what was actually collected.
 pub fn truncated_hit_message(hits: usize) -> String {
     format!("hit list full: {} hits collected, more may exist (refine or raise the limit)", hits)
+}
+
+/// Pointer width the console infers from the title when the PC sends 0 ("auto").
+///
+/// The same rule the CLI documents for `--width`: a main module below 4 GiB is
+/// a 32-bit title and needs 4-byte pointers, everything else 8.  The GUI has no
+/// width selector, so this is what it sends (always 0) and what it displays -
+/// the console is still the one that decides.
+pub fn inferred_pointer_width(main_base: u64) -> u32 {
+    if main_base < 0x1_0000_0000 { 4 } else { 8 }
+}
+
+/// Number of hex digits an address of a title is shown with.
+pub fn address_digits(pointer_width: u32) -> usize {
+    if pointer_width == 4 { 8 } else { 16 }
+}
+
+/// Format an address the way the title's pointer width implies: 8 digits for a
+/// 32-bit title, 16 for a 64-bit one.
+pub fn format_address(address: u64, pointer_width: u32) -> String {
+    format!("{:0width$X}", address, width = address_digits(pointer_width))
 }
 
 /// Frozen addresses as a set: sorted and de-duplicated.
@@ -358,6 +382,12 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
         if let Some(c) = client.as_ref() {
             drain_events(c, &tx);
         }
+        // The client retries a "previous session is still being released" answer
+        // on its own (debug attach/detach/continue/step); the one-shot notice is
+        // parked there because stderr is invisible in the GUI.
+        if let Some(note) = crate::client::take_retry_later_notice() {
+            let _ = tx.send(Ev::Message(note));
+        }
 
         let Some(cmd) = cmd else { continue };
 
@@ -433,15 +463,19 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                     } else {
                         let dump = crate::dump::MemoryDump::load(&path).map_err(|e| e.to_string())?;
                         let (inf_base, inf_size) = dump.infer_main_module();
+                        let module_base = if module_base != 0 { module_base } else { inf_base };
+                        // The walker must use the same pointer width as the title
+                        // (the old hard-coded 4 could not follow a 64-bit chain).
+                        let width = inferred_pointer_width(module_base);
                         let res = crate::dump::ptrscan_dump(
                             &dump,
                             &crate::dump::PtrScanOptions {
                                 target,
-                                module_base: if module_base != 0 { module_base } else { inf_base },
+                                module_base,
                                 module_size: inf_size,
                                 max_depth: depth,
                                 max_offset,
-                                width: 4,
+                                width,
                                 max_results: 64,
                             },
                             &cancel,
@@ -681,8 +715,11 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let _ = tx.send(Ev::Unfrozen { address });
                             let _ = tx.send(Ev::Message(format!("unfrozen {:08X}", address)));
                         }
-                        Cmd::PtrScan { target, module_base, depth, max_offset } => {
-                            let (chains, truncated) = c.ptrscan_begin(target, module_base, depth, max_offset, 64, 4)
+                        Cmd::PtrScan { target, module_base, depth, max_offset, width } => {
+                            // 0 = auto: the console derives the pointer width from
+                            // the title, so a 64-bit title is walked with 8-byte
+                            // pointers instead of the old hard-coded 4.
+                            let (chains, truncated) = c.ptrscan_begin(target, module_base, depth, max_offset, 64, width)
                                 .map_err(|e| e.to_string())?;
                             let note = if truncated { " - TRUNCATED by the console" } else { "" };
                             let _ = tx.send(Ev::Message(format!("pointer scan: {} chain(s){}", chains.len(), note)));
@@ -699,15 +736,19 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             };
                             let dump = crate::dump::MemoryDump::capture(c, Scope::Writable, 0, 0, &cancel, &mut progress)?;
                             let (inf_base, inf_size) = dump.infer_main_module();
+                            let module_base = if module_base != 0 { module_base } else { inf_base };
+                            // Same rule as the console-side scan: a 64-bit title
+                            // needs 8-byte pointers, not the old fixed 4.
+                            let width = inferred_pointer_width(module_base);
                             let res = crate::dump::ptrscan_dump(
                                 &dump,
                                 &crate::dump::PtrScanOptions {
                                     target,
-                                    module_base: if module_base != 0 { module_base } else { inf_base },
+                                    module_base,
                                     module_size: inf_size,
                                     max_depth: depth,
                                     max_offset,
-                                    width: 4,
+                                    width,
                                     max_results: 64,
                                 },
                                 &cancel,
@@ -734,7 +775,13 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                 path, dump.indices.len(), dump.total_bytes() / (1024 * 1024))));
                         }
                         Cmd::Cheat { index, value } => {
-                            let text = c.cheat_export(index, value, 4, true).map_err(|e| e.to_string())?;
+                            // 540F (32-bit) vs 580F (64-bit) pointer loads follow
+                            // the title's pointer width, exactly like the CLI's
+                            // `cheat` (metadata is the cheap authoritative source;
+                            // an unknown base falls back to the 32-bit form).
+                            let module_base = c.metadata().map(|md| md.main_base).unwrap_or(0);
+                            let is_32bit = inferred_pointer_width(module_base) == 4;
+                            let text = c.cheat_export(index, value, 4, is_32bit).map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Cheat(text));
                         }
                         Cmd::Attach => {
@@ -1171,6 +1218,26 @@ impl State {
         self.status.as_ref().map(|s| s.main_base).unwrap_or(0)
     }
 
+    /// Pointer width the console will infer for this title (0 is sent on the
+    /// wire, so this only drives the display and the 540F/580F choice).
+    pub fn pointer_width(&self) -> u32 {
+        inferred_pointer_width(self.main_base())
+    }
+
+    /// Is this a 32-bit (AArch32) title?
+    ///
+    /// The console's own `NxusThreadContext` flag is authoritative (Atmosphère
+    /// masks the CPSR M[4] bits, so the CPSR alone cannot tell the two states
+    /// apart, and a 32-bit title such as MHXX is based at 0x07804000 - below the
+    /// old 0x0800_0000 boundary).  Until a context has been fetched, the title's
+    /// pointer width is the fallback.
+    pub fn is_aarch32_title(&self) -> bool {
+        match &self.last_regs {
+            Some(ctx) => ctx.is_aarch32(),
+            None => self.pointer_width() == 4,
+        }
+    }
+
     /// The target is held.  `NxusStatus.status_flags & ST_DEBUG_STOPPED` is the
     /// ONLY source of truth: a `DebugStopped` event sets the bit immediately (that
     /// is what makes the badge appear without waiting for a poll), and every
@@ -1338,6 +1405,51 @@ mod font_tests {
                 "stop marker {marker} would render as a box"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pointer_width_tests {
+    use super::*;
+
+    /// MHXX's measured main base is 0x07804000: below the old 0x0800_0000
+    /// boundary, so the fixed range check called this 32-bit title 64-bit.
+    #[test]
+    fn a_low_main_base_is_a_32bit_title() {
+        assert_eq!(inferred_pointer_width(0x0780_4000), 4);
+        assert_eq!(inferred_pointer_width(0x0070_0000), 4);
+        assert_eq!(inferred_pointer_width(0), 4, "unknown base: keep the CLI's 32-bit fallback");
+    }
+
+    #[test]
+    fn a_main_base_at_or_above_4gib_is_a_64bit_title() {
+        assert_eq!(inferred_pointer_width(0x1_0000_0000), 8);
+        assert_eq!(inferred_pointer_width(0x0000_0001_0080_0000), 8);
+    }
+
+    #[test]
+    fn addresses_use_the_width_of_the_title() {
+        assert_eq!(address_digits(4), 8);
+        assert_eq!(format_address(0x0780_4000, 4), "07804000");
+        assert_eq!(address_digits(8), 16);
+        assert_eq!(format_address(0x42CA1DC4, 8), "0000000042CA1DC4");
+    }
+
+    /// The console's AArch32 flag wins over the address-space guess: a 32-bit
+    /// context can be based anywhere, and a 64-bit one must not be misread.
+    #[test]
+    fn the_context_flag_decides_aarch32() {
+        let mut st = State::new();
+        st.status = Some(Status { main_base: 0x1_0000_0000, ..Default::default() });
+        assert!(!st.is_aarch32_title(), "no context yet: the 64-bit base decides");
+        st.last_regs = Some(P::ThreadContext {
+            flags: P::NXUS_THREADCTX_FLAG_AARCH32,
+            ..Default::default()
+        });
+        assert!(st.is_aarch32_title(), "the console's flag beats the base");
+
+        st.last_regs = Some(P::ThreadContext::default());
+        assert!(!st.is_aarch32_title(), "an AArch64 context is never 32-bit");
     }
 }
 

@@ -194,6 +194,8 @@ CMD = {
     'LogGet': 0x0061,
     'ProbeRun': 0x0070,
     'ProbeGet': 0x0071,
+
+    'SnapshotRelease': 0x0072,
 }
 
 EVT = {

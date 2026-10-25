@@ -19,3 +19,7 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
 u32 nxusSnapshotGetChanged(NxusChangedBlockWire *out, u32 max_entries, u32 offset);
 
 void nxusSnapshotGetSummary(u32 slot, NxusSnapshotSummary *out);
+
+/* Drop both captures so the heap they charge can be reused (SnapshotRelease /
+   ScanReset).  The next capture reallocates on demand. */
+void nxusSnapshotReleaseAll(void);

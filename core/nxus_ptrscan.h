@@ -35,6 +35,34 @@ typedef struct {
     u32 reserved;
 } NxusPtrRegion;
 
+/*
+ * Pointer width to walk with when the caller does not know it (value_width == 0).
+ *
+ * A 32-bit title (MHXX and friends) maps everything below 4 GiB and MUST be walked
+ * with 4-byte loads: an 8-byte load folds the neighbouring field into the pointer,
+ * so no chain is found at all.  A 64-bit title needs 8-byte loads for the opposite
+ * reason.  Deciding from the module base alone was wrong on AArch64: ASLR puts the
+ * main module below 4 GiB for roughly 1.6% of launches while the heap is randomised
+ * independently, so a 64-bit title was walked with 4-byte loads and silently
+ * produced zero chains.  The mappings the walk is about to traverse are the real
+ * evidence, so:
+ *
+ *   any mapping ends above 4 GiB   -> 8
+ *   every mapping ends below 4 GiB -> 4
+ *   no mapping at all              -> main_base >= 4 GiB ? 8 : 4
+ *   neither known                  -> 8 (the AArch64 default: guessing wide on a
+ *                                     32-bit title finds nothing, guessing narrow
+ *                                     on a 64-bit one also finds nothing, but 8 is
+ *                                     the common case and never over-reads)
+ *
+ * main_base is only the auxiliary hint for an empty table; 0 means "unknown" and is
+ * ignored (it never forces 4 on its own, which is what the old server-side rule
+ * did).  out_max_end is optional and receives the highest mapping end examined, so
+ * the caller can log the evidence.  The return value is always 4 or 8.
+ */
+u32 nxusPtrScanAutoWidth(const NxusPtrRegion *regions, u32 region_count,
+                         u64 main_base, u64 *out_max_end);
+
 typedef struct {
     u64 root_address;                      /* static address holding the first pointer */
     u32 root_offset;                       /* root_address - module base */
@@ -47,7 +75,8 @@ typedef struct {
     u32 max_depth;      /* 1..NXUS_PTRSCAN_MAX_DEPTH (1 = static -> value directly) */
     u32 max_offset;     /* how far a pointer value may be from its target */
     u32 max_results;
-    u32 value_width;    /* 4 for 32-bit titles, 8 for 64-bit titles */
+    u32 value_width;    /* 4 for 32-bit titles, 8 for 64-bit titles, 0 = infer it
+                           with nxusPtrScanAutoWidth() from the region table */
     u32 window_size;    /* bytes read per dereference step (e.g. 0x400) */
     u32 max_reads;      /* hard budget so a scan cannot hang the console */
 } NxusPtrScanOptions;

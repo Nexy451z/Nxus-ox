@@ -4,7 +4,8 @@ use eframe::egui;
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use super::{auto_continue_for, App, Cmd, Tab, DISASM_PAGE, SCOPE_NAMES, WATCH_KINDS};
+use super::{address_digits, auto_continue_for, format_address, App, Cmd, Tab, DISASM_PAGE,
+            SCOPE_NAMES, WATCH_KINDS};
 use crate::protocol::VALUE_TYPE_NAMES;
 
 const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
@@ -411,6 +412,18 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
         .id_salt("sec-pointer")
         .show(ui, |ui| {
         ui.group(|ui| {
+        // One line that says what the scan actually runs with: the GUI has no
+        // width selector, so it always asks the console for automatic (0) and
+        // the console decides from the title.  This is also what the 540F/580F
+        // cheat form follows.
+        let pointer_width = app.st.pointer_width();
+        ui.label(RichText::new(format!(
+            "pointer width: auto ({}-bit) - sent as 0, the console infers it from the title",
+            if pointer_width == 4 { 32 } else { 64 }
+        )).color(DIM))
+            .on_hover_text("32-bit titles (main module below 4 GiB) walk 4-byte pointers and \
+                            export 540F loads; everything else walks 8-byte pointers and \
+                            exports 580F loads");
         ui.horizontal(|ui| {
             ui.label("depth");
             ui.add(egui::DragValue::new(&mut app.prefs.ptr_depth).range(1..=8));
@@ -435,6 +448,8 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                         target, module_base,
                         depth: app.prefs.ptr_depth,
                         max_offset: app.prefs.ptr_max_offset,
+                        // 0 = automatic: the console derives 4 vs 8 from the title.
+                        width: 0,
                     }, "scanning for pointers");
                 }
             }
@@ -473,7 +488,10 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
                 if ui.selectable_label(false, format!("main+{:#x}{} +{:#x}",
                                                       chain.root_offset, steps, chain.final_offset)).clicked() {
                     let val = parse_value(&app.prefs.cheat_value, 4);
-                    app.st.cheat_text = crate::dump::format_cheat(chain, val, 4, true, "Nxus");
+                    // 540F vs 580F follows the title's pointer width, not a
+                    // hard-coded "32-bit": a 64-bit chain needs 580F loads.
+                    app.st.cheat_text = crate::dump::format_cheat(
+                        chain, val, 4, pointer_width == 4, "Nxus");
                 }
             });
         }
@@ -483,7 +501,8 @@ fn pointer_section(app: &mut App, ui: &mut egui::Ui) {
             if ui.button("Generate code").clicked() {
                 let val = parse_value(&app.prefs.cheat_value, 4);
                 if let Some(first) = chains.first() {
-                    app.st.cheat_text = crate::dump::format_cheat(first, val, 4, true, "Nxus");
+                    app.st.cheat_text = crate::dump::format_cheat(
+                        first, val, 4, pointer_width == 4, "Nxus");
                 } else {
                     app.send(Cmd::Cheat { index: 0, value: val }, "generating cheat");
                 }
@@ -603,6 +622,7 @@ fn stop_banner(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let main_base = app.st.main_base();
+    let pointer_width = app.st.pointer_width();
     let mut do_continue = false;
     let mut do_step = false;
     let mut goto_pc = false;
@@ -617,7 +637,7 @@ fn stop_banner(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new("■ STOPPED").heading().strong().color(RED));
                 ui.label(RichText::new(format!("thread {}", stop.thread_id))
                     .strong().color(YELLOW));
-                let pc = RichText::new(format!("PC={:08X} (main+{:#x})", stop.pc,
+                let pc = RichText::new(format!("PC={} (main+{:#x})", format_address(stop.pc, pointer_width),
                                                stop.pc.wrapping_sub(main_base)))
                     .monospace().color(GREEN);
                 if ui.add(egui::Label::new(pc).sense(egui::Sense::click()))
@@ -626,9 +646,9 @@ fn stop_banner(app: &mut App, ui: &mut egui::Ui) {
                 {
                     goto_pc = true;
                 }
-                ui.label(RichText::new(format!("— hit {} on {:08X} (slot {:#x})",
+                ui.label(RichText::new(format!("— hit {} on {} (slot {:#x})",
                                                crate::protocol::break_kind::name(stop.kind),
-                                               stop.address, stop.slot))
+                                               format_address(stop.address, pointer_width), stop.slot))
                     .color(DIM));
                 ui.separator();
                 if ui.add(egui::Button::new(RichText::new("Continue").strong()))
@@ -1208,18 +1228,21 @@ fn disasm_arch_for(app: &App) -> crate::protocol::DisasmArch {
         1 => DisasmArch::Arm32,
         2 => DisasmArch::Thumb,
         _ => {
+            // A fetched context is exact: the console reports AArch32 through
+            // NXUS_THREADCTX_FLAG_AARCH32.  The CPSR M[4] bit cannot be used for
+            // this - Atmosphère masks it, so a 32-bit title also reports
+            // 0x60000000 - and neither can the old 0x0800_0000..0x8000_0000
+            // range: MHXX is based at 0x07804000 and was decoded as AArch64.
             if let Some(ctx) = &app.st.last_regs {
                 if ctx.cpsr & 0x20 != 0 {
                     return DisasmArch::Thumb;
                 }
-                if (ctx.cpsr & 0x10) != 0 {
-                    return DisasmArch::Arm32;
-                }
+                return if ctx.is_aarch32() { DisasmArch::Arm32 } else { DisasmArch::AArch64 };
             }
             let arm32_hits = app.st.disasm_bytes.chunks_exact(4)
                 .filter(|c| (u32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 28) == 0xE)
                 .count();
-            if arm32_hits > 0 || (0x0800_0000..0x8000_0000).contains(&app.st.disasm_base) {
+            if arm32_hits > 0 || app.st.is_aarch32_title() {
                 DisasmArch::Arm32
             } else {
                 DisasmArch::AArch64
@@ -1321,10 +1344,24 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
 
     // Compact register bar: enough to read the arguments of the hitting call.
     if let Some(ctx) = app.st.last_regs.clone() {
+        // A 32-bit context zeroes the sp/lr/fp header fields on purpose; the live
+        // values are r13/r14 (which the console also mirrors into x[13]/x[14]).
+        let (lr, sp) = if ctx.is_aarch32() {
+            (ctx.x[14], ctx.x[13])
+        } else {
+            (ctx.lr, ctx.sp)
+        };
+        // 8 hex digits for a 32-bit title, 16 for a 64-bit one: a padded address
+        // is what makes the two listings comparable at a glance.
+        let digits = address_digits(app.st.pointer_width());
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("REGS").strong().color(ACCENT));
-            for (name, value) in [("PC", ctx.pc), ("LR", ctx.lr), ("SP", ctx.sp)] {
-                ui.label(RichText::new(format!("{}={:08X}", name, value)).monospace().color(GREEN));
+            if ctx.is_aarch32() {
+                ui.label(RichText::new("AArch32").strong().color(YELLOW));
+            }
+            for (name, value) in [("PC", ctx.pc), ("LR", lr), ("SP", sp)] {
+                ui.label(RichText::new(format!("{}={:0digits$X}", name, value, digits = digits))
+                    .monospace().color(GREEN));
             }
             ui.label(RichText::new(format!("CPSR={:08X}", ctx.cpsr)).monospace().color(YELLOW));
             for (index, value) in ctx.r.iter().enumerate() {
@@ -1385,8 +1422,9 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
              'At Current PC (Regs)' reads the running thread's registers and the code around its PC.")
             .color(DIM));
     }
+    let pointer_width = app.st.pointer_width();
     if let Some(pc) = app.st.disasm_highlight_pc {
-        ui.label(RichText::new(format!("=> {:08X} (main+{:#x})", pc,
+        ui.label(RichText::new(format!("=> {} (main+{:#x})", format_address(pc, pointer_width),
                                        pc.wrapping_sub(app.st.main_base())))
             .monospace().color(YELLOW));
     }
@@ -1405,7 +1443,7 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::initial(26.0))
-        .column(Column::initial(170.0))
+        .column(Column::initial(240.0))   // 16 hex digits + "(main+0x...)"
         .column(Column::initial(110.0))
         .column(Column::remainder())
         .column(Column::initial(190.0))
@@ -1428,7 +1466,7 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
                 });
                 row.col(|ui| {
                     paint_hl(ui, is_pc);
-                    let text = format!("{:08X} (main+{:#x})", insn.address,
+                    let text = format!("{} (main+{:#x})", format_address(insn.address, pointer_width),
                                        insn.address.wrapping_sub(main_base));
                     ui.label(RichText::new(text).monospace()
                         .color(if is_pc { GREEN } else { DIM }));

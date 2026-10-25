@@ -56,6 +56,45 @@ pub const RESULT_PTRSCAN_STARTED: u32 = 0x8003_C808;
 /// enough not to spin a core in the console's single connection thread.
 const PTRSCAN_POLL: Duration = Duration::from_millis(250);
 
+/// `NXUS_REASON_RETRY_LATER` (core/nxus_protocol.h): the console has not
+/// finished releasing the previous debug session yet.  It answers a short
+/// debug command (Attach / Detach / Continue / Step) with BUSY + this reason
+/// for a moment right after a detach, and the same command works again once
+/// the release completes.
+pub const REASON_RETRY_LATER: u32 = 13;
+
+/// Delay between the automatic retries of a [`REASON_RETRY_LATER`] answer.
+const RETRY_LATER_DELAY: Duration = Duration::from_millis(250);
+
+/// How many times such a command is retried: 6 x 250 ms = 1.5 s, which covers
+/// the console's release window without making the UI look stuck.
+const RETRY_LATER_RETRIES: u32 = 6;
+
+/// One-shot text for the GUI (which has no stderr) and the CLI log: the retry
+/// is announced exactly once per process, not once per attempt.
+static RETRY_LATER_NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set once [`note_retry_later`] has reported the retry.
+static RETRY_LATER_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_retry_later() {
+    if RETRY_LATER_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let message = "retrying after the previous session was released".to_string();
+    eprintln!("{}", message);
+    // The GUI polls this (see `take_retry_later_notice`): stderr is invisible
+    // there, and a silent one-second stall would look like a hang.
+    *lock(&RETRY_LATER_NOTICE) = Some(message);
+}
+
+/// Take the "retrying after the previous session was released" line, if a
+/// retry happened in this process.  Returns `Some` exactly once.
+pub fn take_retry_later_notice() -> Option<String> {
+    lock(&RETRY_LATER_NOTICE).take()
+}
+
 /// How often a `scan_wait*` run may hand its polled progress to a `report`
 /// callback.
 ///
@@ -387,8 +426,21 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
         8 => Some("bad config payload (expected 16 or 32+ bytes)"),
         9 => Some("argument outside the accepted range"),
         10 => Some("8 MiB heap budget: release the snapshots (or reset) and retry"),
+        11 => Some("the console holds a debug session: detach before freezing"),
+        12 => Some("a fixed table is full (breakpoint slots or pinned views): clear something first"),
+        13 => Some("the previous session is still being released: retry in a moment"),
         _ => None,
     }
+}
+
+/// Is `e` the "the previous session is still being released" answer?
+///
+/// The console reports it as BUSY (`NXUS_MAKE_RESULT(NXUS_ERR_BUSY)`) plus the
+/// [`REASON_RETRY_LATER`] word; [`error_from_reply`] folds the reason into the
+/// message, so that suffix is what identifies it here.
+fn is_retry_later(e: &NxusError) -> bool {
+    e.result == Some(RESULT_BUSY)
+        && e.message.ends_with(&format!("(reason={})", REASON_RETRY_LATER))
 }
 
 /// Build the client error for a `FLAG_ERROR` reply.
@@ -541,6 +593,31 @@ impl NxusClient {
         }
     }
 
+    /// Send a short command, retrying it while the console is still releasing
+    /// the previous debug session (BUSY + [`REASON_RETRY_LATER`]).
+    ///
+    /// Only short commands use this: Attach, Detach, Continue, Step and
+    /// Pause/Resume.  Scans and pointer scans never do - a scan can run for
+    /// minutes, and a pointer scan has its own RESULT_BUSY polling contract
+    /// (see [`ptrscan_begin`](Self::ptrscan_begin)).
+    fn request_when_released(&self, cmd: u16, payload: &[u8],
+                             timeout: Duration) -> Result<(u16, Vec<u8>)> {
+        let mut attempt = 0;
+        loop {
+            match self.request_timeout(cmd, payload, timeout) {
+                Ok(reply) => return Ok(reply),
+                Err(e) if attempt < RETRY_LATER_RETRIES && is_retry_later(&e) => {
+                    if attempt == 0 {
+                        note_retry_later();
+                    }
+                    attempt += 1;
+                    thread::sleep(RETRY_LATER_DELAY);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Wait for the next asynchronous event (Switch-initiated).
     ///
     /// A `NxusEvent_DebugStopped` is remembered on the way through: its payload
@@ -593,11 +670,11 @@ impl NxusClient {
     }
 
     pub fn pause(&self) -> Result<()> {
-        self.request(cmd::PAUSE, &[]).map(|_| ())
+        self.request_when_released(cmd::PAUSE, &[], Duration::from_secs(30)).map(|_| ())
     }
 
     pub fn resume(&self) -> Result<()> {
-        self.request(cmd::RESUME, &[]).map(|_| ())
+        self.request_when_released(cmd::RESUME, &[], Duration::from_secs(30)).map(|_| ())
     }
 
     pub fn heartbeat(&self) -> Result<()> {
@@ -1169,13 +1246,14 @@ impl NxusClient {
         if pid != 0 {
             put_u64(&mut payload, pid);
         }
-        let (_, body) = self.request_timeout(cmd::DEBUG_ATTACH, &payload, Duration::from_secs(60))?;
+        let (_, body) = self.request_when_released(cmd::DEBUG_ATTACH, &payload,
+                                                   Duration::from_secs(60))?;
         Ok(DebugStatus::parse(&body))
     }
 
     pub fn debug_detach(&self) -> Result<()> {
         *lock(&self.last_stop) = None;
-        self.request_timeout(cmd::DEBUG_DETACH, &[], Duration::from_secs(60)).map(|_| ())
+        self.request_when_released(cmd::DEBUG_DETACH, &[], Duration::from_secs(60)).map(|_| ())
     }
 
     pub fn debug_status(&self) -> Result<DebugStatus> {
@@ -1188,14 +1266,16 @@ impl NxusClient {
         // The remembered stop belongs to the hit just acknowledged: dropping it
         // keeps it from naming a thread after the target is running again.
         *lock(&self.last_stop) = None;
-        self.request_timeout(cmd::DEBUG_CONTINUE, &[], Duration::from_secs(60)).map(|_| ())
+        self.request_when_released(cmd::DEBUG_CONTINUE, &[], Duration::from_secs(60))
+            .map(|_| ())
     }
 
     /// Single-step the stopped thread (0 = whichever thread the console holds).
     pub fn debug_step(&self, thread_id: u64) -> Result<()> {
         let mut payload = Vec::new();
         put_u64(&mut payload, thread_id);
-        self.request_timeout(cmd::DEBUG_STEP, &payload, Duration::from_secs(60)).map(|_| ())
+        self.request_when_released(cmd::DEBUG_STEP, &payload, Duration::from_secs(60))
+            .map(|_| ())
     }
 
     /// Thread the console is holding at a breakpoint (None = the target runs).
@@ -1445,7 +1525,8 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text, released_addresses, select_stopped_thread};
+    use super::{error_from_reply, error_reason_text, is_retry_later, released_addresses,
+                select_stopped_thread, NxusError, RESULT_BUSY};
     use crate::protocol::{put_u32, DebugStatus};
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
@@ -1490,7 +1571,7 @@ mod tests {
 
     #[test]
     fn every_documented_reason_has_text() {
-        for reason in 1..=5 {
+        for reason in 1..=13 {
             assert!(
                 error_reason_text(reason).is_some(),
                 "reason {} has no text",
@@ -1498,6 +1579,47 @@ mod tests {
             );
         }
         assert_eq!(error_reason_text(0), None, "0 means 'no detail', never sent");
+    }
+
+    #[test]
+    fn busy_reasons_name_the_blocking_condition() {
+        // 11/12/13 were previously printed as a bare "(reason=N)", which told
+        // the operator nothing about what to do.
+        assert_eq!(
+            error_from_reply(0x0020, &error_body(0x8000_0186, Some(11))).message,
+            "command 0x0020 failed - the console holds a debug session: detach before freezing (reason=11)"
+        );
+        assert_eq!(
+            error_reason_text(12),
+            Some("a fixed table is full (breakpoint slots or pinned views): clear something first")
+        );
+        assert_eq!(
+            error_reason_text(13),
+            Some("the previous session is still being released: retry in a moment")
+        );
+    }
+
+    #[test]
+    fn only_busy_with_reason_13_is_retried() {
+        let busy_later = NxusError {
+            message: "command 0x0013 failed - the previous session is still being released: retry in a moment (reason=13)".into(),
+            result: Some(RESULT_BUSY),
+        };
+        assert!(is_retry_later(&busy_later));
+
+        // Reason 4 (scan in progress) is a real busy state, not a release window.
+        let busy_scan = NxusError {
+            message: "command 0x0013 failed - busy: a scan or pause/resume is in progress (reason=4)".into(),
+            result: Some(RESULT_BUSY),
+        };
+        assert!(!is_retry_later(&busy_scan));
+
+        // A failing command with a reason 13 but no BUSY result is not retried.
+        let not_busy = NxusError {
+            message: "command 0x0013 failed - the previous session is still being released: retry in a moment (reason=13)".into(),
+            result: Some(0x8000_0186),
+        };
+        assert!(!is_retry_later(&not_busy));
     }
 
     #[test]

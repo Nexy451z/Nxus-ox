@@ -136,6 +136,16 @@ typedef enum {
 
     NxusCmd_ProbeRun         = 0x0070,
     NxusCmd_ProbeGet         = 0x0071,
+
+    /* Drop both A/B snapshot captures and the heap-budget claim they hold, so a
+       PtrScanBegin that was refused with NXUS_REASON_HEAP_BUDGET can be retried
+       ("release the snapshots (or reset)" in the PC's message is this command;
+       NxusCmd_ScanReset does the same).  No payload; success is an empty reply.
+       Appended as the current maximum + 1 (0x0072) so no existing value moves and
+       the wire stays compatible both ways: a client that does not know it never
+       sends it, and a server that does not implement it answers
+       NXUS_ERR_UNSUPPORTED with NXUS_REASON_UNKNOWN_COMMAND. */
+    NxusCmd_SnapshotRelease  = 0x0072,
 } NxusCmd;
 
 /* ---- asynchronous events (Switch -> PC) ---- */
@@ -440,6 +450,15 @@ NXUS_STATIC_ASSERT(sizeof(NxusChangedBlockWire) == 16, "NxusChangedBlockWire mus
 /* ---- pointer scan ---- */
 #define NXUS_PTRSCAN_MAX_DEPTH 8
 
+/* NxusPtrScanRequest.value_width: 4 or 8 forces the load width; 0 asks the console
+   to infer it from the mappings the walk will traverse (a mapping whose end lies
+   above 4 GiB means 8-byte pointers, all below 4 GiB means 4; module_base is only
+   the fallback hint when no mapping was collected, and 0 there means "unknown").
+   The inference exists because a 64-bit title's main module can land below 4 GiB
+   (AArch64 ASLR) while its heap is randomised independently: deciding from the
+   module base alone used to pick 4-byte loads and then silently find no chain.
+   Neither the PtrScan chain reply nor NxusPtrChainListHeader carries the chosen
+   width, so a client that wants cheat codes sends the same value to CheatExport. */
 typedef struct NXUS_PACKED {
     u64 target_address;
     u64 module_base;

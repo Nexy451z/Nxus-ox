@@ -59,6 +59,16 @@ static void snapshotSlotInvalidate(u32 slot) {
     g_SlotTruncated[slot] = 0;
 }
 
+/* Release both slots.  The service is the only owner of the validity marker, so
+   the server must not try to fake a release through nxusSnapshotTake(): the clean
+   call keeps the invalidation rule in one place. */
+void nxusSnapshotReleaseAll(void) {
+    for (u32 slot = 0; slot < 2; slot++) snapshotSlotInvalidate(slot);
+    g_ChangedCount = 0;
+    g_DiffTruncated = 0;
+    NXUS_LOG("snapshot: both slots released");
+}
+
 Result nxusSnapshotServiceInit(void) {
     /* Called again on re-init: only the first call allocates, otherwise the
        previous buffer would leak (its pointer is overwritten). */
