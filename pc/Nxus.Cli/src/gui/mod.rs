@@ -25,6 +25,11 @@ pub enum Cmd {
     Connect { host: String, port: u16 },
     Disconnect,
     Refresh,
+    /// Read the console's own frozen table (`FROZEN_LIST`).  Polled every couple
+    /// of seconds, because the GUI only knows the addresses IT froze while the
+    /// console's table is global and can change without telling the PC (another
+    /// dmnt user, or the console's own release of a vanished client).
+    RefreshFrozen,
     FetchModules,
     /// The target's memory map: shown as a list so a scan range can be picked from
     /// the real regions (what "nxus mappings" prints on the CLI).
@@ -103,7 +108,16 @@ pub enum Ev {
     Metadata(Metadata),
     Modules(Vec<ModuleInfo>),
     Mappings(Vec<crate::protocol::MemoryInfo>),
-    Hits { hits: Vec<Hit>, value_size: u32, message: String },
+    Hits { hits: Vec<Hit>, value_size: u32, message: String,
+           /// The console's hit list filled up (`NXUS_HITBATCH_TRUNCATED`): the
+           /// set below is every hit it KEPT, but more may exist.
+           truncated: bool },
+    /// Live scan progress, polled by the worker while `scan_wait_cancellable`
+    /// runs.  The console never sends `NxusEvent_ScanProgress`, so this is the
+    /// only way the progress bar / hit counter can move during a scan.
+    ScanProgress(Status),
+    /// The console's own frozen list (`FROZEN_LIST` answer, sorted addresses).
+    FrozenList(Vec<u64>),
     Read { address: u64, data: Vec<u8> },
     /// Bytes for the disassembler; `address` is where `data` starts.
     DisasmData { address: u64, data: Vec<u8> },
@@ -149,6 +163,28 @@ fn console_scan_stats(c: &NxusClient) -> String {
         .unwrap_or_default()
 }
 
+/// The one line that turns a "quiet incomplete result" into a visible one.
+///
+/// The console reports a full hit list with `NXUS_HITBATCH_TRUNCATED` (surfaced by
+/// `NxusClient::last_scan_truncated`), but nothing consumed that flag: a cut-off
+/// result looked exactly like a complete one, so a scan that never saw a match was
+/// silently treated as final.  The count is what was actually collected.
+pub fn truncated_hit_message(hits: usize) -> String {
+    format!("hit list full: {} hits collected, more may exist (refine or raise the limit)", hits)
+}
+
+/// Frozen addresses as a set: sorted and de-duplicated.
+///
+/// The GUI's own list is in the order the user froze things and the console
+/// answers in wire order, so the two are only comparable (and only worth
+/// logging about) as sets.
+fn sorted_addresses(addresses: &[u64]) -> Vec<u64> {
+    let mut sorted = addresses.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+}
+
 /// Idle keep-alive period.  The console's watchdog resumes a paused target when
 /// it hears nothing for its own timeout, so even an idle PC has to keep talking.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
@@ -158,6 +194,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often a disconnected-but-wanted session is retried in the background.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the console's own frozen list (`FROZEN_LIST`) is re-read.
+///
+/// The GUI used to know only the addresses it had frozen itself.  The console's
+/// table is global, so another dmnt user (or the console releasing the addresses
+/// of a vanished client) changes it without telling the PC; two seconds is fast
+/// enough to notice and slow enough not to chatter on the console's single
+/// connection thread.
+const FROZEN_POLL: Duration = Duration::from_secs(2);
 
 /// Bytes fetched when the disassembler opens itself on a stop: 32 AArch64
 /// instructions, or the same byte count of ARM/Thumb ones.
@@ -415,6 +459,17 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             let st = c.status().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Status(st));
                         }
+                        Cmd::RefreshFrozen => {
+                            // The console's table is the truth (global: another tool's
+                            // freezes show up, and a vanished client's addresses are
+                            // dropped by the console itself).  A failed read keeps the
+                            // last known list instead of clearing it - this runs every
+                            // two seconds, so an error must not spam the log.
+                            if let Ok(entries) = c.frozen_list() {
+                                let addresses = entries.iter().map(|entry| entry.address).collect();
+                                let _ = tx.send(Ev::FrozenList(addresses));
+                            }
+                        }
                         Cmd::FetchConsoleLog => {
                             match c.log() {
                                 Ok(text) => { let _ = tx.send(Ev::ConsoleLog(text)); }
@@ -435,9 +490,15 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             prev_pc_scan = None;
                             let value_size = spec.value_size;
                             c.scan_begin_spec(&spec).map_err(|e| e.to_string())?;
-                            let st = c.scan_wait_cancellable(Duration::from_secs(900), &cancel)
+                            // The polling wait is the ONLY live progress source (the
+                            // console does not send NxusEvent_ScanProgress), so its
+                            // polled status is forwarded instead of being dropped.
+                            let st = c.scan_wait_cancellable_reporting(
+                                    Duration::from_secs(900), &cancel,
+                                    |status| { let _ = tx.send(Ev::ScanProgress(status.clone())); })
                                 .map_err(|e| e.to_string())?;
                             let hits = c.scan_all_hits(8192).map_err(|e| e.to_string())?;
+                            let truncated = c.last_scan_truncated();
                             // anything the console pushed during the scan (e.g. the
                             // stop that "pause while scanning" asked for) must reach
                             // the UI BEFORE the result, or it would arrive after the
@@ -448,22 +509,25 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                                  scan_state::name(st.scan_state),
                                                  st.last_result, hits.len(),
                                                  console_scan_stats(c)),
-                                hits, value_size,
+                                hits, value_size, truncated,
                             });
                         }
                         Cmd::ScanNext { spec } => {
                             let value_size = spec.value_size;
                             c.scan_next_spec(&spec).map_err(|e| e.to_string())?;
-                            let st = c.scan_wait_cancellable(Duration::from_secs(900), &cancel)
+                            let st = c.scan_wait_cancellable_reporting(
+                                    Duration::from_secs(900), &cancel,
+                                    |status| { let _ = tx.send(Ev::ScanProgress(status.clone())); })
                                 .map_err(|e| e.to_string())?;
                             let hits = c.scan_all_hits(8192).map_err(|e| e.to_string())?;
+                            let truncated = c.last_scan_truncated();
                             drain_events(c, &tx);
                             let _ = tx.send(Ev::Hits {
                                 message: format!("next scan {} (result=0x{:08X}): {} hit(s){}",
                                                  scan_state::name(st.scan_state),
                                                  st.last_result, hits.len(),
                                                  console_scan_stats(c)),
-                                hits, value_size,
+                                hits, value_size, truncated,
                             });
                         }
                         Cmd::PcScanUnknown { value_size, scope, begin, end, max_hits } => {
@@ -531,7 +595,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                             pc_scan = None;           // forget the PC-side candidate list too
                             prev_pc_scan = None;
                             c.scan_reset().map_err(|e| e.to_string())?;
-                            let _ = tx.send(Ev::Hits { hits: Vec::new(), value_size: 0, message: "scan reset".into() });
+                            let _ = tx.send(Ev::Hits { hits: Vec::new(), value_size: 0,
+                                                       message: "scan reset".into(),
+                                                       truncated: false });
                         }
                         Cmd::ScanUndo => {
                             if let Some(scan) = prev_pc_scan.take() {
@@ -549,12 +615,15 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                                     message: format!("undo scan: {} hit(s) restored", st.hit_count),
                                     hits,
                                     value_size: 0,
+                                    truncated: c.last_scan_truncated(),
                                 });
                             }
                         }
                         Cmd::FetchHits => {
                             let hits = c.scan_all_hits(8192).map_err(|e| e.to_string())?;
-                            let _ = tx.send(Ev::Hits { message: format!("{} hit(s)", hits.len()), hits, value_size: 0 });
+                            let _ = tx.send(Ev::Hits { message: format!("{} hit(s)", hits.len()),
+                                                       hits, value_size: 0,
+                                                       truncated: c.last_scan_truncated() });
                         }
                         Cmd::RefreshWatchlist { entries } => {
                             let mut out = Vec::with_capacity(entries.len());
@@ -997,6 +1066,15 @@ pub struct State {
     /// Regions picked with "+range": scanned together when the scope is "ranges".
     pub scan_ranges: Vec<(u64, u64)>,
     pub hits: Vec<Hit>,
+    /// The displayed hit list is the console's capped list
+    /// (`NXUS_HITBATCH_TRUNCATED`): more matches may exist.  Shown as a
+    /// TRUNCATED badge next to the hit counter, so an incomplete result cannot
+    /// quietly look like a complete one.
+    pub hits_truncated: bool,
+    /// Hits the console has found so far in the running scan (the polled
+    /// `NxusStatus.hit_count`).  The hit LIST only arrives when the scan is done,
+    /// so this is what the counter can show meanwhile.
+    pub scan_hits: u32,
     pub value_size: u32,
     pub selected: Option<usize>,
     pub filter: String,
@@ -1054,6 +1132,8 @@ impl State {
             regions_writable_only: true,     // the interesting regions are writable ones
             scan_ranges: Vec::new(),
             hits: Vec::new(),
+            hits_truncated: false,
+            scan_hits: 0,
             value_size: 4,
             selected: None,
             filter: String::new(),
@@ -1100,6 +1180,18 @@ impl State {
     /// because a failed Continue would otherwise show a running game.
     pub fn is_stopped(&self) -> bool {
         self.status.as_ref().map(|s| s.debug_stopped()).unwrap_or(false)
+    }
+
+    /// A debug session is held by Nxus (`ST_DEBUG_MODE` / `ST_DEBUG_ATTACHED`).
+    ///
+    /// Frozen-list polling has to stop while this is true: the console answers an
+    /// EMPTY `FROZEN_LIST` while it owns its own debug session (dmnt, and with it
+    /// the global frozen table, is closed), and that empty answer is not
+    /// "everything was released" - treating it as truth would erase the list.
+    pub fn debug_attached(&self) -> bool {
+        self.status.as_ref()
+            .map(|s| s.debug_attached() || s.debug_mode())
+            .unwrap_or(false)
     }
 
     pub fn heap_base(&self) -> u64 {
@@ -1203,6 +1295,8 @@ pub struct App {
     pub scan_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tail of the console's log, shown in the log panel (scan statistics).
     pub console_log: Vec<String>,
+    /// Last time the frozen-list poll asked the worker (see [`App::poll_frozen`]).
+    frozen_poll: Instant,
     screenshot: Option<String>,
     frames: u32,
     shot_requested: bool,
@@ -1272,6 +1366,44 @@ mod debug_stop_tests {
     }
 }
 
+#[cfg(test)]
+mod incomplete_result_tests {
+    use super::*;
+
+    /// A full hit list used to look exactly like a complete one: the console's
+    /// flag has to become a line naming the count and both ways out.
+    #[test]
+    fn full_hit_list_is_reported_with_its_count() {
+        let line = truncated_hit_message(8192);
+        assert!(line.contains("hit list full"), "{line}");
+        assert!(line.contains("8192 hits collected"), "{line}");
+        assert!(line.contains("more may exist"), "{line}");
+        assert!(line.contains("refine or raise the limit"), "{line}");
+    }
+
+    /// Frozen-list polling must stand still while Nxus holds its own debug
+    /// session: the console answers an EMPTY FROZEN_LIST then (dmnt owns the
+    /// table), and replacing the UI list with it would fake a release.
+    #[test]
+    fn frozen_poll_stands_still_while_a_debug_session_is_held() {
+        let mut st = State::new();
+        assert!(!st.debug_attached(), "a fresh state holds no session");
+        st.status = Some(Status { status_flags: P::ST_DEBUG_ATTACHED, ..Default::default() });
+        assert!(st.debug_attached());
+        st.status = Some(Status { status_flags: P::ST_DEBUG_MODE, ..Default::default() });
+        assert!(st.debug_attached(), "dmnt mode alone also closes the table");
+    }
+
+    /// The list the UI collected and the console's reply are in different orders:
+    /// comparing them as sets is what makes the two-second sync quiet.
+    #[test]
+    fn frozen_addresses_compare_as_sets() {
+        assert_eq!(sorted_addresses(&[3, 1, 2, 2]), sorted_addresses(&[1, 2, 3]));
+        assert_ne!(sorted_addresses(&[1, 2]), sorted_addresses(&[1, 3]));
+        assert!(sorted_addresses(&[]).is_empty());
+    }
+}
+
 /// Japanese text (Windows error strings, module paths, cheat names) has no glyphs in
 /// egui's default Latin fonts and used to render as a row of boxes.  M PLUS 1p is a
 /// readable OFL font that covers JIS level 1+2 for ~1.7 MB.
@@ -1321,6 +1453,7 @@ impl App {
             pc_scan_active: false,
             scan_cancel,
             console_log: Vec::new(),
+            frozen_poll: Instant::now(),
             screenshot,
             frames: 0,
             shot_requested: false,
@@ -1376,6 +1509,33 @@ impl App {
                 Err(TryRecvError::Disconnected) => break,
             }
         }
+    }
+
+    /// Keep `st.frozen` in step with the console's own table.
+    ///
+    /// The GUI used to know only the addresses IT froze, so a freeze made by
+    /// another dmnt user - or the console's own release of the addresses of a
+    /// client that was gone for 30 s - stayed invisible, and a "frozen" marker
+    /// described something that no longer existed.  `FROZEN_LIST` is the truth,
+    /// and it is polled instead of being read on demand so the markers correct
+    /// themselves without the user pressing anything.
+    fn poll_frozen(&mut self) {
+        if self.demo || !self.st.connected || self.st.busy {
+            return;                       // nothing to ask, or the worker is busy
+        }
+        if self.st.debug_attached() {
+            // The console answers an EMPTY list while Nxus holds its own debug
+            // session (dmnt and its frozen table are closed then): polling would
+            // wipe the list instead of syncing it.
+            return;
+        }
+        if self.frozen_poll.elapsed() < FROZEN_POLL {
+            return;
+        }
+        self.frozen_poll = Instant::now();
+        // Sent directly, not through `send()`: this is a background refresh and
+        // must not flip the UI into "busy" every two seconds.
+        let _ = self.cmd_tx.send(Cmd::RefreshFrozen);
     }
 
     fn apply(&mut self, ev: Ev) {
@@ -1445,17 +1605,26 @@ impl App {
                                     maps.len()));
                 self.st.mappings = maps;
             }
-            Ev::Hits { hits, value_size, message } => {
+            Ev::Hits { hits, value_size, message, truncated } => {
                 self.st.busy = false;
                 self.pc_scan_active = false;      // console-side result: PC list is gone
                 if value_size > 0 {
                     self.st.value_size = value_size;
                 }
-                self.st.log(format!("{} ({} total)", message, hits.len()));
+                let hit_count = hits.len();
+                self.st.log(format!("{} ({} total)", message, hit_count));
                 self.st.hits = hits;
                 self.st.hits_generation = self.st.hits_generation.wrapping_add(1);
+                self.st.scan_hits = hit_count as u32;
                 self.st.selected = None;
                 self.st.scan_progress = 0.0;
+                self.st.hits_truncated = truncated;
+                if truncated {
+                    // The console's own "my hit list filled up" flag, said out loud
+                    // ONCE per result: the badge alone explains nothing, and without
+                    // this line an incomplete list passes for the complete answer.
+                    self.st.log(truncated_hit_message(hit_count));
+                }
                 if self.prefs.follow_selection {
                     if let Some(first) = self.st.hits.first() {
                         let address = first.address;
@@ -1464,6 +1633,38 @@ impl App {
                     }
                 }
                 self.end_scan_pause();           // the scan is over: let the game run
+            }
+            Ev::ScanProgress(status) => {
+                // Live values the worker polls while `scan_wait_cancellable` runs:
+                // the console has no NxusEvent_ScanProgress sender, so the polled
+                // status IS the progress.  Only the scan fields are merged - a
+                // progress tick must not rewrite the stop/debug flags.
+                self.st.scan_progress =
+                    (status.progress_permille.min(1000) as f32) / 1000.0;
+                self.st.scan_hits = status.hit_count;
+                match self.st.status.as_mut() {
+                    Some(current) => {
+                        current.scan_state = status.scan_state;
+                        current.hit_count = status.hit_count;
+                        current.progress_permille = status.progress_permille;
+                    }
+                    None => self.st.status = Some(status),
+                }
+            }
+            Ev::FrozenList(addresses) => {
+                // The console's own table (`FROZEN_LIST`), polled because the GUI
+                // only knows what IT froze.  While a debug session is held the
+                // server answers an empty list on purpose (dmnt owns the table),
+                // so that answer must not be taken as "nothing is frozen".
+                if self.st.debug_attached() {
+                    return;
+                }
+                let fresh = sorted_addresses(&addresses);
+                if fresh != sorted_addresses(&self.st.frozen) {
+                    self.st.log(format!(
+                        "frozen list: {} address(es) per the console", fresh.len()));
+                }
+                self.st.frozen = fresh;
             }
             Ev::Read { address, data } => {
                 self.hex.set_data(address, data);
@@ -1645,11 +1846,16 @@ impl App {
                     }
                     self.st.debug_stop = None;   // it is running again, banner goes
                 }
+                // No sender on the Switch side exists for this event: the live
+                // progress comes from the polled status (see `Ev::ScanProgress`).
                 event::SCAN_PROGRESS => {}
                 other => self.st.log(format!("event 0x{:04X} ({} bytes)", other, payload.len())),
             },
             Ev::Progress { done, total, label } => {
                 self.st.scan_progress = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                // a PC-side scan reports bytes, not hits: the console's live hit
+                // count from a previous scan is not this scan's answer
+                self.st.scan_hits = 0;
                 self.st.last_message = format!("{} - {} / {} MB", label, done / (1024 * 1024), total / (1024 * 1024));
             }
             Ev::PcHits { hits, value_size, message, truncated } => {
@@ -1664,6 +1870,8 @@ impl App {
                 self.st.hits_generation = self.st.hits_generation.wrapping_add(1);
                 self.st.selected = None;
                 self.st.scan_progress = 0.0;
+                self.st.scan_hits = self.st.hits.len() as u32;
+                self.st.hits_truncated = truncated;
                 self.st.log(message);
                 self.pc_scan_active = true;      // "Next Scan" must refine the PC list
                 if truncated {
@@ -1684,6 +1892,8 @@ impl App {
             }
             Ev::Error(message) => {
                 self.st.busy = false;
+                // the live count belonged to a scan that did not finish
+                self.st.scan_hits = 0;
                 // a failed arm (e.g. not attached) must not leave the panel
                 // claiming a watchpoint is armed
                 self.st.watch_armed = None;
@@ -1782,6 +1992,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        // The console's frozen table changes without telling us (another dmnt
+        // user, or the console's own release of a vanished client's addresses).
+        self.poll_frozen();
         // A console that speaks another protocol version is only detectable in
         // `NxusClient::status` (worker thread, stderr there is invisible to the
         // GUI), so the worker parks the text for us: take it once and log it.
@@ -1801,6 +2014,11 @@ impl eframe::App for App {
 
         if self.st.busy {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if self.st.connected && !self.st.debug_attached() {
+            // The frozen-list sync runs on a wall clock, not on user input: egui
+            // only redraws when something asks for it, so without this the poll
+            // would fire only when the user happened to move the mouse.
+            ctx.request_repaint_after(FROZEN_POLL);
         }
 
         // --screenshot: render a few frames, save one, then close.
@@ -1940,9 +2158,7 @@ impl App {
         if self.st.is_stopped() {
             return;                 // already held at a breakpoint: nothing to do
         }
-        let attached = self.st.status.as_ref()
-            .map(|s| s.debug_attached() || s.debug_mode())
-            .unwrap_or(false);
+        let attached = self.st.debug_attached();
         if !attached {
             return;
         }

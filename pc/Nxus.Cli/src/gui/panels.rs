@@ -13,6 +13,20 @@ const YELLOW: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x66);
 const DIM: Color32 = Color32::from_rgb(0x9A, 0xA3, 0xB0);
 const RED: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 
+/// "The hit list is incomplete" badge, built the same way as the STOPPED badge in
+/// the top bar: a marker square plus strong coloured text, with the explanation
+/// on hover.
+///
+/// The console reports a capped hit list with `NXUS_HITBATCH_TRUNCATED`
+/// (`NxusClient::last_scan_truncated`); without a visible marker a cut-off result
+/// reads exactly like a complete one, which is how a scan that never saw a match
+/// was silently taken as final.
+fn truncated_badge(ui: &mut egui::Ui) {
+    ui.label(RichText::new("■ TRUNCATED").strong().color(YELLOW))
+        .on_hover_text("hit list full: the console kept as many hits as it could and more \
+                        may exist - refine the scan or raise the limit");
+}
+
 pub fn parse_value(text: &str, size: u32) -> u64 {
     let text = text.trim();
     let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
@@ -322,8 +336,19 @@ fn scan_section(app: &mut App, ui: &mut egui::Ui) {
             });
             if app.st.busy {
                 ui.add(egui::ProgressBar::new(app.st.scan_progress).show_percentage());
+                if app.st.scan_hits > 0 {
+                    // The console's live count while it walks: the hit LIST only
+                    // arrives with the finished result, and the polled count is the
+                    // only sign of progress besides the bar.
+                    ui.label(RichText::new(format!("{} found so far", app.st.scan_hits)).color(DIM));
+                }
             }
-            ui.label(RichText::new(format!("{} hit(s)", app.st.hits.len())).color(GREEN));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} hit(s)", app.st.hits.len())).color(GREEN));
+                if app.st.hits_truncated {
+                    truncated_badge(ui);
+                }
+            });
             if compare == crate::protocol::Compare::Unknown {
                 ui.label(RichText::new("Unknown initial value: the candidate list is kept in THIS PC's \
                                         memory (the console heap is far too small), so a whole-module \
@@ -729,8 +754,13 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
     } else {
         ""
     };
-    ui.label(RichText::new(format!("{} of {} hit(s){}", rows.len(), app.st.hits.len(), filter_note))
-                 .color(DIM));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} of {} hit(s){}", rows.len(), app.st.hits.len(), filter_note))
+                     .color(DIM));
+        if app.st.hits_truncated {
+            truncated_badge(ui);
+        }
+    });
 
     let value_size = app.st.value_size as usize;
     let mut pending: Option<(usize, u64)> = None;

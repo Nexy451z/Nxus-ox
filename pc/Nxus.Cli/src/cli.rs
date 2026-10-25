@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::client::{NxusClient, NxusError, ScanSpec};
+use crate::client::{NxusClient, NxusError, ScanSpec, DEBUG_CONFIG_LEN};
 use crate::protocol::*;
 
 type Result<T> = std::result::Result<T, NxusError>;
@@ -27,7 +27,9 @@ session
                                   set the controller hotkey (COMBO: plus, L+PLUS, off),
                                   the console's log verbosity (0=errors, 1=info,
                                   2=debug) and the debug policy (auto-continue 0 = a
-                                  breakpoint hit holds the target)
+                                  breakpoint hit holds the target).  Only the
+                                  settings named here change; every other field
+                                  keeps its current value
   events [--seconds N] [--count N] listen for Switch-initiated events
   pids | processes                list running process IDs on the console
   attach [--pid PID]              attach kernel debugger (default: current game)
@@ -89,11 +91,16 @@ snapshots (dump-free diffing)
   snapshot changed [--limit N] [--csv FILE]
 
 analysis
-  ptrscan <address|auto> [--depth 3] [--max-offset 0x1000] [--module BASE] [--width 4]
-                    [--pc] [--dump FILE] [--save-dump FILE] [--cheat-value N]
+  ptrscan <address|auto> [--depth 3] [--max-offset 0x1000] [--module BASE]
+                    [--width 4|8] [--pc] [--dump FILE] [--save-dump FILE]
+                    [--cheat-value N]
+                    --width is the pointer width; omitted = automatic from the
+                    title (4 for a 32-bit title, 8 for a 64-bit one)
                     auto (or no address) with --dump FILE uses the target saved in
                     an EdiZon-SE (EDZN/eFZN) dump
-  cheat <index> --value N [--width 4] [--64bit] [--out FILE]
+  cheat <index> --value N [--width 4|8] [--64bit] [--out FILE]
+                    --width 8 emits the 64-bit (580F) load form, 4 the 32-bit
+                    (540F) one; omitted = automatic from the title, like ptrscan
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
                   [--count N] [--seconds N] [--keep] [--stop]
                   on every hit: pc / lr / sp / r0-r3, then a disassembly window
@@ -327,7 +334,7 @@ fn execute(opts: &Opts) -> Result<()> {
                             .map_err(|_| NxusError { message: format!("not an address: {}", raw_addr), result: None })
                     })?
                 };
-                let width = opts.num("width").unwrap_or(8) as u32;
+                let width = pointer_width(opts)?;
                 let res = crate::edizon::ptrscan_edizon(
                     &dump,
                     &crate::dump::PtrScanOptions {
@@ -341,7 +348,7 @@ fn execute(opts: &Opts) -> Result<()> {
                     },
                     &cancel,
                 );
-                print_ptrscan_chains(&res.chains, res.truncated, "EdiZon dump", opts)?;
+                print_ptrscan_chains(&res.chains, res.truncated, "EdiZon dump", module_base, opts)?;
                 return Ok(());
             }
 
@@ -359,7 +366,7 @@ fn execute(opts: &Opts) -> Result<()> {
                         .map_err(|_| NxusError { message: format!("not an address: {}", raw_addr), result: None })
                 })?
             };
-            let width = opts.num("width").unwrap_or(4) as u32;
+            let width = pointer_width(opts)?;
             let res = crate::dump::ptrscan_dump(
                 &dump,
                 &crate::dump::PtrScanOptions {
@@ -373,7 +380,7 @@ fn execute(opts: &Opts) -> Result<()> {
                 },
                 &cancel,
             );
-            print_ptrscan_chains(&res.chains, res.truncated, "PC dump", opts)?;
+            print_ptrscan_chains(&res.chains, res.truncated, "PC dump", module_base, opts)?;
             return Ok(());
         }
     }
@@ -743,53 +750,117 @@ fn execute(opts: &Opts) -> Result<()> {
         }
 
         "config" => {
-            let (mask, enabled) = match opts.flag("hotkey").map(|s| s.as_str()) {
-                Some("off") | Some("none") | Some("0") => (0u64, 0u32),
-                Some(combo) => (parse_combo(combo)?, 1u32),
-                None => (0u64, 0u32),
-            };
-            let hold = opts.num("hold").unwrap_or(500) as u32;
-            let watchdog = opts.num("watchdog").unwrap_or(15000) as u32;
-            let chunk = opts.num("chunk").unwrap_or(0) as u32;
-            // NXUS_LOG_LEVEL_*: 0 = errors only, 1 = info, 2 = debug.  The full
-            // NxusConfig request rewrites every field, so leaving the option out
-            // keeps the value this command always sent (INFO) instead of silently
-            // changing what other settings runs have configured.
+            // A CONFIG payload of 32 bytes is the full NxusConfig: the console
+            // copies it over g_Config, so every field this run does not name must
+            // carry its current value.  Sending the old defaults is what made
+            // `nxus config --log-level 2` disable a controller hotkey applied from
+            // the Settings window and reset the watchdog.
+            //
+            // A payload of exactly 16 bytes is the debug-only form: the console
+            // applies just the watch style / auto-continue policy and keeps the
+            // hotkey, watchdog, chunk and log level.  Its reply still carries the
+            // full current g_Config, so it doubles as the read path.
+            let hotkey = opts.flag("hotkey").map(|s| s.as_str());
+            let hold = opts.num("hold");
+            let watchdog = opts.num("watchdog");
+            let chunk = opts.num("chunk");
             let log_level = match opts.num("log-level") {
-                Some(level) if level <= 2 => level as u32,
+                Some(level) if level <= 2 => Some(level as u32),
                 Some(_) => {
                     return Err(usage("config --log-level 0|1|2  (0=errors, 1=info, 2=debug)"))
                 }
-                None => 1,
+                None => None,
             };
-            let debug = match (opts.num("watch-style"), opts.num("auto-continue")) {
-                (None, None) => None,
-                (style, auto_continue) => Some((
-                    style.unwrap_or(WATCH_STYLE_LINK5 as u64) as u32,
-                    auto_continue.unwrap_or(1) as u32,
-                )),
+            let watch_style = opts.num("watch-style");
+            let auto_continue = opts.num("auto-continue");
+            let debug_named = watch_style.is_some() || auto_continue.is_some();
+            let full_named = hotkey.is_some() || hold.is_some() || watchdog.is_some()
+                || chunk.is_some() || log_level.is_some();
+            // Parse the combo before the read below: a typo must fail without
+            // touching the console.
+            let hotkey_state = match hotkey {
+                Some("off") | Some("none") | Some("0") => Some((0u64, 0u32)),
+                Some(combo) => Some((parse_combo(combo)?, 1u32)),
+                None => None,
             };
 
-            let body = client.set_config(mask, hold, enabled, chunk, watchdog, 5000, log_level, debug)?;
-            if body.len() >= 32 {
-                println!("hotkey mask  : 0x{:X}{}", rd_u64(&body, 0),
-                         if enabled == 0 { " (disabled)" } else { "" });
-                println!("hotkey hold  : {} ms", rd_u32(&body, 8));
-                println!("chunk size   : {} bytes", rd_u32(&body, 16));
-                println!("watchdog     : {} ms", rd_u32(&body, 20));
-                // Field order of NxusConfig: mask, hold, enabled, chunk, watchdog,
-                // heartbeat, log_level - so the reply's log level is at offset 28.
-                println!("log level    : {} ({})", rd_u32(&body, 28),
-                         match rd_u32(&body, 28) {
-                             0 => "errors only",
-                             2 => "debug",
-                             _ => "info",
-                         });
+            // Replay the current debug policy in the 16-byte form.  With no full
+            // field named this request IS the change; otherwise it only reads the
+            // current NxusConfig back (NxusCmd_Config always replies with
+            // g_Config, whatever the payload length).
+            let debug_status = client.debug_status().ok();
+            let current_style = debug_status.as_ref().map(|st| st.watch_style)
+                .unwrap_or(WATCH_STYLE_LINK5);
+            let current_auto = debug_status.as_ref().map(|st| st.auto_continue).unwrap_or(1);
+            let probe_style = if full_named {
+                current_style
+            } else {
+                watch_style.map(|v| v as u32).unwrap_or(current_style)
+            };
+            let probe_auto = if full_named {
+                current_auto
+            } else {
+                auto_continue.map(|v| v as u32).unwrap_or(current_auto)
+            };
+            let mut payload = Vec::with_capacity(DEBUG_CONFIG_LEN);
+            put_u32(&mut payload, probe_style);
+            put_u32(&mut payload, probe_auto);
+            put_u32(&mut payload, 0);
+            put_u32(&mut payload, 0);
+            let (_, body) = client.request(cmd::CONFIG, &payload)?;
+            if body.len() < 32 {
+                return Err(NxusError {
+                    message: "short config reply (the console must report the full NxusConfig)".into(),
+                    result: None,
+                });
             }
-            if let Some(dbg) = debug {
-                println!("debug config : watch style {} / auto-continue {}", dbg.0, dbg.1);
+
+            let body = if full_named {
+                // Keep every field the user did not name at its current value.
+                let (mask, enabled) = hotkey_state
+                    .unwrap_or((rd_u64(&body, 0), rd_u32(&body, 12)));
+                let hold = hold.unwrap_or(rd_u32(&body, 8) as u64) as u32;
+                let chunk = chunk.unwrap_or(rd_u32(&body, 16) as u64) as u32;
+                let watchdog = watchdog.unwrap_or(rd_u32(&body, 20) as u64) as u32;
+                let heartbeat = rd_u32(&body, 24);
+                let log_level = log_level.unwrap_or_else(|| rd_u32(&body, 28));
+                // A debug tail is sent only when a debug field was named: the bare
+                // 32-byte form leaves the console's debug policy untouched.
+                let debug = if debug_named {
+                    Some((watch_style.map(|v| v as u32).unwrap_or(current_style),
+                          auto_continue.map(|v| v as u32).unwrap_or(current_auto)))
+                } else {
+                    None
+                };
+                client.set_config(mask, hold, enabled, chunk, watchdog, heartbeat, log_level,
+                                  debug)?
+            } else {
+                body
+            };
+
+            println!("hotkey mask  : 0x{:X}{}", rd_u64(&body, 0),
+                     if rd_u32(&body, 12) == 0 { " (disabled)" } else { "" });
+            println!("hotkey hold  : {} ms", rd_u32(&body, 8));
+            println!("chunk size   : {} bytes", rd_u32(&body, 16));
+            println!("watchdog     : {} ms", rd_u32(&body, 20));
+            // Field order of NxusConfig: mask, hold, enabled, chunk, watchdog,
+            // heartbeat, log_level - so the reply's log level is at offset 28.
+            println!("log level    : {} ({})", rd_u32(&body, 28),
+                     match rd_u32(&body, 28) {
+                         0 => "errors only",
+                         2 => "debug",
+                         _ => "info",
+                     });
+            if debug_named {
+                // The console keeps auto_continue at 0 while a debug-session pause
+                // holds the target, so report what it actually applied instead of
+                // echoing the request.
+                if let Ok(st) = client.debug_status() {
+                    println!("debug config : watch style {} / auto-continue {}",
+                             st.watch_style, st.auto_continue);
+                }
             }
-            if enabled != 0 {
+            if rd_u32(&body, 12) != 0 {
                 println!("the hotkey now pauses the target from the controller");
             }
         }
@@ -1046,7 +1117,9 @@ fn execute(opts: &Opts) -> Result<()> {
             };
             let depth = opts.num("depth").unwrap_or(3) as u32;
             let max_offset = opts.num("max-offset").unwrap_or(0x1000) as u32;
-            let width = opts.num("width").unwrap_or(4) as u32;
+            // Omitted = 0, the console's automatic choice: it infers the pointer
+            // width from the title (see pointer_width()).
+            let width = pointer_width(opts)?;
             let max_results = opts.num("max").unwrap_or(64) as usize;
 
             if opts.has("pc") || opts.flag("save-dump").is_some() {
@@ -1077,10 +1150,10 @@ fn execute(opts: &Opts) -> Result<()> {
                     },
                     &cancel,
                 );
-                print_ptrscan_chains(&res.chains, res.truncated, "PC", opts)?;
+                print_ptrscan_chains(&res.chains, res.truncated, "PC", module_base, opts)?;
             } else {
                 let (chains, truncated) = client.ptrscan_begin(target, module_base, depth, max_offset, max_results as u32, width)?;
-                print_ptrscan_chains(&chains, truncated, "the console", opts)?;
+                print_ptrscan_chains(&chains, truncated, "the console", module_base, opts)?;
             }
         }
 
@@ -1088,7 +1161,13 @@ fn execute(opts: &Opts) -> Result<()> {
             let index = parse_number(opts.positional.get(1).ok_or_else(|| usage("cheat <index> --value N"))?)? as u32;
             let value = opts.num("value").ok_or_else(|| usage("cheat <index> --value N"))?;
             let width = opts.num("width").unwrap_or(4) as u32;
-            let is_32bit = !opts.has("64bit");
+            // The 540F (32-bit) load form used to be hard-coded; follow --width
+            // and, when it is omitted, the title's pointer width.
+            let module_base = initial_status.as_ref().map(|st| st.main_base)
+                .filter(|base| *base != 0)
+                .or_else(|| client.metadata().ok().map(|md| md.main_base))
+                .unwrap_or(0);
+            let is_32bit = cheat_is_32bit(opts, module_base);
             let text = client.cheat_export(index, value, width, is_32bit)?;
             match opts.flag("out") {
                 Some(path) => {
@@ -2301,7 +2380,44 @@ fn break_kind_name(kind: u32) -> &'static str {
     break_kind::name(kind)
 }
 
-fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, opts: &Opts) -> Result<()> {
+/// Pointer width a pointer scan should ask the console for.
+///
+/// `--width 4|8` pins it.  Without the option (or with an explicit 0) the answer
+/// is 0: the console's automatic choice, which infers the width from the title
+/// (a main module below 4 GiB is a 32-bit title and needs 4-byte pointers,
+/// everything else 8).  Any other value is rejected instead of silently turning
+/// into "automatic" on the console, which treats every non-4/8 value that way.
+fn pointer_width(opts: &Opts) -> Result<u32> {
+    match opts.num("width") {
+        Some(0) => Ok(0),
+        Some(4) => Ok(4),
+        Some(8) => Ok(8),
+        None if !opts.has("width") => Ok(0),
+        _ => Err(usage("--width 4|8 (omitted = automatic from the title: 4 for 32-bit, 8 for 64-bit)")),
+    }
+}
+
+/// Should a cheat export use the 32-bit (540F) load form?
+///
+/// The export used to be hard-coded at 32 bits, which produced 4-byte loads even
+/// for a chain walked with 8-byte pointers.  `--width 8` selects the 64-bit
+/// (580F) form and `--width 4` the 32-bit one, so the export follows the pointer
+/// width the scan ran with.  With no explicit width it is inferred from the
+/// title exactly like the console's pointer scan: a main module below 4 GiB is a
+/// 32-bit title.  `--64bit` still forces the wide form.
+fn cheat_is_32bit(opts: &Opts, module_base: u64) -> bool {
+    if opts.has("64bit") {
+        return false;
+    }
+    match opts.num("width") {
+        Some(8) => false,
+        Some(4) => true,
+        _ => module_base == 0 || module_base < 0x1_0000_0000,
+    }
+}
+
+fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, module_base: u64,
+                        opts: &Opts) -> Result<()> {
     if chains.is_empty() {
         /* An empty list is only "no chain exists" when the console also says it
            finished.  It reports truncated=1 when it stopped on max_results or on
@@ -2324,8 +2440,10 @@ fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str, opts
         println!("[{}] main+{:#x}{} +{:#x}", i, chain.root_offset, steps, chain.final_offset);
     }
     if let Some(value) = opts.num("cheat-value") {
-        let width = opts.num("width").unwrap_or(4) as u32;
-        let is_32bit = !opts.has("64bit");
+        // The write keeps its 4-byte default (the console also falls back to 4
+        // for value_width 0); the 540F/580F pointer load form follows --width.
+        let width = opts.num("width").filter(|w| *w == 4 || *w == 8).unwrap_or(4) as u32;
+        let is_32bit = cheat_is_32bit(opts, module_base);
         let text = crate::dump::format_cheat(&chains[0], value, width, is_32bit, "Nxus pointer chain");
         if let Some(path) = opts.flag("out") {
             std::fs::write(path, &text).map_err(|e| NxusError { message: e.to_string(), result: None })?;

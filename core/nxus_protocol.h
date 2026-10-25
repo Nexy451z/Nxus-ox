@@ -46,6 +46,15 @@
 #define NXUS_REASON_BAD_CONFIG      8u   /* CONFIG payload length matches neither shape */
 #define NXUS_REASON_BAD_ARG         9u   /* field value outside its allowed set (width/kind/scope) */
 #define NXUS_REASON_HEAP_BUDGET    10u   /* held snapshots + full hit list would exceed the 8 MiB heap */
+/* The codes below split what used to be one undifferentiated NXUS_ERR_BUSY:
+   the first two name refusals a retry cannot fix (they clear only when the
+   state itself changes), the third names a transient one that is NOT "a scan is
+   running".  A client should keep retrying BUSY_STATE / RETRY_LATER, and ask the
+   user to act (detach, free a slot, clear a breakpoint) on DEBUG_LOCKED /
+   SLOT_FULL.  Appended only, same compatibility rule as above. */
+#define NXUS_REASON_DEBUG_LOCKED   11u   /* dmnt is closed while Nxus holds the debug handle */
+#define NXUS_REASON_SLOT_FULL      12u   /* break table / hardware slot / view-pin table exhausted */
+#define NXUS_REASON_RETRY_LATER    13u   /* the state clears by itself, but is not a running scan */
 
 /* ---- packet header flags ---- */
 #define NXUS_FLAG_ASYNC       0x0001u  /* Switch-initiated event; seq is not a request id */
@@ -484,6 +493,18 @@ typedef struct NXUS_PACKED {
     u32 reserved;
 } NxusFrozenRequest;
 NXUS_STATIC_ASSERT(sizeof(NxusFrozenRequest) == 16, "NxusFrozenRequest must be 16 bytes");
+
+/* FrozenList paging (no wire change, documented here because the request shape
+   is shared).  The reply stays a bare NxusFrozenEntry[] - there is no header
+   field to carry a total, and adding one would change the reply every existing
+   client parses.  A request payload of sizeof(NxusMappingsRequest) (16 B:
+   offset u64, max_count u32, reserved u32) is therefore read as a page request
+   when max_count is 16..512; anything else - including the empty payload the
+   PC sends today, and a NxusFrozenRequest whose width lands in the max_count
+   slot - is page 0 with the server default (64).  "Truncated" is visible only
+   from the server side: a page that comes back full is followed by a dmnt
+   count query, and offset + got < total is logged as a truncation.  dmnt's own
+   table is capped at 0x80 entries, so two 64-entry pages reach all of it. */
 
 /* ---- debug mode ---- */
 typedef enum {

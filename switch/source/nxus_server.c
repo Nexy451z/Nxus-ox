@@ -55,6 +55,19 @@ static bool   g_PauseLockReady = false;
 /* True while one pause/resume hand-off is running (atomic claim, see
    pauseTryEnter/pauseLeave). */
 static atomic_bool g_PauseBusy;
+/* True while the pause in effect was started by the controller hotkey AND no PC
+   was attached at that moment.  The hotkey path is the "freeze the game without
+   touching the PC" feature (serverPauseEx(false) never takes the process over),
+   so with no client there is nobody to send Resume: the 15 s pause watchdog must
+   not thaw a target the user deliberately froze.  nxusServerTick() keeps the
+   session's idle clock fresh while this is set and re-arms the normal watchdog
+   as soon as a client connects.  Cleared by Resume, by a PC-owned pause/attach,
+   by the end of a debug session and on boot (see pauseCommitState). */
+static atomic_bool g_PauseFromHotkey;
+/* One-shot: the "watchdog suspended" line is worth a log entry, not one per tick
+   (the main loop runs this at ~100 Hz).  Atomic for the same reason as the flag
+   it annotates: the HID thread clears it while the tick sets it. */
+static atomic_bool g_PauseHotkeyLogged;
 
 static Result serverPause(void);
 static Result serverPauseEx(bool allow_attach);
@@ -65,6 +78,10 @@ static void pauseUnlock(void);
 static bool pauseIsViaDebug(void);
 static bool pauseTryEnter(void);
 static void pauseLeave(void);
+/* Hotkey-pause hold (see g_PauseFromHotkey); used by the pause paths and the tick. */
+static bool pauseIsHotkeyHold(void);
+static void pauseNoteHotkeyHold(void);
+static void pauseClearHotkeyHold(void);
 
 /* Frozen addresses Nxus itself enabled.  dmnt keeps writing them forever, so if
    the PC disappears while some are frozen the only way out is a console reboot -
@@ -390,6 +407,8 @@ void nxusServerInit(void) {
     if (!g_PauseLockReady) {
         mutexInit(&g_PauseLock);
         atomic_init(&g_PauseBusy, false);
+        atomic_init(&g_PauseFromHotkey, false);
+        atomic_init(&g_PauseHotkeyLogged, false);
         g_PauseLockReady = true;
     }
 
@@ -428,6 +447,26 @@ static void replyErrorReason(int fd, u16 type, u32 seq, Result rc, u32 reason) {
     value[0] = (s32)rc;
     value[1] = (s32)reason;
     nxusNetSendFd(fd, type, NXUS_FLAG_ERROR, seq, value, sizeof(value));
+}
+
+/* True when rc is one of Nxus's own NXUS_ERR_* codes.  Used to decide whether a
+   BUSY deserves a reason: libnx's own "busy" (LibnxError_Busy) must keep going
+   out as a bare Result, because it means something different (a service call). */
+static bool resultIsNxusError(Result rc, u32 desc) {
+    return (R_MODULE(rc) == NXUS_RESULT_MODULE) && (R_DESCRIPTION(rc) == desc);
+}
+
+/* Transient "another operation owns this": retrying later is the fix. */
+static bool resultIsBusyRetryable(Result rc) {
+    return resultIsNxusError(rc, NXUS_ERR_BUSY);
+}
+
+/* Error reply that names a BUSY.  Everything used to be a bare NXUS_ERR_BUSY, so
+   a client could not tell "wait for the scan to finish" from "freeze is
+   impossible while a debug session holds dmnt".  The reason is appended to the
+   Result (wire-compatible, see replyErrorReason). */
+static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
+    replyErrorReason(fd, type, seq, (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY), reason);
 }
 
 /* How long the console waits for a command before it assumes the PC is gone. */
@@ -522,13 +561,32 @@ static void pauseLeave(void) {
     atomic_store_explicit(&g_PauseBusy, false, memory_order_release);
 }
 
+/* Hotkey-pause hold.  Atomic rather than g_PauseLock-guarded because the tick
+   reads it on the main thread while the HID thread sets it; it is a single flag,
+   so a load/store pair is all the ordering that is needed. */
+static bool pauseIsHotkeyHold(void) {
+    return atomic_load_explicit(&g_PauseFromHotkey, memory_order_acquire);
+}
+
+static void pauseNoteHotkeyHold(void) {
+    atomic_store_explicit(&g_PauseFromHotkey, true, memory_order_release);
+}
+
+static void pauseClearHotkeyHold(void) {
+    atomic_store_explicit(&g_PauseFromHotkey, false, memory_order_release);
+    atomic_store_explicit(&g_PauseHotkeyLogged, false, memory_order_relaxed);
+}
+
 /* The pause state is only ever read/written in these short sections; every IPC,
-   attach/detach and thread join happens outside the lock. */
+   attach/detach and thread join happens outside the lock.  A pause that ends by
+   any route also ends the hotkey hold: the target is running again, so there is
+   nothing left for the watchdog to spare. */
 static void pauseCommitState(bool via_debug, bool paused) {
     pauseLock();
     g_PauseViaDebug = via_debug;
     nxusSessionSetPaused(paused);
     pauseUnlock();
+    if (!paused) pauseClearHotkeyHold();
 }
 
 static bool pauseIsViaDebug(void) {
@@ -550,6 +608,9 @@ static bool pauseReleaseDebugSessionPause(void) {
         nxusSessionSetPaused(false);
     }
     pauseUnlock();
+    /* A debug session that ends releases the target, so a hold recorded for the
+       pause is stale (the exit/attach paths rely on this clear). */
+    if (was) pauseClearHotkeyHold();
     return was;
 }
 
@@ -733,6 +794,17 @@ static Result serverPauseEx(bool allow_attach) {
     }
     Result rc = pauseTarget(allow_attach);
     pauseLeave();
+    if (R_SUCCEEDED(rc)) {
+        /* Which path owns the pause decides the watchdog: the explicit PC pause is
+           serviced by the client's own heartbeats (and a PC pause while the client
+           is gone makes no sense), while the hotkey pause may have to outlive the
+           client - that is what "freeze without touching the PC" means.  Only
+           record the hold when nobody was attached at the time: with a client
+           connected the normal watchdog applies and the tick's reconnect branch
+           would otherwise log a transition that never happened. */
+        if (allow_attach || nxusNetClientFd() >= 0) pauseClearHotkeyHold();
+        else pauseNoteHotkeyHold();
+    }
     return rc;
 }
 
@@ -747,6 +819,9 @@ static Result serverResume(void) {
     }
     Result rc = resumeTarget();
     pauseLeave();
+    /* resumeTarget() already cleared it on success (pauseCommitState); do it here
+       too so a failed resume cannot leave the hold set for a pause that is gone. */
+    if (R_SUCCEEDED(rc)) pauseClearHotkeyHold();
     return rc;
 }
 
@@ -898,6 +973,19 @@ static bool        g_PtrThreadLive;
 
 static bool ptrScanBusy(void) {
     return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
+}
+
+/* When the worker last entered Running: the tick uses it to spot a walk that never
+   returns (a wedged IPC read would otherwise keep four BUSY gates closed for the
+   rest of the boot). */
+static u64 g_PtrJobStartedMs;
+
+/* Ask the running walk to stop at its next read.  The worker publishes its own
+   Failed/partial result; this only flips the flag the engine already polls. */
+static void ptrScanRequestCancel(const char *why) {
+    if (!ptrScanBusy()) return;
+    g_PtrJob.budget.cancel = 1;
+    NXUS_LOG("ptrscan: cancel requested (%s) - the worker stops at its next read", why);
 }
 
 /* No walk has run yet, and none can be running while init runs (it is part of the
@@ -1069,8 +1157,11 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
     NxusViewPin pin;
     if (!nxusSessionViewPinCurrent(&pin)) {   /* no live session / pin table full */
         /* Nobody holds a view pin we could use: that is a session-level condition,
-           not "this process has no mappings". */
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+           not "this process has no mappings".  Retrying does not help until the
+           outstanding pin is released, so it is not BUSY_STATE. */
+        NXUS_LOG("ptrscan: view pin table exhausted (%u held) - refusing",
+                 (unsigned)nxusSessionViewPinnedCount());
+        replyBusyReason(fd, type, seq, NXUS_REASON_SLOT_FULL);
         return;
     }
     const NxusMappingTable *maps = nxusSessionMappingsPinned(&pin);
@@ -1157,6 +1248,7 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
         /* Running BEFORE threadStart(): a PtrScanGet that lands while the worker
            is writing g_Chains must see BUSY, never a half-written list.  The
            release store pairs with the acquire load in the PtrScanGet case. */
+        g_PtrJobStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
         atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Running, memory_order_release);
         threadStart(&g_PtrThread);
         NXUS_LOG("ptrscan: started on the worker thread (target=%08llX regions=%u) - "
@@ -1189,7 +1281,7 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
        array below would race with the walk rewriting it.  BUSY is also what the
        client's own scan gate reports, so a retry after the poll loop is natural. */
     if (ptrScanBusy()) {
-        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+        replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
         return;
     }
     if (length < sizeof(NxusCheatExportRequest)) {
@@ -1226,8 +1318,11 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
     NxusViewPin pin;
     if (!nxusSessionViewPinCurrent(&pin)) {
         /* Pin table exhausted (an unpin was forgotten somewhere): refusing is
-           better than serving mapping bases nobody owns. */
-        replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+           better than serving mapping bases nobody owns.  Permanent until that
+           pin is released, hence SLOT_FULL instead of BUSY_STATE. */
+        NXUS_LOG("hits: view pin table exhausted (%u held) - refusing the batch",
+                 (unsigned)nxusSessionViewPinnedCount());
+        replyBusyReason(fd, NxusCmd_ScanGetHits, seq, NXUS_REASON_SLOT_FULL);
         return;
     }
     const NxusHitList *hits = nxusSessionHits();
@@ -1348,9 +1443,17 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Real stop: dmnt breaks the cheat process it owns (65004 ->
                svc::BreakDebugProcess) while keeping the session, so scans and
                snapshots keep working.  Only if dmnt cannot stop it does
-               pauseTarget() take the process over with an own debug session. */
+               pauseTarget() take the process over with an own debug session.
+               A BUSY here means another pause/resume/attach owns the hand-off -
+               the one refusal that a retry does fix, so it is named BUSY_STATE
+               instead of going out as a bare Result. */
             rc = serverPause();
-            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            if (R_FAILED(rc)) {
+                if (resultIsBusyRetryable(rc))
+                    replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+                else
+                    replyError(fd, type, seq, rc);
+            } else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_Resume:
@@ -1358,7 +1461,12 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                dmnt-held stop, continue + detach for a debug-session pause, plain
                continue while the PC holds a debugger. */
             rc = serverResume();
-            if (R_FAILED(rc)) replyError(fd, type, seq, rc); else reply(fd, type, seq, NULL, 0);
+            if (R_FAILED(rc)) {
+                if (resultIsBusyRetryable(rc))
+                    replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+                else
+                    replyError(fd, type, seq, rc);
+            } else reply(fd, type, seq, NULL, 0);
             break;
 
         case NxusCmd_ForceOpen:
@@ -1416,7 +1524,9 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                    dropped on both paths (the table may legitimately be NULL). */
                 NxusViewPin pin;
                 if (!nxusSessionViewPinCurrent(&pin)) {
-                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                    NXUS_LOG("mapping count: view pin table exhausted (%u held) - refusing",
+                             (unsigned)nxusSessionViewPinnedCount());
+                    replyBusyReason(fd, type, seq, NXUS_REASON_SLOT_FULL);
                     break;
                 }
                 const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
@@ -1452,7 +1562,9 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                    legitimate "no snapshot", not an error, but the pin still goes). */
                 NxusViewPin pin;
                 if (!nxusSessionViewPinCurrent(&pin)) {
-                    replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                    NXUS_LOG("mappings: view pin table exhausted (%u held) - refusing the page",
+                             (unsigned)nxusSessionViewPinnedCount());
+                    replyBusyReason(fd, type, seq, NXUS_REASON_SLOT_FULL);
                     free(buffer);
                     break;
                 }
@@ -1581,7 +1693,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                use.  Without it a GetModules arriving mid-scan reads a table that
                is being re-published and can report a half-built module list. */
             if (nxusSessionScanState() == NxusScanState_Running) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             NxusModuleInfo *modules = (NxusModuleInfo *)calloc(NXUS_MAX_MODULES, sizeof(NxusModuleInfo));
@@ -1616,7 +1728,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                8 MB inner heap - the mirror image of the "a running scan refuses
                PtrScanBegin" gate. */
             if (ptrScanBusy()) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             if (length < sizeof(NxusScanRequest)) {
@@ -1749,7 +1861,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Snapshot preparation rebuilds the mapping/region arrays the scan
                worker is reading, so a running scan must be refused first. */
             if (nxusSessionScanState() == NxusScanState_Running) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             /* Same rule for the pointer scan worker: its 256 KiB scratch, region
@@ -1758,7 +1870,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                of them.  Two of those buffers never coexisted before, because the
                walk owned the connection thread. */
             if (ptrScanBusy()) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             if (length < sizeof(NxusSnapshotRequest)) {
@@ -1865,7 +1977,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Same reason as SnapshotCapture: the pointer scan walks the mapping
                snapshot the worker rebuilds under it. */
             if (nxusSessionScanState() == NxusScanState_Running) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             handlePtrScanBegin(fd, type, seq, payload, length);
@@ -1883,11 +1995,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             if (ptr_state == NxusPtrJob_Failed) {
-                /* Report the failure once: the next Get answers from the (empty)
-                   list the failed walk left behind, as a synchronous Begin did. */
-                const Result walk_rc = g_PtrJobResult;
-                atomic_store_explicit(&g_PtrJobState, NxusPtrJob_Idle, memory_order_release);
-                replyError(fd, type, seq, walk_rc);
+                /* Keep reporting the failure until the next Begin.  Clearing it to
+                   Idle made the second poll answer from the empty list the failed
+                   walk left behind, i.e. "no chains (complete)" - worse than an
+                   error, because the client would trust it. */
+                replyError(fd, type, seq, g_PtrJobResult);
                 break;
             }
             /* Idle (never started / after a failure) or Done: the list is stable. */
@@ -1906,21 +2018,30 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 reply(fd, type, seq, NULL, 0);
                 break;
             }
+            u64 offset = 0;
             u32 max_count = 64;
             /* Paging: the request carries a u64 offset at the same place as
                NxusMappingsRequest (offset, max_count).  NxusFrozenRequest itself
                (address, width) has no offset, so a client that sends one gets the
                first page - offset 0 - and only a caller that asks for a page is
-               served past it.  Ignoring the offset made every page the first one. */
+               served past it.  Ignoring the offset made every page the first one,
+               and since dmnt's table holds up to 0x80 entries while the default page
+               is 64, everything past the 64th entry was unreachable. */
             if (length >= sizeof(NxusMappingsRequest)) {
                 NxusMappingsRequest req;
                 memcpy(&req, payload, sizeof(req));
-                /* Only max_count is meaningful here, and the payload is ambiguous:
-                   NxusFrozenRequest {address,width} is byte-compatible with
-                   NxusMappingsRequest {offset,max_count}.  Honouring a width (1..8) as
-                   a page size truncated the reply to a couple of rows, so a value that
-                   small is treated as the frozen-request shape and ignored. */
-                if (req.max_count >= 16 && req.max_count <= 512) max_count = req.max_count;
+                /* The payload is ambiguous: NxusFrozenRequest {address,width} is
+                   byte-compatible with NxusMappingsRequest {offset,max_count}.
+                   Honouring a width (1..8) as a page size truncated the reply to a
+                   couple of rows, so a value that small is treated as the
+                   frozen-request shape.  The same range check gates the offset: a
+                   page size outside 16..512 means the whole 16 bytes are read as a
+                   NxusFrozenRequest, whose first word is an address - and taking
+                   that as an offset would point past every table. */
+                if (req.max_count >= 16 && req.max_count <= 512) {
+                    offset = req.offset;
+                    max_count = req.max_count;
+                }
             }
             NxusFrozenAddressEntry *entries = (NxusFrozenAddressEntry *)calloc(max_count, sizeof(NxusFrozenAddressEntry));
             NxusFrozenEntry *wire = (NxusFrozenEntry *)calloc(max_count, sizeof(NxusFrozenEntry));
@@ -1930,10 +2051,36 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 break;
             }
             size_t got = 0;
-            rc = nxusDmntGetFrozenEntries(entries, max_count, 0, &got);
+            rc = nxusDmntGetFrozenEntries(entries, max_count, (size_t)offset, &got);
+            /* The line that makes paging observable: without it "the client
+               re-reads page 0 for ever" and "dmnt has fewer entries than we asked
+               for" look identical in the log.  Logged only when it says something
+               - a non-first page, or a page that filled up (the truncation case
+               below) - because the GUI polls FrozenList and an unconditional line
+               would drown the ring buffer this diagnosis is read from. */
+            if (R_SUCCEEDED(rc) && (offset != 0 || got == (size_t)max_count)) {
+                NXUS_LOG("frozen: list page offset=%llu max=%u got=%u",
+                         (unsigned long long)offset, (unsigned)max_count, (unsigned)got);
+            }
             if (R_FAILED(rc)) {
                 replyError(fd, type, seq, rc);
             } else {
+                /* The reply is a bare NxusFrozenEntry[] (the client derives the
+                   count from the length), so there is no header field for the
+                   total.  Truncation is therefore reported here instead: a page
+                   that came back full may not be the whole list, and only a dmnt
+                   count tells whether it is.  One extra IPC, and only when the
+                   page is full. */
+                if (got == (size_t)max_count) {
+                    u64 total = 0;
+                    if (R_SUCCEEDED(nxusDmntGetFrozenCount(&total)) &&
+                        offset + (u64)got < total) {
+                        NXUS_LOG("frozen: list page is truncated (offset=%llu got=%u "
+                                 "total=%llu) - ask for the next page",
+                                 (unsigned long long)offset, (unsigned)got,
+                                 (unsigned long long)total);
+                    }
+                }
                 for (size_t i = 0; i < got; i++) {
                     wire[i].address = entries[i].address;
                     wire[i].value = entries[i].value;
@@ -1964,8 +2111,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             if (nxusDebugIsAttached()) {
                 /* Freezing is a dmnt cheat-VM feature and dmnt is closed while we
                    hold the debug handle, so answer with a clear result instead of
-                   a dmnt error the client cannot interpret. */
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                   a dmnt error the client cannot interpret.  Retrying cannot fix
+                   this: only DebugDetach reopens dmnt, so the reason says so. */
+                NXUS_LOG("frozen: enable %016llX refused - the debug session holds dmnt closed",
+                         (unsigned long long)req.address);
+                replyBusyReason(fd, type, seq, NXUS_REASON_DEBUG_LOCKED);
                 break;
             }
             rc = nxusDmntEnableFrozen(req.address, req.width, &value);
@@ -2085,9 +2235,10 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Taking the debug handle moves the same state a pause does (g_Debug,
                the pause flag, the HW slots).  Claim the pause slot so a hotkey
                pause cannot run attach/detach concurrently: the loser gets BUSY
-               instead of closing a handle the winner is still using. */
+               instead of closing a handle the winner is still using.  That one is
+               transient (the in-flight hand-off finishes), so it is BUSY_STATE. */
             if (!pauseTryEnter()) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
 
@@ -2108,8 +2259,21 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 
             rc = nxusDebugAttach(pid);
             if (R_FAILED(rc)) {
-                replyError(fd, type, seq, rc);
+                /* nxusDebugAttach() answers BUSY while a previous session is still
+                   being released (its event thread is joined by the tick): a retry
+                   a moment later succeeds, so name it instead of leaving a bare
+                   BUSY that reads like "the console is busy, give up". */
+                if (resultIsBusyRetryable(rc)) {
+                    NXUS_LOG("debug attach: the previous session is still being released");
+                    replyBusyReason(fd, type, seq, NXUS_REASON_RETRY_LATER);
+                } else {
+                    replyError(fd, type, seq, rc);
+                }
             } else {
+                /* The attach owns the pause state now (nxusDebugAttach sets it): a
+                   hotkey hold from before is no longer what keeps the target. */
+                pauseClearHotkeyHold();
+
                 /* Only a DIFFERENT process invalidates the cached identity: attaching
                    to the current game keeps main_base, which the day-1 flow (scan
                    first, attach afterwards) relies on.  When dmnt still describes the
@@ -2159,7 +2323,7 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             /* Same serialisation as DebugAttach: the detach joins the event thread
                and closes g_Debug, which a concurrent hotkey pause would be using. */
             if (!pauseTryEnter()) {
-                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY));
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             /* The detach (thread join + handle close) runs outside the state
@@ -2205,7 +2369,18 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             }
             rc = nxusDebugSetBreak(&request);
             if (R_FAILED(rc)) {
-                replyError(fd, type, seq, rc);
+                /* Inside SetBreak, BUSY has exactly two producers (nxus_debug.c):
+                   no free hardware slot for the kind, and a full break table.  Both
+                   are permanent until a breakpoint is cleared, so they must not
+                   share the "retry, something is running" meaning. */
+                if (resultIsBusyRetryable(rc)) {
+                    NXUS_LOG("break set: no free slot (kind=%u requested slot=0x%X) - "
+                             "clear a breakpoint first",
+                             (unsigned)request.kind, (unsigned)request.slot);
+                    replyBusyReason(fd, type, seq, NXUS_REASON_SLOT_FULL);
+                } else {
+                    replyError(fd, type, seq, rc);
+                }
             } else {
                 NxusBreakEntry entries[NXUS_DEBUG_SERVER_BREAK_MAX];
                 u32 n = nxusDebugGetBreaks(entries, NXUS_DEBUG_SERVER_BREAK_MAX);
@@ -2413,6 +2588,20 @@ void nxusServerTick(void) {
             }
         }
 
+        /* Deadman for the pointer-scan worker: the 90 s budget is enforced inside
+           the walk, but a wedged IPC read could keep it Running for ever and that
+           closes four BUSY gates (Begin/CheatExport/ScanBegin/SnapshotCapture). */
+        if (ptrScanBusy()) {
+            const u64 started = g_PtrJobStartedMs;
+            const u64 limit_ms = NXUS_PTRSCAN_TIME_BUDGET_MS + 30000ull;  /* budget + slack */
+            if (started != 0 && now_ms > started && now_ms - started > limit_ms) {
+                ptrScanRequestCancel("worker exceeded its time budget");
+            } else if (nxusNetClientFd() < 0 && last_client_ms != 0 &&
+                       now_ms - last_client_ms >= NXUS_SCAN_ABANDON_AFTER_MS) {
+                ptrScanRequestCancel("client gone");
+            }
+        }
+
         /* A scan started by a client that then disappeared keeps the worker, the SD
            baseline and the SCANNING flag alive for minutes, and a reconnecting client
            only ever gets BUSY.  Cancel it once nobody has been connected for a while. */
@@ -2445,8 +2634,34 @@ void nxusServerTick(void) {
     }
     reapExitedDebugSession();
     reapStaleDebugSession();
+
+    /* Hotkey pause with no client attached: nobody can send Resume, so the 15 s
+       pause watchdog would thaw exactly the freeze the user asked for by pressing
+       the button.  Refreshing the session's idle clock suspends it honestly, and
+       means the watchdog is not already "expired" the instant a client connects -
+       which would resume the target before its first command even arrived. */
+    bool hotkey_hold = false;
+    if (pauseIsHotkeyHold()) {
+        if (nxusNetClientFd() >= 0) {
+            pauseClearHotkeyHold();
+            NXUS_LOG("pause: a client connected - the hotkey pause watchdog is active again");
+        } else if (!nxusSessionIsPaused()) {
+            /* The pause ended somewhere else (dmnt resumed, auto-continue): there
+               is nothing to hold, so drop the flag instead of logging a hold that
+               no longer exists. */
+            pauseClearHotkeyHold();
+        } else {
+            hotkey_hold = true;
+            nxusSessionHeartbeat();
+            if (!atomic_load_explicit(&g_PauseHotkeyLogged, memory_order_relaxed)) {
+                atomic_store_explicit(&g_PauseHotkeyLogged, true, memory_order_relaxed);
+                NXUS_LOG("pause: hotkey pause is held without a client (watchdog suspended)");
+            }
+        }
+    }
+
     refreshTargetIdentityThrottled();
-    if (nxusSessionWatchdogExpired(nxusSessionWatchdogTimeout())) {
+    if (!hotkey_hold && nxusSessionWatchdogExpired(nxusSessionWatchdogTimeout())) {
         if (nxusDebugIsAttached()) {
             /* dmnt is closed while we hold a debug session: resuming here would fail
                and still tell the client "auto-resumed" while the target stays held. */

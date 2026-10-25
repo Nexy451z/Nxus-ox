@@ -217,6 +217,10 @@ int main(void) {
     u8 *chunk = (u8 *)malloc(4096);
     rc = nxusSnapshotCapture(&s3, g_Regions, 2, fakeRead, &f, chunk, 4096, NULL, NULL);
     CHECK(rc == NXUS_SNAPSHOT_ERR_FULL, "expected FULL, got %d", rc);
+    /* FULL is a truncated capture, not a failed one: the blocks that were hashed
+       stay usable (the service reports it as truncated=1). */
+    CHECK(s3.block_size == BLOCK_SIZE, "a FULL capture must keep its block grid (block_size %u)",
+          s3.block_size);
     free(chunk);
 
     printf("[test] cancellation keeps a consistent partial snapshot\n");
@@ -226,6 +230,9 @@ int main(void) {
     rc = nxusSnapshotCapture(&s3, g_Regions, 2, fakeRead, &f, chunk, 4096, NULL, &cancel);
     CHECK(rc == NXUS_SNAPSHOT_ERR_CANCELLED, "expected CANCELLED, got %d", rc);
     CHECK(s3.count <= expected_blocks, "partial count %u", s3.count);
+    /* Cancellation is not a failure either: the partial snapshot keeps its grid. */
+    CHECK(s3.block_size == BLOCK_SIZE, "a cancelled capture must keep its block grid (block_size %u)",
+          s3.block_size);
     free(chunk);
 
     printf("[test] regions appearing/vanishing are reported\n");
@@ -365,6 +372,52 @@ int main(void) {
     CHECK(sameEntries(&c1, g_ch1, g_ca1, &c2, g_ch2, g_ca2, COV_ENTRIES),
           "hashes/addresses around the hole differ between the two paths");
     free(hf.low); free(hf.high);
+
+    /*
+     * A capture that fails must not leave "0 blocks, but valid" behind: the diff
+     * then reports every block of the other side as vanished, which the client
+     * shows as a confident "N changed" for a comparison that never happened.
+     * The service layer relies on this to hand the client BAD_STATE instead.
+     */
+    printf("[test] a failed capture leaves no usable snapshot\n");
+    u64 fh[16], fa[16];
+    NxusSnapshot bad;
+    nxusSnapshotInit(&bad, fh, fa, 16, BLOCK_SIZE);
+    chunk = (u8 *)malloc(1024);
+    /* chunk_size < 16 cannot hash even one block: the capture never starts. */
+    rc = nxusSnapshotCapture(&bad, g_Regions, 2, fakeRead, &f, chunk, 15, NULL, NULL);
+    CHECK(rc == NXUS_SNAPSHOT_ERR_PARAM, "small-chunk capture rc=%d", rc);
+    CHECK(bad.count == 0 && bad.block_size == 0,
+          "a failed capture must not look valid (count=%u block_size=%u)",
+          bad.count, bad.block_size);
+    changed = 0;
+    rc = nxusSnapshotDiff(&s1, &bad, changes, cap, &changed);
+    CHECK(rc == NXUS_SNAPSHOT_ERR_PARAM,
+          "diff against a failed capture must fail, got rc=%d", rc);
+
+    /* Two uncaptured slots are not "nothing changed" either. */
+    NxusSnapshot bad2;
+    nxusSnapshotInit(&bad2, fh, fa, 16, BLOCK_SIZE);
+    rc = nxusSnapshotCapture(&bad2, g_Regions, 2, NULL, &f, chunk, 16 * BLOCK_SIZE, NULL, NULL);
+    CHECK(rc == NXUS_SNAPSHOT_ERR_PARAM, "missing reader rc=%d", rc);
+    CHECK(bad2.count == 0 && bad2.block_size == 0, "the second failed slot stayed valid");
+    changed = 0;
+    rc = nxusSnapshotDiff(&bad, &bad2, changes, cap, &changed);
+    CHECK(rc == NXUS_SNAPSHOT_ERR_PARAM, "diff of two failed captures rc=%d", rc);
+    free(chunk);
+
+    printf("[test] a re-initialised slot captures normally again\n");
+    nxusSnapshotInit(&bad, h2, a2, cap, BLOCK_SIZE);
+    chunk = (u8 *)malloc(16 * 1024);
+    rc = nxusSnapshotCapture(&bad, g_Regions, 2, fakeRead, &f, chunk, 16 * 1024, NULL, NULL);
+    CHECK(rc == NXUS_SNAPSHOT_OK, "recovery capture rc=%d", rc);
+    CHECK(bad.count == expected_blocks && bad.block_size == BLOCK_SIZE,
+          "recovered slot: %u blocks, block_size %u", bad.count, bad.block_size);
+    NxusSnapshot fresh = makeSnapshot(&f, g_ch1, g_ca1, COV_ENTRIES);
+    changed = 0;
+    rc = nxusSnapshotDiff(&bad, &fresh, changes, cap, &changed);
+    CHECK(rc == NXUS_SNAPSHOT_OK && changed == 0,
+          "recovered slot vs a fresh capture: rc=%d, %u changed", rc, changed);
 
     free(h1); free(a1); free(h2); free(a2); free(changes);
     free(f.a); free(f.b);

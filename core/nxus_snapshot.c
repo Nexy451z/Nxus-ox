@@ -30,6 +30,21 @@ void nxusSnapshotInit(NxusSnapshot *snapshot, u64 *hash_storage, u64 *address_st
     snapshot->block_size = block_size ? block_size : NXUS_SNAPSHOT_DEFAULT_BLOCK_SIZE;
 }
 
+/*
+ * A capture that failed must not leave the slot looking like a valid capture of
+ * zero blocks.  nxusSnapshotDiff() reports every block that only exists on one
+ * side, so a zero-block "valid" snapshot turns "this slot was never captured"
+ * into "every block of the other side vanished" - a convincing N-changed result
+ * that never happened.  block_size is the validity marker (nxusSnapshotInit()
+ * never stores 0, and a capture always picks a non-zero block size), so an
+ * invalidated snapshot has no block grid at all and the diff refuses it.
+ */
+static void nxusSnapshotMarkInvalid(NxusSnapshot *snapshot) {
+    snapshot->count = 0;
+    snapshot->region_count = 0;
+    snapshot->block_size = 0;
+}
+
 int nxusSnapshotCapture(NxusSnapshot *snapshot, const NxusScanRegion *regions, u32 region_count,
                         NxusReadFn read, void *read_ctx,
                         u8 *chunk, u32 chunk_size,
@@ -38,12 +53,23 @@ int nxusSnapshotCapture(NxusSnapshot *snapshot, const NxusScanRegion *regions, u
        below must not leave uninitialised stats behind for the caller to read. */
     if (stats != NULL) memset(stats, 0, sizeof(*stats));
 
-    if (snapshot == NULL || regions == NULL || read == NULL || chunk == NULL ||
+    if (snapshot == NULL) return NXUS_SNAPSHOT_ERR_PARAM;
+    if (regions == NULL || read == NULL || chunk == NULL ||
         snapshot->hashes == NULL || snapshot->addresses == NULL || chunk_size < 16) {
+        /* The capture never started, so not a single block of the previous
+           content can be vouched for: drop it instead of keeping a stale grid
+           that a later diff would happily use. */
+        nxusSnapshotMarkInvalid(snapshot);
         return NXUS_SNAPSHOT_ERR_PARAM;
     }
+    /* block_size 0 means "nothing captured" (see above): there is no grid to
+       walk.  Leave it invalid rather than inventing one. */
     if (snapshot->block_size == 0) return NXUS_SNAPSHOT_ERR_PARAM;
 
+    /* From here the walk only stops on FULL (the block table filled up) or
+       CANCELLED.  Both are partial snapshots whose already-hashed blocks are
+       real, so neither invalidates the grid: the caller reports FULL as
+       truncated and CANCELLED as a cancelled capture. */
     snapshot->count = 0;
     snapshot->region_count = region_count;
 
@@ -155,6 +181,10 @@ int nxusSnapshotCapture(NxusSnapshot *snapshot, const NxusScanRegion *regions, u
 int nxusSnapshotDiff(const NxusSnapshot *from, const NxusSnapshot *to,
                      NxusChangedBlock *out, u32 max_out, u32 *out_count) {
     if (from == NULL || to == NULL || out == NULL || out_count == NULL) return NXUS_SNAPSHOT_ERR_PARAM;
+    /* block_size 0 = a capture that never completed (or a slot that was never
+       captured): there is no block grid to merge against, and treating it as
+       "zero blocks" would report the whole other side as vanished.  Refuse. */
+    if (from->block_size == 0 || to->block_size == 0) return NXUS_SNAPSHOT_ERR_PARAM;
     if (from->block_size != to->block_size) return NXUS_SNAPSHOT_ERR_PARAM;
 
     u32 i = 0, j = 0, n = 0;

@@ -56,6 +56,15 @@ pub const RESULT_PTRSCAN_STARTED: u32 = 0x8003_C808;
 /// enough not to spin a core in the console's single connection thread.
 const PTRSCAN_POLL: Duration = Duration::from_millis(250);
 
+/// How often a `scan_wait*` run may hand its polled progress to a `report`
+/// callback.
+///
+/// The status poll itself runs every 20 ms (see `scan_wait_cancellable`), which
+/// is the right rate for noticing "done", but a UI cannot absorb 50 progress
+/// updates per second: `progress_permille` only moves as fast as the walk does,
+/// so a fifth of a second is plenty and keeps the GUI's event channel quiet.
+const SCAN_PROGRESS_REPORT: Duration = Duration::from_millis(200);
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub kind: u16,
@@ -706,23 +715,66 @@ impl NxusClient {
     /// inside the wait itself.
     pub fn scan_wait_cancellable(&self, timeout: Duration,
                                  cancel: &std::sync::atomic::AtomicBool) -> Result<Status> {
+        self.scan_wait_cancellable_reporting(timeout, cancel, |_| {})
+    }
+
+    /// [`NxusClient::scan_wait_cancellable`] plus live progress.
+    ///
+    /// The console never pushes `NxusEvent_ScanProgress`: nothing on the Switch
+    /// side posts that event (`event::SCAN_PROGRESS` is only decoded, never
+    /// sent), so the *polled* status is the only source of `progress_permille`,
+    /// `hit_count` and `scan_state` while a walk runs.  A caller that throws the
+    /// polled reply away - as the GUI's progress bar did - shows a bar stuck at
+    /// 0 for the whole scan and a hit counter frozen at whatever the previous
+    /// scan left behind.
+    ///
+    /// `report` is therefore called with the first reply, then whenever one of
+    /// those three values changes, throttled to [`SCAN_PROGRESS_REPORT`], and
+    /// once more with the final status (also when the scan was cancelled) so the
+    /// caller never has to guess how the walk ended.
+    pub fn scan_wait_cancellable_reporting<F>(&self, timeout: Duration,
+                                              cancel: &std::sync::atomic::AtomicBool,
+                                              mut report: F) -> Result<Status>
+    where
+        F: FnMut(&Status),
+    {
         let start = Instant::now();
         let mut last_heartbeat = Instant::now();
+        let mut last_report: Option<Instant> = None;
+        let mut last_seen: Option<(u32, u32, u32)> = None;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 cancel.store(false, Ordering::Relaxed);
                 let _ = self.request(cmd::SCAN_CANCEL, &[]);
                 let _ = self.heartbeat();
-                return self.scan_status();
+                let status = self.scan_status()?;
+                report(&status);
+                return Ok(status);
             }
             if last_heartbeat.elapsed() >= Duration::from_secs(4) {
                 last_heartbeat = Instant::now();
                 let _ = self.heartbeat();
             }
             let status = self.scan_status()?;
-            match status.scan_state {
-                scan_state::DONE | scan_state::ERROR | scan_state::CANCELLED => return Ok(status),
-                _ => {}
+            let finished = matches!(
+                status.scan_state,
+                scan_state::DONE | scan_state::ERROR | scan_state::CANCELLED
+            );
+            let seen = (status.scan_state, status.hit_count, status.progress_permille);
+            if finished {
+                // The final state always reaches the caller, even when it lands
+                // inside the throttle window: that is the value the UI ends on.
+                report(&status);
+                return Ok(status);
+            }
+            let due = match last_report {
+                Some(at) => at.elapsed() >= SCAN_PROGRESS_REPORT,
+                None => true,
+            };
+            if due && last_seen != Some(seen) {
+                last_seen = Some(seen);
+                last_report = Some(Instant::now());
+                report(&status);
             }
             if start.elapsed() > timeout {
                 return Err(NxusError { message: "scan did not finish".into(), result: None });
