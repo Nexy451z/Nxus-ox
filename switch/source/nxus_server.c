@@ -549,7 +549,8 @@ static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
     replyErrorReason(fd, type, seq, (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY), reason);
 }
 
-/* Drop the stored scan results when they belong to an earlier target.
+/* Drop the stored scan results when they belong to an earlier target, or when the
+ * mapping table they were stamped against was rebuilt.
  *
  * hits and the mapping snapshot are keyed to the process that produced them (see
  * the ownership block in nxus_session.h).  Switching titles - ForceOpen to another
@@ -559,20 +560,54 @@ static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
  * table the PC holds, so the batch looks completely valid.  The chain list already
  * refuses this (ptrChainOwnerCheck); this is the same gate for the scan results.
  *
+ * The SAME title is not enough either: a re-snapshot replaces the mapping table, and
+ * mapping_idx is an ordinal into it, so hits stamped before the replacement resolve
+ * through the new table to a different region.  nxusSessionHitsMatchTarget() compares
+ * the stamped generation too; this function then discards and logs which of the two
+ * causes fired.
+ *
  * Runs on the connection thread (status path) and in the 1 Hz identity tick:
  * nxusSessionInvalidateHits() is safe from both (it never frees the arrays a handler
  * may be walking).  The log line is emitted once per mismatch: a client that keeps
- * polling after the refusal must not flood the log ring. */
-static void discardResultsOfEarlierTarget(void) {
+ * polling after the refusal must not flood the log ring.
+ *
+ * compare_mapping_generation selects which comparison drives the discard.  The
+ * connection-thread readers pass true (a rebuilt table must not be served either),
+ * the 1 Hz tick passes false: it must only react to a target change.  A re-snapshot
+ * publishes the new table before ScanBegin stamps the owner, so the tick could catch
+ * that transient, call this, and drop the mapping table the on-going ScanBegin is
+ * still building - a sporadic BAD_INPUT for a scan.  A generation-only mismatch is
+ * picked up by the next status / hits request on the connection thread instead, which
+ * is serialized with the publication. */
+static void discardHitsOfEarlierTarget(bool compare_mapping_generation) {
     static atomic_int logged;
-    if (nxusSessionHitsMatchTarget()) {
+    const bool matches = compare_mapping_generation
+                             ? nxusSessionHitsMatchTarget()
+                             : nxusSessionHitsMatchTargetIdentity();
+    if (matches) {
         atomic_store_explicit(&logged, 0, memory_order_relaxed);   /* re-arm */
         return;
     }
+    /* Name the cause once: a rebuilt table breaks mapping_idx even on the same
+       target, an identity change means the addresses belong to somebody else.  Both
+       end in the same discard. */
+    u32 owner_gen = 0, now_gen = 0;
+    const bool table_rebuilt = compare_mapping_generation &&
+                               nxusSessionHitsMappingGenerationChanged(&owner_gen, &now_gen);
     if (atomic_exchange_explicit(&logged, 1, memory_order_relaxed) == 0) {
-        NXUS_LOG("hits: the hit list belongs to an earlier target - discarding");
+        if (table_rebuilt) {
+            NXUS_LOG("hits: the mapping table was rebuilt (gen %u -> %u) - discarding",
+                     (unsigned)owner_gen, (unsigned)now_gen);
+        } else {
+            NXUS_LOG("hits: the hit list belongs to an earlier target - discarding");
+        }
     }
     nxusSessionInvalidateHits();
+}
+
+/* Connection-thread entry point: identity AND mapping generation. */
+static void discardResultsOfEarlierTarget(void) {
+    discardHitsOfEarlierTarget(true);
 }
 
 /* Same rule for the mapping snapshot: the PC resolves every address it received
@@ -1678,13 +1713,16 @@ static void handleCheatExport(int fd, u16 type, u32 seq, const u8 *payload, u32 
 /* ---- scan results ------------------------------------------------------ */
 
 static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
-    /* The list is tied to the target that produced it: after a title switch every
-       address and mapping_idx in it belongs to a different process, and the batch
-       would still look valid to the PC (it resolves against the base array it was
-       given).  Refuse and discard BEFORE the pin is taken, so this path cannot leak
-       one; the client has to rescan.  No dedicated NXUS_REASON_* exists for "the
-       target changed", and a reason word here would read as an argument problem, so
-       the refusal stays a bare NXUS_ERR_BAD_STATE (the log names the cause). */
+    /* The list is tied to the target that produced it, and to the mapping table its
+       mapping_idx values were stamped against: after a title switch every address
+       belongs to a different process, and after a re-snapshot of the SAME title the
+       indices name different regions - in both cases the batch would still look
+       valid to the PC (it resolves against the base array it was given).  Refuse and
+       discard BEFORE the pin is taken, so this path cannot leak one; the client has
+       to rescan.  No dedicated NXUS_REASON_* exists for "the results no longer
+       describe this table", and a reason word here would read as an argument
+       problem, so the refusal stays a bare NXUS_ERR_BAD_STATE (the log names the
+       cause). */
     if (!nxusSessionHitsMatchTarget()) {
         discardResultsOfEarlierTarget();
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
@@ -2370,6 +2408,19 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
         }
 
         case NxusCmd_SnapshotChanged: {
+            /* The cached list belongs to the diff that produced it: once the
+               session moved to another target (title switch, relaunch, re-attach)
+               every address in it is the previous process's memory.  Refuse the
+               page with BAD_STATE instead of handing those rectangles out - or,
+               worse, replying "0 changed", which the client reads as "nothing
+               changed in this target".  With no cached diff this stays true, so
+               the old empty reply before the first SnapshotDiff is unchanged. */
+            if (!nxusSnapshotDiffMatchesCurrent()) {
+                NXUS_LOG("snapshot changed: the cached diff belongs to another target - "
+                         "refusing the page (capture both slots and diff again)");
+                replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                break;
+            }
             u32 offset = 0, count = 1024;
             if (length >= sizeof(NxusGetHitsRequest)) {
                 NxusGetHitsRequest req;
@@ -3004,8 +3055,12 @@ static void refreshTargetIdentityThrottled(void) {
        game A, start game B, and never ask for a status in between).  The stored hits
        and the mapping snapshot then describe the process we left, so drop them here
        too - once per second is enough, and with a debug session attached dmnt is
-       closed, which is why this sits after the refresh instead of at the top. */
-    discardResultsOfEarlierTarget();
+       closed, which is why this sits after the refresh instead of at the top.
+       Identity only: this also runs on the main thread, where reacting to a mapping
+       generation change could race a ScanBegin between its table publication and its
+       owner stamp (see discardHitsOfEarlierTarget).  A rebuilt table is detected by
+       the next status / hits request on the connection thread. */
+    discardHitsOfEarlierTarget(false);
 }
 
 /* The debugee exited while we were attached.  The event thread has already

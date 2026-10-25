@@ -194,26 +194,62 @@ const NxusHitList      *nxusSessionHits(void);
  *
  *   - nxusSessionScanBegin() stamps {pid, program_id, session_id} when it arms a
  *     list, after refreshing the identity and taking the mapping snapshot, so the
- *     stamp describes the same read of the target,
+ *     stamp describes the same read of the target.  The stamp also carries the
+ *     MAPPING-TABLE GENERATION the scan published (see
+ *     nxusSessionMappingGeneration()); a re-snapshot replaces the table, and a
+ *     mapping_idx is an ordinal into that table, so the same target can still hand
+ *     back indices that now name different regions,
  *   - nxusSessionHitsMatchTarget() compares that stamp with the identity the session
- *     currently holds.  A pid or program id that is 0 on either side is "unknown",
- *     not a mismatch (an explicit DebugAttach can leave the title unknown, and
- *     refusing the session's own list would break scan-then-attach).  With no pid at
- *     all the scan generation is the token, exactly like the chain list,
+ *     currently holds, and the stamped mapping generation with the published one.  A
+ *     value that is 0 on either side is "unknown", not a mismatch (an explicit
+ *     DebugAttach can leave the title unknown, and refusing the session's own list
+ *     would break scan-then-attach); with no pid at all the scan generation is the
+ *     token, exactly like the chain list.  A generation change, however, is ALWAYS a
+ *     mismatch: it invalidates every mapping_idx regardless of the target,
  *   - nxusSessionInvalidateHits() discards hits + mapping snapshot.
  *
- * Detection is the server's job: fillStatus() and the 1 Hz identity tick call
- * MatchTarget() and InvalidateHits() when it returns false, and every reader of a
- * stored address (sendHits, ScanNext) checks it first.
+ * Detection is the server's job: fillStatus() and sendHits(), plus ScanNext() inside
+ * the session, call MatchTarget() and InvalidateHits() when it returns false.  The
+ * 1 Hz identity tick runs on another thread, so it uses the identity-only partial
+ * check below instead.
  */
 /* True while the stored hit list may be served to the current target.  Also false
-   after nxusSessionInvalidateHits() until a new scan stamps a list, so one detection
-   is enough for every later reader.  An empty session (no list ever built) matches:
-   there is nothing that could be stale. */
+   after nxusSessionInvalidateHits() until a new scan stamps a list, and when the
+   mapping table was rebuilt after the list was stamped, so one detection is enough
+   for every later reader.  An empty session (no list ever built) matches: there is
+   nothing that could be stale. */
 bool nxusSessionHitsMatchTarget(void);
 
-/* Discard the stored hits and the mapping snapshot because they describe an earlier
-   target, and ask a pass that is still reading it to cancel.  Idempotent, cheap to
+/* Identity half of the check above: the same pid / program id / scan-generation
+   comparison, WITHOUT the mapping-table generation.  Meant for the 1 Hz identity
+   tick, which must not act on a re-snapshot: ScanBegin (and the other re-snapshot
+   call sites) publishes the new table before it stamps the hit owner, so for a
+   moment the new generation and the old stamp coexist.  Discarding on that
+   transient would drop the table the on-going command is building.  Readers that
+   can serve a stored mapping_idx - fillStatus / sendHits / ScanNext - run on the
+   connection thread that publishes, so they use the full nxusSessionHitsMatchTarget()
+   and no stale index is ever served. */
+bool nxusSessionHitsMatchTargetIdentity(void);
+
+/* Current generation of the published mapping snapshot.  It is bumped every time
+   the table is replaced (a successful snapshot publish, or a drop) - including a
+   re-snapshot of the SAME process, because the new list may order the mappings
+   differently and every stored mapping_idx then resolves to a different region.
+   It does NOT change when a refine pass revalidates the entries in place, so a
+   refined hit list keeps working.  0 means no table has been published yet. */
+u32  nxusSessionMappingGeneration(void);
+
+/* If the stored list is refused only because the mapping table was rebuilt under it,
+   report the generation it was stamped with and the current one.  False for every
+   other case (no stamped list, already discarded, or an identity mismatch whose
+   generations still match), which lets the server name the actual cause in its log
+   line.  Either out pointer may be NULL. */
+bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current_generation);
+
+/* Discard the stored hits and the mapping snapshot because they no longer describe
+   what the session would serve - an earlier target, or a mapping table that was
+   rebuilt after the hits were stamped (their mapping_idx then resolves to other
+   regions) - and ask a pass that is still reading it to cancel.  Idempotent, cheap to
    repeat, and SAFE FROM ANY THREAD (the connection thread's status path and the main
    thread's tick both call it):
  *

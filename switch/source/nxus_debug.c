@@ -111,6 +111,14 @@ static NxusBreakHit g_Hits[NXUS_DEBUG_MAX_HITS];
 static u32          g_HitCount;      /* entries currently stored */
 static u32          g_HitTotal;      /* ever recorded (also the next index) */
 static u32          g_HitNext;       /* ring position */
+/* Session epoch of the hit ring, bumped every time the ring is wiped (attach,
+   detach, explicit HitClear).  recordHit() reads it before it starts assembling a
+   hit and re-checks it under g_Mutex, so a hit that was already in flight when the
+   session changed is dropped instead of being published as the first hit of the
+   new title.  Without it a detach/attach pair could leave the previous title's
+   breakpoint hit at ring index 0 - exactly where the next title's first hit
+   lands - and the PC would show it as that session's own hit. */
+static atomic_uint g_HitEpoch;
 
 static NxusThreadEntry g_Threads[NXUS_DEBUG_MAX_THREADS];
 static u32             g_ThreadCount;
@@ -138,6 +146,34 @@ static atomic_bool     g_Is64Bit;
    session starts, when it ends, and when the debugee exits, so one target's
    architecture can never leak into the next one's registers or pointer scan. */
 static atomic_bool     g_Is64BitKnown;
+
+/* ---- hit ring ------------------------------------------------------------ */
+
+/* Wipe the break-hit ring: the stored count, the running index (which is also the
+   next hit.index), the write position, the records themselves and the session
+   epoch (see g_HitEpoch).
+ *
+ * The ring belongs to the debug SESSION, not to the console.  nxusDebugAttach()
+ * and nxusDebugDetach() both wipe it, because otherwise a detach followed by an
+ * attach to a different title served the previous title's breakpoint hits as the
+ * new session's: same slots, same addresses, plausible-looking PCs, and index 0
+ * of the new session is exactly where the old hit used to be.  The explicit
+ * HitClear command goes through the same helper, so the epoch rule has a single
+ * implementation and the "clear" the user asked for also drops a hit that was
+ * still being recorded.
+ *
+ * The caller must hold g_Mutex (recordHit() writes the ring under it, and the
+ * attach/detach paths wipe the rest of the session state under it as well). */
+static void clearHitRingLocked(void) {
+    g_HitCount = 0;
+    g_HitTotal = 0;
+    g_HitNext = 0;
+    memset(g_Hits, 0, sizeof(g_Hits));
+    /* Bumped last, still under the lock: a recordHit() that captured the old epoch
+       either already stored its hit (and this wipe removes it) or re-checks under
+       the mutex below and drops it. */
+    atomic_fetch_add_explicit(&g_HitEpoch, 1, memory_order_acq_rel);
+}
 
 /* ---- control word construction ----------------------------------------- */
 
@@ -438,6 +474,12 @@ static void recordHit(const DebugEventInfo *event) {
     NxusBreakHit hit;
     memset(&hit, 0, sizeof(hit));
 
+    /* Which session this hit was observed in (see g_HitEpoch).  The function runs
+       on the event thread and on every thread that drains the debug queue, so it
+       can overlap an attach/detach (or a HitClear) that wipes the ring.  The value
+       is re-checked under g_Mutex before anything is stored. */
+    const u32 hit_epoch = atomic_load_explicit(&g_HitEpoch, memory_order_acquire);
+
     const u32 bp_type = event->info.exception.specific.break_point.type;
     /* On hardware the kernel frequently reports 0 in break_point.address for a
        watchpoint exception (observed: "last watch addr=00000000 pc=21122038"), so
@@ -518,6 +560,13 @@ static void recordHit(const DebugEventInfo *event) {
     u32  auto_hits = 0;
 
     mutexLock(&g_Mutex);
+    if (hit_epoch != atomic_load_explicit(&g_HitEpoch, memory_order_relaxed)) {
+        /* The ring was wiped while this hit was being assembled: the session it
+           belongs to is gone (detach/attach) or the user cleared the list.  Storing
+           it now would publish a previous title's hit as this session's hit #0. */
+        mutexUnlock(&g_Mutex);
+        return;
+    }
     hit.index = g_HitTotal++;
     hit.tick = now;
     /* The ring copy is a whole NxusBreakHit structure (112 bytes); no memcpy is
@@ -1027,6 +1076,17 @@ Result nxusDebugAttach(u64 pid) {
        wiped without harming anyone else. */
     clearAllHardwareSlots();
 
+    /* The hit ring is per session, and it is wiped BEFORE g_Attached becomes true:
+       a client of the next session must never be able to read the previous
+       title's breakpoint hits, not even for the few instructions between the two
+       stores below.  The wipe also bumps the epoch, so a hit that another thread
+       is still recording right now is dropped instead of landing at index 0 of the
+       new session (see clearHitRingLocked). */
+    mutexLock(&g_Mutex);
+    clearHitRingLocked();
+    mutexUnlock(&g_Mutex);
+    NXUS_LOG("debug: hit ring cleared (attach/detach)");
+
     g_Debug = debug;
     g_Attached = true;
     g_BreakCount = 0;
@@ -1207,6 +1267,15 @@ Result nxusDebugDetach(void) {
     }
     nxusDmntSetAutoReopen(true);
     atomic_store_explicit(&g_HandoffBusy, false, memory_order_release);
+    /* The session is over: wipe its hit ring before the console can serve another
+       one (see clearHitRingLocked).  A hit the event thread recorded a moment
+       before the join stays out of the next title's session because the epoch
+       changes here, and a client that reconnects sees an empty list instead of the
+       previous title's breakpoints. */
+    mutexLock(&g_Mutex);
+    clearHitRingLocked();
+    mutexUnlock(&g_Mutex);
+    NXUS_LOG("debug: hit ring cleared (attach/detach)");
     NXUS_LOG("debug mode released");
     return 0;
 }
@@ -1467,11 +1536,11 @@ u32 nxusDebugGetHits(NxusBreakHit *out, u32 max_entries) {
 }
 
 void nxusDebugClearHits(void) {
+    /* Same helper as attach/detach: the explicit clear must also bump the epoch so
+       a hit that is being recorded right now cannot reappear after the list the
+       user just emptied. */
     mutexLock(&g_Mutex);
-    g_HitCount = 0;
-    g_HitNext = 0;
-    g_HitTotal = 0;
-    memset(g_Hits, 0, sizeof(g_Hits));
+    clearHitRingLocked();
     mutexUnlock(&g_Mutex);
 }
 

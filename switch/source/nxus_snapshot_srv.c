@@ -19,6 +19,71 @@ static u32                g_BlockSize = NXUS_SNAPSHOT_DEFAULT_BLOCK_SIZE;
    changed list itself fits. */
 static u32                g_SlotTruncated[2];
 
+/*
+ * Which target each slot's capture describes (and which target the cached diff
+ * was computed for).
+ *
+ * A snapshot is nothing but per-block hashes of one process's memory, so a diff
+ * is only meaningful while both slots still describe the SAME process.  Without
+ * such a stamp, switching titles between the two captures still produced a
+ * successful "N changed": the reply compared two unrelated address spaces, and
+ * every address in the changed list pointed into whichever process was attached
+ * when the diff ran.  The stamp is taken from the session inside
+ * nxusSnapshotTake() - the same identity the capture reads through
+ * (nxusSessionProcessId / ProgramId / Id) - and is only published when the take
+ * succeeded.
+ *
+ * "Same target" follows the rule nxusSessionHitsMatchTarget() uses, so an
+ * explicit DebugAttach (program id unknown = 0) does not turn every comparison
+ * into a mismatch:
+ *   - both sides know a pid -> the pid must match, and so must the program id
+ *     once both know one (a new pid is a relaunch, a new title id is a title
+ *     switch),
+ *   - a pid is unknown on either side -> the session generation is the only
+ *     token left, exactly like the hit-list owner check.
+ */
+typedef struct {
+    u64  pid;
+    u64  program_id;
+    u32  session_id;
+    bool valid;
+} NxusSnapshotOwner;
+
+static NxusSnapshotOwner g_SlotOwner[2];
+/* Owner of the cached changed-block list (equal to both slots' owner: the diff
+   only runs once A and B were proven to describe the same target). */
+static NxusSnapshotOwner g_DiffOwner;
+
+/* The identity the session holds RIGHT NOW. */
+static NxusSnapshotOwner snapshotOwnerCurrent(void) {
+    NxusSnapshotOwner owner;
+    owner.pid        = nxusSessionProcessId();
+    owner.program_id = nxusSessionProgramId();
+    owner.session_id = nxusSessionId();
+    owner.valid      = true;
+    return owner;
+}
+
+/* Do two stamps describe the same target?  See the block comment above. */
+static bool snapshotOwnerSame(const NxusSnapshotOwner *a, const NxusSnapshotOwner *b) {
+    if (!a->valid || !b->valid) return false;
+    if (a->pid != 0 && b->pid != 0) {
+        if (a->pid != b->pid) return false;
+        return a->program_id == 0 || b->program_id == 0 ||
+               a->program_id == b->program_id;
+    }
+    return a->session_id == b->session_id;
+}
+
+static bool snapshotOwnerMatchesCurrent(const NxusSnapshotOwner *owner) {
+    const NxusSnapshotOwner now = snapshotOwnerCurrent();
+    return snapshotOwnerSame(owner, &now);
+}
+
+static void snapshotOwnerClear(u32 slot) {
+    memset(&g_SlotOwner[slot], 0, sizeof(g_SlotOwner[slot]));
+}
+
 /* Slots are allocated on first use: two slots x two arrays of u64 hashes and
    addresses would otherwise reserve 2 MB of the 8 MB inner heap from boot, even
    in a session that only scans. */
@@ -61,12 +126,17 @@ static bool snapshotSlotResident(u32 slot) {
  * capture still looked valid and nxusSnapshotCompare() reported every block of
  * the other slot as vanished (a confident "N changed" for a comparison that
  * never happened).
+ *
+ * The target stamp goes with the grid: a slot with no capture must not keep
+ * claiming it was taken on the target the previous capture saw, or a diff could
+ * accept a *new* capture next to a slot that no longer holds anything.
  */
 static void snapshotSlotInvalidate(u32 slot) {
     g_Snapshots[slot].count = 0;
     g_Snapshots[slot].region_count = 0;
     g_Snapshots[slot].block_size = 0;
     g_SlotTruncated[slot] = 0;
+    snapshotOwnerClear(slot);
 }
 
 /*
@@ -105,10 +175,14 @@ void nxusSnapshotReleaseAll(void) {
     u64 returned = 0;
     for (u32 slot = 0; slot < 2; slot++) {
         if (snapshotSlotResident(slot)) returned += NXUS_SNAPSHOT_SLOT_BYTES;
-        snapshotSlotFree(slot);
+        snapshotSlotFree(slot);   /* also drops the slot's target stamp */
     }
     g_ChangedCount = 0;
     g_DiffTruncated = 0;
+    /* The cached diff described the released captures, so its owner stamp has to
+       go with them: GetChanged() must not page rows of a diff that no longer has
+       a pair of captures behind it. */
+    memset(&g_DiffOwner, 0, sizeof(g_DiffOwner));
     NXUS_LOG("snapshot: both slots released (%llu B returned to the heap, "
              "re-allocated by the next capture)", (unsigned long long)returned);
 }
@@ -148,9 +222,11 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     /* A capture ends the life of the previous diff: its changed_count must not
        leak into this capture's summary (the GUI printed "N changed" with an
        empty list) and SnapshotChanged must not page rows of a diff that no
-       longer belongs to the slots as captured now. */
+       longer belongs to the slots as captured now.  The diff's target stamp goes
+       with it - a new capture starts a new pair. */
     g_ChangedCount = 0;
     g_DiffTruncated = 0;
+    memset(&g_DiffOwner, 0, sizeof(g_DiffOwner));
 
     snapshotSlotEnsure(slot);
     if (g_Snapshots[slot].hashes == NULL) return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
@@ -181,6 +257,13 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     }
     u32 region_count = 0;
     const NxusScanRegion *regions = nxusSessionRegionsPinned(&pin, &region_count);
+
+    /* The identity this capture is taken on.  Read once, BEFORE the reads, so the
+       stamp names the process the hashes came from even if the 1 Hz identity tick
+       attaches to another target while the capture runs.  It is published only
+       when the take succeeds (see the two success paths below), never on an early
+       return: an uncaptured slot carries no owner. */
+    const NxusSnapshotOwner owner = snapshotOwnerCurrent();
 
     nxusSnapshotInit(&g_Snapshots[slot], g_Hashes[slot], g_Addresses[slot],
                      NXUS_SNAPSHOT_MAX_BLOCKS, block_size);
@@ -228,6 +311,7 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
            block size) instead of discarding a snapshot the user waited for. */
         g_BlockSize = block_size;
         g_SlotTruncated[slot] = 1;
+        g_SlotOwner[slot] = owner;   /* partial, but still this target's blocks */
         nxusSnapshotGetSummary(slot, out);
         NXUS_LOG("snapshot %c: hit the block limit - reporting %u block(s) as truncated",
                  slot ? 'B' : 'A', (unsigned)g_Snapshots[slot].count);
@@ -245,6 +329,12 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     }
 
     g_BlockSize = block_size;
+    /* The take is complete: the slot now describes this target, and a diff may
+       use it - but only next to a slot stamped with the same identity. */
+    g_SlotOwner[slot] = owner;
+    NXUS_LOG("snapshot %c: captured on pid=%llu title=%016llX (session %u)",
+             slot ? 'B' : 'A', (unsigned long long)owner.pid,
+             (unsigned long long)owner.program_id, (unsigned)owner.session_id);
     nxusSnapshotGetSummary(slot, out);
     return 0;
 }
@@ -255,9 +345,11 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
     /* Whatever this comparison decides, the previous diff's rows stop being
        pageable now: a refused or failed diff leaving changed_count behind made
        SnapshotChanged hand out rectangles of a comparison the client never got a
-       success reply for. */
+       success reply for.  Clearing the owner stamp is part of that: a diff below
+       only re-publishes it when it really ran. */
     g_ChangedCount = 0;
     g_DiffTruncated = 0;
+    memset(&g_DiffOwner, 0, sizeof(g_DiffOwner));
 
     /* An uncaptured slot (never taken, the take failed, released by
        nxusSnapshotReleaseAll(), or not a single block could be hashed - it then has
@@ -281,6 +373,41 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
        the missing storage instead of walking a NULL pointer. */
     if (g_Snapshots[from_slot].hashes == NULL || g_Snapshots[to_slot].hashes == NULL)
         return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+
+    /* A diff is only meaningful between captures of the SAME process: two
+       unrelated address spaces merged into one "N changed" list report success
+       for a comparison that means nothing.  This is the title-switch case
+       (capture A on title 1, ForceOpen title 2, capture B): both slots are
+       captured and the block sizes even match, so nothing below would have
+       refused it.  BAD_STATE is what the client can act on ("capture both
+       again"); the log names both slots in A/B order, whatever order the client
+       passed them in. */
+    if (!snapshotOwnerSame(&g_SlotOwner[from_slot], &g_SlotOwner[to_slot])) {
+        NXUS_LOG("snapshot: slots were captured for different targets "
+                 "(A pid=%llu title=%016llX, B pid=%llu title=%016llX) - capture both again",
+                 (unsigned long long)g_SlotOwner[0].pid,
+                 (unsigned long long)g_SlotOwner[0].program_id,
+                 (unsigned long long)g_SlotOwner[1].pid,
+                 (unsigned long long)g_SlotOwner[1].program_id);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
+
+    /* The pair also has to describe the target the session is on NOW.  A
+       relaunch / re-attach / switch to a third title between the captures and the
+       diff would otherwise page rectangles of a process that is gone (or, worse,
+       of a new process at the same numeric addresses).  The capture keeps working
+       after a scan or a Reset on the same target: the pid/title rule ignores the
+       session generation while a pid is known. */
+    if (!snapshotOwnerMatchesCurrent(&g_SlotOwner[from_slot])) {
+        const NxusSnapshotOwner now = snapshotOwnerCurrent();
+        NXUS_LOG("snapshot diff %c->%c: captures were taken on pid=%llu title=%016llX "
+                 "but the current target is pid=%llu title=%016llX - capture both again",
+                 from_slot ? 'B' : 'A', to_slot ? 'B' : 'A',
+                 (unsigned long long)g_SlotOwner[from_slot].pid,
+                 (unsigned long long)g_SlotOwner[from_slot].program_id,
+                 (unsigned long long)now.pid, (unsigned long long)now.program_id);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
 
     /* An incomplete slot makes the whole comparison unreliable, even if the diff
        itself does not overflow (otherwise a truncated A looks like a clean A). */
@@ -313,6 +440,11 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
 
+    /* The comparison ran against a pair of captures that describe one target, and
+       both still match the session: the changed list may be paged for exactly this
+       target from now on. */
+    g_DiffOwner = g_SlotOwner[from_slot];
+
     NXUS_LOG("snapshot diff %c->%c: %u changed blocks%s",
              from_slot ? 'B' : 'A', to_slot ? 'B' : 'A', (unsigned)g_ChangedCount,
              g_DiffTruncated ? " (truncated)" : "");
@@ -327,8 +459,23 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
     return 0;
 }
 
+/* May the cached changed-block list still be served?  See the contract in
+   nxus_snapshot_srv.h and the owner block at the top of this file. */
+bool nxusSnapshotDiffMatchesCurrent(void) {
+    /* No cached diff: nothing can be stale, and SnapshotChanged before the first
+       diff keeps its old (empty) reply instead of turning into an error. */
+    if (g_ChangedCount == 0) return true;
+    return snapshotOwnerMatchesCurrent(&g_DiffOwner);
+}
+
 u32 nxusSnapshotGetChanged(NxusChangedBlockWire *out, u32 max_entries, u32 offset) {
     if (out == NULL || offset >= g_ChangedCount) return 0;
+    /* The cached rows are rectangles of the target the diff ran on.  Once the
+       session moved elsewhere they describe the previous process's memory, so
+       none of them is served: the server refuses the page with BAD_STATE (via
+       nxusSnapshotDiffMatchesCurrent), and a caller that skipped that check gets
+       an empty page instead of addresses it cannot trust. */
+    if (!snapshotOwnerMatchesCurrent(&g_DiffOwner)) return 0;
     u32 n = g_ChangedCount - offset;
     if (n > max_entries) n = max_entries;
     for (u32 i = 0; i < n; i++) {

@@ -38,6 +38,36 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 | **Sysmodule Title IDs** | `0x4200000000004E58` (`nxus`)<br>`0x4200000000004E59` (`probe`) | NPDM ACID/ACI0 patched with single-bit `ForceDebug` (`0x08`) |
 | **PC Client (`nxus.exe`)** | **Windows x64** (Rust `eframe` / `egui` + CLI) | **Single unified executable** for both GUI and CLI |
 
+### PC ↔ console wire compatibility (mixed builds)
+
+The wire protocol stays `v1`: newer fields are **appended**, never inserted, so every
+structure keeps the offsets of its original fields. Each side therefore decides by
+**frame length**, not by a version number, and the two directions degrade
+differently:
+
+| Wire change | Older console + this PC | This console + older PC |
+|---|---|---|
+| **20-byte `NxusPtrChainListHeader`** (`pointer_width` appended; chain records now start at offset 20) | ✔ Works. The 16-byte header is recognised from the reply length (it is not the `20 + count*48` shape); `pointer_width` reads `0`, so the PC falls back to its own width rule and the GUI reports *an unreported width* (its local cheat preview is disabled). Chain decoding is unaffected. | ⚠ The first 16 bytes (count / total / truncated) still decode, but the records now start at 20. A PC older than the field starts them at 16 and reads every record four bytes early — **the only silent mismatch in this table**. The length probe shipped in the same build as the field, so any PC from this release (or later) decodes both shapes; a build older than the field must be updated. |
+| **40-byte `NxusDebugStatus`** (`stopped_thread` appended) | ✔ Works. A 32-byte reply is parsed through `stopped_thread_low`; `stopped_thread` is only read when the payload is at least 40 bytes, so a stopped thread id above 4 GiB can only be read truncated (the value the old console could express anyway). | ✔ Works. The 32-byte prefix keeps its offsets (offset 28 used to be `reserved`) and the trailing `u64` is ignored. |
+| **`NXUS_RESULT_PTRSCAN_STARTED`** (`0x8003C808`) answered by `PtrScanBegin` | ✔ Works. An older console walks inside the command and answers with the chain list; the PC accepts both shapes and only starts polling `PtrScanGet` (250 ms, 150 s budget) after the new result. | ⚠ The result is unknown to it, so the command is reported as failed (`command 0x0030 failed` for the Rust CLI/GUI, `PtrScanBegin failed: result=0x8003C808` for the Python client) and the PC never polls: the walk keeps running on the console but its list is never collected. Nothing is corrupted — re-run with a current PC. |
+| **Reason codes 10–13** (`HEAP_BUDGET`, `DEBUG_LOCKED`, `SLOT_FULL`, `RETRY_LATER`) | ✔ Works. The tail is optional: a console that sends no reason keeps the old `command 0x.... failed` text, every code 1–13 is named, and an unknown code is still printed as `(reason=N)`. | ⚠ Informational only. An older PC names the codes it knows (1–10 in the build before this one) and prints `(reason=11..13)` without text; one older than the reason word itself ignores the extra four bytes. The `Result` is unchanged, so only the guidance/retry policy is coarser (11/12 need a user action, 13 clears by itself). |
+| **`NxusCmd_SnapshotRelease`** (`0x0072`) | ✔ Refused, loudly. The console answers `NXUS_ERR_UNSUPPORTED` (plus `NXUS_REASON_UNKNOWN_COMMAND` when it sends the tail), the CLI prints `command 0x0072 failed - unknown command: this console does not implement it (reason=6)`, and both snapshot slots stay resident — free them with `ScanReset`, or restart the module on a console that also predates the release-on-reset. | ✔ An older PC never sends `0x0072`; the console still frees both slots on `ScanReset`, so nothing changes for it. |
+
+**No combination above fails silently, with one documented caveat.** All five changes
+are append-only and self-describing by payload length, so a mismatch either works,
+degrades visibly (unreported width, disabled preview, unknown command, unknown
+result) or is refused with an explicit `Result` + `reason` — never by returning
+plausible-looking data that belongs to another structure. The caveat is row 1: a
+**pre-release** PC build (one compiled from the repository before the field existed,
+so it is not shipped with any console) meeting the 20-byte chain header cannot detect
+the tail and would read the records four bytes early. The probe and the field shipped
+together, so keep the console and the PC on the same release — every officially
+packaged pair does that by construction.
+
+Two rules keep the table true: never insert a field into an existing structure
+(append it and let the length decide), and never turn a success into an error — or an
+error into a success — merely because a field is missing.
+
 ---
 
 ## Key Features
@@ -79,6 +109,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
   - **GUI**: a `■ STOPPED` badge plus a banner with **[Continue] [Step]**; on every stop the GUI automatically fetches the stopped thread's registers and disassembles the code around its PC (`=>` highlight).
   - **Real freeze / pause**: `nxus pause` suspends every thread of the title. The preferred path is `dmnt:cht`'s `PauseCheatProcess` (`BreakDebugProcess` on dmnt's own debug handle, cmdid `65004`), which keeps the cheat session open so reads, scans and snapshot diffs keep working against the frozen title. If dmnt cannot stop it, the console falls back to opening its own debug session (`svcDebugActiveProcess`) and issuing `svcBreakDebugProcess`; reads/queries/mapping enumeration automatically switch to that handle. `nxus resume` mirrors whichever path was used. The GUI's *"pause target while scanning"* option drives the same mechanism.
   - **Automatic `dmnt:cht` recovery**: when the cheat process has been dropped (`0x0032C80D`), every `dmnt:cht` command re-issues `ForceOpenCheatProcess` once and retries, so a dropped session no longer turns into a permanent error.
+- **Per-session hit history**: the breakpoint/watchpoint ring behind `nxus hits` and the GUI **Watch** tab belongs to one debug session. `DebugAttach` and `DebugDetach` both wipe it (the log line is `debug: hit ring cleared (attach/detach)`) and bump an internal epoch, so a hit that was still being recorded when the session changed is dropped instead of becoming hit #0 of the next title. A freshly attached title therefore starts with an empty list, and a hit from the previous title can never be presented as this session's.
 - **Recovery matrix (what heals itself, what needs a reboot)**:
   | Situation | Behaviour |
   |---|---|
@@ -249,7 +280,7 @@ Nxus-ox/
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (102 tests)
+    tests/    Cross-language protocol parity & end-to-end test suite (110 tests)
   tests/      Host C unit test suite (1,406 checks across 7 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
@@ -276,9 +307,9 @@ bash tools/build_pc.sh
 # 1. Host C Core Tests (1,406 checks / 7 binaries: scan 797, ptrscan 45, snapshot 75, budget 39, scantypes 275, hotkey 11, session_view 164)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (87 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (112 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (102 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (110 tests)
 cd pc && python -m unittest discover -s tests
 ```

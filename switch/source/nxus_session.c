@@ -74,6 +74,11 @@ typedef struct {
        so serving the previous title's hits after a switch is detectable. */
     u64 hits_owner_pid, hits_owner_program_id;
     u32 hits_owner_session_id;
+    /* Generation of the mapping snapshot the hit indices belong to (see the
+       mapping-generation block below).  A hit stores mapping_idx, an ORDINAL into
+       the published table, so it is only meaningful while that exact table is the
+       one being served - not just while the target identity matches. */
+    u32 hits_owner_mapping_generation;
     bool hits_owner_valid;
 } Session;
 
@@ -90,6 +95,11 @@ static Mutex   g_SessionMutex;
  * out a list from an earlier target (ptrChainOwnerCheck in nxus_server.c); the hit
  * list records its owner here and answers the same question.
  *
+ * The owner also carries the mapping-table generation: mapping_idx is an ordinal
+ * into the snapshot, so a re-snapshot of the SAME target can move it to another
+ * region (see the mapping-generation block below).  Identity and generation are
+ * compared together by nxusSessionHitsMatchTarget().
+ *
  * g_HitsStale is the "discarded, not replaced yet" latch.  Invalidating must not
  * free the hit arrays (the connection thread may be walking them inside sendHits),
  * so the discarded list stays allocated and every accessor refuses to serve it until
@@ -101,14 +111,62 @@ static bool hitsStale(void) {
     return atomic_load_explicit(&g_HitsStale, memory_order_acquire) != 0;
 }
 
+/* ---- mapping-table generation ------------------------------------------
+ *
+ * A hit does not carry an address: it carries mapping_idx - an ORDINAL into the
+ * mapping snapshot - plus an offset inside that mapping, and the PC resolves it as
+ * mapping_bases[mapping_idx] + offset.  The snapshot is replaced on every
+ * re-snapshot (ScanBegin, nxusSessionRefreshMappings(), a failed dmnt query that
+ * drops it), and the new walk is not guaranteed to list mappings in the same order:
+ * a mapping that split, merged or disappeared between the two walks shifts every
+ * later index.  The SAME title therefore hands back a table in which the stored
+ * mapping_idx still "resolves" - just to a different region, i.e. a silently wrong
+ * address that no range check on the PC side can catch.
+ *
+ * The counter below is bumped every time the published table is actually swapped
+ * (mappingSnapshotPublish / mappingSnapshotDrop).  ScanBegin stamps the generation
+ * of the table its own snapshot just published into the hit owner (hitsOwnerStamp),
+ * and nxusSessionHitsMatchTarget() compares it again on every read, so a table from
+ * another generation makes the list unservable exactly like a target change does
+ * (the server's discard path answers BAD_STATE).
+ *
+ * It must NOT change when entries are revalidated in place: a refine pass
+ * (revalidateMappings) updates validity/type in the same array without touching an
+ * index, so the stored mapping_idx stays correct and the refine keeps working.
+ *
+ * Acquire load pairs with the release bump that follows the seqlock publication, so
+ * a reader that observes the new generation also observes the new table (or the
+ * empty view).  Only the connection thread and the thread-safe
+ * nxusSessionInvalidateHits() bump it, and it wraps harmlessly: a wrapped value can
+ * only ever alias a generation 2^32 swaps apart, while the owner stamp is cleared on
+ * every discard and re-stamped on every scan.
+ */
+static atomic_uint g_MappingGeneration;
+
+static u32 mappingGenerationLoad(void) {
+    return (u32)atomic_load_explicit(&g_MappingGeneration, memory_order_acquire);
+}
+
+static void mappingGenerationBump(void) {
+    (void)atomic_fetch_add_explicit(&g_MappingGeneration, 1u, memory_order_release);
+}
+
+/* Generation of the mapping snapshot currently published, 0 before the first one. */
+u32 nxusSessionMappingGeneration(void) {
+    return mappingGenerationLoad();
+}
+
 /* Remember the identity a freshly armed hit list belongs to.  Callers pass the
    session's own cached identity: ScanBegin refreshes it (cacheProcessInfo) and takes
    the mapping snapshot immediately before stamping, so all three describe the same
-   read of the target. */
+   read of the target.  The mapping generation is read HERE, after ScanBegin's
+   snapshotMappings() published the table the worker will scan with and before
+   startJob() runs it - i.e. it names that table, not one published mid-scan. */
 static void hitsOwnerStamp(void) {
     g_Session.hits_owner_pid = g_Session.process_id;
     g_Session.hits_owner_program_id = g_Session.program_id;
     g_Session.hits_owner_session_id = g_Session.session_id;
+    g_Session.hits_owner_mapping_generation = mappingGenerationLoad();
     g_Session.hits_owner_valid = true;
 }
 
@@ -534,6 +592,9 @@ static void mappingSnapshotDrop(void) {
     g_Session.maps.count = 0;
     g_Session.map_entries = NULL;
     viewUpdateEnd();
+    /* An empty table is still a different table: no stored mapping_idx can resolve
+       through it any more, so the hits stamped against the old one are unservable. */
+    mappingGenerationBump();
     viewRetire(old, "mappings");
 }
 
@@ -544,6 +605,11 @@ static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
     viewUpdateEnd();
+    /* New indices: every hit stamped with the previous generation must be refused
+       from here on (nxusSessionHitsMatchTarget compares this, the server logs the
+       two generations and discards).  After viewUpdateEnd, so the bump cannot be
+       observed before the new table is. */
+    mappingGenerationBump();
     viewRetire(old, "mappings");
 }
 
@@ -946,17 +1012,10 @@ const NxusHitList *nxusSessionHits(void) {
     return &g_Session.hits;
 }
 
-/* Does the retained hit list still belong to the target the session is on?
-   See the ownership block at the top of this file and the contract in
-   nxus_session.h. */
-bool nxusSessionHitsMatchTarget(void) {
-    /* A discarded list is not replaced until a new scan arms one, and it must stay
-       refused in the meantime (the arrays are still there, see
-       nxusSessionInvalidateHits). */
-    if (hitsStale()) return false;
-    /* Nothing was ever built for a target: nothing can be stale. */
-    if (!g_Session.hits_owner_valid) return true;
-
+/* Identity half of the ownership check (pid / program id / scan generation), shared
+   by the full match and by the identity-only variant the main-thread tick uses.  The
+   caller has already checked hitsStale() and hits_owner_valid. */
+static bool hitsOwnerIdentityMatches(void) {
     if (g_Session.hits_owner_pid != 0) {
         /* Both sides know a pid, so that is the identity.  The program id is only
            compared when BOTH sides have one: an explicit DebugAttach can leave it 0
@@ -973,6 +1032,56 @@ bool nxusSessionHitsMatchTarget(void) {
        the only per-target token the session publishes, because nxusSessionId()
        changes on every ScanBegin/Reset. */
     return g_Session.hits_owner_session_id == g_Session.session_id;
+}
+
+/* Can the retained hit list still be served?  Two independent things have to hold:
+   the list must belong to the target the session is on, and it must have been
+   stamped against the mapping snapshot that is published now (its mapping_idx is an
+   ordinal into THAT table).  See the ownership and mapping-generation blocks at the
+   top of this file, and the contract in nxus_session.h. */
+bool nxusSessionHitsMatchTarget(void) {
+    /* A discarded list is not replaced until a new scan arms one, and it must stay
+       refused in the meantime (the arrays are still there, see
+       nxusSessionInvalidateHits). */
+    if (hitsStale()) return false;
+    /* Nothing was ever built for a target: nothing can be stale. */
+    if (!g_Session.hits_owner_valid) return true;
+
+    /* The mapping snapshot was replaced after this list was stamped.  mapping_idx is
+       an ordinal into that table, so even for the SAME target it now names a
+       different region - the addresses would look perfectly valid and be wrong.
+       Refusing here is what the server's discard path turns into BAD_STATE. */
+    if (g_Session.hits_owner_mapping_generation != mappingGenerationLoad()) return false;
+
+    return hitsOwnerIdentityMatches();
+}
+
+/* The identity half of nxusSessionHitsMatchTarget(), without the mapping generation.
+   The 1 Hz identity tick uses it: a ScanBegin publishes its table BEFORE it stamps the
+   owner (and so do the other re-snapshot call sites, which then use that table in the
+   same call).  Acting on the intermediate "new table, old stamp" state would drop the
+   very table that command is building; the connection-thread readers
+   (fillStatus / sendHits / ScanNext) are serialized with those publications and do
+   compare the generation, so nothing is served stale. */
+bool nxusSessionHitsMatchTargetIdentity(void) {
+    if (hitsStale()) return false;
+    if (!g_Session.hits_owner_valid) return true;
+    return hitsOwnerIdentityMatches();
+}
+
+/* Was the stored list refused ONLY because the table was rebuilt under it?  This
+   lets the server name the cause (and both generations) in its log line instead of
+   reporting every refusal as a target change.  Returns false for a list that was
+   never stamped or is already discarded, so a stale latch does not masquerade as a
+   rebuild. */
+bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current_generation) {
+    const u32 current = mappingGenerationLoad();
+    const bool stamped = g_Session.hits_owner_valid;
+    const u32 owner = stamped ? g_Session.hits_owner_mapping_generation : 0;
+    if (owner_generation != NULL) *owner_generation = owner;
+    if (current_generation != NULL) *current_generation = current;
+    if (hitsStale() || !stamped) return false;
+    return owner != current;
 }
 
 void nxusSessionInvalidateHits(void) {
@@ -1716,7 +1825,9 @@ Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsil
        discarded (hitsStale): the arrays are still in memory but must not be refined,
        and a baseline that belongs to the old target must not be either. */
     if (!nxusSessionHitsMatchTarget()) {
-        NXUS_LOG("refine: the hit list belongs to an earlier target - discarding");
+        /* Either an earlier target or a rebuilt mapping table: in both cases the
+           stored addresses/indices no longer describe what a refine would read. */
+        NXUS_LOG("refine: the stored hit list no longer matches the target/mapping table - discarding");
         nxusSessionInvalidateHits();
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
