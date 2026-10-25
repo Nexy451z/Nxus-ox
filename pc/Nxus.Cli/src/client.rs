@@ -846,6 +846,20 @@ impl NxusClient {
 
     // ---- freeze ----
 
+    /// Current frozen entries (`FROZEN_LIST`, i.e. `NxusCmd_FrozenList`).
+    ///
+    /// The console answers with a bare `NxusFrozenEntry[]`; the count is implied
+    /// by the payload length, so [`parse_frozen_list`] derives it.  An empty
+    /// payload is a valid answer ("nothing is frozen").  The server also pages
+    /// the list when the request carries a `NxusMappingsRequest`
+    /// (offset u64, max_count u32), but dmnt's table is capped at 0x80 entries
+    /// and the default page already covers it, so the empty request asks for the
+    /// first page with the server's default count.
+    pub fn frozen_list(&self) -> Result<Vec<FrozenEntry>> {
+        let (_, body) = self.request(cmd::FROZEN_LIST, &[])?;
+        Ok(parse_frozen_list(&body))
+    }
+
     pub fn frozen_enable(&self, address: u64, width: u32) -> Result<u64> {
         let mut payload = Vec::new();
         put_u64(&mut payload, address);

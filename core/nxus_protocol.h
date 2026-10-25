@@ -532,10 +532,21 @@ typedef struct NXUS_PACKED {
     u64 fp;
     u32 cpsr;
     u32 r[13];        /* r0..r12 / x0..x12 low halves */
-    u32 reserved;
+    u32 reserved;     /* NXUS_THREADCTX_FLAG_* */
     u64 x[29];        /* x0..x28 full 64-bit general-purpose registers */
 } NxusThreadContext;
 NXUS_STATIC_ASSERT(sizeof(NxusThreadContext) == 332, "NxusThreadContext must be 332 bytes");
+
+/* NxusThreadContext.reserved flags.  The field is a bit set, not padding:
+   bit0 (NXUS_THREADCTX_FLAG_AARCH32) marks an AArch32 context.  A 32-bit title
+   reports zeros in the sp/lr/fp header fields; the live SP, LR and FP are
+   cpu_gprs[13], cpu_gprs[14] and cpu_gprs[11], which nxusDebugGetRegs() mirrors
+   into x[13]/x[14]/x[11] (the r[] alias covers r0..r12 only).
+   Bit 0 already means "x[0..28] is authoritative" in the RegsSet direction
+   (both PC encoders hard-code it as 1), so AArch32 uses bit 1: the reply can
+   carry it without changing the meaning of any existing request bit. */
+#define NXUS_THREADCTX_FLAG_X_AUTHORITATIVE 0x0001u   /* request (RegsSet) */
+#define NXUS_THREADCTX_FLAG_AARCH32         0x0002u   /* reply (GetRegs) */
 
 typedef struct NXUS_PACKED {
     u32 attached;         /* 0/1 */

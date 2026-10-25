@@ -50,6 +50,19 @@ pub mod cmd {
     pub const FROZEN_ENABLE: u16 = 0x0041;
     pub const FROZEN_DISABLE: u16 = 0x0042;
 
+    // Intentionally undefined here (not an oversight):
+    //
+    //   NxusCmd_CheatList   = 0x0043
+    //   NxusCmd_CheatToggle = 0x0044
+    //   NxusCmd_ProbeRun    = 0x0070
+    //   NxusCmd_ProbeGet    = 0x0071
+    //
+    // Those ids exist in core/nxus_protocol.h, but the C server
+    // (switch/source/nxus_server.c) has no `case` for any of them: they fall
+    // through to `default:` and answer NXUS_ERR_UNSUPPORTED.  Mirroring them as
+    // constants would only invite client calls the console must reject, so they
+    // stay out until the console implements them.
+
     pub const DEBUG_ATTACH: u16 = 0x0050;
     pub const DEBUG_DETACH: u16 = 0x0051;
     pub const DEBUG_STATUS: u16 = 0x0052;
@@ -603,6 +616,50 @@ pub struct PtrChain {
     pub root_offset: u32,
     pub final_offset: u32,
     pub steps: Vec<u32>,
+}
+
+/// One entry of a `FROZEN_LIST` reply (C: `NxusFrozenEntry`).
+///
+/// `core/nxus_protocol.h` declares it as
+/// `typedef struct NXUS_PACKED { u64 address; u64 value; u32 width; u32 reserved; }`,
+/// so one record is 24 bytes on the wire (`pc/nxus/protocol.py` agrees:
+/// `struct.Struct('<QQII')`).  The trailing `reserved` word has no field here -
+/// it only pads the stride and is always zero from the server - but it must be
+/// counted in [`FrozenEntry::SIZE`] or every entry after the first decodes
+/// shifted by 4 bytes.
+#[derive(Debug, Clone, Default)]
+pub struct FrozenEntry {
+    pub address: u64,
+    /// Value the console is holding the address at (the frozen value).
+    pub value: u64,
+    /// Frozen width in bytes (1/2/4/8), the same field `FrozenEnable` takes.
+    pub width: u32,
+}
+
+impl FrozenEntry {
+    /// Wire stride = `sizeof(NxusFrozenEntry)` = address + value + width + reserved.
+    pub const SIZE: usize = 24;
+
+    pub fn parse(data: &[u8]) -> FrozenEntry {
+        FrozenEntry {
+            address: rd_u64(data, 0),
+            value: rd_u64(data, 8),
+            width: rd_u32(data, 16),
+            // data[20..24] is the reserved word: skipped on purpose.
+        }
+    }
+}
+
+/// Decode a `FROZEN_LIST` reply.
+///
+/// The C server (`NxusCmd_FrozenList` in switch/source/nxus_server.c) answers
+/// with a plain `NxusFrozenEntry[]` whose length is `count * sizeof(NxusFrozenEntry)`;
+/// there is no count field in the reply, so the entry count is the payload
+/// length divided by the stride.  `chunks_exact` drops a trailing partial
+/// record: a cut-off reply yields the complete entries it does contain instead
+/// of a half-decoded last one.
+pub fn parse_frozen_list(data: &[u8]) -> Vec<FrozenEntry> {
+    data.chunks_exact(FrozenEntry::SIZE).map(FrozenEntry::parse).collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2308,6 +2365,11 @@ mod tests {
         // the range list that NXUS_SCAN_F_RANGES introduces
         assert_eq!(header_size(HEADER, "NxusRangeListHeader"), Some(RANGE_LIST_HEADER_SIZE as u32));
         assert_eq!(header_size(HEADER, "NxusRangeEntry"), Some(RANGE_ENTRY_SIZE as u32));
+        // NxusFrozenEntry has no NXUS_STATIC_ASSERT in the header (unlike its
+        // NxusFrozenRequest sibling): its fields are {u64 address; u64 value;
+        // u32 width; u32 reserved}, i.e. 24 packed bytes, matching protocol.py's
+        // '<QQII'.  Pin the stride here so either side drifting fails the test.
+        assert_eq!(FrozenEntry::SIZE, 24);
     }
 
     #[test]

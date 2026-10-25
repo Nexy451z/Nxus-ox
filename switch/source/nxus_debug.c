@@ -1370,6 +1370,9 @@ Result nxusDebugGetRegs(u64 thread_id, NxusThreadContext *out) {
         out->lr = ctx.cpu_gprs[14].r;
         out->fp = ctx.cpu_gprs[11].r;
         for (u32 i = 0; i < 15; i++) out->x[i] = ctx.cpu_gprs[i].r;
+        /* Tell the client explicitly instead of making it guess from sp/lr being
+           zero: a 32-bit title's real SP may legitimately be 0 in a fault frame. */
+        out->reserved |= NXUS_THREADCTX_FLAG_AARCH32;
     } else {
         out->lr = ctx.lr;
         out->sp = ctx.sp;

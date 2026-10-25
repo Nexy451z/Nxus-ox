@@ -2,9 +2,13 @@
 
 This exists so the whole wire protocol, the client and the tooling can be
 developed and tested before the console arrives.  It mirrors the semantics of
-switch/source/nxus_server.c, including:
+switch/source/nxus_server.c and core/nxus_scan.c, including:
   * mapping enumeration and absolute/relative hit conversion
   * first / refine scan passes with in-place compaction
+  * the full nxusCompareBytes() rule set (float + epsilon, signed, Between,
+    Unknown, change modes, UTF-16 / case-insensitive patterns, aligned walks)
+  * the asynchronous scan worker: Running + progress_permille, BUSY while it
+    runs, Cancel/Reset (opt in with MockSwitch(scan_async=True))
   * pause + heartbeat + watchdog auto-resume (emitting NxusEvent_AutoResume)
   * error Results encoded as NXUS_MAKE_RESULT(...)
 """
@@ -97,56 +101,234 @@ class MockTarget:
 
 
 # --- scan helpers --------------------------------------------------------
+#
+# The comparison rules below are a transcription of nxusCompareBytes() in
+# core/nxus_scan.c (the console is the authority): float/epsilon, signed,
+# Between, Unknown, and the six change modes all have to answer exactly like the
+# firmware, otherwise a mock scan "finds nothing" where the console finds a hit
+# (or the other way round) and the PC-side code is validated against a lie.
 
 def _load_value(raw: bytes, size: int) -> int:
     return int.from_bytes(raw[:size], 'little')
 
 
-def _compare(cur: bytes, prev: bytes | None, target: int, size: int, mode: int, flags: int = 0) -> bool:
-    c = _load_value(cur, size)
-    if flags & P.SCAN_F['NXUS_SCAN_F_SIGNED']:
-        bits = size * 8
-        if c >= (1 << (bits - 1)):
-            c -= (1 << bits)
-    t = target
-    if flags & P.SCAN_F['NXUS_SCAN_F_SIGNED'] and t >= (1 << (size * 8 - 1)):
-        t -= (1 << (size * 8))
-    p = _load_value(prev, size) if prev else 0
-    if prev and (flags & P.SCAN_F['NXUS_SCAN_F_SIGNED']):
-        bits = size * 8
-        if p >= (1 << (bits - 1)):
-            p -= (1 << bits)
+def _unsigned_of(value: int, size: int) -> int:
+    return value & ((1 << (size * 8)) - 1)
 
-    if mode == P.CMP['NxusCmp_Equal']:
+
+def _signed_of(value: int, size: int) -> int:
+    """Sign-extend the low `size` bytes (loadSignedLE(), nxus_scan.c:13-31)."""
+    bits = size * 8
+    value &= (1 << bits) - 1
+    return value - (1 << bits) if value >= (1 << (bits - 1)) else value
+
+
+def _load_signed(raw: bytes, size: int) -> int:
+    return _signed_of(_load_value(raw, size), size)
+
+
+def _as_f32(bits: int) -> float:
+    """bitsToF32() (nxus_scan.c:39-44): the value widens to double for compare."""
+    return struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+
+
+def _as_f64(bits: int) -> float:
+    return struct.unpack('<d', struct.pack('<Q', bits & 0xFFFFFFFFFFFFFFFF))[0]
+
+
+def _fold_case(byte: int) -> int:
+    """foldCase() (nxus_scan.c:261-263): ASCII only, exactly like the console."""
+    return byte + 32 if 0x41 <= byte <= 0x5A else byte
+
+
+def fuzzy_epsilon_bits(value_type: int, value_size: int, epsilon_decimals: int) -> int:
+    """fuzzyEpsilonBits() (nxus_scan.c:625-640).
+
+    A FuzzyEqual request that leaves target2 at 0 (what the GUI/CLI send) takes
+    its epsilon from epsilon_decimals (default 2).  The epsilon is divided out
+    step by step on purpose: 1.0/10.0/10.0 is not the same double as 1.0/100.0,
+    and the console compares against the repeated-division value.
+    """
+    decimals = epsilon_decimals if epsilon_decimals > 0 else 2
+    if decimals > 9:
+        decimals = 9
+    eps = 1.0
+    for _ in range(decimals):
+        eps /= 10.0
+    if value_type == P.VT_F64 or (value_type == 0 and value_size == 8):
+        return struct.unpack('<Q', struct.pack('<d', eps))[0]
+    eps32 = struct.unpack('<f', struct.pack('<f', eps))[0]      # `float e = (float)eps`
+    return struct.unpack('<I', struct.pack('<f', eps32))[0]
+
+
+class NotImplementedScan(Exception):
+    """A scan shape this mock cannot decide.
+
+    Raised instead of answering False: a comparison that always says "no" is
+    indistinguishable from "value not found" on the PC, so an unsupported shape
+    would look like a successful, empty scan.  The scan handlers turn this into
+    an explicit NXUS_ERR_NOT_IMPLEMENTED error result instead.
+    """
+
+
+_CMP = P.CMP
+_NUMERIC_CMP_MODES = frozenset(_CMP.values())
+
+
+def _compare(cur: bytes, prev: bytes | None, target: int, size: int, mode: int,
+             flags: int = 0, target2: int = 0, epsilon_decimals: int = 0,
+             value_type: int = 0) -> bool:
+    """nxusCompareBytes() (core/nxus_scan.c:50-148), branch for branch.
+
+    `cur` / `prev` are raw little-endian value bytes (`prev is None` on a first
+    pass, which is why Increased/Changed/... answer False there), `target` is the
+    scan value and `target2` the second operand: the Between upper bound, the
+    float epsilon *bits*, or the |difference| wanted by Different.
+    """
+    if cur is None or size == 0 or size > 8:
+        return False
+
+    if flags & P.SCAN_F_FLOAT:
+        # The engine sizes a float compare from the type, not from value_size:
+        # anything but 8 bytes is a 4-byte float (compareTyped / patternFromRequest).
+        wide = size == 8
+        conv = _as_f64 if wide else _as_f32
+        c = conv(_load_value(cur, size))
+        t = conv(target)
+        eps_bits = target2
+        if mode == _CMP['NxusCmp_FuzzyEqual'] and eps_bits == 0:
+            eps_bits = fuzzy_epsilon_bits(value_type, size, epsilon_decimals)
+        eps = conv(eps_bits)
+        p = conv(_load_value(prev, size)) if prev is not None else 0.0
+
+        # |c - t| <= eps is written as two deltas: (Inf - Inf) is NaN, so testing
+        # c == t first is what lets an Is-Infinity scan match (nxus_scan.c:67-69).
+        equal = c == t or ((c - t) <= eps and (t - c) <= eps)
+        if mode in (_CMP['NxusCmp_Equal'], _CMP['NxusCmp_FuzzyEqual']):
+            return equal
+        if mode == _CMP['NxusCmp_NotEqual']:
+            return not equal
+        if mode == _CMP['NxusCmp_Greater']:
+            return c > t
+        if mode == _CMP['NxusCmp_Less']:
+            return c < t
+        if mode == _CMP['NxusCmp_GreaterOrEqual']:
+            return c >= t
+        if mode == _CMP['NxusCmp_LessOrEqual']:
+            return c <= t
+        if mode == _CMP['NxusCmp_Increased']:
+            return prev is not None and c > p
+        if mode == _CMP['NxusCmp_Decreased']:
+            return prev is not None and c < p
+        if mode == _CMP['NxusCmp_Unchanged']:
+            return prev is not None and c == p
+        if mode == _CMP['NxusCmp_Changed']:
+            return prev is not None and c != p
+        if mode == _CMP['NxusCmp_Different']:
+            if prev is None:
+                return False
+            diff = (c - p) if c >= p else (p - c)
+            return (diff - t) <= eps and (t - diff) <= eps
+        if mode == _CMP['NxusCmp_Between']:
+            hi = conv(target2)          # raw bits: no epsilon derivation here
+            return c >= t and c <= hi
+        if mode == _CMP['NxusCmp_Unknown']:
+            return True
+        raise NotImplementedScan(f'float compare mode {mode}')
+
+    if flags & P.SCAN_F_SIGNED:
+        c = _load_signed(cur, size)
+        t = _load_signed(target.to_bytes(8, 'little'), size)
+        p = _load_signed(prev, size) if prev is not None else 0
+        if mode == _CMP['NxusCmp_Equal']:
+            return c == t
+        if mode == _CMP['NxusCmp_NotEqual']:
+            return c != t
+        if mode == _CMP['NxusCmp_Greater']:
+            return c > t
+        if mode == _CMP['NxusCmp_Less']:
+            return c < t
+        if mode == _CMP['NxusCmp_GreaterOrEqual']:
+            return c >= t
+        if mode == _CMP['NxusCmp_LessOrEqual']:
+            return c <= t
+        if mode == _CMP['NxusCmp_Increased']:
+            return prev is not None and c > p
+        if mode == _CMP['NxusCmp_Decreased']:
+            return prev is not None and c < p
+        if mode == _CMP['NxusCmp_Unchanged']:
+            return prev is not None and c == p
+        if mode == _CMP['NxusCmp_Changed']:
+            return prev is not None and c != p
+        if mode == _CMP['NxusCmp_Different']:
+            if prev is None:
+                return False
+            diff = (c - p) if c >= p else (p - c)
+            return diff == abs(t)
+        if mode == _CMP['NxusCmp_Between']:
+            # the engine compares the upper bound as a *64-bit* signed value, not
+            # truncated to value_size (nxus_scan.c:117)
+            hi = _signed_of(target2, 8)
+            return c >= t and c <= hi
+        if mode == _CMP['NxusCmp_Unknown']:
+            return True
+        raise NotImplementedScan(f'signed compare mode {mode}')
+
+    c = _load_value(cur, size)
+    t = _unsigned_of(target, size)
+    p = _load_value(prev, size) if prev is not None else 0
+    if mode == _CMP['NxusCmp_Equal']:
         return c == t
-    if mode == P.CMP['NxusCmp_NotEqual']:
+    if mode == _CMP['NxusCmp_NotEqual']:
         return c != t
-    if mode == P.CMP['NxusCmp_Greater']:
+    if mode == _CMP['NxusCmp_Greater']:
         return c > t
-    if mode == P.CMP['NxusCmp_Less']:
+    if mode == _CMP['NxusCmp_Less']:
         return c < t
-    if mode == P.CMP['NxusCmp_GreaterOrEqual']:
+    if mode == _CMP['NxusCmp_GreaterOrEqual']:
         return c >= t
-    if mode == P.CMP['NxusCmp_LessOrEqual']:
+    if mode == _CMP['NxusCmp_LessOrEqual']:
         return c <= t
-    if mode == P.CMP['NxusCmp_Increased']:
+    if mode == _CMP['NxusCmp_Increased']:
         return prev is not None and c > p
-    if mode == P.CMP['NxusCmp_Decreased']:
+    if mode == _CMP['NxusCmp_Decreased']:
         return prev is not None and c < p
-    if mode == P.CMP['NxusCmp_Unchanged']:
+    if mode == _CMP['NxusCmp_Unchanged']:
         return prev is not None and c == p
-    if mode == P.CMP['NxusCmp_Changed']:
+    if mode == _CMP['NxusCmp_Changed']:
         return prev is not None and c != p
-    if mode == P.CMP['NxusCmp_Different']:
-        return prev is not None and abs(c - p) == abs(t)
-    return False
+    if mode == _CMP['NxusCmp_Different']:
+        if prev is None:
+            return False
+        diff = (c - p) if c >= p else (p - c)
+        return diff == t
+    if mode == _CMP['NxusCmp_Between']:
+        return c >= t and c <= target2
+    if mode == _CMP['NxusCmp_Unknown']:
+        return True
+    raise NotImplementedScan(f'unsigned compare mode {mode}')
 
 
 # --- server --------------------------------------------------------------
 
 class MockSwitch:
     def __init__(self, host: str = '127.0.0.1', port: int = 0, watchdog_ms: int = 15000,
-                 money: int = 6440):
+                 money: int = 6440, scan_async: bool = False):
+        # A real scan is a worker thread (nxus_session.c:891-919): ScanBegin
+        # answers with NxusScanState_Running, the PC polls ScanStatus and watches
+        # progress_permille climb, and ScanGetHits / SnapshotCapture /
+        # PtrScanBegin answer BUSY until the worker publishes Done.
+        #
+        # scan_async=True selects that behaviour.  The default stays the direct
+        # completion the Python client tests assume (they read the hit list
+        # straight after ScanBegin); the Rust CLI exercises the polled path via
+        # scan_wait(), so both shapes remain testable.
+        self.scan_async = bool(scan_async)
+        self._scan_ticks = 0
+        self._pending_hits = None
+        self.scan_patterned = False       # hits came from a String/Bytes pattern
+        self.epsilon = 0                  # NxusScanExt.epsilon_decimals
+        self._wildcard_mask = None        # mask bytes that follow a '??' pattern
         self.target = MockTarget(money)
         self.watchdog_ms = watchdog_ms
         self.hits: list[tuple[int, int, bytes]] = []   # (mapping_idx, offset, value bytes)
@@ -196,6 +378,7 @@ class MockSwitch:
         self.scan_state = P.SCAN_STATE['NxusScanState_Idle']
         self.session_id = 0
         self.progress = 0
+        self.scan_last_result = 0       # NxusStatus.last_result while scanning
         self.paused = False
         self.last_heartbeat = time.time()
         self.log = []
@@ -407,7 +590,12 @@ class MockSwitch:
     # ---- command handling ----
 
     def _error(self, desc: int):
-        return (P.FLAG_ERROR, struct.pack('<i', struct.unpack('<i', struct.pack('<I', P.make_result(desc)))[0]))
+        return (P.FLAG_ERROR, struct.pack('<i', self._result_i32(desc)))
+
+    @staticmethod
+    def _result_i32(desc: int) -> int:
+        """NXUS_MAKE_RESULT(...) as the signed i32 the wire carries."""
+        return struct.unpack('<i', struct.pack('<I', P.make_result(desc)))[0]
 
     def _status(self) -> bytes:
         flags = 0
@@ -420,9 +608,13 @@ class MockSwitch:
         if self.stopped_thread:
             flags |= P.ST['NXUS_ST_DEBUG_STOPPED']
         flags |= P.ST['NXUS_ST_HAS_PROCESS']
+        # NxusStatus as fillStatus() fills it (nxus_server.c:104-160): the scan
+        # state, the hit count and progress_permille, plus last_result for the
+        # Error case.  The scan *session id* is not part of this struct - it
+        # travels in NxusHitBatchHeader (see _get_hits()).
         return P.STATUS.pack(P.PROTO_VERSION, P.MODE['NXUS_MODE_DMNT'], flags, self.scan_state,
                              0x1234, 0x0100C3800049C000, MAIN_BASE, MAIN_SIZE,
-                             len(self.hits), self.progress, 0, 1234,
+                             len(self.hits), self.progress, self.scan_last_result, 1234,
                              0, 8 * 1024 * 1024, self.max_read)
 
     def _handle(self, cmd: int, payload: bytes):
@@ -439,6 +631,9 @@ class MockSwitch:
             self.paused = False
             return b''
         if cmd in (P.CMD['GetStatus'], P.CMD['ScanStatus']):
+            # Both answer NxusStatus (fillStatus(), nxus_server.c:1060-1065), so
+            # both are a chance for the PC to watch the worker advance.
+            self._advance_scan()
             return self._status()
         if cmd == P.CMD['GetMetadata']:
             return P.PROCESS_METADATA.pack(0x1234, 0x0100C3800049C000,
@@ -490,6 +685,10 @@ class MockSwitch:
         if cmd == P.CMD['GetProcesses']:
             return struct.pack('<2Q', 0x51, 0x82)
         if cmd == P.CMD['SnapshotCapture']:
+            # Snapshot preparation rebuilds the arrays the scan worker reads, so a
+            # running scan is refused first (nxus_server.c:1102-1108).
+            if self._scan_running():
+                return self._error(P.ERR_BUSY)
             return self._snapshot_capture(payload)
         if cmd == P.CMD['SnapshotDiff']:
             from_slot, to_slot = 0, 1
@@ -610,6 +809,10 @@ class MockSwitch:
             self.break_hits = []
             return b''
         if cmd == P.CMD['PtrScanBegin']:
+            # the pointer scan walks the same mapping/region arrays (BUSY gate of
+            # nxus_server.c:1168-1175)
+            if self._scan_running():
+                return self._error(P.ERR_BUSY)
             return self._ptr_scan(payload)
         if cmd == P.CMD['PtrScanGet']:
             return self._chain_list()
@@ -634,16 +837,29 @@ class MockSwitch:
         if cmd == P.CMD['ScanNext']:
             return self._scan_next(payload)
         if cmd == P.CMD['ScanCancel']:
-            if self.scan_state == P.SCAN_STATE['NxusScanState_Running']:
+            if self._scan_running():
+                # nxusSessionScanCancel(): the worker stops at the next block
+                # boundary and publishes Cancelled; a cancelled pass must not
+                # surface as a complete hit list.
                 self.scan_state = P.SCAN_STATE['NxusScanState_Cancelled']
+                self._pending_hits = None
+                self._scan_ticks = 0
+                self.hits = []
+                self.progress = 0
+                self.scan_last_result = 0
             return b''
         if cmd == P.CMD['ScanReset']:
             self.hits = []
             self.prev_scan_hits = []
+            self._pending_hits = None
+            self._scan_ticks = 0
             self.scan_state = P.SCAN_STATE['NxusScanState_Idle']
             self.progress = 0
+            self.scan_last_result = 0
             return b''
         if cmd == P.CMD['ScanUndo']:
+            if self._scan_running():
+                return self._error(P.ERR_BUSY)      # nxusSessionScanUndo()
             if not getattr(self, 'prev_scan_hits', None):
                 return self._error(P.ERR_BAD_STATE)
             self.hits = list(self.prev_scan_hits)
@@ -652,6 +868,10 @@ class MockSwitch:
             self.progress = 1000
             return self._status()
         if cmd == P.CMD['ScanGetHits']:
+            # reading the hit arrays while the worker reallocs them would be a
+            # use-after-free on the console, so it answers BUSY (nxus_server.c:1088)
+            if self._scan_running():
+                return self._error(P.ERR_BUSY)
             return self._get_hits(payload)
         if cmd == P.CMD['FrozenList']:
             return b''
@@ -1012,9 +1232,114 @@ class MockSwitch:
             out.append((idx, m, begin, end))
         return out
 
+    # A worker on the console takes tens of milliseconds; the PC-side
+    # scan_wait() poll loop only needs a bounded, observable climb.  One step per
+    # ScanStatus / GetStatus read, done after this many of them.
+    _SCAN_POLLS_TO_DONE = 32
+
+    def _scan_running(self) -> bool:
+        return self.scan_state == P.SCAN_STATE['NxusScanState_Running']
+
+    def _advance_scan(self):
+        """Publish scan progress the way the worker does (nxus_session.c:852-883).
+
+        Called from every NxusStatus read (ScanStatus and GetStatus both answer
+        fillStatus()).  The last step installs the results, sets Done and writes
+        the console's statistics line - the ordering the PC relies on: a reader
+        that sees "not Running" also sees the final hit list and progress 1000.
+        """
+        if not self.scan_async or not self._scan_running():
+            return
+        self._scan_ticks += 1
+        self.progress = min(1000, (self._scan_ticks * 1000) // self._SCAN_POLLS_TO_DONE)
+        if self._scan_ticks >= self._SCAN_POLLS_TO_DONE:
+            self._finish_scan()
+
+    def _finish_scan(self):
+        self.hits = self._pending_hits or []
+        self._pending_hits = None
+        self._scan_ticks = 0
+        self.progress = 1000
+        self.scan_last_result = 0
+        self.scan_state = P.SCAN_STATE['NxusScanState_Done']
+        self._log_scan_done()
+
+    def _log_scan_done(self):
+        """The console's own statistics line (nxus_session.c:879-883)."""
+        self.log.append(f"scan done: state={self.scan_state} hits={len(self.hits)} "
+                        f"candidates={len(self.hits)} reads=1 bytes=0 dropped=0")
+
+    def _scan_rejected(self, reason: str):
+        """Refuse a scan shape explicitly instead of reporting zero hits."""
+        self.hits = []
+        self._pending_hits = None
+        self._scan_ticks = 0
+        self.progress = 0
+        self.scan_last_result = self._result_i32(P.ERR_NOT_IMPLEMENTED)
+        self.scan_state = P.SCAN_STATE['NxusScanState_Error']
+        self.log.append(f"scan rejected: {reason}")
+        return self._error(P.ERR_NOT_IMPLEMENTED)
+
+    def _check_scan_supported(self, value_type: int, cmp_mode: int, patterned: bool,
+                              refine: bool = False):
+        """Reject what this mock cannot decide, so it can never look like a
+        successful empty scan (see NotImplementedScan)."""
+        if patterned:
+            if refine:
+                raise NotImplementedScan('refining a String/Bytes pattern hit list')
+            # The engine also allows NotEqual/Changed/Unchanged for patterns
+            # (nxus_scan.c:718-729); this mock only searches for a match.
+            if cmp_mode != _CMP['NxusCmp_Equal']:
+                raise NotImplementedScan(f'pattern scan with compare mode {cmp_mode}')
+            return
+        if value_type == P.VT_ALL:
+            # window 8 / stride 4: the engine reports only the widest numeric
+            # value, which this mock does not model.
+            raise NotImplementedScan('NxusValueType_All scans')
+        if cmp_mode not in _NUMERIC_CMP_MODES:
+            raise NotImplementedScan(f'compare mode {cmp_mode}')
+
+    def _pattern_hits(self, data: bytes, base_off: int, idx: int, pattern: bytes,
+                      flags: int):
+        """matchPatternAt() (nxus_scan.c:265-288): strings are ASCII or UTF-16LE
+        (high byte zero), optionally case-folded; byte patterns honour '??'
+        wildcards through the mask that follows them in the payload."""
+        fold = bool(flags & P.SCAN_F_CASE_INSENS)
+        utf16 = bool(flags & P.SCAN_F_UTF16)
+        window = len(pattern) * 2 if utf16 else len(pattern)
+        mask = b'\xff' * len(pattern)
+        if flags & P.SCAN_F_WILDCARD and self._wildcard_mask is not None:
+            mask = self._wildcard_mask
+        hits = []
+        for off in range(0, len(data) - window + 1):
+            if utf16 or fold:
+                ok = True
+                for i, want in enumerate(pattern):
+                    at = off + i * 2 if utf16 else off + i
+                    got = data[at]
+                    if utf16 and data[at + 1] != 0:
+                        ok = False
+                        break
+                    if fold:
+                        want, got = _fold_case(want), _fold_case(got)
+                    if want != got:
+                        ok = False
+                        break
+            else:
+                ok = True
+                for i, want in enumerate(pattern):
+                    if ((data[off + i] ^ want) & mask[i]) != 0:
+                        ok = False
+                        break
+            if ok:
+                hits.append((idx, base_off + off, pattern))
+        return hits
+
     def _scan_begin(self, payload: bytes):
         kind, value_size, cmp_mode, scope, range_begin, range_end, target, target2, _chunk, flags = \
             P.SCAN_REQUEST.unpack_from(payload, 0)
+        if self._scan_running():
+            return self._error(P.ERR_BUSY)      # nxusSessionScanBegin(): worker alive
         if value_size not in (1, 2, 4, 8):
             return self._error(P.ERR_UNSUPPORTED)
 
@@ -1032,87 +1357,159 @@ class MockSwitch:
 
         value_type = P.VT_U32
         pattern = b''
+        epsilon = 0
+        self._wildcard_mask = None
         if len(payload) >= tail + P.SCAN_EXT.size:
-            value_type, pattern_len, _eps, _res = P.SCAN_EXT.unpack_from(payload, tail)
+            value_type, pattern_len, epsilon, _res = P.SCAN_EXT.unpack_from(payload, tail)
             start = tail + P.SCAN_EXT.size
             pattern = bytes(payload[start:start + pattern_len])
+            if pattern and (flags & P.SCAN_F_WILDCARD):
+                # the mask lives right after the pattern, at pattern + pattern_len
+                mask_at = start + pattern_len
+                self._wildcard_mask = bytes(payload[mask_at:mask_at + pattern_len])
+                if len(self._wildcard_mask) != len(pattern):
+                    return self._error(P.ERR_BAD_STATE)
 
         if scope == P.SCOPE['NxusScope_Ranges'] and not ranges:
             # the console rejects this instead of scanning nothing (nxus_server.c)
             return self._error(P.ERR_BAD_STATE)
 
+        # A float compare is sized by the value type, not by value_size
+        # (compareTyped(), nxus_scan.c:291-301).
+        if value_type == P.VT_F64:
+            value_size = 8
+        elif value_type == P.VT_F32 or (flags & P.SCAN_F_FLOAT):
+            value_size = 8 if value_size == 8 else 4
+
+        patterned = bool(pattern) and value_type in (P.VT_STRING, P.VT_BYTES, P.VT_BINARY)
+        job = dict(value_type=value_type, value_size=value_size, cmp_mode=cmp_mode,
+                   flags=flags, target=target, target2=target2, epsilon=epsilon,
+                   pattern=pattern, patterned=patterned, scope=scope,
+                   range_begin=range_begin, range_end=range_end, ranges=ranges)
+
         self.value_size = value_size
         self.value_type = value_type
         self.pattern = pattern
+        self.epsilon = epsilon
+        self.scan_patterned = patterned
         self.hits = []
+        self._pending_hits = None
+        self._scan_ticks = 0
         self.prev_scan_hits = []
         self.progress = 0
+        self.scan_last_result = 0
         self.session_id += 1
 
-        for idx, m, begin, end in self._regions(scope, range_begin, range_end, ranges):
+        try:
+            self._check_scan_supported(value_type, cmp_mode, patterned)
+            hits = self._first_pass_hits(job)
+        except NotImplementedScan as exc:
+            return self._scan_rejected(str(exc))
+
+        return self._publish_scan(hits)
+
+    def _first_pass_hits(self, job: dict) -> list:
+        hits = []
+        # compareTyped(): the value type decides whether a float compare happens
+        cmp_flags = job['flags']
+        if job['value_type'] in (P.VT_F32, P.VT_F64):
+            cmp_flags |= P.SCAN_F_FLOAT
+        step = job['value_size']
+        for idx, m, begin, end in self._regions(job['scope'], job['range_begin'],
+                                                job['range_end'], job['ranges']):
             # hits carry MAPPING-relative offsets (as on the console): the window is
             # clipped, the offsets are not
             base_off = begin - m['base']
             data = bytes(m['buf'][base_off:end - m['base']])
 
-            if value_type == P.VT_STRING and pattern:
-                # string scan: byte-for-byte search
-                needle = pattern
-                for off in range(0, len(data) - len(needle) + 1):
-                    if data[off:off + len(needle)] == needle:
-                        self.hits.append((idx, base_off + off, needle))
+            if job['patterned']:
+                hits.extend(self._pattern_hits(data, base_off, idx, job['pattern'],
+                                               job['flags']))
                 continue
 
-            if value_type in (P.VT_BYTES, P.VT_BINARY) and pattern:
-                # byte array search, honouring ?? wildcards
-                if flags & P.SCAN_F_WILDCARD:
-                    start2 = P.SCAN_REQUEST.size + P.SCAN_EXT.size + len(pattern)
-                    mask = bytes(payload[start2:start2 + len(pattern)])
-                else:
-                    mask = b'\xff' * len(pattern)
-                width = len(pattern)
-                for off in range(0, len(data) - width + 1):
-                    ok = True
-                    for i, want in enumerate(pattern):
-                        if ((data[off + i] ^ want) & mask[i]) != 0:
-                            ok = False
-                            break
-                    if ok:
-                        self.hits.append((idx, base_off + off, pattern))
-                continue
-
-            step = value_size
-            for off in range(0, len(data) - step + 1, step):
+            # Numeric candidates sit on absolute multiples of the value size: the
+            # engine walks `addr = (pos + step - 1) & ~(step - 1)` (nxus_scan.c:799),
+            # which is exactly what NXUS_SCAN_F_ALIGNED asks for, and a clipped
+            # region start must not shift that grid.  (nxus_scan.c:711-715: the flag
+            # cannot change a numeric result - every numeric candidate is aligned.)
+            start_off = (step - (begin % step)) % step
+            for off in range(start_off, len(data) - step + 1, step):
                 cur = data[off:off + step]
-                if _compare(cur, None, target, value_size, cmp_mode, flags):
-                    self.hits.append((idx, base_off + off, cur))
+                if _compare(cur, None, job['target'], step, job['cmp_mode'], cmp_flags,
+                            job['target2'], job['epsilon'], job['value_type']):
+                    hits.append((idx, base_off + off, cur))
+        return hits
 
-        self.progress = 1000
-        self.scan_state = P.SCAN_STATE['NxusScanState_Done']
-        # the real sysmodule logs its statistics; mirror the line the GUI shows
-        self.log.append(f"scan done: hits={len(self.hits)} dropped=0 retries=0 reads=1")
+    def _publish_scan(self, hits: list):
+        """Install a finished pass, or start the emulated worker (scan_async)."""
+        if not self.scan_async:
+            # direct completion: the shape the Python client tests assume
+            self.hits = hits
+            self.progress = 1000
+            self.scan_last_result = 0
+            self.scan_state = P.SCAN_STATE['NxusScanState_Done']
+            self._log_scan_done()
+            return self._status()
+
+        # The results are already known, but they stay unpublished (and
+        # hit_count reads 0) until the emulated worker finishes - a reader must
+        # never see Done's results while the state still says Running.
+        self._pending_hits = hits
+        self._scan_ticks = 0
+        self.progress = 0
+        self.scan_state = P.SCAN_STATE['NxusScanState_Running']
         return self._status()
 
     def _scan_next(self, payload: bytes):
-        _kind, _vs, cmp_mode, _scope, _rb, _re, target, _t2, _chunk, flags = \
+        _kind, _value_size, cmp_mode, _scope, _rb, _re, target, target2, _chunk, flags = \
             P.SCAN_REQUEST.unpack_from(payload, 0)
+        if self._scan_running():
+            return self._error(P.ERR_BUSY)      # nxusSessionScanNext(): worker alive
+
+        # the refine carries the same optional ext tail as the first pass
+        epsilon = self.epsilon
+        value_type = self.value_type
+        pattern = self.pattern
+        tail = P.SCAN_REQUEST.size
+        if flags & P.SCAN_F_RANGES:
+            # a refine of a list scan: the ranges are ignored by the engine and so
+            # are they here, but the tail still has to be skipped
+            count, _res = P.RANGE_LIST_HEADER.unpack_from(payload, tail)
+            tail += P.RANGE_LIST_HEADER.size + min(count, P.MAX_SCAN_RANGES) * P.RANGE_ENTRY.size
+        if len(payload) >= tail + P.SCAN_EXT.size:
+            ext_type, pattern_len, ext_epsilon, _res = P.SCAN_EXT.unpack_from(payload, tail)
+            value_type = ext_type
+            epsilon = ext_epsilon
+            start = tail + P.SCAN_EXT.size
+            pattern = bytes(payload[start:start + pattern_len])
+
         self.prev_scan_hits = list(self.hits)
-        kept = []
-        for idx, off, prev in self.hits:
-            m = self.target.mappings[idx]
-            cur = bytes(m['buf'][off:off + self.value_size])
-            if _compare(cur, prev, target, self.value_size, cmp_mode, flags):
-                kept.append((idx, off, cur))
-        self.hits = kept
-        self.progress = 1000
-        self.scan_state = P.SCAN_STATE['NxusScanState_Done']
-        self.log.append(f"scan done: hits={len(self.hits)} dropped=0 retries=0 reads=1")
-        return self._status()
+        cmp_flags = flags
+        if value_type in (P.VT_F32, P.VT_F64):
+            cmp_flags |= P.SCAN_F_FLOAT
+
+        try:
+            self._check_scan_supported(value_type, cmp_mode, self.scan_patterned, refine=True)
+            kept = []
+            for idx, off, prev in self.hits:
+                m = self.target.mappings[idx]
+                cur = bytes(m['buf'][off:off + self.value_size])
+                if _compare(cur, prev, target, self.value_size, cmp_mode, cmp_flags,
+                            target2, epsilon, value_type):
+                    kept.append((idx, off, cur))
+        except NotImplementedScan as exc:
+            return self._scan_rejected(str(exc))
+
+        return self._publish_scan(kept)
 
     def _get_hits(self, payload: bytes):
         offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
         count = min(count, len(self.hits) - offset) if offset < len(self.hits) else 0
         bases = [m['base'] for m in self.target.mappings]
+        # The scan session id the PC matches hit batches against lives here, in
+        # NxusHitBatchHeader (nxus_protocol.h:336-344) - NxusStatus has no field
+        # for it.  A new ScanBegin (or a Reset) bumps it, so a stale batch from a
+        # previous scan cannot be mistaken for the current one.
         header = P.HIT_BATCH_HEADER.pack(self.session_id, count, len(self.hits),
                                          self.value_size, len(bases), 0)
         body = header + b''.join(struct.pack('<Q', b) for b in bases)

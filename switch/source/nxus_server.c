@@ -134,7 +134,15 @@ static void replyError(int fd, u16 type, u32 seq, Result rc) {
 static void fillStatus(NxusStatus *st) {
     memset(st, 0, sizeof(*st));
     st->proto_version = NXUS_PROTO_VERSION;
-    st->mode = NXUS_MODE_DMNT;
+    /* Which read path the console is serving, not a build-time constant: while
+       Nxus owns the kernel debug handle dmnt:cht is closed and nxusSessionReadMemory()
+       answers every read through svc debug memory, so the PC can only tell "dmnt
+       read" from "debug handle read" by looking at this field.  Probing the session
+       once and reusing the result for the flags below keeps mode and status_flags
+       consistent within one reply (a debug-session pause attaches too, which counts
+       as DEBUG exactly like an explicit DebugAttach). */
+    const bool debug_attached = nxusDebugIsAttached();
+    st->mode = debug_attached ? NXUS_MODE_DEBUG : NXUS_MODE_DMNT;
     st->scan_state = nxusSessionScanState();
     st->process_id = nxusSessionProcessId();
     st->program_id = nxusSessionProgramId();
@@ -157,7 +165,7 @@ static void fillStatus(NxusStatus *st) {
     }
 
     u32 flags = 0;
-    if (nxusDebugIsAttached()) {
+    if (debug_attached) {
         /* dmnt is closed (has_process would fail), but we do hold the process. */
         flags |= NXUS_ST_HAS_PROCESS | NXUS_ST_DEBUG_MODE | NXUS_ST_DEBUG_ATTACHED;
         /* GDB-style stop: the target is being held at a break/watch stop. */
