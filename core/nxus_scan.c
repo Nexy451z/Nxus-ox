@@ -1371,16 +1371,6 @@ int nxusScanFirstBaseline(NxusBaseline *bl,
     const u32 window = bl->value_size;
     if (window == 0 || window > 8) return NXUS_SCAN_ERR_PARAM;
 
-    /* NxusBaselineBlock.store_off is a u32 offset into the baseline stream.  A
-       larger total would wrap, so every later comparison would read the wrong
-       history (silently wrong hits) - refuse it instead. */
-    {
-        u64 total = 0;
-        for (u32 r = 0; r < region_count; r++) {
-            total += regions[r].size;
-            if (total > 0xFFFFFFFFull) return NXUS_SCAN_ERR_PARAM;
-        }
-    }
 
     const u32 value_type = baselineValueType(bl->value_type, window, req->flags);
     if (value_type == NxusValueType_All) return NXUS_SCAN_ERR_PARAM;

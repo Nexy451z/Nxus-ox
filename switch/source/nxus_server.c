@@ -892,14 +892,24 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
                 value_type = ext.value_type;
                 epsilon = ext.epsilon_decimals;
                 pattern_len = ext.pattern_len;
-                u32 room = length - tail - (u32)sizeof(NxusScanExt);
-                if (pattern_len > room) pattern_len = room;
-                if (pattern_len > NXUS_SCAN_MAX_PATTERN) pattern_len = NXUS_SCAN_MAX_PATTERN;
+                const u32 room = length - tail - (u32)sizeof(NxusScanExt);
                 if (pattern_len > 0) {
-                    pattern = payload + tail + sizeof(NxusScanExt);
-                    if ((req.flags & NXUS_SCAN_F_WILDCARD) && room >= pattern_len * 2) {
-                        mask = pattern + pattern_len;
+                    /* The wildcard mask lives at pattern + pattern_len, so the
+                       declared length IS the mask offset.  Clamping it (the old
+                       behaviour) moved the mask and made every "??" compare the
+                       wrong byte, i.e. a silently wrong scan.  Reject a pattern
+                       that does not fit the payload exactly instead. */
+                    const bool want_mask = (req.flags & NXUS_SCAN_F_WILDCARD) != 0;
+                    const u64 need = (u64)pattern_len * (want_mask ? 2u : 1u);
+                    if (pattern_len > NXUS_SCAN_MAX_PATTERN || need > (u64)room) {
+                        NXUS_LOG("scan: rejecting pattern_len=%u (room=%u, wildcard=%d) - "
+                                 "the mask offset would not match the payload",
+                                 (unsigned)pattern_len, (unsigned)room, want_mask ? 1 : 0);
+                        replyError(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
+                        break;
                     }
+                    pattern = payload + tail + sizeof(NxusScanExt);
+                    if (want_mask) mask = pattern + pattern_len;
                 }
             }
             rc = (type == NxusCmd_ScanBegin)
