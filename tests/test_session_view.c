@@ -1063,7 +1063,227 @@ static void testConcurrentReaders(void) {
           readers());
 }
 
-/* ---- target identity ---------------------------------------------------- */
+/* ---- mixed-view sampling ------------------------------------------------
+ *
+ * Both published views are a pointer+count pair behind the g_ViewSeq seqlock.  A
+ * sampler that omits the ACQUIRE FENCE between the copy and the re-check can accept
+ * a pair whose count came from a newer publication than the block it points at
+ * (arm64 may move the plain loads past the check), so the caller walks `count`
+ * entries over a block that only holds the older (smaller) publication.
+ *
+ * The stress makes the pair self-describing instead of relying on a crash:
+ *   - every block is allocated with MIX_VIEW_CAP entries, so even a stale count
+ *     stays inside the allocation (the test must not read OOB when the bug it
+ *     hunts is present),
+ *   - the published COUNT is written into every entry, so a count from another
+ *     publication disagrees with every entry of the block it was paired with,
+ *   - the publication count alternates between a small value and the full
+ *     capacity, so an old/new mix cannot pass by coincidence.
+ *
+ * The region accessors hand the verified pair back BY VALUE, so the sample itself
+ * is what gets validated.  The mapping accessor returns NxusMappingTable by
+ * address and re-publishes its fields in place (nxus_session.h: "the pin protects
+ * the block, not the struct fields"), so the capture is done twice there and only
+ * a pair that stayed put is validated - a publish landing between the sample and
+ * the capture is that documented re-publication, not a seqlock failure.
+ *
+ * x86 does not reorder the two plain loads, so on the host this is a protocol
+ * regression guard (it fails if the writer barriers are dropped or the samplers
+ * start returning a torn pair as if it were a copy), not a reproduction of the
+ * arm64 reorder.
+ */
+#define MIX_VIEW_CAP    64u
+#define MIX_SMALL_COUNT 4u
+#define MIX_PUBLISHES   240u
+#define MIX_READERS     2
+
+static atomic_int  g_MixStop;
+static atomic_uint g_MixWalks;
+static atomic_uint g_MixMixed;
+static atomic_uint g_MixSkipped;
+
+static void mixFillMappings(NxusMappingEntry *entries, u32 gen, u32 count) {
+    for (u32 i = 0; i < MIX_VIEW_CAP; i++) {
+        entries[i].base = 0x40000000ull + (u64)gen * 0x00100000ull + (u64)i * 0x1000ull;
+        entries[i].size = (u64)count;
+        entries[i].valid = 1;
+        entries[i].reserved = NXUS_PERM_R;
+        entries[i].type = 3;
+    }
+}
+
+static void mixFillRegions(NxusScanRegion *regions, u32 gen, u32 count) {
+    for (u32 i = 0; i < MIX_VIEW_CAP; i++) {
+        regions[i].base = 0x40000000ull + (u64)gen * 0x00100000ull + (u64)i * 0x1000ull;
+        regions[i].addr_base = regions[i].base;
+        regions[i].size = (u64)count;
+        regions[i].perm = NXUS_PERM_R;
+        regions[i].mapping_idx = i;
+    }
+}
+
+/* One pass over the mapping pair.  table->entries/count are the LIVE fields, so a
+   publish between the sample and this capture is skipped rather than blamed on the
+   seqlock (see the block comment). */
+static u32 mixCheckMappings(const NxusMappingTable *table, u32 *skipped) {
+    if (table == NULL) return 0;
+    const NxusMappingEntry *e1 = table->entries;
+    const u32 c1 = table->count;
+    atomic_thread_fence(memory_order_acquire);
+    const NxusMappingEntry *e2 = table->entries;
+    const u32 c2 = table->count;
+    if (e1 != e2 || c1 != c2) {
+        (*skipped)++;
+        return 0;
+    }
+    if (e1 == NULL || c1 == 0 || c1 > MIX_VIEW_CAP) return 1;
+    for (u32 i = 0; i < c1; i++) {
+        if (e1[i].valid != 1u || e1[i].size != (u64)c1 || (e1[i].base & 0xFFFu) != 0u) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One pass over the region pair.  regions/count are the sampler's own verified
+   copies (returned by value), so a mismatch here is a mixed sample. */
+static u32 mixCheckRegions(const NxusScanRegion *regions, u32 count) {
+    if (regions == NULL) return 0;
+    if (count == 0 || count > MIX_VIEW_CAP) return 1;
+    for (u32 i = 0; i < count; i++) {
+        if (regions[i].perm != NXUS_PERM_R || regions[i].size != (u64)count ||
+            regions[i].mapping_idx != i) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *mixReader(void *arg) {
+    (void)arg;
+    while (atomic_load_explicit(&g_MixStop, memory_order_acquire) == 0) {
+        NxusViewPin pin;
+        if (!nxusSessionViewPinCurrent(&pin)) continue;   /* table exhausted: retry */
+
+        const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
+        u32 region_count = 0;
+        const NxusScanRegion *regions = nxusSessionRegionsPinned(&pin, &region_count);
+
+        u32 skipped = 0;
+        u32 mixed = mixCheckMappings(table, &skipped);
+        mixed += mixCheckRegions(regions, region_count);
+
+        if (mixed != 0) atomic_fetch_add_explicit(&g_MixMixed, mixed, memory_order_relaxed);
+        if (skipped != 0) atomic_fetch_add_explicit(&g_MixSkipped, skipped, memory_order_relaxed);
+        nxusSessionViewUnpin(&pin);
+        atomic_fetch_add_explicit(&g_MixWalks, 1u, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+static void testNoMixedViewSample(void) {
+    printf("- a sampled view pair never mixes two publications\n");
+    freshSession();
+
+    /* A block to sample from before the writer starts (readers tolerate NULL, but
+       this keeps the first iterations on the validated path). */
+    NxusMappingEntry *first = (NxusMappingEntry *)calloc(MIX_VIEW_CAP, sizeof(*first));
+    NxusScanRegion *first_regions = (NxusScanRegion *)calloc(MIX_VIEW_CAP, sizeof(*first_regions));
+    if (first == NULL || first_regions == NULL) {
+        free(first);
+        free(first_regions);
+        CHECK(0, "could not allocate the initial mixed-view blocks");
+        return;
+    }
+    mixFillMappings(first, 0, MIX_SMALL_COUNT);
+    mixFillRegions(first_regions, 0, MIX_SMALL_COUNT);
+    mappingSnapshotPublish(first, MIX_SMALL_COUNT);
+    regionListPublish(first_regions, MIX_SMALL_COUNT);
+
+    atomic_store(&g_MixStop, 0);
+    atomic_store(&g_MixWalks, 0);
+    atomic_store(&g_MixMixed, 0);
+    atomic_store(&g_MixSkipped, 0);
+
+    pthread_t threads[MIX_READERS];
+    int started = 0;
+    for (int i = 0; i < MIX_READERS; i++) {
+        if (pthread_create(&threads[i], NULL, mixReader, NULL) != 0) break;
+        started++;
+    }
+    CHECK(started == MIX_READERS, "started %d/%d mixed-read readers", started, MIX_READERS);
+
+    for (u32 gen = 1; gen <= MIX_PUBLISHES; gen++) {
+        const u32 count = (gen & 1u) ? MIX_SMALL_COUNT : MIX_VIEW_CAP;
+        NxusMappingEntry *entries =
+            (NxusMappingEntry *)calloc(MIX_VIEW_CAP, sizeof(*entries));
+        NxusScanRegion *regions =
+            (NxusScanRegion *)calloc(MIX_VIEW_CAP, sizeof(*regions));
+        if (entries == NULL || regions == NULL) {
+            free(entries);
+            free(regions);
+            CHECK(0, "could not allocate publication %u", gen);
+            break;
+        }
+        mixFillMappings(entries, gen, count);
+        mixFillRegions(regions, gen, count);
+        mappingSnapshotPublish(entries, count);
+        regionListPublish(regions, count);
+    }
+
+    atomic_store(&g_MixStop, 1);
+    for (int i = 0; i < started; i++) pthread_join(threads[i], NULL);
+
+    CHECK(atomic_load(&g_MixMixed) == 0u,
+          "%u view sample(s) paired a count with a block from another publication",
+          atomic_load(&g_MixMixed));
+    CHECK(atomic_load(&g_MixWalks) > 0u, "readers actually sampled both views (%u walks)",
+          atomic_load(&g_MixWalks));
+    /* The captures that raced a publish are the documented in-place re-publication;
+       they only skip a validation, they are not counted as a mixed sample. */
+    CHECK(atomic_load(&g_MixSkipped) <= atomic_load(&g_MixWalks),
+          "skipped captures (%u) cannot exceed the walks (%u)",
+          atomic_load(&g_MixSkipped), atomic_load(&g_MixWalks));
+    CHECK(readers() == 0u, "every mixed-view sample was unpinned (%u pins left)", readers());
+}
+
+/* ---- hit cap ------------------------------------------------------------
+ *
+ * The hit arrays are charged against NXUS_SESSION_HIT_BUDGET_BYTES, so the cap has
+ * to be derived per width and the 150k default must never raise it: a u64 row is
+ * 24 B and the old flat floor made a full list 3.6 MB (0.5 MiB over budget).
+ * test_budget.c mirrors the formula against its own constants; this test calls the
+ * shipped inline function so the two cannot drift apart silently. */
+static void testHitLimitBudget(void) {
+    printf("- the hit cap follows the row width and stays inside the budget\n");
+    const u32 widths[4] = { 1u, 2u, 4u, 8u };
+    const u32 expected[4] = { 150000u, 150000u, 150000u, 128000u };
+
+    for (u32 i = 0; i < 4; i++) {
+        const u32 row = (u32)sizeof(NxusHitAddress) + widths[i];
+        const u32 cap = nxusSessionHitLimit(widths[i]);
+        CHECK(cap == expected[i], "u%u: cap is %u hits (expected %u)",
+              (unsigned)(widths[i] * 8u), (unsigned)cap, (unsigned)expected[i]);
+        CHECK((u64)cap * row <= (u64)NXUS_SESSION_HIT_BUDGET_BYTES,
+              "u%u: %u hits * %u B exceeds the %u B budget",
+              (unsigned)(widths[i] * 8u), (unsigned)cap, (unsigned)row,
+              (unsigned)NXUS_SESSION_HIT_BUDGET_BYTES);
+        CHECK(cap <= NXUS_SESSION_DEFAULT_MAXHITS,
+              "u%u: the default is clamped by the budget, not raised (%u > %u)",
+              (unsigned)(widths[i] * 8u), (unsigned)cap,
+              (unsigned)NXUS_SESSION_DEFAULT_MAXHITS);
+    }
+    CHECK((u64)NXUS_SESSION_DEFAULT_MAXHITS * 24ull == 3600000ull,
+          "150k u64 rows are %llu B - 0.5 MiB over the 3.0 MiB budget",
+          (unsigned long long)((u64)NXUS_SESSION_DEFAULT_MAXHITS * 24ull));
+    CHECK((u64)nxusSessionHitLimit(8u) * 24ull ==
+              (u64)NXUS_SESSION_HIT_BUDGET_BYTES,
+          "the u64 cap lands exactly on the budget (%u hits * 24 B)",
+          (unsigned)nxusSessionHitLimit(8u));
+    CHECK(nxusSessionHitLimit(0u) == nxusSessionHitLimit(1u),
+          "value_size 0 is treated as a 1-byte value (%u/%u)",
+          (unsigned)nxusSessionHitLimit(0u), (unsigned)nxusSessionHitLimit(1u));
+}
 
 /* The identity is ONE snapshot since the four fields are written through a seqlock.
    The regression was a reader pairing "new pid" with "old main range" (or the title
@@ -1329,6 +1549,8 @@ int main(void) {
     testHitsRescueValueMustFitMapping();
     testExitIsTerminal();
     testConcurrentReaders();
+    testNoMixedViewSample();
+    testHitLimitBudget();
     testTargetIdentitySnapshot();
     testTargetIdentityNoTornRead();
 

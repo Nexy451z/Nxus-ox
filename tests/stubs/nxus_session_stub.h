@@ -65,3 +65,6 @@ u32        nxusTestSessionRegionSize(void);
    the text it produced. */
 const char *nxusTestLastLog(void);
 void        nxusTestLogClear(void);
+
+/* Move the emulated dmnt target incarnation (default 1). */
+void nxusTestSessionSetIncarnation(u32 incarnation);

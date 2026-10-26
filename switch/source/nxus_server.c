@@ -95,19 +95,25 @@ static void refreshTargetIdentityThrottled(void);
    unless we remember what we froze and release it ourselves.  The dmnt frozen
    table is capped at 0x80 entries, which is what this array mirrors.
  *
- * An entry also carries the target it was frozen in (pid + program id).  The
- * address alone is not an identity: the next title can map something else at the
- * same address, so a table of bare addresses would (a) disable a freeze in the
- * new title because an earlier one froze that address, (b) keep retrying a
- * release for memory that disappeared with the old process, and (c) treat a
- * same-address freeze of the new title as "ours" although this session never
+ * An entry also carries the target it was frozen in (pid + program id + the dmnt
+ * target incarnation).  The address alone is not an identity: the next title can map
+ * something else at the same address, so a table of bare addresses would (a) disable
+ * a freeze in the new title because an earlier one froze that address, (b) keep
+ * retrying a release for memory that disappeared with the old process, and (c) treat
+ * a same-address freeze of the new title as "ours" although this session never
  * asked for it.  The stamp is taken from the session when the freeze is enabled
- * and compared again before anything is released. */
+ * and compared again before anything is released.
+ *
+ * The incarnation matters as much as the pid: a title restarted into a fixed layout
+ * comes back under the SAME pid with the same title id, so pid + program id alone
+ * cannot tell the old freeze from a freeze of the new process.  See
+ * frozenOwnerIsCurrent(). */
 #define NXUS_FROZEN_OWNED_MAX 128
 typedef struct {
     u64 address;
     u64 pid;          /* target the freeze was requested in (0 = unknown) */
     u64 program_id;   /* its title id (0 = unknown)                       */
+    u32 incarnation;  /* its dmnt cheat-process generation (0 = unknown)  */
 } NxusFrozenOwner;
 static NxusFrozenOwner g_FrozenOwned[NXUS_FROZEN_OWNED_MAX];
 static u32 g_FrozenOwnedCount;
@@ -131,37 +137,54 @@ static u32 g_FrozenReleasedTotal;
 /* Does this entry describe a freeze of the target the session is on now?
  *
  * Same rule as hitsOwnerIdentityMatches() / ptrChainOwnerCheck(), so the frozen
- * table cannot disagree with the hit list about what "the same target" means: the
- * pid is the identity, and a program id that is 0 on either side is "unknown"
- * (dmnt metadata unavailable), not a mismatch.  A pid known on only one side is a
- * mismatch: an entry stamped when dmnt had no metadata cannot be proven to belong
- * to the process running now, and releasing on a guess would write into whatever
- * the new title has mapped at that address. */
-static bool frozenOwnerIsCurrent(const NxusFrozenOwner *owned, u64 pid, u64 program_id) {
+ * table cannot disagree with the hit list about what "the same target" means:
+ *   - the dmnt target INCARNATION is compared first and on its own.  pid + title
+ *     cannot see a title restarted into a fixed layout: it returns with the SAME
+ *     pid and the same program id, so an entry stamped for the earlier process
+ *     would look current and a release would disable the freeze of the new one -
+ *     or, worse, write into whatever it has mapped at that address.  A bumped
+ *     incarnation is therefore "another target" regardless of pid/title,
+ *   - the pid is the identity, and a program id that is 0 on either side is
+ *     "unknown" (dmnt metadata unavailable), not a mismatch.  A pid known on only
+ *     one side is a mismatch: an entry stamped when dmnt had no metadata cannot be
+ *     proven to belong to the process running now, and releasing on a guess would
+ *     write into whatever the new title has mapped at that address.
+ *
+ * A false result means "leave it to the caller to drop the entry WITHOUT releasing
+ * it" (releasing happens only for entries of the current target). */
+static bool frozenOwnerIsCurrent(const NxusFrozenOwner *owned, u64 pid, u64 program_id,
+                                 u32 incarnation) {
+    if (owned->incarnation != incarnation) return false;
     if (owned->pid != pid) return false;
     return owned->program_id == 0 || program_id == 0 || owned->program_id == program_id;
 }
 
 static void frozenOwnedAdd(u64 address) {
-    /* Stamp the target the freeze was just applied to.  Both values come from the
-       session, i.e. the same identity Status reports and the chain/pointer-scan
-       owners use, so the table means "Nxus froze this address in THIS title". */
+    /* Stamp the target the freeze was just applied to.  All three values come from
+       the session/dmnt, i.e. the same identity Status reports and the
+       chain/pointer-scan/hit owners use, so the table means "Nxus froze this address
+       in THIS process" - including the incarnation, which is what a restart into a
+       fixed layout changes. */
     const u64 pid = nxusSessionProcessId();
     const u64 program_id = nxusSessionProgramId();
+    const u32 incarnation = nxusDmntTargetIncarnation();
     frozenLock();
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
         if (g_FrozenOwned[i].address == address) {
             /* Already tracked, but possibly for an earlier target: dmnt just froze
                the address in the current one, so the entry belongs to it now. */
-            if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
-                NXUS_LOG("frozen: %016llX re-owned by pid=%llu title=%016llX "
-                         "(was pid=%llu title=%016llX)",
+            if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id, incarnation)) {
+                NXUS_LOG("frozen: %016llX re-owned by pid=%llu title=%016llX incarnation=%u "
+                         "(was pid=%llu title=%016llX incarnation=%u)",
                          (unsigned long long)address,
                          (unsigned long long)pid, (unsigned long long)program_id,
+                         (unsigned)incarnation,
                          (unsigned long long)g_FrozenOwned[i].pid,
-                         (unsigned long long)g_FrozenOwned[i].program_id);
+                         (unsigned long long)g_FrozenOwned[i].program_id,
+                         (unsigned)g_FrozenOwned[i].incarnation);
                 g_FrozenOwned[i].pid = pid;
                 g_FrozenOwned[i].program_id = program_id;
+                g_FrozenOwned[i].incarnation = incarnation;
             }
             frozenUnlock();
             return;
@@ -176,6 +199,7 @@ static void frozenOwnedAdd(u64 address) {
     g_FrozenOwned[g_FrozenOwnedCount].address = address;
     g_FrozenOwned[g_FrozenOwnedCount].pid = pid;
     g_FrozenOwned[g_FrozenOwnedCount].program_id = program_id;
+    g_FrozenOwned[g_FrozenOwnedCount].incarnation = incarnation;
     g_FrozenOwnedCount++;
     frozenUnlock();
 }
@@ -204,28 +228,36 @@ static void frozenOwnedRemove(u64 address) {
 static u32 frozenOwnedDropEarlierTarget(void) {
     const u64 pid = nxusSessionProcessId();
     const u64 program_id = nxusSessionProgramId();
+    const u32 incarnation = nxusDmntTargetIncarnation();
     u32 dropped = 0;
     u64 dropped_pid = 0;
+    u32 dropped_incarnation = 0;
 
     frozenLock();
     if (g_FrozenOwnedCount == 0) { frozenUnlock(); return 0; }
     for (u32 i = 0; i < g_FrozenOwnedCount; ) {
-        if (frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
+        if (frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id, incarnation)) {
             i++;
             continue;
         }
         /* Swap-remove: the table's order carries no meaning. */
-        if (dropped == 0) dropped_pid = g_FrozenOwned[i].pid;
+        if (dropped == 0) {
+            dropped_pid = g_FrozenOwned[i].pid;
+            dropped_incarnation = g_FrozenOwned[i].incarnation;
+        }
         g_FrozenOwned[i] = g_FrozenOwned[--g_FrozenOwnedCount];
         dropped++;
     }
     frozenUnlock();
 
     if (dropped != 0) {
+        /* Both identity halves are named: a fixed-layout restart keeps pid and
+           title, so the incarnation is the only value that explains the drop. */
         NXUS_LOG("frozen: dropping %u address(es) from an earlier target "
-                 "(pid %llu -> %llu)",
+                 "(pid %llu -> %llu, incarnation %u -> %u)",
                  (unsigned)dropped, (unsigned long long)dropped_pid,
-                 (unsigned long long)pid);
+                 (unsigned long long)pid, (unsigned)dropped_incarnation,
+                 (unsigned)incarnation);
     }
     return dropped;
 }
@@ -265,21 +297,26 @@ static void releaseOwnedFrozen(void) {
     u32 snapshot = 0;
     u32 dropped = 0;
     u64 dropped_pid = 0;
+    u32 dropped_incarnation = 0;
     const u64 pid = nxusSessionProcessId();
     const u64 program_id = nxusSessionProgramId();
+    const u32 incarnation = nxusDmntTargetIncarnation();
 
     frozenLock();
     if (g_FrozenOwnedCount == 0) { frozenUnlock(); return; }
     if (nxusDebugIsAttached()) { frozenUnlock(); return; }
     /* Only freezes of the current target are ours to undo.  An entry stamped for an
-       earlier title is dropped instead of released: its address either belonged to
-       a process that no longer exists or was reused by the title that runs now, and
-       writing that address through dmnt would touch memory this session never
-       froze.  The table is cleared either way - these entries cannot become
-       meaningful again. */
+       earlier title or an earlier incarnation of the same title is dropped instead
+       of released: its address either belonged to a process that no longer exists or
+       was reused by the title that runs now, and writing that address through dmnt
+       would touch memory this session never froze.  The table is cleared either
+       way - these entries cannot become meaningful again. */
     for (u32 i = 0; i < g_FrozenOwnedCount; i++) {
-        if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id)) {
-            if (dropped == 0) dropped_pid = g_FrozenOwned[i].pid;
+        if (!frozenOwnerIsCurrent(&g_FrozenOwned[i], pid, program_id, incarnation)) {
+            if (dropped == 0) {
+                dropped_pid = g_FrozenOwned[i].pid;
+                dropped_incarnation = g_FrozenOwned[i].incarnation;
+            }
             dropped++;
             continue;
         }
@@ -296,9 +333,10 @@ static void releaseOwnedFrozen(void) {
     if (dropped != 0) {
         /* Same wording as frozenOwnedDropEarlierTarget(): one event, one meaning. */
         NXUS_LOG("frozen: dropping %u address(es) from an earlier target "
-                 "(pid %llu -> %llu)",
+                 "(pid %llu -> %llu, incarnation %u -> %u)",
                  (unsigned)dropped, (unsigned long long)dropped_pid,
-                 (unsigned long long)pid);
+                 (unsigned long long)pid, (unsigned)dropped_incarnation,
+                 (unsigned)incarnation);
     }
     if (released == 0) {
         /* Only leftovers of an earlier target were in the table, so there is
@@ -958,6 +996,16 @@ void nxusServerInit(void) {
        otherwise start with every command and every tick refused by the flag the
        previous round left behind.  This is the only place the gate is cleared. */
     serverExitGateReset();
+
+    /* The command-in-flight flag is part of the same boot state.  A handler that was
+       still running when the previous lifetime's Exit gave up on it (or that never
+       returned) leaves g_CommandActive set, and the tick would then suppress the
+       pause watchdog and the stale-session reaper for NXUS_COMMAND_GRACE_MS in the
+       new lifetime - with a timestamp from the round before.  No handler can be in
+       flight here (the listener does not exist yet and the previous Exit drained
+       what it could), so clearing it cannot race a reader. */
+    atomic_store_explicit(&g_CommandActive, false, memory_order_release);
+    g_CommandStartedMs = 0;
 }
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -1823,6 +1871,34 @@ static bool ptrScanBusy(void) {
     return atomic_load_explicit(&g_PtrJobState, memory_order_acquire) == NxusPtrJob_Running;
 }
 
+/* Give the job's two heap buffers back and put the job into the state a never-used
+ * one has.  EVERY release path goes through here (the walk's own ptrScanPublish(),
+ * each failure path in handlePtrScanBegin(), and ptrScanInit() between lifetimes).
+ *
+ * Clearing the pointers is the point, not cosmetics: the failure paths used to
+ * free(regions)/free(scratch) and leave g_PtrJob pointing at the freed blocks, so a
+ * following PtrScanGet / CheatExport / Begin could still read them (and the next
+ * ptrScanPublish() could free them a second time).  The sizes go with the pointers
+ * for the same reason: a stale region_count / scratch_size describes an array that
+ * no longer exists.  The page cache is disarmed here too - it holds a pointer INTO
+ * the region array and clamps reads by it, so it must never outlive the free.
+ *
+ * The caller must be the thread that owns the job: the connection thread while it
+ * sets a walk up, the walk itself (worker or inline) from ptrScanPublish(), or
+ * nxusServerInit() before a listener exists.  It is idempotent (all-NULL is the
+ * normal state), so a second call cannot double-free. */
+static void ptrScanJobRelease(void) {
+    free(g_PtrJob.regions);
+    free(g_PtrJob.scratch);
+    g_PtrJob.regions = NULL;
+    g_PtrJob.scratch = NULL;
+    g_PtrJob.region_count = 0;
+    g_PtrJob.scratch_size = 0;
+    /* Drop the cache's view of the region array that may just have been freed.  The
+       next walk arms its own list (ptrScanJobRun) before the engine can read again. */
+    ptrScanPageCacheArm(NULL, 0);
+}
+
 /* Join and close the worker Thread.  The caller must hold the slot claim (see
    ptrScanClaimSlot).  Returns true when a worker was actually reaped. */
 static bool ptrScanJoinSlotLocked(void) {
@@ -1943,6 +2019,13 @@ static void ptrScanInit(void) {
     atomic_init(&g_PtrJob.budget.cancel_flag, 0);
     g_PtrJob.budget.cancel = 0;
     g_PtrJobResult = 0;
+    /* A previous lifetime whose Exit gave up on a handler may have left the job's
+       buffers behind.  Free them through the common release (they are NULL after
+       every normal path, so this is a no-op in practice) instead of letting the next
+       Begin overwrite the only pointer to them: that would leak the region array and
+       the 256 KiB scratch for the rest of the process, and leave a state where the
+       first publish frees a block from the round before. */
+    ptrScanJobRelease();
 }
 
 /* Publish the walk's outcome and hand the state over to the readers.  Runs on the
@@ -2013,13 +2096,10 @@ static void ptrScanPublish(int src, u32 count, u64 elapsed_ms) {
              (unsigned long long)elapsed_ms, (unsigned)g_ChainCount,
              (unsigned long long)g_PtrStats.reads);
 
-    free(g_PtrJob.regions);
-    free(g_PtrJob.scratch);
-    g_PtrJob.regions = NULL;
-    g_PtrJob.scratch = NULL;
-    /* Drop the cache's view of the region array that was just freed; the next walk
-       arms its own list (ptrScanJobRun) before the engine can read again. */
-    ptrScanPageCacheArm(NULL, 0);
+    /* Hand the buffers back and NULL them out in one place (see ptrScanJobRelease):
+       the state store below is what lets a reader run, so the pointers a Get/export
+       could look at must already describe "no job buffers" by then. */
+    ptrScanJobRelease();
 
     g_PtrJobResult = ok ? 0 : (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     atomic_store_explicit(&g_PtrJobState, ok ? NxusPtrJob_Done : NxusPtrJob_Failed,
@@ -2317,8 +2397,18 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
 
     NxusPtrRegion *regions = (NxusPtrRegion *)calloc(region_cap, sizeof(NxusPtrRegion));
     u8 *scratch = (u8 *)malloc(256 * 1024);
+    /* The job owns both buffers from here on, before any of the checks that can
+       still fail: every failure path below (OOM here, the Thread-slot claim, a
+       shutdown that becomes visible under the claim) releases them through
+       ptrScanJobRelease(), which also clears the pointers.  Doing the hand-over
+       before the first failure is what keeps a later Get/CheatExport/Begin from
+       reading - or freeing again - a block this handler already gave back. */
+    g_PtrJob.regions = regions;
+    g_PtrJob.scratch = scratch;
+    g_PtrJob.scratch_size = 256 * 1024;
+    g_PtrJob.region_count = 0;   /* set to the real count once the list is built */
     if (regions == NULL || scratch == NULL) {
-        free(regions); free(scratch);
+        ptrScanJobRelease();
         replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
         return;
     }
@@ -2391,11 +2481,12 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
 
     /* Everything the walk needs is in place, so hand the job to the worker.  The
        start clock was taken at the top of the handler: the client times the whole
-       command from its request, and the mapping refresh is part of it. */
+       command from its request, and the mapping refresh is part of it.
+       The two heap buffers were already handed over right after they were
+       allocated (see above); only the fields that describe the walk are filled
+       here, so no path between here and threadStart() can leave the job pointing
+       at a block it released. */
     g_PtrJob.req = req;
-    g_PtrJob.regions = regions;
-    g_PtrJob.scratch = scratch;
-    g_PtrJob.scratch_size = 256 * 1024;
     g_PtrJob.region_count = region_count;
     g_PtrJob.opts = opts;
     g_PtrJob.walk_width = walk_width;
@@ -2448,15 +2539,16 @@ static void handlePtrScanBegin(int fd, u16 type, u32 seq, const u8 *payload, u32
        refused this request; the exit path's cancel is what brings a running walk back
        to ptrScanPublish(). */
     if (!ptrScanClaimSlot(200)) {
-        free(regions);
-        free(scratch);
+        /* Released through the same helper the walk uses: it frees BOTH buffers and
+           clears the job's pointers, so a PtrScanGet / CheatExport that arrives after
+           this refusal cannot read freed memory. */
+        ptrScanJobRelease();
         replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
         return;
     }
     if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
         ptrScanReleaseSlot();
-        free(regions);
-        free(scratch);
+        ptrScanJobRelease();
         replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                          NXUS_REASON_BUSY_STATE);
         return;
@@ -4079,10 +4171,10 @@ static void refreshTargetIdentityThrottled(void) {
        owner stamp (see discardHitsOfEarlierTarget).  A rebuilt table is detected by
        the next status / hits request on the connection thread. */
     discardHitsOfEarlierTarget(false, false);
-    /* Same reason, for the frozen table: a freeze stamped for the title that just
-       went away cannot be released any more, and keeping it would let the release
-       that runs once the client is gone touch the same address in the title that
-       runs now.  Dropping is all that happens here (see
+    /* Same reason, for the frozen table: a freeze stamped for the title (or the dmnt
+       incarnation) that just went away cannot be released any more, and keeping it
+       would let the release that runs once the client is gone touch the same address
+       in the title that runs now.  Dropping is all that happens here (see
        frozenOwnedDropEarlierTarget) - this runs on the main thread too, where
        calling into dmnt to release would be an unasked-for write. */
     (void)frozenOwnedDropEarlierTarget();

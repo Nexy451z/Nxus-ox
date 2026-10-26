@@ -512,17 +512,24 @@ static void sessionStateStore(NxusScanState state) {
  * seqlock makes the pair observable as one unit:
  *
  *   g_ViewSeq is even while both pairs are stable, odd while an update is in
- *   flight.  A writer bumps it to odd (release), stores the pair, and bumps it
- *   back to even (release).  A reader samples it (acquire), rejects odd values,
- *   copies the pair, and samples again: an unchanged value means the pair it
- *   copied was one consistent publication; otherwise it retries.
+ *   flight.  A writer bumps it to odd (release), passes a STORE/STORE barrier,
+ *   stores the pair, passes the mirror barrier, and bumps it back to even
+ *   (release).  A reader samples it (acquire), rejects odd values, copies the
+ *   pair, passes an ACQUIRE FENCE, and samples again: an unchanged value means the
+ *   pair it copied was one consistent publication; otherwise it retries.
  *
- * The old atomic_thread_fence()s were useless here: a fence only orders atomic
- * operations, so the plain pointer/count stores stayed free to be observed torn
- * apart.  The "clear before free" rule stays - the published pair is emptied
- * before the block is released, so a reader that loses the race anywhere still
- * sees either the old view or an explicitly empty one, never a pointer into
- * memory that is already back in the allocator.
+ * The fences are load-bearing on arm64 (release/acquire on the sequence alone is
+ * not enough): a release RMW only keeps PRIOR operations before it, so it does not
+ * stop the plain stores that follow the odd bump from being observed first, and an
+ * acquire load only keeps LATER accesses after it, so it does not stop the copy
+ * from being retired past the re-check.  The fences order the plain loads/stores;
+ * the sequence and its atomics are what make "odd" a publication marker.  (Fences
+ * ALONE never made the pair atomic - without the odd/even protocol the plain
+ * pointer/count stores stayed free to be observed torn apart, which is why the old
+ * fence-only version was broken.)  The "clear before free" rule stays - the
+ * published pair is emptied before the block is released, so a reader that loses
+ * the race anywhere still sees either the old view or an explicitly empty one,
+ * never a pointer into memory that is already back in the allocator.
  *
  * Writers are the publish / drop / buildRegions calls; they share a single seqlock
  * counter, and g_ViewPublishMutex keeps two writer THREADS out of the pair (see its
@@ -619,9 +626,22 @@ static Mutex g_ViewPublishMutex;
 static void viewUpdateBegin(void) {
     mutexLock(&g_ViewPublishMutex);
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* odd */
+    /* Store/store barrier after the "write in flight" marker.  A release RMW only
+       keeps PRIOR operations before it, so without this the plain pointer/count
+       stores below could become visible BEFORE the odd value (arm64 does not order
+       later stores after a release store).  A reader would then observe the new data
+       with the old even sequence and accept a mixed pair while this writer is still
+       in the middle of the update. */
+    atomic_thread_fence(memory_order_release);
 }
 
 static void viewUpdateEnd(void) {
+    /* Mirror barrier before the "stable" marker: the two plain stores must be on
+       their way out before the even value that invites a reader to copy them.  The
+       release RMW below already orders them (release covers prior loads AND stores);
+       the fence states the requirement explicitly instead of relying on the RMW's
+       exact memory order at every call site. */
+    atomic_thread_fence(memory_order_release);
     atomic_fetch_add_explicit(&g_ViewSeq, 1u, memory_order_release);   /* even */
     mutexUnlock(&g_ViewPublishMutex);
 }
@@ -1849,6 +1869,13 @@ static const NxusMappingTable *mappingsSample(void) {
         if ((seq & 1u) != 0) continue;              /* update in progress */
         NxusMappingEntry *const entries = g_Session.maps.entries;
         const u32 count = g_Session.maps.count;
+        /* Load/load barrier, the same shape as nxusSessionTargetIdentity(): the
+           acquire load above only keeps LATER accesses after itself, so without this
+           fence arm64 may retire the two plain loads above after the re-check below.
+           The sample would then be accepted although it paired the count of one
+           publication with the entries pointer of the next - a count larger than the
+           block it points at, i.e. an out-of-bounds walk for the caller. */
+        atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
         if (count == 0 || entries == NULL) return NULL;   /* empty view */
         return &g_Session.maps;
@@ -2057,6 +2084,10 @@ static const NxusScanRegion *regionsSample(u32 *out_count) {
         if ((seq & 1u) != 0) continue;              /* update in progress */
         const NxusScanRegion *regions = g_Session.regions;
         const u32 count = g_Session.region_count;
+        /* Load/load barrier before the re-check: see mappingsSample().  Without it
+           arm64 can move the two plain loads past the re-check and accept a pair
+           whose count comes from a newer publication than the list. */
+        atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
         if (regions == NULL || count == 0) {
             if (out_count != NULL) *out_count = 0;
@@ -2586,11 +2617,15 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     }
 
     nxusHitListFree(&g_Session.hits);
-    /* Dynamic ceiling: NXUS_SESSION_HIT_BUDGET_BYTES split into
-       8 B address + value_size B value, so a narrower type buys more hits
-       (u8 ~341k, u16 ~307k, u32 ~256k, u64 ~192k) for the same ~3 MB. */
+    /* Dynamic cap: nxusSessionHitLimit() splits NXUS_SESSION_HIT_BUDGET_BYTES into
+       (16 B address + value_size B value) rows and never returns more than the
+       budget allows, so u8/u16/u32 stay at the 150k default (2.55 / 2.70 / 3.00 MB)
+       while a u64 row stops at 128k (3,072,000 B) instead of the old flat 150k
+       (3,600,000 B, 0.5 MiB over budget).  g_Session.max_hits is a CEILING here,
+       not a floor: honouring a larger configured value would put the arrays back
+       over the budget. */
     u32 max_hits = nxusSessionHitLimit(hit_value_size);
-    if (max_hits < g_Session.max_hits) max_hits = g_Session.max_hits;
+    if (g_Session.max_hits < max_hits) max_hits = g_Session.max_hits;
     u32 initial = 65536;
     if (initial > max_hits) initial = max_hits;
     rc = nxusHitListInit(&g_Session.hits, initial, max_hits, hit_value_size);

@@ -11,7 +11,9 @@ Result nxusSnapshotServiceInit(void);
 /* Capture into slot A/B.  scope is a NxusScanScope.
  *
  * Every successful capture stamps the slot with the target identity the session
- * held when the capture started ({pid, program_id, session_id}); a failed take,
+ * held when the capture started ({pid, program_id, session_id} plus the dmnt
+ * target incarnation, nxusDmntTargetIncarnation, which is the only field that
+ * changes when a title is restarted into the same fixed layout); a failed take,
  * a release and the next capture of that slot clear it.  The stamp is what makes
  * a later diff meaningful: hashes describe ONE process's memory, so A and B may
  * only be compared while they describe the same target. */
@@ -25,6 +27,9 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
  *   - either slot holds no capture,
  *   - A and B were captured for DIFFERENT targets (the classic case: capture A on
  *     one title, switch titles, capture B - two unrelated address spaces),
+ *   - the dmnt target incarnation differs between the captures, or between the
+ *     captures and the session now (a title restarted into a fixed layout: same
+ *     pid, same title id, same mappings, different process),
  *   - the session has moved on from the captures' target (another title, a
  *     relaunch, a re-attach), so the addresses would be served for the wrong
  *     process,

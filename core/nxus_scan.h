@@ -224,8 +224,10 @@ int nxusScanNext(NxusHitList *hits, const NxusScanRequest *req,
 /*
  * An "unknown initial value" scan has to answer "which of the N candidates
  * changed?", but materialising N hits is both O(memory) and capped by the hit
- * list (150k hits is the practical wall).  The dense baseline replaces the hit
- * list with a per-block FINGERPRINT of the first pass:
+ * list: the cap is min(150k, 3.0 MiB / (16 B address + value_size bytes)), so
+ * u8/u16/u32 stop at 150k and u64 at 128k - a full list never exceeds the byte
+ * budget.  The dense baseline replaces the hit list with a per-block FINGERPRINT
+ * of the first pass:
  *
  *   - the scanned range is cut into 16 KB (or larger) blocks,
  *   - each block is described by a 64-bit FNV-1a hash plus an all-zero flag,

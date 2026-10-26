@@ -12,27 +12,36 @@
    128 KB, reading the same bytes. */
 #define NXUS_SESSION_DEFAULT_WINDOW  (1024u * 1024u)
 #define NXUS_SESSION_DEFAULT_GAP     (16u * 1024u)
-/* Floor for the hit cap (150k hits = ~3.6 MB with a 16 B address + an 8 B value
-   each).  The ceiling is derived per scan from NXUS_SESSION_HIT_BUDGET_BYTES below;
-   this constant stays a FLOOR, so a width whose budgeted cap comes out lower (u64)
-   still keeps the old 150k hits and costs ~3.6 MB rather than 3.0 MB. */
+/* Default hit cap: 150k hits, and the floor of the per-width cap derived below.
+   The floor is CLAMPED by the byte budget, never the other way round:
+       max_hits = min(DEFAULT_MAXHITS, BUDGET / (sizeof(NxusHitAddress) + value_size))
+   so a width whose rows would not fit the budget gets the smaller cap.  A u64 row
+   is 16 B (address) + 8 B (value) = 24 B, and 150k of those would be 3,600,000 B -
+   0.5 MiB over the 3.0 MiB budget; the clamp gives 128,000 hits (exactly
+   3,072,000 B).  u8/u16/u32 keep the 150k default (2.55 / 2.70 / 3.00 MB). */
 #define NXUS_SESSION_DEFAULT_MAXHITS 150000u
 
 /* Unknown scans cannot discard anything: the first pass stores a baseline of the
    whole scoped range (SD card, RAM fallback) and every match must survive until
    the second pass.  A flat 150k ceiling therefore truncates real candidates, so
    the cap is derived from a byte budget instead:
-       max_hits = BUDGET / (sizeof(NxusHitAddress) B address + value_size B value)
+       max_hits = min(DEFAULT_MAXHITS, BUDGET / (16 B address + value_size B value))
    NxusHitAddress is 16 bytes since the absolute address was appended to it (the
-   packed prefix is still offset / mapping_idx / value_type), so 3.0 MB yields
-   ~153k hits for u32, ~170k for u16, ~180k for u8 and ~128k for u64.  The stride
-   MUST track sizeof(): with a hard-coded 8 B a u32 list reached 256k hits, i.e.
-   5.1 MB of arrays for a 3.0 MB budget - enough to overrun the 8 MB inner heap. */
+   packed prefix is still offset / mapping_idx / value_type), so the budget alone
+   would allow ~180k hits for u8, ~170k for u16, ~153k for u32 and ~128k for u64.
+   The default floor caps the first three at 150k and u64 at 128k, so every width
+   stays inside the budget.  The stride MUST track sizeof(): with a hard-coded 8 B
+   a u32 list reached 256k hits, i.e. 5.1 MB of arrays for a 3.0 MB budget - enough
+   to overrun the 8 MB inner heap. */
 #define NXUS_SESSION_HIT_BUDGET_BYTES (3000u * 1024u)
 
 static inline u32 nxusSessionHitLimit(u32 value_size) {
     if (value_size == 0) value_size = 1;
-    return (u32)(NXUS_SESSION_HIT_BUDGET_BYTES / (sizeof(NxusHitAddress) + value_size));
+    const u32 row = (u32)sizeof(NxusHitAddress) + value_size;
+    const u32 budgeted = (u32)(NXUS_SESSION_HIT_BUDGET_BYTES / row);
+    /* The default is a floor that the budget may LOWER (u64: 128k instead of
+       150k), never a floor that may push the arrays past the budget. */
+    return budgeted < NXUS_SESSION_DEFAULT_MAXHITS ? budgeted : NXUS_SESSION_DEFAULT_MAXHITS;
 }
 
 /* Baseline dump the Unknown scan keeps on the SD card (RAM fallback inside the
@@ -43,7 +52,10 @@ static inline u32 nxusSessionHitLimit(u32 value_size) {
 /* Bring the session up.  Idempotent: a second call while the session is live
    does nothing and keeps the current limits - it must NOT reinitialise, which
    would leak the mapping snapshot / region list / hit list and leave callers
-   holding freed pointers.  Call nxusSessionExit() first to reinitialise. */
+   holding freed pointers.  Call nxusSessionExit() first to reinitialise.
+   max_hits is a CEILING for the per-width hit cap, not a floor: a value larger
+   than nxusSessionHitLimit() is clamped to it, so the configured number can
+   lower the cap but never push the hit arrays past NXUS_SESSION_HIT_BUDGET_BYTES. */
 void nxusSessionInit(u32 chunk_size, u32 max_hits);
 /* Tear the session down: stop the worker, free every owned block and unpublish
    the mapping/region views.  Safe to call when not initialised (no-op).  Clears

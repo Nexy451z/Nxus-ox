@@ -1,5 +1,6 @@
 #include "nxus_snapshot_srv.h"
 
+#include "nxus_dmntcht.h"
 #include "nxus_log.h"
 #include "nxus_session.h"
 
@@ -30,12 +31,19 @@ static u32                g_SlotTruncated[2];
  * every address in the changed list pointed into whichever process was attached
  * when the diff ran.  The stamp is taken from the session inside
  * nxusSnapshotTake() - the same identity the capture reads through
- * (nxusSessionProcessId / ProgramId / Id) - and is only published when the take
- * succeeded.
+ * (nxusSessionProcessId / ProgramId / Id) plus the dmnt target incarnation
+ * (nxusDmntTargetIncarnation, the one token a fixed-layout restart changes) - and
+ * is only published when the take succeeded.
  *
- * "Same target" follows the rule nxusSessionHitsMatchTarget() uses, so an
- * explicit DebugAttach (program id unknown = 0) does not turn every comparison
- * into a mismatch:
+ * "Same target" follows the rule nxusSessionHitsMatchTarget() / ptrChainOwnerCheck()
+ * use, so an explicit DebugAttach (program id unknown = 0) does not turn every
+ * comparison into a mismatch:
+ *   - the dmnt target INCARNATION (nxusDmntTargetIncarnation) must be equal on both
+ *     sides.  It is the strongest token and is compared on its own: a title
+ *     restarted into a FIXED layout comes back with the SAME pid, the same title id
+ *     and the same mappings, so every block hash below still lines up - against
+ *     another process.  A bumped incarnation is therefore a different target
+ *     whatever the pid/title say,
  *   - both sides know a pid -> the pid must match, and so must the program id
  *     once both know one (a new pid is a relaunch, a new title id is a title
  *     switch),
@@ -46,6 +54,7 @@ typedef struct {
     u64  pid;
     u64  program_id;
     u32  session_id;
+    u32  incarnation;   /* dmnt cheat-process generation (nxusDmntTargetIncarnation) */
     bool valid;
 } NxusSnapshotOwner;
 
@@ -57,16 +66,22 @@ static NxusSnapshotOwner g_DiffOwner;
 /* The identity the session holds RIGHT NOW. */
 static NxusSnapshotOwner snapshotOwnerCurrent(void) {
     NxusSnapshotOwner owner;
-    owner.pid        = nxusSessionProcessId();
-    owner.program_id = nxusSessionProgramId();
-    owner.session_id = nxusSessionId();
-    owner.valid      = true;
+    owner.pid         = nxusSessionProcessId();
+    owner.program_id  = nxusSessionProgramId();
+    owner.session_id  = nxusSessionId();
+    owner.incarnation = nxusDmntTargetIncarnation();
+    owner.valid       = true;
     return owner;
 }
 
 /* Do two stamps describe the same target?  See the block comment above. */
 static bool snapshotOwnerSame(const NxusSnapshotOwner *a, const NxusSnapshotOwner *b) {
     if (!a->valid || !b->valid) return false;
+    /* First, and unconditionally: the incarnation is the only token that separates
+       two processes with the same pid and title id (a restart in a fixed layout).
+       It also covers the no-pid fallback, where the session generation alone would
+       not notice such a restart. */
+    if (a->incarnation != b->incarnation) return false;
     if (a->pid != 0 && b->pid != 0) {
         if (a->pid != b->pid) return false;
         return a->program_id == 0 || b->program_id == 0 ||
@@ -332,9 +347,10 @@ Result nxusSnapshotTake(u32 slot, u32 scope, u64 range_begin, u64 range_end,
     /* The take is complete: the slot now describes this target, and a diff may
        use it - but only next to a slot stamped with the same identity. */
     g_SlotOwner[slot] = owner;
-    NXUS_LOG("snapshot %c: captured on pid=%llu title=%016llX (session %u)",
+    NXUS_LOG("snapshot %c: captured on pid=%llu title=%016llX (session %u, incarnation %u)",
              slot ? 'B' : 'A', (unsigned long long)owner.pid,
-             (unsigned long long)owner.program_id, (unsigned)owner.session_id);
+             (unsigned long long)owner.program_id, (unsigned)owner.session_id,
+             (unsigned)owner.incarnation);
     nxusSnapshotGetSummary(slot, out);
     return 0;
 }
@@ -382,6 +398,19 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
        refused it.  BAD_STATE is what the client can act on ("capture both
        again"); the log names both slots in A/B order, whatever order the client
        passed them in. */
+    /* The incarnation is checked before the pid/title rule so the refusal can name
+       it.  The "different targets" line below could not: both captures then carry
+       the same pid AND the same title id - that is exactly what a restart into a
+       fixed layout looks like - so the log would print two identical stamps and
+       explain nothing. */
+    if (g_SlotOwner[from_slot].valid && g_SlotOwner[to_slot].valid &&
+        g_SlotOwner[from_slot].incarnation != g_SlotOwner[to_slot].incarnation) {
+        NXUS_LOG("snapshot: slots were captured in different target incarnations "
+                 "(A incarnation=%u, B incarnation=%u) - capture both again",
+                 (unsigned)g_SlotOwner[0].incarnation,
+                 (unsigned)g_SlotOwner[1].incarnation);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
     if (!snapshotOwnerSame(&g_SlotOwner[from_slot], &g_SlotOwner[to_slot])) {
         NXUS_LOG("snapshot: slots were captured for different targets "
                  "(A pid=%llu title=%016llX, B pid=%llu title=%016llX) - capture both again",
@@ -398,8 +427,21 @@ Result nxusSnapshotCompare(u32 from_slot, u32 to_slot, NxusSnapshotSummary *out)
        of a new process at the same numeric addresses).  The capture keeps working
        after a scan or a Reset on the same target: the pid/title rule ignores the
        session generation while a pid is known. */
+    const NxusSnapshotOwner now = snapshotOwnerCurrent();
+    /* The incarnation first, and with both values in the log: a restart in a fixed
+       layout keeps pid and title id, so the generic line below would print the same
+       identity on both sides ("was pid=100 title=... , now pid=100 title=...") and
+       leave the client guessing why its comparison was refused. */
+    if (g_SlotOwner[from_slot].valid &&
+        g_SlotOwner[from_slot].incarnation != now.incarnation) {
+        NXUS_LOG("snapshot diff %c->%c: captures belong to an earlier dmnt target "
+                 "incarnation (was %u, now %u) - capture both again",
+                 from_slot ? 'B' : 'A', to_slot ? 'B' : 'A',
+                 (unsigned)g_SlotOwner[from_slot].incarnation,
+                 (unsigned)now.incarnation);
+        return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+    }
     if (!snapshotOwnerMatchesCurrent(&g_SlotOwner[from_slot])) {
-        const NxusSnapshotOwner now = snapshotOwnerCurrent();
         NXUS_LOG("snapshot diff %c->%c: captures were taken on pid=%llu title=%016llX "
                  "but the current target is pid=%llu title=%016llX - capture both again",
                  from_slot ? 'B' : 'A', to_slot ? 'B' : 'A',

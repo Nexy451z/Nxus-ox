@@ -24,7 +24,7 @@
  *     + 4096 * sizeof(NxusScanRegion)                          (128 KiB)
  *   one snapshot slot =
  *       NXUS_SNAPSHOT_MAX_BLOCKS * 2 * sizeof(u64)             (256 KiB)
- *   hit list          = retained capacity * (8 + value_size)
+ *   hit list          = retained capacity * (16 + value_size)
  *                       (<= NXUS_SESSION_HIT_BUDGET_BYTES)     (max 3.0 MiB)
  *   scan buffers      = NXUS_SESSION_DEFAULT_CHUNK
  *                     + NXUS_SESSION_DEFAULT_WINDOW            (2.0 MiB)
@@ -70,6 +70,7 @@ static int g_checks = 0;
 #define MAX_MAPPINGS             4096u                    /* nxus_session.c cap */
 #define MAX_REGIONS              4096u                    /* nxus_session.c cap */
 #define HIT_BUDGET_BYTES         (3000u * 1024u)          /* NXUS_SESSION_HIT_BUDGET_BYTES */
+#define DEFAULT_MAXHITS          150000u                  /* NXUS_SESSION_DEFAULT_MAXHITS */
 #define SESSION_CHUNK_BYTES      (1024u * 1024u)          /* NXUS_SESSION_DEFAULT_CHUNK */
 #define SESSION_WINDOW_BYTES     (1024u * 1024u)          /* NXUS_SESSION_DEFAULT_WINDOW */
 #define SNAPSHOT_CAPTURE_BYTES   (256u * 1024u)           /* nxus_snapshot_srv.c */
@@ -118,9 +119,9 @@ int main(void) {
     printf("[test] element sizes the formula is built from\n");
     /* NxusHitAddress keeps its packed 8-byte prefix (offset / mapping_idx /
        value_type) and appends the u64 absolute address, so one hit now occupies
-       16 B.  nxusSessionHitLimit() derives its stride from sizeof(NxusHitAddress);
-       estimateHeapPeak() in nxus_server.c still charges 8 B per hit, and switching
-       it over has to update the row formula below in the same change. */
+       16 B.  nxusSessionHitLimit() derives its stride from sizeof(NxusHitAddress)
+       plus value_size, and estimateHeapPeak() in nxus_server.c charges the same
+       16 + value_size per retained slot. */
     CHECK(sizeof(NxusHitAddress) == 16, "NxusHitAddress is %u B (8 B prefix + u64 address)",
           (unsigned)sizeof(NxusHitAddress));
     CHECK(offsetof(NxusHitAddress, address) == 8,
@@ -145,18 +146,44 @@ int main(void) {
           "hash array alone is %llu B",
           (unsigned long long)((u64)NXUS_SNAPSHOT_MAX_BLOCKS * sizeof(u64)));
 
-    printf("[test] hit list cap = HIT_BUDGET / (8 B address + value_size)\n");
+    printf("[test] hit list cap = min(DEFAULT_MAXHITS, HIT_BUDGET / (16 B + value_size))\n");
+    /* Mirrors nxusSessionHitLimit() (switch/include/nxus_session.h): the default is
+       a FLOOR that the byte budget may lower, never a floor that pushes the arrays
+       past the budget.  The old flat 150k floor cost 150000 * 24 B = 3.6 MB for
+       u64, i.e. 0.5 MiB over the 3.0 MiB budget. */
     const u32 widths[4] = { 1u, 2u, 4u, 8u };
+    const u32 expected[4] = { 150000u, 150000u, 150000u, 128000u };
     for (u32 i = 0; i < 4; i++) {
-        const u64 row = sizeof(NxusHitAddress) + widths[i];   /* the hit record is 16 B now */
-        const u64 cap = (u64)HIT_BUDGET_BYTES / row;
+        const u64 row = sizeof(NxusHitAddress) + widths[i];   /* 17 / 18 / 20 / 24 B */
+        const u64 budgeted = (u64)HIT_BUDGET_BYTES / row;
+        const u64 cap = (u64)DEFAULT_MAXHITS < budgeted ? (u64)DEFAULT_MAXHITS : budgeted;
+        CHECK(cap == (u64)expected[i], "u%u: cap is %llu hits (expected %u)",
+              (unsigned)(widths[i] * 8u), (unsigned long long)cap,
+              (unsigned)expected[i]);
+        CHECK(cap <= (u64)DEFAULT_MAXHITS, "u%u: cap %llu exceeds the default floor",
+              (unsigned)(widths[i] * 8u), (unsigned long long)cap);
         CHECK(cap * row <= (u64)HIT_BUDGET_BYTES,
               "u%u: %llu hits * %llu B overflows the hit budget",
               (unsigned)(widths[i] * 8u), (unsigned long long)cap,
               (unsigned long long)row);
-        CHECK((cap + 1u) * row > (u64)HIT_BUDGET_BYTES,
-              "u%u: cap is not maximal", (unsigned)(widths[i] * 8u));
+        /* The cap is the largest value inside both bounds: one more hit of this
+           width either leaves the budget or (for the capped widths) breaks the
+           default floor, which is the intended limit. */
+        const bool budget_bound = (cap + 1u) * row > (u64)HIT_BUDGET_BYTES;
+        const bool default_bound = cap == (u64)DEFAULT_MAXHITS;
+        CHECK(budget_bound || default_bound,
+              "u%u: cap is not maximal (%llu hits)", (unsigned)(widths[i] * 8u),
+              (unsigned long long)cap);
     }
+    /* The regression itself: the old floor at the widest row does not fit. */
+    CHECK((u64)DEFAULT_MAXHITS * (sizeof(NxusHitAddress) + 8u) == 3600000ull,
+          "150k u64 rows are %llu B (expected 3600000)",
+          (unsigned long long)((u64)DEFAULT_MAXHITS * (sizeof(NxusHitAddress) + 8u)));
+    CHECK((u64)DEFAULT_MAXHITS * (sizeof(NxusHitAddress) + 8u) > (u64)HIT_BUDGET_BYTES,
+          "the u64 cap must be lowered below the old 150k floor");
+    CHECK(128000ull * (sizeof(NxusHitAddress) + 8u) == (u64)HIT_BUDGET_BYTES,
+          "the u64 cap lands exactly on the budget (%llu B)",
+          (unsigned long long)(128000ull * (sizeof(NxusHitAddress) + 8u)));
     CHECK((u64)HIT_BUDGET_BYTES == 3072000ull, "hit budget is %llu B (expected 3072000)",
           (unsigned long long)HIT_BUDGET_BYTES);
 

@@ -161,3 +161,19 @@ void nxusLogWriteError(const char *fmt, ...) {
     logStore(fmt, ap);
     va_end(ap);
 }
+
+/* The dmnt wrapper counts target incarnations; the snapshot owner stamps it, so the
+   stub has to provide the symbol (and a setter so a test can move the generation). */
+static u32 g_TestIncarnation = 1;
+
+u32 nxusDmntTargetIncarnation(void) {
+    return g_TestIncarnation;
+}
+
+void nxusTestSessionSetIncarnation(u32 incarnation) {
+    g_TestIncarnation = incarnation;
+}
+
+void nxusDmntAdoptNextOpen(void) {
+    /* the tests never reopen dmnt */
+}
