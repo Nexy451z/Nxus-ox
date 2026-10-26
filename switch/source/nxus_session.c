@@ -2682,12 +2682,14 @@ Result nxusSessionScanNext(const NxusScanRequest *req, u32 value_type, u32 epsil
        in the baseline until the refine pass materialises the matches.  So an
        empty hit list is only an error when there is no baseline to refine. */
     if (g_Session.hits.count == 0 && !g_Session.baseline.active) {
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        /* Report this as OUR bad-state, not libnx's BadInput: the PC can label the
+           former ("wrong state for this") and the latter only as a raw number. */
+        return NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
     /* A refine must not widen the values it compares against the stored ones:
        that would read past every slot in the hit list. */
     if (nxusHitListValueSize(value_type, req->value_size ? req->value_size : 4) > g_Session.hits.value_size) {
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        return NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
     }
 
     g_Session.job_req = *req;

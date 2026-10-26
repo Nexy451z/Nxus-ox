@@ -573,9 +573,52 @@ fn is_retry_later(e: &NxusError) -> bool {
 /// (see [`error_reason_text`]).  A short or reason-less payload keeps the old
 /// message exactly ("command 0x.... failed"), so a console that predates the
 /// reason word still produces the familiar text.
+/// Human hint for a result code, whatever module produced it.
+///
+/// Two encodings arrive here:
+/// * our own codes, `0x80000000 | (NXUS_RESULT_MODULE << 9) | description`;
+/// * libnx's `MAKERESULT`, which is **small and bit-31 clear** (`(module) |
+///   (description << 9)`, module 345 = Module_Libnx).  Printing `0x00001759`
+///   told the user nothing, even though it is just "bad input".
+const RESULT_MODULE_NXUS: u32 = 484;   // core/nxus_protocol.h NXUS_RESULT_MODULE
+
+fn result_text(rc: u32) -> Option<&'static str> {
+    // Two different layouts: libnx packs (module | description << 9) with bit 31
+    // clear, while our own codes are 0x80000000 | (module << 9) | description.
+    let (module, desc) = if rc & 0x8000_0000 != 0 {
+        ((rc >> 9) & 0x1FF, rc & 0x1FF)
+    } else {
+        (rc & 0x1FF, (rc >> 9) & 0x1FFF)
+    };
+    if module == RESULT_MODULE_NXUS {
+        return match desc {
+            1 => Some("the console does not implement this command"),
+            2 => Some("the console does not support this"),
+            3 => Some("the console is busy - retry"),
+            4 => Some("nothing is attached"),
+            5 => Some("no process is running"),
+            6 => Some("the console is in the wrong state for this"),
+            7 => Some("the request is too large"),
+            8 => Some("a pointer scan is already running"),
+            _ => None,
+        };
+    }
+    if module == 345 {
+        // Module_Libnx: LibnxError_BadInput is 11 (the usual "nothing to refine").
+        return match desc {
+            11 => Some("libnx rejected the input (nothing to refine?)"),
+            _ => None,
+        };
+    }
+    None
+}
+
 fn error_from_reply(cmd: u16, body: &[u8]) -> NxusError {
     let rc = if body.len() >= 4 { rd_u32(body, 0) } else { 0 };
     let mut message = format!("command 0x{:04X} failed", cmd);
+    if let Some(text) = result_text(rc) {
+        message.push_str(&format!(" - {}", text));
+    }
     if body.len() >= 8 {
         let reason = rd_u32(body, 4);
         match error_reason_text(reason) {
@@ -1715,7 +1758,7 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
+    use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for, result_text,
                 pointer_width_with_reason, released_addresses, select_stopped_thread,
                 Mapping, Metadata, NxusError, PERM_R, RESULT_BUSY,
                 WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
@@ -2089,5 +2132,25 @@ mod tests {
     fn without_the_new_field_the_truncated_half_is_the_last_resort() {
         // Old console whose event was never polled: still the legacy behaviour.
         assert_eq!(select_stopped_thread(&stopped(0x1001, 0), None), Some(0x1001));
+    }
+
+    #[test]
+    fn result_text_labels_both_encodings() {
+        // libnx MAKERESULT(Module_Libnx, LibnxError_BadInput): bit 31 clear, tiny.
+        assert_eq!(
+            result_text(0x0000_1759),
+            Some("libnx rejected the input (nothing to refine?)")
+        );
+        // Our own BAD_STATE: 0x80000000 | (484 << 9) | 6.
+        assert_eq!(
+            result_text(0x8003_C806),
+            Some("the console is in the wrong state for this")
+        );
+        assert_eq!(
+            result_text(0x8003_C801),
+            Some("the console does not implement this command")
+        );
+        assert_eq!(result_text(0), None, "0 is never an error");
+        assert_eq!(result_text(0x1234_5678), None, "unknown module stays unlabelled");
     }
 }
