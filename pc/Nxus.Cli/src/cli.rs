@@ -271,9 +271,22 @@ fn hexdump(data: &[u8], base: u64) {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+    // `-help` / `-?` used to fall through to the flag parser, which left the
+    // command empty and dialled 127.0.0.1:7332.  Any bare help spelling prints the
+    // usage and exits 0 instead of touching the network.
+    let first = args.first().map(|s| s.as_str()).unwrap_or("");
+    if args.is_empty()
+        || matches!(first, "-h" | "--help" | "-help" | "/?" | "-?" | "--usage" | "help" | "usage")
+    {
         print!("{}", USAGE);
         return 0;
+    }
+    // A leading flag means the user forgot the command: show usage rather than
+    // connecting to the default host with an empty command.
+    if first.starts_with('-') && !matches!(first, "--host" | "-host" | "--port" | "-port") {
+        print!("{}", USAGE);
+        eprintln!("error: no command given (flags only)");
+        return 2;
     }
 
     let opts = Opts::parse(args);
@@ -2749,6 +2762,26 @@ fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str,
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::run;
+
+    #[test]
+    fn every_help_spelling_prints_usage_and_succeeds() {
+        for spelling in ["-help", "--help", "-h", "help", "usage", "-?"] {
+            let args = vec![spelling.to_string()];
+            assert_eq!(run(&args), 0, "{} should print usage and exit 0", spelling);
+        }
+    }
+
+    #[test]
+    fn flags_without_a_command_do_not_connect() {
+        // Used to fall through to the default host and dial 127.0.0.1:7332.
+        let args = vec!["--depth".to_string(), "3".to_string()];
+        assert_eq!(run(&args), 2, "a flags-only command line is a usage error");
+    }
 }
 
 #[cfg(test)]

@@ -208,7 +208,8 @@ Because every network assigns a different local IP address to the Switch (e.g., 
 3. **Via Command-Line Flag**: Pass `--host <SWITCH_IP>` (and optionally `--port 7332`) to any CLI or GUI invocation.
 
 #### Launching the GUI
-- **Double-click `nxus.exe`** (or `nxus-gui.bat`), or launch from a terminal:
+- **Double-click `nxus.exe`** (or `nxus-gui.bat`) - no arguments opens the GUI;
+  `nxus.exe --help` (also `-h`, `-help`, `help`) prints the command reference, or launch from a terminal:
   ```powershell
   .\nxus.exe
   # or pass an initial IP address:
