@@ -999,7 +999,15 @@ fn execute(opts: &Opts) -> Result<()> {
                     print_scan_failure(&st);
                 }
                 "refine" => {
-                    let compare = opts.flag("cmp").and_then(|c| Compare::parse(c)).unwrap_or(Compare::Decreased);
+                    // Defaulting to "decreased" made the obvious command line
+        // (`scan refine 9997199`) compare "has it decreased?" and silently
+        // throw away every hit.  With a value the user means "still equals
+        // this"; without one the useful default is "unchanged".
+        let has_value = opts.num("value").is_some() || opts.positional.get(2).is_some();
+        let compare = opts
+            .flag("cmp")
+            .and_then(|c| Compare::parse(c))
+            .unwrap_or(if has_value { Compare::Equal } else { Compare::Unchanged });
                     // --load switches to the PC-side candidate list
                     if let Some(path) = opts.flag("load") {
                         let mut scan = crate::pcscan::load(path)
@@ -2186,7 +2194,16 @@ fn thumb32_text(pc: u64, word: u32) -> String {
 fn build_spec(opts: &Opts, text: &str, refine: bool) -> Result<ScanSpec> {
     let value_type = opts.flag("type").and_then(|t| ValueType::parse(t)).unwrap_or(ValueType::U32);
     let compare = if refine {
-        opts.flag("cmp").and_then(|c| Compare::parse(c)).unwrap_or(Compare::Increased)
+        // "Increased" as the blanket refine default threw away every hit when the
+        // user refined with a value (`scan refine 9997199` means "still equals
+        // this").  Only a value-less refine keeps the numeric "went up" default.
+        opts.flag("cmp")
+            .and_then(|c| Compare::parse(c))
+            .unwrap_or(if text.trim().is_empty() {
+                Compare::Increased
+            } else {
+                Compare::Equal
+            })
     } else {
         opts.flag("cmp").and_then(|c| Compare::parse(c)).unwrap_or(Compare::Equal)
     };
