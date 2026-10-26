@@ -359,6 +359,11 @@ Result nxusDmntForceOpen(void) {
 
     if (R_SUCCEEDED(rc) && (R_FAILED(probe_rc) || !already_open)) {
         (void)dmntTargetOpened();
+    } else {
+        /* The "this reopen is the same process" hint applies to ONE attempt only.
+           Leaving it latched made the next genuinely different open inherit the old
+           incarnation, which silently disabled every staleness check. */
+        atomic_store_explicit(&g_AdoptNextOpen, false, memory_order_release);
     }
     return rc;
 }

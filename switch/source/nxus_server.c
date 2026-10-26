@@ -292,6 +292,12 @@ static void sendFrozenReleasedEvent(u32 total, const u64 *addresses) {
 }
 
 static void releaseOwnedFrozen(void) {
+    /* Every current-target entry is released through dmnt; only the EVENT payload is
+       capped at NXUS_FROZEN_RELEASE_ADDR_MAX.  Capping the release loop as well left
+       up to 96 of the 128 tracked freezes active until the next reboot while the log
+       claimed they were all released. */
+    u64 release_all[NXUS_FROZEN_OWNED_MAX];
+    u32 release_all_count = 0;
     u64 released_addresses[NXUS_FROZEN_RELEASE_ADDR_MAX];
     u32 released = 0;
     u32 snapshot = 0;
@@ -323,6 +329,8 @@ static void releaseOwnedFrozen(void) {
         if (released < NXUS_FROZEN_RELEASE_ADDR_MAX) {
             released_addresses[released] = g_FrozenOwned[i].address;
         }
+        if (release_all_count < NXUS_FROZEN_OWNED_MAX)
+            release_all[release_all_count++] = g_FrozenOwned[i].address;
         released++;
     }
     snapshot = (released < NXUS_FROZEN_RELEASE_ADDR_MAX)
@@ -345,11 +353,11 @@ static void releaseOwnedFrozen(void) {
     }
 
     NXUS_LOG("frozen: releasing %u address(es) - the client is gone", (unsigned)released);
-    for (u32 i = 0; i < snapshot; i++) {
-        Result rc = nxusDmntDisableFrozen(released_addresses[i]);
+    for (u32 i = 0; i < release_all_count; i++) {
+        Result rc = nxusDmntDisableFrozen(release_all[i]);
         if (R_FAILED(rc)) {
             NXUS_LOG("frozen: release of %016llX failed rc=0x%08X",
-                     (unsigned long long)released_addresses[i], (unsigned)rc);
+                     (unsigned long long)release_all[i], (unsigned)rc);
         }
     }
 

@@ -80,7 +80,7 @@ error into a success — merely because a field is missing.
 - **Uncapped Unknown Initial Scan (Dense Baseline + Zero-Block Skip + 16 KiB Hash Skip)**:
   - Instead of pushing every address into the hit list on Pass 1 (which would truncate at 150k hits), `Unknown` scans use a **2-stage Dense Baseline → Lazy Hit Materialization** pipeline on both the Switch (`sdmc:/nxus/scan_base.bin` + RAM hybrid) and the PC (`pcscan.rs`).
   - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
-  - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `341k` hits for `u8`, `307k` for `u16`, `256k` for `u32`).
+  - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `180k` hits for `u8`, `170k` for `u16`, `153k` for `u32`).
 - **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.40 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.40 MiB` in total, inside the Switch `System` pool partition.
 - **Incomplete results are never silent**: three independent limits can cut a result
   short, and each one is reported instead of being presented as complete —
@@ -305,7 +305,7 @@ Nxus-ox/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
     tests/    Cross-language protocol parity & end-to-end test suite (121 tests)
-  tests/      Host C unit test suite (1,769 checks across 8 test binaries)
+  tests/      Host C unit test suite (1,775 checks across 8 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
 
@@ -328,7 +328,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,769 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 51, scantypes 275, hotkey 11, session_view 313, snapshot_owner 202)
+# 1. Host C Core Tests (1,775 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 51, scantypes 275, hotkey 11, session_view 313, snapshot_owner 208)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)

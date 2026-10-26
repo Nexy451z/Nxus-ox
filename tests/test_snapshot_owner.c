@@ -205,6 +205,34 @@ static void testSameTargetDiffSucceeds(void) {
     CHECK(nxusSnapshotGetChanged(&row, 1, 1) == 0, "offset past the list pages nothing");
 }
 
+
+/* ---- the same pid/title after a restart: only the dmnt incarnation differs --- */
+
+static void testIncarnationSwitchRefused(void) {
+    printf("[test] same pid/title but a new target incarnation -> BAD_STATE\n");
+    fresh();
+    nxusTestSessionSetIdentity(NXUS_TEST_PID_A, NXUS_TEST_TITLE_A, 1);
+    nxusTestSessionSetIncarnation(7);
+    memset(memory(), 0x55, REGION_SIZE);
+    CHECK(R_SUCCEEDED(takeSlot(0)), "capture A on incarnation 7");
+
+    nxusTestSessionSetIncarnation(8);   /* the title was restarted underneath us */
+    memset(memory(), 0x66, REGION_SIZE);
+    CHECK(R_SUCCEEDED(takeSlot(1)), "capture B on incarnation 8");
+
+    NxusSnapshotSummary d;
+    Result rc = compareSlots(0, 1, &d);
+    CHECK(rc == BAD_STATE, "cross-incarnation diff rc=0x%08X", (unsigned)rc);
+    CHECK(d.changed_count == 0, "refused diff reports no rows (%u)",
+          (unsigned)d.changed_count);
+    CHECK(pageAll() == 0, "nothing is pageable after a refused diff");
+
+    /* A capture that predates the restart is not "current" either. */
+    CHECK(!nxusSnapshotDiffMatchesCurrent() || g_ChangedCount == 0,
+          "a diff from an earlier incarnation is not served as current");
+    nxusTestSessionSetIncarnation(1);
+}
+
 /* ---- title / pid mismatches between the two captures -------------------- */
 
 static void testTitleSwitchRefused(void) {
@@ -669,6 +697,7 @@ int main(void) {
 
     testSameTargetDiffSucceeds();
     testTitleSwitchRefused();
+    testIncarnationSwitchRefused();
     testRelaunchAndCurrentTargetMoves();
     testSamePidRules();
     testUnknownPidUsesGeneration();
