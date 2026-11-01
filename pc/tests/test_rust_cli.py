@@ -74,6 +74,18 @@ class RustCli(unittest.TestCase):
             self.assertIn(needle, text, f"missing {needle!r} in:\n{text}")
         return text
 
+    def write_cheat_file(self, relative_path, text):
+        path = os.path.join(self.tmp, relative_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8', newline='\n') as handle:
+            handle.write(text)
+        return path
+
+    def read_target_u32(self, address):
+        raw = self.server.target.read(address, 4)
+        self.assertIsNotNone(raw, f'unreadable mock memory at {address:08X}')
+        return int.from_bytes(raw, 'little')
+
     # ---- tests ----
 
     def test_01_help_without_a_console(self):
@@ -637,6 +649,97 @@ class RustCli(unittest.TestCase):
         # ... and says it once: the second run already knows the list is empty
         text = self.assert_ok(self.run_nxus('status'))
         self.assertNotIn('hint: nothing is frozen', text)
+
+    def test_28_cheat_list_reads_a_file(self):
+        """`cheat list` shows every block with its mode, master/off flags and size."""
+        address = DATA_BASE + 0x3000
+        path = self.write_cheat_file('cheat28/cheats.txt', f"""\
+[Money]
+04400000 {address:08X} 00000063
+--off
+04400000 {address:08X} 00000005
+
+[Looping]
+@loop
+04400000 {address + 4:08X} 0000002A
+
+{{Master Code}}
+04400000 {address + 8:08X} 00000001
+""")
+        text = self.assert_ok(self.run_nxus('cheat', 'list', '--file', path))
+        self.assertIn('Money', text)
+        self.assertIn('mode=Patch', text)
+        self.assertIn('off=yes', text)
+        self.assertIn('Looping', text)
+        self.assertIn('mode=Loop', text)
+        self.assertIn('Master Code', text)
+        self.assertIn('master=yes', text)
+        self.assertIn('instructions=1', text)
+
+    def test_29_cheat_on_and_off_restore_mock_memory(self):
+        """ON writes the patched value; OFF restores the original bytes from the journal."""
+        address = DATA_BASE + 0x3010
+        original, patched = 0x1111, 0x2222
+        self.assert_ok(self.run_nxus('write', hex(address), f'u32:{original}'))
+        self.assertEqual(self.read_target_u32(address), original)
+
+        path = self.write_cheat_file('cheat29/cheats.txt', f"""\
+[Money]
+04400000 {address:08X} {patched:08X}
+""")
+        text = self.assert_ok(self.run_nxus('cheat', 'on', 'Money', '--file', path))
+        self.assertIn("enabled 'Money'", text)
+        self.assertEqual(self.read_target_u32(address), patched,
+                         'the cheat VM did not write the patched value to the mock target')
+
+        text = self.assert_ok(self.run_nxus('cheat', 'off', 'Money', '--file', path))
+        self.assertIn("disabled 'Money'", text)
+        self.assertIn('restored the backed-up original bytes', text)
+        self.assertEqual(self.read_target_u32(address), original,
+                         'the original bytes were not restored from the sidecar journal')
+
+    def test_30_cheat_off_runs_an_explicit_off_block(self):
+        """A `@off` / `:OFF` program is executed instead of the automatic restore."""
+        address = DATA_BASE + 0x3020
+        original, patched = 0x3333, 0x4444
+        self.assert_ok(self.run_nxus('write', hex(address), f'u32:{original}'))
+
+        path = self.write_cheat_file('cheat30/cheats.txt', f"""\
+[Money]
+04400000 {address:08X} {patched:08X}
+@off
+04400000 {address:08X} {original:08X}
+""")
+        self.assert_ok(self.run_nxus('cheat', 'on', 'Money', '--file', path))
+        self.assertEqual(self.read_target_u32(address), patched)
+
+        text = self.assert_ok(self.run_nxus('cheat', 'off', 'Money', '--file', path))
+        self.assertIn('ran its :OFF/@off block', text)
+        self.assertEqual(self.read_target_u32(address), original,
+                         'the explicit OFF program did not run')
+
+    def test_31_cheat_panic_off_restores_every_backup(self):
+        """panic-off restores every address in the sidecar journal in one go."""
+        first = DATA_BASE + 0x3030
+        second = DATA_BASE + 0x3034
+        self.assert_ok(self.run_nxus('write', hex(first), 'u32:4660'))
+        self.assert_ok(self.run_nxus('write', hex(second), 'u32:22136'))
+        path = self.write_cheat_file('cheat31/cheats.txt', f"""\
+[One]
+04400000 {first:08X} 0000AAAA
+
+[Two]
+04400000 {second:08X} 0000BBBB
+""")
+        self.assert_ok(self.run_nxus('cheat', 'on', 'One', '--file', path))
+        self.assert_ok(self.run_nxus('cheat', 'on', 'Two', '--file', path))
+        self.assertEqual(self.read_target_u32(first), 0xAAAA)
+        self.assertEqual(self.read_target_u32(second), 0xBBBB)
+
+        text = self.assert_ok(self.run_nxus('cheat', 'panic-off', '--file', path))
+        self.assertIn('panic-off: restored 2 backed-up address(es)', text)
+        self.assertEqual(self.read_target_u32(first), 4660)
+        self.assertEqual(self.read_target_u32(second), 22136)
 
 
 if __name__ == '__main__':

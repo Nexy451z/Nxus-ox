@@ -4,6 +4,7 @@
 //! watchpoint tooling, and settings that persist between runs.  All network work
 //! happens on a worker thread, so the UI never blocks.
 
+pub mod cheats;
 pub mod hexview;
 pub mod panels;
 
@@ -1252,6 +1253,9 @@ pub enum Tab {
     Disasm,
     Snapshot,
     Watch,
+    /// Atmosphere cheat files: edit/save `<exe_dir>/cheats/<BUILDID>.txt`,
+    /// toggle Patch/Loop cheats against the live target and panic-restore.
+    Cheats,
     Info,
 }
 
@@ -1725,6 +1729,9 @@ pub struct App {
     pub st: State,
     pub prefs: Prefs,
     pub hex: hexview::HexView,
+    /// `[Cheats]` tab state and its own worker (the tab owns a separate
+    /// connection so toggling cheats never blocks a scan).
+    pub cheats: cheats::CheatUi,
     pub tab: Tab,
     pub show_settings: bool,
     pub show_modules: bool,
@@ -2307,6 +2314,7 @@ impl App {
             st: State::new(),
             prefs,
             hex: hexview::HexView::new(),
+            cheats: cheats::CheatUi::new(),
             tab: Tab::Results,
             show_settings: false,
             show_modules: false,
@@ -2929,6 +2937,10 @@ impl eframe::App for App {
         self.frames += 1;
         let ctx = ui.ctx().clone();
 
+        // The cheat tab's Loop cheats must keep ticking even while another tab
+        // is visible; `poll` also drains its worker and asks for repaints.
+        self.cheats.poll(&ctx);
+
         self.handle_keys(&ctx);
         panels::top_bar(self, ui);
         panels::status_bar(self, ui);
@@ -3418,6 +3430,7 @@ pub fn run(host: Option<String>, port: Option<u16>, screenshot: Option<String>, 
                 Some("disasm") => Tab::Disasm,
                 Some("snapshot") => Tab::Snapshot,
                 Some("watch") => Tab::Watch,
+                Some("cheats") | Some("cheat") => Tab::Cheats,
                 Some("info") => Tab::Info,
                 _ => Tab::Results,
             };

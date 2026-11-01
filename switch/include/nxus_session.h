@@ -201,6 +201,23 @@ int nxusSessionReadCallback(void *ctx, u64 address, void *buffer, u32 size);
    debug session does not silently break reads. */
 int nxusSessionReadMemory(u64 address, void *buffer, u32 size);
 
+/* ---- write-range permission checks -------------------------------------
+ * Both validate that [address, address + size) lies inside ONE currently mapped
+ * region of the target and never straddles a mapping boundary.  They query the
+ * live target (debug handle while attached, dmnt otherwise), so a freshly
+ * mapped heap or a reloaded .text segment is judged as it is now, not against a
+ * scan snapshot that may predate it.
+ *
+ *   nxusSessionCheckRange: `require_writable` asks for read + write; false
+ *       accepts any readable mapping.
+ *   nxusSessionCheckCodePatchRange: accepts read + (write OR execute), i.e.
+ *       RW .data and RX .text.  This is the deliberate escape hatch for PC
+ *       cheat ASM patches, which must rewrite Read-Execute code pages; a plain
+ *       NxusCmd_Write (no ALLOW_RX flag) still goes through the writable check.
+ */
+bool nxusSessionCheckRange(u64 address, u64 size, bool require_writable);
+bool nxusSessionCheckCodePatchRange(u64 address, u64 size);
+
 /* Refresh mappings and rebuild the region list for a scope without starting a
    scan; the snapshot service reuses it. */
 Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end);

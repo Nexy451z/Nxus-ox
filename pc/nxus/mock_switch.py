@@ -40,6 +40,18 @@ import time
 
 from . import protocol as P
 
+# NxusWriteHeader.reserved bit 0 (NXUS_WRITE_FLAG_ALLOW_RX in
+# core/nxus_protocol.h): a Write carrying it may target Read-Execute .text.
+WRITE_FLAG_ALLOW_RX = 0x01
+
+# NxusStatus was 76 bytes; keys_held was appended at that offset (Chapter 7
+# append-only rule), so a current status reply is 84 bytes.  Keeping the offset
+# explicit lets the mock stay correct even while protocol.py's mirror is the
+# legacy prefix.
+STATUS_LEGACY_SIZE = 76
+STATUS_KEYS_HELD_OFFSET = STATUS_LEGACY_SIZE
+STATUS_SIZE = STATUS_KEYS_HELD_OFFSET + 8
+
 # --- synthetic target ----------------------------------------------------
 
 MAIN_BASE = 0x00700000
@@ -99,7 +111,31 @@ class MockTarget:
     def set_money(self, value: int) -> None:
         struct.pack_into('<i', self.rec, REC_OFFSET + 4, value)
 
+    def _mapping_at(self, address: int, size: int, allow_rx: bool = False):
+        """A mapping containing [address, address+size) that permits the write.
+
+        The synthetic main module mapping overlaps .data in this mock, so the
+        first containing mapping can be the Read-Execute main mapping even when
+        a writable .data mapping also covers the address.  Return the first
+        containing mapping that satisfies the requested policy, falling back to
+        the first match so the caller can report "not writable" rather than
+        "unmapped".
+        """
+        first = None
+        for m in self.mappings:
+            if m['base'] <= address and address + size <= m['base'] + m['size']:
+                if first is None:
+                    first = m
+                perm = m['perm']
+                if perm & P.PERM['NXUS_PERM_W']:
+                    return m
+                if allow_rx and (perm & P.PERM['NXUS_PERM_X']):
+                    return m
+        return first
+
     def _locate(self, address: int, size: int):
+        # Keep the historical first-match behaviour for data access: the mock's
+        # overlapping synthetic mappings are part of its existing test contract.
         for m in self.mappings:
             if m['base'] <= address and address + size <= m['base'] + m['size']:
                 return m['buf'], address - m['base']
@@ -111,10 +147,23 @@ class MockTarget:
             return None
         return bytes(buf[off:off + size])
 
-    def write(self, address: int, data: bytes) -> bool:
-        buf, off = self._locate(address, len(data))
-        if buf is None:
+    def write(self, address: int, data: bytes, allow_rx: bool = False) -> bool:
+        """Write target memory.
+
+        A normal write (allow_rx=False) must land in a writable mapping, like the
+        console's zero-reserved NxusWriteHeader path.  With allow_rx=True (the
+        wire's WRITE_FLAG_ALLOW_RX) a Read-Execute .text mapping is accepted too,
+        which is what cheat/ASM patches need.  Read-only non-executable mappings
+        stay unwritable either way.
+        """
+        mapping = self._mapping_at(address, len(data), allow_rx=allow_rx)
+        if mapping is None:
             return False
+        perm = mapping['perm']
+        if not (perm & P.PERM['NXUS_PERM_W']):
+            if not (allow_rx and (perm & P.PERM['NXUS_PERM_X'])):
+                return False
+        buf, off = self._locate(address, len(data))
         buf[off:off + len(data)] = data
         return True
 
@@ -446,6 +495,10 @@ class MockSwitch:
         # Address-space window reported in GetMetadata (0 = not reported).
         self.aslr_base = 0
         self.aslr_size = 0
+        # Live HidNpadButton held mask reported by NxusStatus.keys_held, so a
+        # Python E2E test can simulate holding controller buttons for opcode 8
+        # (e.g. server.keys_held = 1 << 0 for A).  0 = nothing held.
+        self.keys_held = 0
         self.changed: list = []
         self.changed_truncated = 0
         self.hotkey = dict(mask=0, hold_ms=0, enabled=0)
@@ -759,10 +812,18 @@ class MockSwitch:
         # state, the hit count and progress_permille, plus last_result for the
         # Error case.  The scan *session id* is not part of this struct - it
         # travels in NxusHitBatchHeader (see _get_hits()).
-        return P.STATUS.pack(P.PROTO_VERSION, P.MODE['NXUS_MODE_DMNT'], flags, self.scan_state,
-                             0x1234, 0x0100C3800049C000, MAIN_BASE, MAIN_SIZE,
-                             len(self.hits), self.progress, self.scan_last_result, 1234,
-                             0, 8 * 1024 * 1024, self.max_read)
+        #
+        # keys_held was APPENDED at offset 76 (Chapter 7), so a current reply is
+        # 84 bytes.  protocol.py may still carry the 76-byte legacy mirror; then
+        # append the field by hand so the mock always speaks the current shape.
+        fields = (P.PROTO_VERSION, P.MODE['NXUS_MODE_DMNT'], flags, self.scan_state,
+                  0x1234, 0x0100C3800049C000, MAIN_BASE, MAIN_SIZE,
+                  len(self.hits), self.progress, self.scan_last_result, 1234,
+                  0, 8 * 1024 * 1024, self.max_read)
+        keys_held = int(self.keys_held) & 0xFFFFFFFFFFFFFFFF
+        if P.STATUS.size >= STATUS_SIZE:
+            return P.STATUS.pack(*fields, keys_held)
+        return P.STATUS.pack(*fields) + struct.pack('<Q', keys_held)
 
     def _handle(self, cmd: int, payload: bytes):
         # --- fault injection (before any handler, so no state is touched) ----
@@ -832,9 +893,12 @@ class MockSwitch:
                 data = data[:self.short_read_bytes]
             return data
         if cmd == P.CMD['Write']:
-            address, size, _res = P.WRITE_HEADER.unpack_from(payload, 0)
+            address, size, reserved = P.WRITE_HEADER.unpack_from(payload, 0)
             data = payload[P.WRITE_HEADER.size:P.WRITE_HEADER.size + size]
-            if not self.target.write(address, data):
+            # A cheat patch sets NXUS_WRITE_FLAG_ALLOW_RX so .text (RX) becomes
+            # writable; a plain write keeps the historical writable-only rule.
+            allow_rx = (reserved & WRITE_FLAG_ALLOW_RX) != 0
+            if not self.target.write(address, data, allow_rx=allow_rx):
                 return self._error(P.ERR_BAD_STATE)
             return b''
         if cmd == P.CMD['GetModules']:

@@ -489,6 +489,92 @@ static void testRegionsHoldAcrossRebuild(void) {
           (unsigned)g_ViewRetiredCount);
 }
 
+/* Perm_X must survive the mapping snapshot: the old mask (`perm & 0x03`) turned
+   every RX .text mapping into RO, which made the PC believe code could not be
+   patched and made the RX write path reject it.  The same live-query policy is
+   what NxusCmd_Write uses: ALLOW_RX accepts RX (.text) or RW (.data); a plain
+   write still requires RW. */
+static void testPermXAndCodePatchRange(void) {
+    printf("- Perm_X survives the snapshot; RX code-patch ranges are recognised\n");
+    freshSession();
+
+    const u64 rx_base = 0x7100000000ull;
+    const u64 ro_base = 0x7200000000ull;
+    const u64 rw_base = 0x7300000000ull;
+    const u64 rx_size = 0x4000ull;
+    const u64 ro_size = 0x2000ull;
+    const u64 rw_size = 0x3000ull;
+
+    fakeClearMappings();
+    fakeAddMapping(rx_base, rx_size, NXUS_PERM_R | NXUS_PERM_X);   /* .text   */
+    fakeAddMapping(ro_base, ro_size, NXUS_PERM_R);                 /* .rodata */
+    fakeAddMapping(rw_base, rw_size, NXUS_PERM_R | NXUS_PERM_W);   /* .data   */
+
+    Result rc = nxusSessionRefreshMappings();
+    CHECK(R_SUCCEEDED(rc), "mapping snapshot rc=0x%08X", (unsigned)rc);
+
+    NxusViewPin pin;
+    CHECK(nxusSessionViewPinCurrent(&pin), "mapping view pinned");
+    const NxusMappingTable *table = nxusSessionMappingsPinned(&pin);
+    CHECK(table != NULL && table->count == 3u, "three mappings published (%u)",
+          table ? (unsigned)table->count : 0u);
+    if (table != NULL && table->count == 3u) {
+        CHECK(table->entries[0].reserved == (NXUS_PERM_R | NXUS_PERM_X),
+              "RX .text keeps Perm_X (perm=0x%X)", (unsigned)table->entries[0].reserved);
+        CHECK(table->entries[1].reserved == NXUS_PERM_R,
+              "RO .rodata stays read-only (perm=0x%X)", (unsigned)table->entries[1].reserved);
+        CHECK(table->entries[2].reserved == (NXUS_PERM_R | NXUS_PERM_W),
+              "RW .data keeps Perm_W (perm=0x%X)", (unsigned)table->entries[2].reserved);
+    }
+    nxusSessionViewUnpin(&pin);
+
+    /* The region list carries the same permission word to the PC. */
+    rc = nxusSessionPrepareRegions(NxusScope_All, 0, 0);
+    CHECK(R_SUCCEEDED(rc), "region list rc=0x%08X", (unsigned)rc);
+    u32 count = 0;
+    const NxusScanRegion *regions = nxusSessionRegions(&count);
+    CHECK(regions != NULL && count == 3u, "three regions published (%u)", (unsigned)count);
+    if (regions != NULL && count == 3u) {
+        CHECK((regions[0].perm & NXUS_PERM_X) != 0,
+              "region .text still advertises Perm_X (perm=0x%X)", (unsigned)regions[0].perm);
+        CHECK((regions[2].perm & NXUS_PERM_W) != 0,
+              "region .data still advertises Perm_W (perm=0x%X)", (unsigned)regions[2].perm);
+    }
+    nxusSessionViewRelease();
+
+    /* Code-patch (ALLOW_RX) policy: readable + (writable OR executable). */
+    CHECK(nxusSessionCheckCodePatchRange(rx_base, rx_size),
+          "the whole RX .text range is patchable");
+    CHECK(nxusSessionCheckCodePatchRange(rx_base + 0x100, 0x20),
+          "an interior RX .text range is patchable");
+    CHECK(!nxusSessionCheckCodePatchRange(ro_base, ro_size),
+          "RO .rodata is not patchable");
+    CHECK(nxusSessionCheckCodePatchRange(rw_base + 0x40, 0x10),
+          "RW .data is patchable through the same flag");
+
+    /* One mapping only: a patch that straddles the .text end must be refused. */
+    CHECK(!nxusSessionCheckCodePatchRange(rx_base + rx_size - 0x10, 0x20),
+          "a range crossing the RX mapping end is refused");
+    CHECK(!nxusSessionCheckCodePatchRange(rx_base, 0),
+          "a zero-length patch is refused");
+    CHECK(!nxusSessionCheckCodePatchRange(0xFFFFFFFFFFFFFFFFull, 2),
+          "an address+size overflow is refused");
+    CHECK(!nxusSessionCheckCodePatchRange(0x7000000000ull, 0x10),
+          "an unmapped address is refused");
+
+    /* Normal writes still require RW: RX .text is not writable without the flag. */
+    CHECK(nxusSessionCheckRange(rw_base, rw_size, true),
+          "RW .data passes the normal writable check");
+    CHECK(!nxusSessionCheckRange(rx_base, rx_size, true),
+          "RX .text fails the normal writable check");
+    CHECK(!nxusSessionCheckRange(ro_base, ro_size, true),
+          "RO .rodata fails the normal writable check");
+    CHECK(nxusSessionCheckRange(ro_base, ro_size, false),
+          "the read-only variant accepts a readable mapping");
+
+    nxusSessionExit();
+}
+
 /* ---- hit rescue across a mapping rebuild --------------------------------
  *
  * nxusSessionHitsRevalidate() used to verify "mapping_base[same idx] + offset ==
@@ -1495,6 +1581,22 @@ Result nxusDmntRead(u64 address, void *buffer, size_t size) {
     return 0;
 }
 
+/* Live mapping query used by nxusSessionCheckRange()/CheckCodePatchRange():
+   answer from the fake mapping table, exactly one region per address. */
+Result nxusDmntQuery(u64 address, NxusMemoryInfo *out) {
+    if (out == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    for (u64 i = 0; i < g_FakeMapCount; i++) {
+        const NxusMemoryInfo *m = &g_FakeMaps[i];
+        if (m->size == 0 || address < m->base_addr) continue;
+        if (address - m->base_addr < m->size) {
+            *out = *m;
+            return 0;
+        }
+    }
+    memset(out, 0, sizeof(*out));
+    return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+}
+
 Result nxusDmntGetMappingCount(u64 *out_count) {
     if (out_count == NULL) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     *out_count = g_FakeMapCount;
@@ -1540,6 +1642,7 @@ int main(void) {
     testUnpinnedPublishDrains();
     testLegacyCallerNeverReleases();
     testRegionsHoldAcrossRebuild();
+    testPermXAndCodePatchRange();
     testHitsRescueShiftedRebuild();
     testHitsRescueDropsOnlyUnresolvable();
     testHitsRescueSameBaseReuse();

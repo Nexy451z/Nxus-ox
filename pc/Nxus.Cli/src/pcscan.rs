@@ -258,7 +258,12 @@ pub struct Progress<'a> {
 }
 
 /// Regions to scan for a scope, taken from the live mapping table.
-pub fn regions_for_scope(client: &NxusClient, scope: Scope, begin: u64, end: u64) -> Result<Vec<Region>, String> {
+pub fn regions_for_scope(
+    client: &NxusClient,
+    scope: Scope,
+    begin: u64,
+    end: u64,
+) -> Result<Vec<Region>, String> {
     let metadata = client.metadata().map_err(|e| e.to_string())?;
     let mut regions = Vec::new();
 
@@ -290,7 +295,9 @@ pub fn regions_for_scope(client: &NxusClient, scope: Scope, begin: u64, end: u64
             // console).  Returning every readable mapping here silently scanned the
             // whole memory instead of the ranges the user picked.
             Scope::Ranges => {
-                return Err("scope 'ranges' is console-side only - use --scope custom, or drop --pc".into());
+                return Err(
+                    "scope 'ranges' is console-side only - use --scope custom, or drop --pc".into(),
+                );
             }
             Scope::Main => {
                 if metadata.main_size == 0 {
@@ -337,7 +344,10 @@ pub fn regions_for_scope(client: &NxusClient, scope: Scope, begin: u64, end: u64
         if end_at <= base {
             continue;
         }
-        regions.push(Region { base, size: end_at - base });
+        regions.push(Region {
+            base,
+            size: end_at - base,
+        });
     }
 
     Ok(regions)
@@ -378,8 +388,15 @@ fn bits_to_f64(bits: u64, size: u32) -> f64 {
 }
 
 /// Mirrors the console engine's comparison so both agree on the semantics.
-pub fn compare_value(cur: u64, prev: u64, size: u32, compare: Compare, target: u64,
-                     target2: u64, flags: u32) -> bool {
+pub fn compare_value(
+    cur: u64,
+    prev: u64,
+    size: u32,
+    compare: Compare,
+    target: u64,
+    target2: u64,
+    flags: u32,
+) -> bool {
     if flags & SCAN_F_FLOAT != 0 {
         let c = bits_to_f64(cur, size);
         let t = bits_to_f64(target, size);
@@ -498,8 +515,11 @@ impl ScanGeneration {
 }
 
 /// Generations a normal load tries, best first.
-const LOAD_CHAIN: [ScanGeneration; 3] =
-    [ScanGeneration::Body, ScanGeneration::Backup, ScanGeneration::Backup2];
+const LOAD_CHAIN: [ScanGeneration; 3] = [
+    ScanGeneration::Body,
+    ScanGeneration::Backup,
+    ScanGeneration::Backup2,
+];
 /// Generations `scan undo` walks: only the backups, newest first.
 const BACKUP_CHAIN: [ScanGeneration; 2] = [ScanGeneration::Backup, ScanGeneration::Backup2];
 
@@ -513,7 +533,11 @@ const BACKUP_CHAIN: [ScanGeneration; 2] = [ScanGeneration::Backup, ScanGeneratio
 fn write_staged(path: &str, scan: &PcScan) -> std::io::Result<()> {
     use std::io::{BufWriter, Write};
     let total = scan.len();
-    debug_assert_eq!(scan.iter().count(), total, "baseline_candidates must match the stored candidates");
+    debug_assert_eq!(
+        scan.iter().count(),
+        total,
+        "baseline_candidates must match the stored candidates"
+    );
 
     let mut header = [0u8; HEADER_LEN];
     header[0..8].copy_from_slice(FILE_MAGIC);
@@ -563,11 +587,17 @@ fn rotate_generation(bak: &str, bak2: &str) -> std::io::Result<()> {
     match std::fs::remove_file(bak2) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(std::io::Error::new(err.kind(), format!("remove stale generation {}: {}", bak2, err))),
+        Err(err) => {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("remove stale generation {}: {}", bak2, err),
+            ))
+        }
     }
     if std::path::Path::new(bak).is_file() {
-        std::fs::rename(bak, bak2)
-            .map_err(|err| std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", bak, bak2, err)))?;
+        std::fs::rename(bak, bak2).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", bak, bak2, err))
+        })?;
     }
     Ok(())
 }
@@ -592,7 +622,11 @@ fn sync_parent_dir(path: &str) {
                     eprintln!("warning: fsync {} failed: {}", parent.display(), err);
                 }
             }
-            Err(err) => eprintln!("warning: cannot open {} for fsync: {}", parent.display(), err),
+            Err(err) => eprintln!(
+                "warning: cannot open {} for fsync: {}",
+                parent.display(),
+                err
+            ),
         }
     }
 }
@@ -624,8 +658,9 @@ pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
     let had_body = std::path::Path::new(&body).is_file();
     let shifted = rotate_generation(&bak, &bak2).and_then(|_| {
         if had_body {
-            std::fs::rename(&body, &bak)
-                .map_err(|err| std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", body, bak, err)))
+            std::fs::rename(&body, &bak).map_err(|err| {
+                std::io::Error::new(err.kind(), format!("rotate {} -> {}: {}", body, bak, err))
+            })
         } else {
             Ok(())
         }
@@ -640,13 +675,18 @@ pub fn save(path: &str, scan: &PcScan) -> std::io::Result<()> {
     if let Err(err) = std::fs::rename(&tmp, &body) {
         if had_body {
             if let Err(restore) = std::fs::rename(&bak, &body) {
-                eprintln!("warning: {} is missing and restoring it from {} failed: {}; \
+                eprintln!(
+                    "warning: {} is missing and restoring it from {} failed: {}; \
                            the candidate list is still readable from the backup generation",
-                          body, bak, restore);
+                    body, bak, restore
+                );
             }
         }
         discard_staged(&tmp);
-        return Err(std::io::Error::new(err.kind(), format!("publish {}: {}", body, err)));
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("publish {}: {}", body, err),
+        ));
     }
     sync_parent_dir(&body);
     Ok(())
@@ -685,7 +725,11 @@ pub fn backup(path: &str, scan: &PcScan) -> std::io::Result<()> {
 /// OOM abort the old silent clamp worked around.
 fn parse_scan(data: &[u8]) -> Result<PcScan, String> {
     if data.len() < HEADER_LEN {
-        return Err(format!("truncated header ({} of {} bytes)", data.len(), HEADER_LEN));
+        return Err(format!(
+            "truncated header ({} of {} bytes)",
+            data.len(),
+            HEADER_LEN
+        ));
     }
     if &data[0..8] != FILE_MAGIC {
         return Err("bad magic (not a Nxus candidate file)".into());
@@ -699,11 +743,18 @@ fn parse_scan(data: &[u8]) -> Result<PcScan, String> {
 
     let payload = &data[HEADER_LEN..];
     if payload.len() % RECORD_LEN != 0 {
-        return Err(format!("torn record area ({} bytes is not a multiple of {})", payload.len(), RECORD_LEN));
+        return Err(format!(
+            "torn record area ({} bytes is not a multiple of {})",
+            payload.len(),
+            RECORD_LEN
+        ));
     }
     let available = payload.len() / RECORD_LEN;
     if count > available as u64 {
-        return Err(format!("header claims {} candidate(s) but the file holds only {}", count, available));
+        return Err(format!(
+            "header claims {} candidate(s) but the file holds only {}",
+            count, available
+        ));
     }
 
     let count = count as usize;
@@ -714,7 +765,15 @@ fn parse_scan(data: &[u8]) -> Result<PcScan, String> {
         let value = u64::from_le_bytes(payload[at + 8..at + 16].try_into().unwrap());
         hits.push(PcHit { address, value });
     }
-    Ok(PcScan { value_size, hits, truncated, bytes_read: 0, reads: 0, failed_reads: 0, ..Default::default() })
+    Ok(PcScan {
+        value_size,
+        hits,
+        truncated,
+        bytes_read: 0,
+        reads: 0,
+        failed_reads: 0,
+        ..Default::default()
+    })
 }
 
 /// Read the first usable generation of `chain`, reporting every one it skips.
@@ -722,7 +781,10 @@ fn parse_scan(data: &[u8]) -> Result<PcScan, String> {
 /// Returns the generation that was read.  Corruption and unreadable files are
 /// logged and skipped; when nothing is usable the error names every generation
 /// that was tried instead of quietly handing back an empty scan.
-fn load_from_chain(path: &str, chain: &[ScanGeneration]) -> std::io::Result<(PcScan, ScanGeneration)> {
+fn load_from_chain(
+    path: &str,
+    chain: &[ScanGeneration],
+) -> std::io::Result<(PcScan, ScanGeneration)> {
     let mut problems: Vec<String> = Vec::new();
     let mut saw_file = false;
     for &generation in chain {
@@ -732,14 +794,20 @@ fn load_from_chain(path: &str, chain: &[ScanGeneration]) -> std::io::Result<(PcS
                 Ok(scan) => return Ok((scan, generation)),
                 Err(msg) => {
                     saw_file = true;
-                    eprintln!("warning: candidate file {} is corrupt: {}; trying the next generation", file, msg);
+                    eprintln!(
+                        "warning: candidate file {} is corrupt: {}; trying the next generation",
+                        file, msg
+                    );
                     problems.push(format!("{}: {}", file, msg));
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 saw_file = true;
-                eprintln!("warning: cannot read candidate file {}: {}; trying the next generation", file, err);
+                eprintln!(
+                    "warning: cannot read candidate file {}: {}; trying the next generation",
+                    file, err
+                );
                 problems.push(format!("{}: {}", file, err));
             }
         }
@@ -747,10 +815,17 @@ fn load_from_chain(path: &str, chain: &[ScanGeneration]) -> std::io::Result<(PcS
     if saw_file {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("no usable candidate list for {}: {}", path, problems.join("; ")),
+            format!(
+                "no usable candidate list for {}: {}",
+                path,
+                problems.join("; ")
+            ),
         ));
     }
-    let tried: Vec<String> = chain.iter().map(|generation| generation.path(path)).collect();
+    let tried: Vec<String> = chain
+        .iter()
+        .map(|generation| generation.path(path))
+        .collect();
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("no candidate list at {} (tried {})", path, tried.join(", ")),
@@ -764,7 +839,11 @@ fn load_from_chain(path: &str, chain: &[ScanGeneration]) -> std::io::Result<(PcS
 /// logged too.  A damaged state file never silently turns into an empty scan.
 pub fn load(path: &str) -> std::io::Result<PcScan> {
     let (scan, generation) = load_from_chain(path, &LOAD_CHAIN)?;
-    eprintln!("pcscan: loaded candidate list from {} ({})", generation.path(path), generation.label());
+    eprintln!(
+        "pcscan: loaded candidate list from {} ({})",
+        generation.path(path),
+        generation.label()
+    );
     Ok(scan)
 }
 
@@ -781,8 +860,14 @@ pub fn load_backup(path: &str) -> std::io::Result<(PcScan, ScanGeneration)> {
 /// [`EAGER_MATERIALIZE_CANDIDATES`]), which is what removes the old
 /// `max_hits` truncation: the baseline costs `value_size`-free raw bytes plus
 /// 8 bytes per 16 KiB block instead of 16 bytes per candidate.
-pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, max_hits: usize,
-                    cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<PcScan, String> {
+pub fn scan_unknown(
+    client: &NxusClient,
+    regions: &[Region],
+    value_size: u32,
+    max_hits: usize,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<PcScan, String> {
     if value_size == 0 || value_size > 8 {
         return Err("value size must be 1, 2, 4 or 8".into());
     }
@@ -791,7 +876,10 @@ pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, ma
     let _ = max_hits;
     let total: u64 = regions.iter().map(|r| r.size).sum();
     let mut done = 0u64;
-    let mut scan = PcScan { value_size, ..Default::default() };
+    let mut scan = PcScan {
+        value_size,
+        ..Default::default()
+    };
     let read_chunk = client.max_read().min(1 << 20).max(4096);
 
     for (region_index, region) in regions.iter().enumerate() {
@@ -858,7 +946,7 @@ pub fn scan_unknown(client: &NxusClient, regions: &[Region], value_size: u32, ma
             }
 
             if got == 0 {
-                break;                                  // nothing more readable here
+                break; // nothing more readable here
             }
             pos += got;
             done += got;
@@ -883,8 +971,13 @@ fn block_skip_applies(compare: Compare, target: u64) -> bool {
 }
 
 /// Append every remaining candidate of `segment` with its baseline value.
-fn keep_baseline_candidates(hits: &mut Vec<PcHit>, segment: &BaselineSegment, value_size: u32,
-                            mut index: usize, processed: &mut u64) {
+fn keep_baseline_candidates(
+    hits: &mut Vec<PcHit>,
+    segment: &BaselineSegment,
+    value_size: u32,
+    mut index: usize,
+    processed: &mut u64,
+) {
     let size = value_size as usize;
     if size == 0 {
         return;
@@ -974,9 +1067,13 @@ fn dense_refine_core(
             if skip_blocks && unchanged {
                 // O(1): every candidate starting in this block still holds its
                 // baseline value, so none of them can match a change compare.
-                let last_start = len - size;                     // inclusive
-                let take_end = block_end.min(last_start + 1);     // exclusive
-                let count = if index >= take_end { 0 } else { (take_end - 1 - index) / size + 1 };
+                let last_start = len - size; // inclusive
+                let take_end = block_end.min(last_start + 1); // exclusive
+                let count = if index >= take_end {
+                    0
+                } else {
+                    (take_end - 1 - index) / size + 1
+                };
                 if count > 0 {
                     index += count * size;
                     processed += count as u64;
@@ -998,9 +1095,19 @@ fn dense_refine_core(
 
             let value = load_value(&current[index..], value_size);
             *compared += 1;
-            if compare_value(value, load_value(&segment.data[index..], value_size), value_size,
-                             compare, target, target2, flags) {
-                hits.push(PcHit { address: segment.address + index as u64, value });
+            if compare_value(
+                value,
+                load_value(&segment.data[index..], value_size),
+                value_size,
+                compare,
+                target,
+                target2,
+                flags,
+            ) {
+                hits.push(PcHit {
+                    address: segment.address + index as u64,
+                    value,
+                });
             }
             index += size;
             processed += 1;
@@ -1033,13 +1140,29 @@ fn dense_refine_core(
 /// [`dense_refine_core`], which is where the baseline is materialised.  Every
 /// later pass sees a normal `hits` vector and uses the sparse windowed reader
 /// below.
-pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: u64,
-              target2: u64, flags: u32, cancel: &AtomicBool,
-              progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+pub fn refine(
+    client: &NxusClient,
+    scan: &mut PcScan,
+    compare: Compare,
+    target: u64,
+    target2: u64,
+    flags: u32,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), String> {
     if !scan.baseline.is_empty() {
         let mut compared = 0u64;
-        return dense_refine_core(scan, compare, target, target2, flags, cancel, progress, &mut compared,
-                                 |address, size| client.read(address, size).map_err(|_| ()));
+        return dense_refine_core(
+            scan,
+            compare,
+            target,
+            target2,
+            flags,
+            cancel,
+            progress,
+            &mut compared,
+            |address, size| client.read(address, size).map_err(|_| ()),
+        );
     }
 
     let size = scan.value_size;
@@ -1089,9 +1212,19 @@ pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: 
                     Ok(data) => {
                         match checked_value(&data, size) {
                             Some(cur) => {
-                                if compare_value(cur, scan.hits[j].value, size, compare,
-                                                 target, target2, flags) {
-                                    scan.hits[keep] = PcHit { address, value: cur };
+                                if compare_value(
+                                    cur,
+                                    scan.hits[j].value,
+                                    size,
+                                    compare,
+                                    target,
+                                    target2,
+                                    flags,
+                                ) {
+                                    scan.hits[keep] = PcHit {
+                                        address,
+                                        value: cur,
+                                    };
                                     keep += 1;
                                 }
                             }
@@ -1106,7 +1239,7 @@ pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: 
                         }
                     }
                     Err(_) => {
-                        scan.hits[keep] = scan.hits[j];   // keep it for a retry
+                        scan.hits[keep] = scan.hits[j]; // keep it for a retry
                         scan.failed_reads += 1;
                         keep += 1;
                     }
@@ -1146,8 +1279,19 @@ pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: 
                 continue;
             }
             let cur = load_value(&data[offset..], size);
-            if compare_value(cur, scan.hits[j].value, size, compare, target, target2, flags) {
-                scan.hits[keep] = PcHit { address, value: cur };
+            if compare_value(
+                cur,
+                scan.hits[j].value,
+                size,
+                compare,
+                target,
+                target2,
+                flags,
+            ) {
+                scan.hits[keep] = PcHit {
+                    address,
+                    value: cur,
+                };
                 keep += 1;
             }
         }
@@ -1210,7 +1354,15 @@ mod tests {
         assert!(compare_value(140, 100, 4, Compare::Different, 40, 0, 0));
         assert!(compare_value(100, 140, 4, Compare::Different, 40, 0, 0));
         assert!(!compare_value(140, 100, 4, Compare::Different, 41, 0, 0));
-        assert!(compare_value(u32::MAX as u64, 0, 4, Compare::Equal, u32::MAX as u64, 0, 0));
+        assert!(compare_value(
+            u32::MAX as u64,
+            0,
+            4,
+            Compare::Equal,
+            u32::MAX as u64,
+            0,
+            0
+        ));
         assert!(compare_value(5, 7, 4, Compare::Changed, 0, 0, 0));
         assert!(compare_value(5, 5, 4, Compare::Unchanged, 0, 0, 0));
     }
@@ -1219,19 +1371,115 @@ mod tests {
     fn compare_signed_integers() {
         let f = SCAN_F_SIGNED;
         // -5 < 3 only when interpreted as signed.
-        assert!(compare_value(s32_bits(-5), 0, 4, Compare::Less, s32_bits(3), 0, f));
-        assert!(!compare_value(s32_bits(-5), 0, 4, Compare::Greater, s32_bits(3), 0, f));
+        assert!(compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::Less,
+            s32_bits(3),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::Greater,
+            s32_bits(3),
+            0,
+            f
+        ));
         // ... and the unsigned interpretation really does differ.
-        assert!(compare_value(s32_bits(-5), 0, 4, Compare::Greater, s32_bits(3), 0, 0));
-        assert!(compare_value(s32_bits(-5), 0, 4, Compare::Equal, s32_bits(-5), 0, f));
-        assert!(compare_value(s32_bits(-5), 0, 4, Compare::LessOrEqual, s32_bits(-5), 0, f));
-        assert!(compare_value(s32_bits(-5), 0, 4, Compare::GreaterOrEqual, s32_bits(-5), 0, f));
-        assert!(compare_value(s32_bits(-2), 0, 4, Compare::GreaterOrEqual, s32_bits(-5), 0, f));
-        assert!(!compare_value(s32_bits(-5), 0, 4, Compare::GreaterOrEqual, s32_bits(-2), 0, f));
-        assert!(compare_value(s32_bits(0), 0, 4, Compare::Between, s32_bits(-10), s32_bits(0), f));
-        assert!(!compare_value(s32_bits(1), 0, 4, Compare::Between, s32_bits(-10), s32_bits(0), f));
-        assert!(compare_value(s32_bits(-3), s32_bits(-5), 4, Compare::Different, 2, 0, f));
-        assert!(!compare_value(s32_bits(-3), s32_bits(-5), 4, Compare::Different, 3, 0, f));
+        assert!(compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::Greater,
+            s32_bits(3),
+            0,
+            0
+        ));
+        assert!(compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::Equal,
+            s32_bits(-5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::LessOrEqual,
+            s32_bits(-5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            s32_bits(-5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            s32_bits(-2),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            s32_bits(-5),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            s32_bits(-5),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            s32_bits(-2),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            s32_bits(0),
+            0,
+            4,
+            Compare::Between,
+            s32_bits(-10),
+            s32_bits(0),
+            f
+        ));
+        assert!(!compare_value(
+            s32_bits(1),
+            0,
+            4,
+            Compare::Between,
+            s32_bits(-10),
+            s32_bits(0),
+            f
+        ));
+        assert!(compare_value(
+            s32_bits(-3),
+            s32_bits(-5),
+            4,
+            Compare::Different,
+            2,
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            s32_bits(-3),
+            s32_bits(-5),
+            4,
+            Compare::Different,
+            3,
+            0,
+            f
+        ));
         // Size 8 uses the raw i64 interpretation.
         assert!(compare_value((-7i64) as u64, 0, 8, Compare::Less, 7, 0, f));
     }
@@ -1241,43 +1489,235 @@ mod tests {
         let f = SCAN_F_FLOAT;
         // Equal is an epsilon compare in the C engine; with target2 == 0 the
         // default epsilon is 1e-2.
-        assert!(compare_value(f32_bits(1.25), 0, 4, Compare::Equal, f32_bits(1.25), 0, f));
-        assert!(compare_value(f32_bits(1.254), 0, 4, Compare::Equal, f32_bits(1.25), 0, f));
-        assert!(!compare_value(f32_bits(1.30), 0, 4, Compare::Equal, f32_bits(1.25), 0, f));
-        assert!(compare_value(f32_bits(1.30), 0, 4, Compare::NotEqual, f32_bits(1.25), 0, f));
-        assert!(!compare_value(f32_bits(1.25), 0, 4, Compare::NotEqual, f32_bits(1.25), 0, f));
+        assert!(compare_value(
+            f32_bits(1.25),
+            0,
+            4,
+            Compare::Equal,
+            f32_bits(1.25),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.254),
+            0,
+            4,
+            Compare::Equal,
+            f32_bits(1.25),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(1.30),
+            0,
+            4,
+            Compare::Equal,
+            f32_bits(1.25),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.30),
+            0,
+            4,
+            Compare::NotEqual,
+            f32_bits(1.25),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(1.25),
+            0,
+            4,
+            Compare::NotEqual,
+            f32_bits(1.25),
+            0,
+            f
+        ));
 
         // FuzzyEqual with an explicit epsilon (target2 bits of 1e-3).
         let eps = f32_bits(1e-3);
-        assert!(compare_value(f32_bits(1.2505), 0, 4, Compare::FuzzyEqual, f32_bits(1.25), eps, f));
+        assert!(compare_value(
+            f32_bits(1.2505),
+            0,
+            4,
+            Compare::FuzzyEqual,
+            f32_bits(1.25),
+            eps,
+            f
+        ));
         // A tighter epsilon from the caller must reject the same delta.
-        assert!(!compare_value(f32_bits(1.2505), 0, 4, Compare::FuzzyEqual, f32_bits(1.25), f32_bits(1e-4), f));
+        assert!(!compare_value(
+            f32_bits(1.2505),
+            0,
+            4,
+            Compare::FuzzyEqual,
+            f32_bits(1.25),
+            f32_bits(1e-4),
+            f
+        ));
 
         // f64 path (size 8) behaves the same, with f64 epsilon bits.
-        assert!(compare_value(f64_bits(0.1 + 0.2), 0, 8, Compare::Equal, f64_bits(0.3), 0, f));
-        assert!(compare_value(f64_bits(1.0 + 1e-9), 0, 8, Compare::Equal, f64_bits(1.0), 0, f));
-        assert!(!compare_value(f64_bits(1.0 + 1e-3), 0, 8, Compare::FuzzyEqual, f64_bits(1.0), f64_bits(1e-6), f));
-        assert!(compare_value(f64_bits(1.0 + 1e-9), 0, 8, Compare::FuzzyEqual, f64_bits(1.0), f64_bits(1e-6), f));
+        assert!(compare_value(
+            f64_bits(0.1 + 0.2),
+            0,
+            8,
+            Compare::Equal,
+            f64_bits(0.3),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f64_bits(1.0 + 1e-9),
+            0,
+            8,
+            Compare::Equal,
+            f64_bits(1.0),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f64_bits(1.0 + 1e-3),
+            0,
+            8,
+            Compare::FuzzyEqual,
+            f64_bits(1.0),
+            f64_bits(1e-6),
+            f
+        ));
+        assert!(compare_value(
+            f64_bits(1.0 + 1e-9),
+            0,
+            8,
+            Compare::FuzzyEqual,
+            f64_bits(1.0),
+            f64_bits(1e-6),
+            f
+        ));
     }
 
     #[test]
     fn compare_float_ordering_and_different() {
         let f = SCAN_F_FLOAT;
-        assert!(compare_value(f32_bits(0.5), 0, 4, Compare::LessOrEqual, f32_bits(0.5), 0, f));
-        assert!(compare_value(f32_bits(0.25), 0, 4, Compare::LessOrEqual, f32_bits(0.5), 0, f));
-        assert!(!compare_value(f32_bits(0.75), 0, 4, Compare::LessOrEqual, f32_bits(0.5), 0, f));
-        assert!(compare_value(f32_bits(2.0), 0, 4, Compare::GreaterOrEqual, f32_bits(1.5), 0, f));
-        assert!(compare_value(f32_bits(1.5), 0, 4, Compare::GreaterOrEqual, f32_bits(1.5), 0, f));
-        assert!(!compare_value(f32_bits(1.4), 0, 4, Compare::GreaterOrEqual, f32_bits(1.5), 0, f));
-        assert!(compare_value(f32_bits(1.5), 0, 4, Compare::Between, f32_bits(1.0), f32_bits(2.0), f));
-        assert!(!compare_value(f32_bits(2.5), 0, 4, Compare::Between, f32_bits(1.0), f32_bits(2.0), f));
-        assert!(compare_value(f32_bits(1.75), f32_bits(1.5), 4, Compare::Increased, 0, 0, f));
-        assert!(compare_value(f32_bits(1.5), f32_bits(1.75), 4, Compare::Decreased, 0, 0, f));
+        assert!(compare_value(
+            f32_bits(0.5),
+            0,
+            4,
+            Compare::LessOrEqual,
+            f32_bits(0.5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(0.25),
+            0,
+            4,
+            Compare::LessOrEqual,
+            f32_bits(0.5),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(0.75),
+            0,
+            4,
+            Compare::LessOrEqual,
+            f32_bits(0.5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(2.0),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            f32_bits(1.5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.5),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            f32_bits(1.5),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(1.4),
+            0,
+            4,
+            Compare::GreaterOrEqual,
+            f32_bits(1.5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.5),
+            0,
+            4,
+            Compare::Between,
+            f32_bits(1.0),
+            f32_bits(2.0),
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(2.5),
+            0,
+            4,
+            Compare::Between,
+            f32_bits(1.0),
+            f32_bits(2.0),
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.75),
+            f32_bits(1.5),
+            4,
+            Compare::Increased,
+            0,
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f32_bits(1.5),
+            f32_bits(1.75),
+            4,
+            Compare::Decreased,
+            0,
+            0,
+            f
+        ));
 
         // Different compares |cur - prev| against |target|.
-        assert!(compare_value(f32_bits(1.75), f32_bits(1.5), 4, Compare::Different, f32_bits(0.25), 0, f));
-        assert!(!compare_value(f32_bits(1.75), f32_bits(1.5), 4, Compare::Different, f32_bits(0.5), 0, f));
-        assert!(compare_value(f64_bits(3.0), f64_bits(1.5), 8, Compare::Different, f64_bits(1.5), 0, f));
+        assert!(compare_value(
+            f32_bits(1.75),
+            f32_bits(1.5),
+            4,
+            Compare::Different,
+            f32_bits(0.25),
+            0,
+            f
+        ));
+        assert!(!compare_value(
+            f32_bits(1.75),
+            f32_bits(1.5),
+            4,
+            Compare::Different,
+            f32_bits(0.5),
+            0,
+            f
+        ));
+        assert!(compare_value(
+            f64_bits(3.0),
+            f64_bits(1.5),
+            8,
+            Compare::Different,
+            f64_bits(1.5),
+            0,
+            f
+        ));
     }
 
     // ---- state files: atomic save, generations, corruption ----------------
@@ -1286,15 +1726,24 @@ mod tests {
     const STATE_SUFFIXES: [&str; 5] = ["", ".bak", ".bak2", ".tmp", ".bak.tmp"];
 
     fn state_path(name: &str) -> String {
-        std::env::temp_dir().join(format!("nxus_pcscan_{}.bin", name)).to_string_lossy().to_string()
+        std::env::temp_dir()
+            .join(format!("nxus_pcscan_{}.bin", name))
+            .to_string_lossy()
+            .to_string()
     }
 
     /// Remove the body and all generations, asserting that nothing else failed.
     fn cleanup(path: &str) {
         for suffix in STATE_SUFFIXES {
             if let Err(err) = std::fs::remove_file(format!("{}{}", path, suffix)) {
-                assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
-                           "could not clean up {}{}: {}", path, suffix, err);
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "could not clean up {}{}: {}",
+                    path,
+                    suffix,
+                    err
+                );
             }
         }
     }
@@ -1306,14 +1755,23 @@ mod tests {
     fn scan_with(values: &[u64]) -> PcScan {
         PcScan {
             value_size: 4,
-            hits: values.iter().map(|&value| PcHit { address: 0x1000 + value * 4, value }).collect(),
+            hits: values
+                .iter()
+                .map(|&value| PcHit {
+                    address: 0x1000 + value * 4,
+                    value,
+                })
+                .collect(),
             ..Default::default()
         }
     }
 
     /// First value of a loaded list: identifies which generation was read.
     fn marker(scan: &PcScan) -> u64 {
-        scan.hits.first().map(|hit| hit.value).expect("a loaded candidate list must not be empty")
+        scan.hits
+            .first()
+            .map(|hit| hit.value)
+            .expect("a loaded candidate list must not be empty")
     }
 
     fn write_raw(path: &str, data: &[u8]) {
@@ -1333,7 +1791,16 @@ mod tests {
     fn save_load_round_trip() {
         let scan = PcScan {
             value_size: 4,
-            hits: vec![PcHit { address: 0x1000, value: 7 }, PcHit { address: 0x2000, value: 9 }],
+            hits: vec![
+                PcHit {
+                    address: 0x1000,
+                    value: 7,
+                },
+                PcHit {
+                    address: 0x2000,
+                    value: 9,
+                },
+            ],
             truncated: true,
             bytes_read: 0,
             reads: 0,
@@ -1359,23 +1826,44 @@ mod tests {
         cleanup(&path);
 
         save(&path, &scan_with(&[1])).expect("save v1");
-        assert!(!exists(&format!("{}.tmp", path)), "the staging file must be renamed into place");
-        assert!(!exists(&format!("{}.bak", path)), "the first save has nothing to back up");
+        assert!(
+            !exists(&format!("{}.tmp", path)),
+            "the staging file must be renamed into place"
+        );
+        assert!(
+            !exists(&format!("{}.bak", path)),
+            "the first save has nothing to back up"
+        );
         assert_eq!(marker(&load(&path).expect("load v1")), 1);
 
         save(&path, &scan_with(&[2])).expect("save v2");
         assert_eq!(marker(&load(&path).expect("load v2")), 2);
-        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v1")), 1);
+        assert_eq!(
+            marker(&load(&format!("{}.bak", path)).expect(".bak is v1")),
+            1
+        );
 
         save(&path, &scan_with(&[3])).expect("save v3");
-        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v2")), 2);
-        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v1")), 1);
+        assert_eq!(
+            marker(&load(&format!("{}.bak", path)).expect(".bak is v2")),
+            2
+        );
+        assert_eq!(
+            marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v1")),
+            1
+        );
         assert!(!exists(&format!("{}.tmp", path)));
 
         save(&path, &scan_with(&[4])).expect("save v4");
         assert_eq!(marker(&load(&path).expect("body is v4")), 4);
-        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v3")), 3);
-        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2, v1 was dropped")), 2);
+        assert_eq!(
+            marker(&load(&format!("{}.bak", path)).expect(".bak is v3")),
+            3
+        );
+        assert_eq!(
+            marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2, v1 was dropped")),
+            2
+        );
 
         cleanup(&path);
     }
@@ -1398,7 +1886,10 @@ mod tests {
         let mut torn = header_bytes(4, 1);
         torn.extend_from_slice(&[0u8; 8]);
         write_raw(&path, &torn);
-        assert_eq!(marker(&load(&path).expect("a torn body falls back to .bak")), 2);
+        assert_eq!(
+            marker(&load(&path).expect("a torn body falls back to .bak")),
+            2
+        );
 
         // Body and .bak are both broken: the oldest generation still loads.
         write_raw(&format!("{}.bak", path), b"garbage");
@@ -1410,7 +1901,11 @@ mod tests {
         write_raw(&format!("{}.bak2", path), b"garbage");
         let err = load(&path).expect_err("a corrupt chain must not load as empty");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains(".bak2"), "the error must name every generation: {}", err);
+        assert!(
+            err.to_string().contains(".bak2"),
+            "the error must name every generation: {}",
+            err
+        );
 
         cleanup(&path);
     }
@@ -1441,7 +1936,11 @@ mod tests {
         write_raw(&path, &header_bytes(4, 1 << 40));
         let err = load(&path).expect_err("a torn write is corruption, not an empty scan");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("only 0"), "unexpected message: {}", err);
+        assert!(
+            err.to_string().contains("only 0"),
+            "unexpected message: {}",
+            err
+        );
 
         // ... and the good generation next to it still wins.
         save(&path, &scan_with(&[42])).expect("save a good list");
@@ -1460,11 +1959,20 @@ mod tests {
 
         backup(&path, &scan_with(&[2])).expect("backup v2");
         assert_eq!(marker(&load(&path).expect("the body is untouched")), 1);
-        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v2")), 2);
+        assert_eq!(
+            marker(&load(&format!("{}.bak", path)).expect(".bak is v2")),
+            2
+        );
 
         backup(&path, &scan_with(&[3])).expect("backup v3");
-        assert_eq!(marker(&load(&format!("{}.bak", path)).expect(".bak is v3")), 3);
-        assert_eq!(marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2")), 2);
+        assert_eq!(
+            marker(&load(&format!("{}.bak", path)).expect(".bak is v3")),
+            3
+        );
+        assert_eq!(
+            marker(&load(&format!("{}.bak2", path)).expect(".bak2 is v2")),
+            2
+        );
         assert_eq!(marker(&load(&path).expect("the body is still v1")), 1);
 
         cleanup(&path);
@@ -1490,7 +1998,11 @@ mod tests {
         cleanup(&path);
         let err = load_backup(&path).expect_err("no backup generation left");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(err.to_string().contains(".bak2"), "the error must name what was tried: {}", err);
+        assert!(
+            err.to_string().contains(".bak2"),
+            "the error must name what was tried: {}",
+            err
+        );
     }
 
     #[test]
@@ -1501,9 +2013,13 @@ mod tests {
             .join("state.bin")
             .to_string_lossy()
             .to_string();
-        let err = save(&missing, &scan_with(&[1])).expect_err("saving into a missing directory must fail");
+        let err = save(&missing, &scan_with(&[1]))
+            .expect_err("saving into a missing directory must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(!exists(&format!("{}.tmp", missing)), "a failed save must not leave a staging file");
+        assert!(
+            !exists(&format!("{}.tmp", missing)),
+            "a failed save must not leave a staging file"
+        );
 
         // A directory occupying the body path makes the publish rename fail; the
         // error must reach the caller and the staged file must be cleaned up.
@@ -1511,9 +2027,17 @@ mod tests {
         cleanup(&blocked.to_string_lossy());
         std::fs::create_dir_all(&blocked).expect("create the blocking directory");
         let blocked = blocked.to_string_lossy().to_string();
-        let err = save(&blocked, &scan_with(&[1])).expect_err("publishing onto a directory must fail");
-        assert!(err.to_string().contains("publish"), "unexpected message: {}", err);
-        assert!(!exists(&format!("{}.tmp", blocked)), "a failed publish must remove the staging file");
+        let err =
+            save(&blocked, &scan_with(&[1])).expect_err("publishing onto a directory must fail");
+        assert!(
+            err.to_string().contains("publish"),
+            "unexpected message: {}",
+            err
+        );
+        assert!(
+            !exists(&format!("{}.tmp", blocked)),
+            "a failed publish must remove the staging file"
+        );
         std::fs::remove_dir(&blocked).expect("remove the blocking directory");
     }
 
@@ -1521,7 +2045,10 @@ mod tests {
 
     /// Build the state `scan_unknown` leaves behind for a linear memory image.
     fn dense_scan_from_image(image: &[u8], base: u64, value_size: u32, chunk: usize) -> PcScan {
-        let mut scan = PcScan { value_size, ..Default::default() };
+        let mut scan = PcScan {
+            value_size,
+            ..Default::default()
+        };
         let mut at = 0usize;
         while at < image.len() {
             let end = (at + chunk).min(image.len());
@@ -1553,11 +2080,14 @@ mod tests {
     #[test]
     fn dense_baseline_skips_unchanged_16k_blocks_on_changed() {
         let base = 0x3600_0000u64;
-        let mut image = u32_image(8192);                       // 32 KiB = two blocks
+        let mut image = u32_image(8192); // 32 KiB = two blocks
         let mut scan = dense_scan_from_image(&image, base, 4, 32 * 1024);
 
         // The first pass must not have built a hit vector.
-        assert!(scan.hits.is_empty(), "scan_unknown must not materialise PcHit");
+        assert!(
+            scan.hits.is_empty(),
+            "scan_unknown must not materialise PcHit"
+        );
         assert!(scan.is_dense());
         assert_eq!(scan.len(), 8192);
         assert_eq!(scan.baseline.len(), 1);
@@ -1577,9 +2107,18 @@ mod tests {
                 let offset = (address - base) as usize;
                 Ok(image[offset..offset + size as usize].to_vec())
             };
-            dense_refine_core(&mut scan, Compare::Changed, 0, 0, 0, &cancel,
-                              &mut progress, &mut compared, &mut read)
-                .expect("dense refine");
+            dense_refine_core(
+                &mut scan,
+                Compare::Changed,
+                0,
+                0,
+                0,
+                &cancel,
+                &mut progress,
+                &mut compared,
+                &mut read,
+            )
+            .expect("dense refine");
         }
 
         assert_eq!(scan.hits.len(), 1, "only the changed value survives");
@@ -1587,9 +2126,15 @@ mod tests {
         assert_eq!(scan.hits[0].value, 0xDEAD_BEEF);
         // 4096 candidates live in the touched block; the untouched 16 KiB block
         // was skipped by hash, so only one block was ever compared.
-        assert_eq!(compared, 4096, "the unchanged 16 KiB block must be skipped O(1)");
+        assert_eq!(
+            compared, 4096,
+            "the unchanged 16 KiB block must be skipped O(1)"
+        );
         assert_eq!(processed, 8192);
-        assert!(scan.baseline.is_empty(), "the baseline memory must be released");
+        assert!(
+            scan.baseline.is_empty(),
+            "the baseline memory must be released"
+        );
         assert_eq!(scan.baseline_candidates, 0);
         assert_eq!(scan.len(), 1);
     }
@@ -1598,7 +2143,7 @@ mod tests {
     fn dense_baseline_increased_materialises_lazily_and_pages_from_the_baseline() {
         let base = 0x3600_0000u64;
         let mut image = u32_image(8192);
-        let mut scan = dense_scan_from_image(&image, base, 4, 0x4000);   // two segments
+        let mut scan = dense_scan_from_image(&image, base, 4, 0x4000); // two segments
 
         assert_eq!(scan.baseline.len(), 2);
         assert!(scan.hits.is_empty());
@@ -1622,9 +2167,18 @@ mod tests {
                 let offset = (address - base) as usize;
                 Ok(image[offset..offset + size as usize].to_vec())
             };
-            dense_refine_core(&mut scan, Compare::Increased, 0, 0, 0, &cancel,
-                              &mut |_, _| {}, &mut compared, &mut read)
-                .expect("dense refine");
+            dense_refine_core(
+                &mut scan,
+                Compare::Increased,
+                0,
+                0,
+                0,
+                &cancel,
+                &mut |_, _| {},
+                &mut compared,
+                &mut read,
+            )
+            .expect("dense refine");
         }
 
         assert_eq!(scan.hits.len(), 1);
@@ -1650,12 +2204,24 @@ mod tests {
                 let offset = (address - base) as usize;
                 Ok(image[offset..offset + size as usize].to_vec())
             };
-            dense_refine_core(&mut scan, Compare::Different, 0, 0, 0, &cancel,
-                              &mut |_, _| {}, &mut compared, &mut read)
-                .expect("dense refine");
+            dense_refine_core(
+                &mut scan,
+                Compare::Different,
+                0,
+                0,
+                0,
+                &cancel,
+                &mut |_, _| {},
+                &mut compared,
+                &mut read,
+            )
+            .expect("dense refine");
         }
 
-        assert_eq!(compared, 8192, "a zero Different target must compare every candidate");
+        assert_eq!(
+            compared, 8192,
+            "a zero Different target must compare every candidate"
+        );
         assert_eq!(scan.hits.len(), 8192);
     }
 
@@ -1669,13 +2235,26 @@ mod tests {
         let mut compared = 0u64;
         {
             let mut read = |_address: u64, _size: u32| -> Result<Vec<u8>, ()> { Err(()) };
-            dense_refine_core(&mut scan, Compare::Changed, 0, 0, 0, &cancel,
-                              &mut |_, _| {}, &mut compared, &mut read)
-                .expect("dense refine");
+            dense_refine_core(
+                &mut scan,
+                Compare::Changed,
+                0,
+                0,
+                0,
+                &cancel,
+                &mut |_, _| {},
+                &mut compared,
+                &mut read,
+            )
+            .expect("dense refine");
         }
 
         assert_eq!(compared, 0);
-        assert_eq!(scan.hits.len(), 8192, "a failed read must not drop candidates");
+        assert_eq!(
+            scan.hits.len(),
+            8192,
+            "a failed read must not drop candidates"
+        );
         assert_eq!(scan.hits[0].value, 0);
         assert_eq!(scan.failed_reads, 1);
         assert!(!scan.is_dense());
@@ -1738,8 +2317,13 @@ mod tests {
                 let len = 64 + misalign as usize;
                 let image = vec![0u8; len];
                 let scan = dense_scan_from_image(&image, base, value_size, len);
-                assert_eq!(scan.baseline_candidates, scan.iter().count(),
-                           "value_size {} misalign {}", value_size, misalign);
+                assert_eq!(
+                    scan.baseline_candidates,
+                    scan.iter().count(),
+                    "value_size {} misalign {}",
+                    value_size,
+                    misalign
+                );
             }
         }
     }

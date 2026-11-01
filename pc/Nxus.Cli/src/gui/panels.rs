@@ -753,7 +753,8 @@ pub fn central(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tab, name) in [(Tab::Results, "Results"), (Tab::Hex, "Hex editor"),
                                 (Tab::Disasm, "Disasm"), (Tab::Snapshot, "Snapshot"),
-                                (Tab::Watch, "Watch"), (Tab::Info, "Info")] {
+                                (Tab::Watch, "Watch"), (Tab::Cheats, "Cheats"),
+                                (Tab::Info, "Info")] {
                 if ui.selectable_label(app.tab == tab, RichText::new(name).strong()).clicked() {
                     app.tab = tab;
                 }
@@ -769,9 +770,24 @@ pub fn central(app: &mut App, ui: &mut egui::Ui) {
             Tab::Disasm => disasm_tab(app, ui),
             Tab::Snapshot => snapshot_tab(app, ui),
             Tab::Watch => watch_tab(app, ui),
+            Tab::Cheats => cheats_tab(app, ui),
             Tab::Info => info_tab(app, ui),
         }
     });
+}
+
+/// The main GUI's `[Cheats]` tab: same files, engine and backup journal as
+/// `NCL.exe` and `nxus cheat ...`, but inside the main window.  It keeps its own
+/// connection so a long scan on the main worker never blocks a cheat toggle.
+fn cheats_tab(app: &mut App, ui: &mut egui::Ui) {
+    let host = if app.prefs.host.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        app.prefs.host.clone()
+    };
+    let port = app.prefs.port.trim().parse().unwrap_or(crate::protocol::DEFAULT_PORT);
+    let connected = app.st.connected;
+    app.cheats.ui(ui, &host, port, connected);
 }
 
 fn results_tab(app: &mut App, ui: &mut egui::Ui) {

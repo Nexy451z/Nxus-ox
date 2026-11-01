@@ -131,7 +131,9 @@ impl Compare {
             "not-equal" | "ne" | "!=" => Some(Compare::NotEqual),
             "greater" | "gt" | ">" => Some(Compare::Greater),
             "less" | "lt" | "<" => Some(Compare::Less),
-            "greater-equal" | "greater-or-equal" | "ge" | "gte" | ">=" => Some(Compare::GreaterOrEqual),
+            "greater-equal" | "greater-or-equal" | "ge" | "gte" | ">=" => {
+                Some(Compare::GreaterOrEqual)
+            }
             "less-equal" | "less-or-equal" | "le" | "lte" | "<=" => Some(Compare::LessOrEqual),
             "increased" | "inc" | "+" => Some(Compare::Increased),
             "decreased" | "dec" | "-" => Some(Compare::Decreased),
@@ -181,7 +183,7 @@ impl ValueType {
             ValueType::U16 => 2,
             ValueType::U32 | ValueType::F32 => 4,
             ValueType::U64 | ValueType::F64 => 8,
-            _ => 4,             // pattern types carry their own length
+            _ => 4, // pattern types carry their own length
         }
     }
 
@@ -194,7 +196,11 @@ impl ValueType {
     }
 
     pub fn name(self) -> &'static str {
-        VALUE_TYPE_NAMES.iter().find(|(_, t)| *t == self).map(|(n, _)| *n).unwrap_or("?")
+        VALUE_TYPE_NAMES
+            .iter()
+            .find(|(_, t)| *t == self)
+            .map(|(n, _)| *n)
+            .unwrap_or("?")
     }
 
     pub fn parse(text: &str) -> Option<ValueType> {
@@ -317,6 +323,17 @@ pub const WATCH_STYLE_LINK5: u32 = 1;
 pub const WATCH_STYLE_LINK6: u32 = 2;
 pub const CHEAT_F_32BIT: u32 = 0x0001;
 
+/// `NxusWriteHeader.reserved` bit 0 (`NXUS_WRITE_FLAG_ALLOW_RX`).
+///
+/// A plain Write only lands in a writable mapping.  A cheat patch that rewrites
+/// Read-Execute `.text` sets this flag, which lets the console accept a readable
+/// range that is either writable or executable.  The flag is opt-in: an older
+/// client's zero reserved word keeps the strict writable-range rule.
+pub const WRITE_FLAG_ALLOW_RX: u32 = 0x01;
+
+/// Wire size of `NxusWriteHeader`: `{ u64 address; u32 size; u32 reserved; }`.
+pub const WRITE_HEADER_SIZE: usize = 16;
+
 pub const SNAPSHOT_DEFAULT_BLOCK_SIZE: u32 = 16384;
 pub const CHANGE_CHANGED: u32 = 0;
 pub const CHANGE_VANISHED: u32 = 1;
@@ -331,6 +348,26 @@ pub fn put_u32(buf: &mut Vec<u8>, v: u32) {
 }
 pub fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Encode a `NxusWriteHeader` followed by `data`.
+///
+/// `flags` goes in the header's 4-byte `reserved` word; [`encode_write`] keeps
+/// the historical zero.  Use [`WRITE_FLAG_ALLOW_RX`] for intentional `.text`
+/// patches (cheat code writes), which a normal writable mapping check would
+/// otherwise reject.
+pub fn encode_write_flags(address: u64, data: &[u8], flags: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(WRITE_HEADER_SIZE + data.len());
+    put_u64(&mut out, address);
+    put_u32(&mut out, data.len() as u32);
+    put_u32(&mut out, flags);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Encode a normal Write (reserved/flags = 0).
+pub fn encode_write(address: u64, data: &[u8]) -> Vec<u8> {
+    encode_write_flags(address, data, 0)
 }
 
 /// Copy `N` little-endian bytes at `off`, or `None` when they are not all there.
@@ -392,10 +429,22 @@ pub struct Status {
     pub heap_total: u32,
     /// Largest single Read the server accepts (0 = unspecified: use the default).
     pub max_read: u32,
+    /// Live `HidNpadButton` held mask (opcode 8 key-conditional cheats).
+    ///
+    /// APPENDED after the historical 76-byte struct.  A legacy console's 76-byte
+    /// reply decodes this as 0; a reply of at least 84 bytes carries it at
+    /// offset 76 (Chapter 7 length-based compatibility).
+    pub keys_held: u64,
 }
 
 impl Status {
-    pub const SIZE: usize = 76;
+    /// Historical wire size: the prefix every console has always sent.
+    pub const LEGACY_SIZE: usize = 76;
+    /// Current wire size (`sizeof(NxusStatus)`): the legacy prefix + `keys_held`.
+    pub const SIZE: usize = 84;
+    /// Offset of the appended `keys_held` field.
+    pub const KEYS_HELD_OFFSET: usize = Self::LEGACY_SIZE;
+
     pub fn parse(data: &[u8]) -> Status {
         Status {
             proto_version: rd_u32(data, 0),
@@ -413,6 +462,9 @@ impl Status {
             heap_used: rd_u32(data, 64),
             heap_total: rd_u32(data, 68),
             max_read: rd_u32(data, 72),
+            // `rd_u64` reads all eight bytes or nothing: a 76-byte (or shorter)
+            // legacy reply therefore decodes as 0 without a separate length test.
+            keys_held: rd_u64(data, Self::KEYS_HELD_OFFSET),
         }
     }
     pub fn paused(&self) -> bool {
@@ -501,7 +553,11 @@ impl Metadata {
         }
     }
     pub fn build_id_hex(&self) -> String {
-        self.build_id.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+        self.build_id
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 
     /// Architecture the process's address space proves (see [`AddressSpaceArch`]).
@@ -525,7 +581,8 @@ impl Metadata {
             return AddressSpaceArch::Aarch64;
         }
         // The whole region sits inside the AArch32 address space.
-        if self.aslr_size != 0 && self.aslr_base < LIMIT && self.aslr_size <= LIMIT - self.aslr_base {
+        if self.aslr_size != 0 && self.aslr_base < LIMIT && self.aslr_size <= LIMIT - self.aslr_base
+        {
             return AddressSpaceArch::Aarch32;
         }
         // No size at all, or a region that starts below 4 GiB and ends above it:
@@ -575,12 +632,15 @@ pub struct Hit {
 impl Hit {
     /// Renders the value the way the value type implies.
     pub fn display_value(&self, fallback_size: u32) -> String {
-        let kind = VALUE_TYPE_NAMES.iter().find(|(_, t)| *t as u16 == self.value_type).map(|(_, t)| *t);
+        let kind = VALUE_TYPE_NAMES
+            .iter()
+            .find(|(_, t)| *t as u16 == self.value_type)
+            .map(|(_, t)| *t);
         match kind {
             Some(ValueType::F32) => format!("{}", f32::from_bits(self.value as u32)),
             Some(ValueType::F64) => format!("{}", f64::from_bits(self.value)),
             Some(ValueType::Str) | Some(ValueType::Bytes) | Some(ValueType::Binary) => {
-                format!("{:016X}", self.value)      // FNV-1a of the matched bytes
+                format!("{:016X}", self.value) // FNV-1a of the matched bytes
             }
             Some(ValueType::U8) => format!("{}", self.value as u8),
             Some(ValueType::U16) => format!("{}", self.value as u16),
@@ -687,7 +747,14 @@ impl HitBatch {
                 value,
             });
         }
-        HitBatch { session_id, total, value_size, truncated, dropped, hits }
+        HitBatch {
+            session_id,
+            total,
+            value_size,
+            truncated,
+            dropped,
+            hits,
+        }
     }
 }
 
@@ -739,7 +806,9 @@ impl FrozenEntry {
 /// record: a cut-off reply yields the complete entries it does contain instead
 /// of a half-decoded last one.
 pub fn parse_frozen_list(data: &[u8]) -> Vec<FrozenEntry> {
-    data.chunks_exact(FrozenEntry::SIZE).map(FrozenEntry::parse).collect()
+    data.chunks_exact(FrozenEntry::SIZE)
+        .map(FrozenEntry::parse)
+        .collect()
 }
 
 /// C: `NXUS_FROZEN_RELEASE_ADDR_MAX` - the most addresses one
@@ -776,7 +845,9 @@ impl FrozenReleased {
         let count = rd_u32(data, 0);
         // data[4..8] is the reserved word: skipped on purpose.
         let available = (data.len() - Self::HEADER_SIZE) / Self::ADDRESS_SIZE;
-        let n = (count as usize).min(available).min(FROZEN_RELEASE_ADDRESSES_MAX);
+        let n = (count as usize)
+            .min(available)
+            .min(FROZEN_RELEASE_ADDRESSES_MAX);
         let mut addresses = Vec::with_capacity(n);
         for i in 0..n {
             addresses.push(rd_u64(data, Self::HEADER_SIZE + i * Self::ADDRESS_SIZE));
@@ -1087,14 +1158,12 @@ impl ThreadContext {
 /// ARM (AArch32) condition suffixes, indexed by the 4-bit condition field.
 /// 0xE means "always" and therefore prints no suffix at all.
 const ARM_COND: [&str; 16] = [
-    "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
-    "hi", "ls", "ge", "lt", "gt", "le", "", "nv",
+    "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "", "nv",
 ];
 
 /// AArch64 condition suffixes (hs/lo instead of cs/cc, al instead of none).
 const ARM64_COND: [&str; 16] = [
-    "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
-    "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
+    "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
 ];
 
 const ARM_REGS: [&str; 13] = [
@@ -1224,7 +1293,11 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
         }
         return format!(".word 0x{:08X}", word);
     }
-    let cs = if cond == 0xE { "" } else { ARM_COND[cond as usize] };
+    let cs = if cond == 0xE {
+        ""
+    } else {
+        ARM_COND[cond as usize]
+    };
 
     // Well-known spellings that carry no operands worth decoding.
     if word == 0xE320F000 || word == 0xE1A00000 {
@@ -1277,20 +1350,36 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
         let rm = word & 0xF;
         match op {
             0 if ((word >> 12) & 0xF) == 0 => {
-                return format!("mul{}{} {}, {}, {}", ss, cs, arm_reg(rd), arm_reg(rm), arm_reg(rs));
+                return format!(
+                    "mul{}{} {}, {}, {}",
+                    ss,
+                    cs,
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    arm_reg(rs)
+                );
             }
             1 => {
                 let rn = (word >> 12) & 0xF;
                 return format!(
                     "mla{}{} {}, {}, {}, {}",
-                    ss, cs, arm_reg(rd), arm_reg(rm), arm_reg(rs), arm_reg(rn)
+                    ss,
+                    cs,
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    arm_reg(rs),
+                    arm_reg(rn)
                 );
             }
             3 if !sets_flags => {
                 let ra = (word >> 12) & 0xF;
                 return format!(
                     "mls{} {}, {}, {}, {}",
-                    cs, arm_reg(rd), arm_reg(rm), arm_reg(rs), arm_reg(ra)
+                    cs,
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    arm_reg(rs),
+                    arm_reg(ra)
                 );
             }
             _ => {}
@@ -1340,7 +1429,14 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
             };
             let addr = arm_mem(p, w, rn, off.as_deref());
             if mnem.ends_with('d') {
-                return format!("{}{} {}, {}, {}", mnem, cs, arm_reg(rt), arm_reg(rt + 1), addr);
+                return format!(
+                    "{}{} {}, {}, {}",
+                    mnem,
+                    cs,
+                    arm_reg(rt),
+                    arm_reg(rt + 1),
+                    addr
+                );
             }
             return format!("{}{} {}, {}", mnem, cs, arm_reg(rt), addr);
         }
@@ -1412,8 +1508,8 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
     // ---- data processing -----------------------------------------------
     if (word & 0x0C00_0000) == 0 {
         let names = [
-            "and", "eor", "sub", "rsb", "add", "adc", "sbc", "rsc",
-            "tst", "teq", "cmp", "cmn", "orr", "mov", "bic", "mvn",
+            "and", "eor", "sub", "rsb", "add", "adc", "sbc", "rsc", "tst", "teq", "cmp", "cmn",
+            "orr", "mov", "bic", "mvn",
         ];
         let opcode = (word >> 21) & 0xF;
         let sets_flags = ((word >> 20) & 1) != 0;
@@ -1429,7 +1525,15 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
         if opcode == 13 || opcode == 15 {
             return format!("{}{}{} {}, {}", name, ss, cs, arm_reg(rd), op2);
         }
-        return format!("{}{}{} {}, {}, {}", name, ss, cs, arm_reg(rd), arm_reg(rn), op2);
+        return format!(
+            "{}{}{} {}, {}, {}",
+            name,
+            ss,
+            cs,
+            arm_reg(rd),
+            arm_reg(rn),
+            op2
+        );
     }
 
     format!(".word 0x{:08X}", word)
@@ -1442,7 +1546,11 @@ fn disasm_aarch32(pc: u64, word: u32) -> String {
 fn a64_gpr(sf: bool, reg: u32, sp_is_31: bool) -> String {
     if reg == 31 {
         if sp_is_31 {
-            if sf { "sp".into() } else { "wsp".into() }
+            if sf {
+                "sp".into()
+            } else {
+                "wsp".into()
+            }
         } else if sf {
             "xzr".into()
         } else {
@@ -1474,7 +1582,11 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
     }
     if (word & 0xFFFF_FC1F) == 0xD65F_0000 {
         let rn = (word >> 5) & 0x1F;
-        return if rn == 30 { "ret".to_string() } else { format!("ret x{}", rn) };
+        return if rn == 30 {
+            "ret".to_string()
+        } else {
+            format!("ret x{}", rn)
+        };
     }
     // Unconditional B / BL
     if (word & 0x7C00_0000) == 0x1400_0000 {
@@ -1497,7 +1609,12 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
         let imm19 = ((((word >> 5) & 0x7FFFF) as i32) << 13) >> 11;
         let rt = word & 0x1F;
         let target = pc.wrapping_add(imm19 as i64 as u64);
-        return format!("{} {}, {:#x}", if n { "cbnz" } else { "cbz" }, a64_gpr(sf, rt, false), target);
+        return format!(
+            "{} {}, {:#x}",
+            if n { "cbnz" } else { "cbz" },
+            a64_gpr(sf, rt, false),
+            target
+        );
     }
     // TBZ / TBNZ
     if (word & 0x7E00_0000) == 0x3600_0000 {
@@ -1570,7 +1687,13 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
         if hw == 0 {
             return format!("{} {}, #{:#x}", mnem, a64_gpr(sf, rd, false), imm16);
         } else {
-            return format!("{} {}, #{:#x}, lsl #{}", mnem, a64_gpr(sf, rd, false), imm16, hw);
+            return format!(
+                "{} {}, #{:#x}, lsl #{}",
+                mnem,
+                a64_gpr(sf, rd, false),
+                imm16,
+                hw
+            );
         }
     }
     // LDR / STR (unsigned immediate)
@@ -1592,7 +1715,12 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
             _ => ("mem", size == 3),
         };
         if imm12 == 0 {
-            return format!("{} {}, [{}]", mnem, a64_gpr(sf, rt, false), a64_gpr(true, rn, true));
+            return format!(
+                "{} {}, [{}]",
+                mnem,
+                a64_gpr(sf, rt, false),
+                a64_gpr(true, rn, true)
+            );
         } else {
             return format!(
                 "{} {}, [{}, #{:#x}]",
@@ -1655,7 +1783,13 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
             if imm9 == 0 {
                 return format!("{} {}, [{}]", mnem, a64_gpr(sf, rt, false), base);
             }
-            return format!("{} {}, [{}, {}]", mnem, a64_gpr(sf, rt, false), base, fmt_off(imm9));
+            return format!(
+                "{} {}, [{}, {}]",
+                mnem,
+                a64_gpr(sf, rt, false),
+                base,
+                fmt_off(imm9)
+            );
         }
     }
     // ADD / SUB (shifted register), with the CMP / CMN aliases
@@ -1699,10 +1833,20 @@ fn disasm_aarch64(pc: u64, word: u32) -> String {
         let rd = word & 0x1F;
         let sh = a64_shift(shift, amt);
         if opc == 1 && rn == 31 {
-            return format!("mov {}, {}{}", a64_gpr(sf, rd, false), a64_gpr(sf, rm, false), sh);
+            return format!(
+                "mov {}, {}{}",
+                a64_gpr(sf, rd, false),
+                a64_gpr(sf, rm, false),
+                sh
+            );
         }
         if opc == 3 && rd == 31 {
-            return format!("tst {}, {}{}", a64_gpr(sf, rn, false), a64_gpr(sf, rm, false), sh);
+            return format!(
+                "tst {}, {}{}",
+                a64_gpr(sf, rn, false),
+                a64_gpr(sf, rm, false),
+                sh
+            );
         }
         let mnem = match opc {
             0 => "and",
@@ -1763,7 +1907,12 @@ fn raw_hex_bytes(bytes: &[u8]) -> String {
 /// AArch64 and AArch32 are fixed-width (4 bytes).  Thumb is variable: a halfword
 /// of 0xE800 or more introduces a 32-bit Thumb-2 instruction, anything else is
 /// a 16-bit instruction.  `max_insns` of 0 means "no limit".
-pub fn disasm_stream(base_addr: u64, data: &[u8], arch: DisasmArch, max_insns: usize) -> Vec<DisasmInsn> {
+pub fn disasm_stream(
+    base_addr: u64,
+    data: &[u8],
+    arch: DisasmArch,
+    max_insns: usize,
+) -> Vec<DisasmInsn> {
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < data.len() {
@@ -1866,15 +2015,30 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
                 if imm5 == 0 {
                     return format!("movs {}, {}", arm_reg(rd), arm_reg(rm));
                 }
-                return format!("lsls {}, {}, {}", arm_reg(rd), arm_reg(rm), fmt_off(imm5 as i64));
+                return format!(
+                    "lsls {}, {}, {}",
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    fmt_off(imm5 as i64)
+                );
             }
             1 => {
                 let amt = if imm5 == 0 { 32 } else { imm5 };
-                return format!("lsrs {}, {}, {}", arm_reg(rd), arm_reg(rm), fmt_off(amt as i64));
+                return format!(
+                    "lsrs {}, {}, {}",
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    fmt_off(amt as i64)
+                );
             }
             2 => {
                 let amt = if imm5 == 0 { 32 } else { imm5 };
-                return format!("asrs {}, {}, {}", arm_reg(rd), arm_reg(rm), fmt_off(amt as i64));
+                return format!(
+                    "asrs {}, {}, {}",
+                    arm_reg(rd),
+                    arm_reg(rm),
+                    fmt_off(amt as i64)
+                );
             }
             _ => {}
         }
@@ -1897,8 +2061,8 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
     // ---- data processing (register) ------------------------------------
     if (w & 0xFC00) == 0x4000 {
         let names = [
-            "ands", "eors", "lsls", "lsrs", "asrs", "adcs", "sbcs", "rors",
-            "tst", "rsbs", "cmp", "cmn", "orrs", "muls", "bics", "mvns",
+            "ands", "eors", "lsls", "lsrs", "asrs", "adcs", "sbcs", "rors", "tst", "rsbs", "cmp",
+            "cmn", "orrs", "muls", "bics", "mvns",
         ];
         let op = (w >> 6) & 0xF;
         let rm = (w >> 3) & 7;
@@ -1932,12 +2096,20 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
 
     // ---- LDR/STR (register offset) -------------------------------------
     if (w & 0xF000) == 0x5000 {
-        let ops = ["str", "strh", "strb", "ldrsb", "ldr", "ldrh", "ldrb", "ldrsh"];
+        let ops = [
+            "str", "strh", "strb", "ldrsb", "ldr", "ldrh", "ldrb", "ldrsh",
+        ];
         let op = (w >> 9) & 7;
         let rm = (w >> 6) & 7;
         let rn = (w >> 3) & 7;
         let rt = w & 7;
-        return format!("{} {}, [{}, {}]", ops[op as usize], arm_reg(rt), arm_reg(rn), arm_reg(rm));
+        return format!(
+            "{} {}, [{}, {}]",
+            ops[op as usize],
+            arm_reg(rt),
+            arm_reg(rn),
+            arm_reg(rm)
+        );
     }
 
     // ---- LDR/STR/LDRB/STRB (immediate 5) -------------------------------
@@ -1972,14 +2144,23 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
         } else {
             format!("[sp, {}]", fmt_off(imm as i64))
         };
-        return format!("{} {}, {}", if l { "ldr" } else { "str" }, arm_reg(rt), addr);
+        return format!(
+            "{} {}, {}",
+            if l { "ldr" } else { "str" },
+            arm_reg(rt),
+            addr
+        );
     }
 
     // ---- ADD/SUB SP, #imm ---------------------------------------------
     if (w & 0xFF80) == 0xB000 {
         let sub = ((w >> 7) & 1) != 0;
         let imm = (w & 0x7F) * 4;
-        return format!("{} sp, {}", if sub { "sub" } else { "add" }, fmt_off(imm as i64));
+        return format!(
+            "{} sp, {}",
+            if sub { "sub" } else { "add" },
+            fmt_off(imm as i64)
+        );
     }
 
     // ---- PUSH / POP ----------------------------------------------------
@@ -1988,7 +2169,11 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
         let bit8 = (w >> 8) & 1;
         let extra = if pop { bit8 << 15 } else { bit8 << 14 };
         let mask = (w & 0xFF) | extra;
-        return format!("{} {}", if pop { "pop" } else { "push" }, arm_reg_list(mask));
+        return format!(
+            "{} {}",
+            if pop { "pop" } else { "push" },
+            arm_reg_list(mask)
+        );
     }
 
     // ---- CBZ / CBNZ ----------------------------------------------------
@@ -1999,7 +2184,12 @@ pub fn disasm_thumb16(pc: u64, hw: u16) -> String {
         let off = ((i << 5) | imm5) << 1;
         let rn = w & 7;
         let target = pc.wrapping_add(4).wrapping_add(off as u64);
-        return format!("{} {}, {:#x}", if nz { "cbnz" } else { "cbz" }, arm_reg(rn), target);
+        return format!(
+            "{} {}, {:#x}",
+            if nz { "cbnz" } else { "cbz" },
+            arm_reg(rn),
+            target
+        );
     }
 
     // ---- B<cond> / UDF / SVC -------------------------------------------
@@ -2062,7 +2252,11 @@ pub fn disasm_thumb32(pc: u64, hw1: u16, hw2: u16) -> String {
                 | (((w2 & 0x7FF) as i64) << 1);
             let imm = (imm << 7) >> 7;
             let target = pc.wrapping_add(4).wrapping_add(imm as u64);
-            return format!("{} {:#x}", if kind == 0xD000 { "bl" } else { "b.w" }, target);
+            return format!(
+                "{} {:#x}",
+                if kind == 0xD000 { "bl" } else { "b.w" },
+                target
+            );
         }
         if kind == 0x8000 {
             let cond = (w1 >> 6) & 0xF;
@@ -2253,7 +2447,6 @@ impl ModuleInfo {
         }
     }
 }
-
 
 /// Evaluate an address / offset expression (jnoexs ExpressionEvaluator parity).
 ///
@@ -2447,7 +2640,10 @@ pub fn eval_expr(text: &str, main_base: u64, heap_base: u64) -> Option<u64> {
                 return Some(self.heap_base);
             }
             let clean = tok.replace('_', "");
-            if let Some(hex) = clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")) {
+            if let Some(hex) = clean
+                .strip_prefix("0x")
+                .or_else(|| clean.strip_prefix("0X"))
+            {
                 return u64::from_str_radix(hex, 16).ok();
             }
             if let Ok(dec) = clean.parse::<u64>() {
@@ -2474,7 +2670,6 @@ pub fn eval_expr(text: &str, main_base: u64, heap_base: u64) -> Option<u64> {
         None
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2503,9 +2698,16 @@ mod tests {
 
         let mut value: u32 = 0;
         for raw in body.lines() {
-            let line = raw.split("/*").next().unwrap_or("")
-                .split("//").next().unwrap_or("")
-                .trim().trim_end_matches(',').trim();
+            let line = raw
+                .split("/*")
+                .next()
+                .unwrap_or("")
+                .split("//")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(',')
+                .trim();
             if line.is_empty() {
                 continue;
             }
@@ -2534,7 +2736,8 @@ mod tests {
         let rest = text[start..].trim_start().trim_start_matches('(');
         let end = rest.find(|c: char| !(c.is_ascii_hexdigit() || c == 'x' || c == 'X'))?;
         let raw = rest[..end].trim_end_matches(['u', 'U']);
-        raw.strip_prefix("0x").and_then(|h| u32::from_str_radix(h, 16).ok())
+        raw.strip_prefix("0x")
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
     }
 
     /// `(field, byte offset)` of a flat packed struct, in declaration order.
@@ -2543,8 +2746,12 @@ mod tests {
     /// header actually uses; comments (including multi-line ones) are stripped
     /// first, exactly like pc/tests/test_protocol_parity.py does.
     fn header_fields(text: &str, name: &str) -> Vec<(String, usize)> {
-        let close = text.find(&format!("}} {};", name)).expect("struct not found");
-        let head = text[..close].rfind("typedef struct").expect("typedef struct not found");
+        let close = text
+            .find(&format!("}} {};", name))
+            .expect("struct not found");
+        let head = text[..close]
+            .rfind("typedef struct")
+            .expect("typedef struct not found");
         let body = &text[head + text[head..].find('{').expect("opening brace") + 1..close];
 
         let mut stripped = String::new();
@@ -2574,8 +2781,14 @@ mod tests {
             }
             let mut parts = decl.split_whitespace();
             let ty = parts.next().unwrap_or("");
-            let field = parts.next().unwrap_or_else(|| panic!("no name in `{}`", decl));
-            assert!(parts.next().is_none(), "unsupported field declaration `{}`", decl);
+            let field = parts
+                .next()
+                .unwrap_or_else(|| panic!("no name in `{}`", decl));
+            assert!(
+                parts.next().is_none(),
+                "unsupported field declaration `{}`",
+                decl
+            );
             let size = match ty {
                 "u8" => 1,
                 "u16" => 2,
@@ -2592,12 +2805,34 @@ mod tests {
     #[test]
     fn sizes_match_the_c_header() {
         assert_eq!(header_size(HEADER, "NxusStatus"), Some(Status::SIZE as u32));
+        // The appended field starts exactly at the historical end; a drift here
+        // would make an 84-byte reply decode keys_held from the wrong place.
+        assert!(HEADER.contains(&format!(
+            "#define NXUS_STATUS_MIN_SIZE {}u",
+            Status::LEGACY_SIZE
+        )));
+        assert_eq!(
+            header_define(HEADER, "NXUS_WRITE_FLAG_ALLOW_RX"),
+            Some(WRITE_FLAG_ALLOW_RX)
+        );
         assert_eq!(header_size(HEADER, "NxusHit"), Some(16));
-        assert_eq!(header_size(HEADER, "NxusModuleInfo"), Some(ModuleInfo::SIZE as u32));
-        assert_eq!(header_size(HEADER, "NxusThreadContext"), Some(ThreadContext::SIZE as u32));
+        assert_eq!(
+            header_size(HEADER, "NxusModuleInfo"),
+            Some(ModuleInfo::SIZE as u32)
+        );
+        assert_eq!(
+            header_size(HEADER, "NxusThreadContext"),
+            Some(ThreadContext::SIZE as u32)
+        );
         // the range list that NXUS_SCAN_F_RANGES introduces
-        assert_eq!(header_size(HEADER, "NxusRangeListHeader"), Some(RANGE_LIST_HEADER_SIZE as u32));
-        assert_eq!(header_size(HEADER, "NxusRangeEntry"), Some(RANGE_ENTRY_SIZE as u32));
+        assert_eq!(
+            header_size(HEADER, "NxusRangeListHeader"),
+            Some(RANGE_LIST_HEADER_SIZE as u32)
+        );
+        assert_eq!(
+            header_size(HEADER, "NxusRangeEntry"),
+            Some(RANGE_ENTRY_SIZE as u32)
+        );
         // NxusFrozenEntry has no NXUS_STATIC_ASSERT in the header (unlike its
         // NxusFrozenRequest sibling): its fields are {u64 address; u64 value;
         // u32 width; u32 reserved}, i.e. 24 packed bytes, matching protocol.py's
@@ -2609,8 +2844,14 @@ mod tests {
     fn threadctx_flags_match_the_c_header() {
         // Bit 0 is the RegsSet request flag, bit 1 the GetRegs AArch32 marker: a
         // drift here would make is_aarch32() answer for the wrong bit.
-        assert_eq!(header_define(HEADER, "NXUS_THREADCTX_FLAG_X_AUTHORITATIVE"), Some(NXUS_THREADCTX_FLAG_X_AUTHORITATIVE));
-        assert_eq!(header_define(HEADER, "NXUS_THREADCTX_FLAG_AARCH32"), Some(NXUS_THREADCTX_FLAG_AARCH32));
+        assert_eq!(
+            header_define(HEADER, "NXUS_THREADCTX_FLAG_X_AUTHORITATIVE"),
+            Some(NXUS_THREADCTX_FLAG_X_AUTHORITATIVE)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_THREADCTX_FLAG_AARCH32"),
+            Some(NXUS_THREADCTX_FLAG_AARCH32)
+        );
     }
 
     #[test]
@@ -2618,17 +2859,24 @@ mod tests {
         // A 32-bit reply: header sp/lr/fp stay zero, the live values sit in
         // x[13]/x[14]/x[11], and reserved carries bit 1.
         let mut data = vec![0u8; ThreadContext::SIZE];
-        data[40..44].copy_from_slice(&0x6000_0000u32.to_le_bytes());   // cpsr
+        data[40..44].copy_from_slice(&0x6000_0000u32.to_le_bytes()); // cpsr
         data[ThreadContext::FLAGS_OFFSET..ThreadContext::FLAGS_OFFSET + 4]
             .copy_from_slice(&NXUS_THREADCTX_FLAG_AARCH32.to_le_bytes());
-        for (i, reg) in [(13usize, 0x3600_F000u64), (14, 0x1B00_4001), (11, 0x3600_0FF0)] {
+        for (i, reg) in [
+            (13usize, 0x3600_F000u64),
+            (14, 0x1B00_4001),
+            (11, 0x3600_0FF0),
+        ] {
             let off = 100 + i * 8;
             data[off..off + 8].copy_from_slice(&reg.to_le_bytes());
         }
         let ctx = ThreadContext::parse(&data);
         assert!(ctx.is_aarch32());
         assert_eq!(ctx.cpsr, 0x6000_0000);
-        assert_eq!((ctx.x[13], ctx.x[14], ctx.x[11]), (0x3600_F000, 0x1B00_4001, 0x3600_0FF0));
+        assert_eq!(
+            (ctx.x[13], ctx.x[14], ctx.x[11]),
+            (0x3600_F000, 0x1B00_4001, 0x3600_0FF0)
+        );
         // A 64-bit reply (bit 0 from an echo, or nothing at all) is not AArch32.
         let mut data64 = data.clone();
         data64[ThreadContext::FLAGS_OFFSET..ThreadContext::FLAGS_OFFSET + 4]
@@ -2642,42 +2890,71 @@ mod tests {
         // NxusCmd is an enum, so the values come from header_enum (header_define is
         // only for #define lines - asserting with the wrong helper silently returned
         // None and "passed" nothing).
-        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_GetProcesses"),
-                   Some(cmd::GET_PROCESSES as u32));
-        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_ScanUndo"),
-                   Some(cmd::SCAN_UNDO as u32));
-        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_DebugAttach"),
-                   Some(cmd::DEBUG_ATTACH as u32));
-        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_ScanBegin"),
-                   Some(cmd::SCAN_BEGIN as u32));
+        assert_eq!(
+            header_enum(HEADER, "NxusCmd", "NxusCmd_GetProcesses"),
+            Some(cmd::GET_PROCESSES as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCmd", "NxusCmd_ScanUndo"),
+            Some(cmd::SCAN_UNDO as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCmd", "NxusCmd_DebugAttach"),
+            Some(cmd::DEBUG_ATTACH as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCmd", "NxusCmd_ScanBegin"),
+            Some(cmd::SCAN_BEGIN as u32)
+        );
     }
 
     #[test]
     fn debug_step_stop_and_flags_match_the_c_header() {
-        assert_eq!(header_enum(HEADER, "NxusCmd", "NxusCmd_DebugStep"),
-                   Some(cmd::DEBUG_STEP as u32));
-        assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_DebugStopped"),
-                   Some(event::DEBUG_STOPPED as u32));
+        assert_eq!(
+            header_enum(HEADER, "NxusCmd", "NxusCmd_DebugStep"),
+            Some(cmd::DEBUG_STEP as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusEvent", "NxusEvent_DebugStopped"),
+            Some(event::DEBUG_STOPPED as u32)
+        );
         // The release event the console sends after `releaseOwnedFrozen()`:
         // payload is NxusFrozenReleased (parsed by FrozenReleased::parse), and
         // the cap on the addresses that fit in one frame is 32.
-        assert_eq!(header_enum(HEADER, "NxusEvent", "NxusEvent_FrozenReleased"),
-                   Some(event::FROZEN_RELEASED as u32));
+        assert_eq!(
+            header_enum(HEADER, "NxusEvent", "NxusEvent_FrozenReleased"),
+            Some(event::FROZEN_RELEASED as u32)
+        );
         // header_define() only reads hex values and this macro is decimal, so
         // match the #define line itself: either side drifting fails here.
-        assert!(HEADER.contains(&format!("#define NXUS_FROZEN_RELEASE_ADDR_MAX {}",
-                                         FROZEN_RELEASE_ADDRESSES_MAX)));
-        assert_eq!(header_define(HEADER, "NXUS_ST_DEBUG_STOPPED"), Some(ST_DEBUG_STOPPED));
+        assert!(HEADER.contains(&format!(
+            "#define NXUS_FROZEN_RELEASE_ADDR_MAX {}",
+            FROZEN_RELEASE_ADDRESSES_MAX
+        )));
+        assert_eq!(
+            header_define(HEADER, "NXUS_ST_DEBUG_STOPPED"),
+            Some(ST_DEBUG_STOPPED)
+        );
         // reserved-flag on the hit batch (added in Round 4/5): a drift here would
         // silently turn a truncated result back into a "complete" one.
-        assert_eq!(header_define(HEADER, "NXUS_HITBATCH_TRUNCATED"),
-                   Some(NXUS_HITBATCH_TRUNCATED));
+        assert_eq!(
+            header_define(HEADER, "NXUS_HITBATCH_TRUNCATED"),
+            Some(NXUS_HITBATCH_TRUNCATED)
+        );
         // Round 23: hits dropped because their mapping is gone.  A drift here would
         // make the page walk stop on an empty page and lose every later hit.
-        assert_eq!(header_define(HEADER, "NXUS_HITBATCH_DROPPED"),
-                   Some(NXUS_HITBATCH_DROPPED));
-        assert_eq!(header_size(HEADER, "NxusDebugStop"), Some(DebugStop::SIZE as u32));
-        assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
+        assert_eq!(
+            header_define(HEADER, "NXUS_HITBATCH_DROPPED"),
+            Some(NXUS_HITBATCH_DROPPED)
+        );
+        assert_eq!(
+            header_size(HEADER, "NxusDebugStop"),
+            Some(DebugStop::SIZE as u32)
+        );
+        assert_eq!(
+            header_size(HEADER, "NxusDebugStatus"),
+            Some(DebugStatus::SIZE as u32)
+        );
     }
 
     #[test]
@@ -2690,32 +2967,53 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
-            ["attached", "watch_style", "break_count", "hit_count", "thread_count",
-             "last_result", "auto_continue", "stopped_thread_low", "stopped_thread"]
+            [
+                "attached",
+                "watch_style",
+                "break_count",
+                "hit_count",
+                "thread_count",
+                "last_result",
+                "auto_continue",
+                "stopped_thread_low",
+                "stopped_thread"
+            ]
         );
         assert_eq!(fields[7], ("stopped_thread_low".to_string(), 28));
         assert_eq!(fields[8], ("stopped_thread".to_string(), 32));
-        assert_eq!(DebugStatus::LEGACY_SIZE, 32, "the legacy prefix must not move");
+        assert_eq!(
+            DebugStatus::LEGACY_SIZE,
+            32,
+            "the legacy prefix must not move"
+        );
         assert_eq!(DebugStatus::FULL_THREAD_OFFSET, fields[8].1);
-        assert_eq!(header_size(HEADER, "NxusDebugStatus"), Some(DebugStatus::SIZE as u32));
+        assert_eq!(
+            header_size(HEADER, "NxusDebugStatus"),
+            Some(DebugStatus::SIZE as u32)
+        );
         // The header spells the compatibility boundary out as a macro so the C
         // side can reason about an old console's reply; pin it here too.
-        assert!(HEADER.contains(&format!("#define NXUS_DEBUG_STATUS_LEGACY_SIZE {}u",
-                                         DebugStatus::LEGACY_SIZE)));
+        assert!(HEADER.contains(&format!(
+            "#define NXUS_DEBUG_STATUS_LEGACY_SIZE {}u",
+            DebugStatus::LEGACY_SIZE
+        )));
     }
 
     #[test]
     fn debug_status_decodes_the_stopped_thread_at_offset_28() {
         let mut data = vec![0u8; DebugStatus::SIZE];
-        data[0..4].copy_from_slice(&1u32.to_le_bytes());          // attached
-        data[24..28].copy_from_slice(&0u32.to_le_bytes());        // auto_continue
-        data[28..32].copy_from_slice(&0x1001u32.to_le_bytes());   // stopped_thread_low
+        data[0..4].copy_from_slice(&1u32.to_le_bytes()); // attached
+        data[24..28].copy_from_slice(&0u32.to_le_bytes()); // auto_continue
+        data[28..32].copy_from_slice(&0x1001u32.to_le_bytes()); // stopped_thread_low
         let status = DebugStatus::parse(&data);
         assert!(status.attached);
         assert_eq!(status.auto_continue, 0);
         assert_eq!(status.stopped_thread(), Some(0x1001));
         // a running target reports 0 there, and a short reply must not panic
-        assert_eq!(DebugStatus::parse(&vec![0u8; DebugStatus::SIZE]).stopped_thread(), None);
+        assert_eq!(
+            DebugStatus::parse(&vec![0u8; DebugStatus::SIZE]).stopped_thread(),
+            None
+        );
         assert_eq!(DebugStatus::parse(&[0u8; 20]).stopped_thread(), None);
     }
 
@@ -2729,7 +3027,10 @@ mod tests {
         data[DebugStatus::FULL_THREAD_OFFSET..DebugStatus::SIZE]
             .copy_from_slice(&tid.to_le_bytes());
         let status = DebugStatus::parse(&data);
-        assert_eq!(status.stopped_thread_low, 0x2A3B, "legacy half stays truncated");
+        assert_eq!(
+            status.stopped_thread_low, 0x2A3B,
+            "legacy half stays truncated"
+        );
         assert_eq!(status.stopped_thread, tid);
         assert_eq!(status.stopped_thread(), Some(tid));
     }
@@ -2758,58 +3059,114 @@ mod tests {
         data[24..28].copy_from_slice(&1u32.to_le_bytes());
         data[28..32].copy_from_slice(&0x10u32.to_le_bytes());
         let stop = DebugStop::parse(&data);
-        assert_eq!((stop.thread_id, stop.pc, stop.address, stop.kind, stop.slot),
-                   (0x1001, 0x00712345, 0x42CA1DC4, 1, 0x10));
+        assert_eq!(
+            (stop.thread_id, stop.pc, stop.address, stop.kind, stop.slot),
+            (0x1001, 0x00712345, 0x42CA1DC4, 1, 0x10)
+        );
     }
 
     #[test]
     fn enums_match_the_c_header() {
-        assert_eq!(header_enum(HEADER, "NxusCompareMode", "NxusCmp_Between"),
-                   Some(Compare::Between as u32));
-        assert_eq!(header_enum(HEADER, "NxusCompareMode", "NxusCmp_Unknown"),
-                   Some(Compare::Unknown as u32));
-        assert_eq!(header_enum(HEADER, "NxusCompareMode", "NxusCmp_GreaterOrEqual"),
-                   Some(Compare::GreaterOrEqual as u32));
-        assert_eq!(header_enum(HEADER, "NxusCompareMode", "NxusCmp_LessOrEqual"),
-                   Some(Compare::LessOrEqual as u32));
-        assert_eq!(header_enum(HEADER, "NxusCompareMode", "NxusCmp_Different"),
-                   Some(Compare::Different as u32));
-        assert_eq!(header_enum(HEADER, "NxusScanScope", "NxusScope_Ranges"),
-                   Some(Scope::Ranges as u32));
-        assert_eq!(header_enum(HEADER, "NxusValueType", "NxusValueType_All"),
-                   Some(ValueType::All as u32));
-        assert_eq!(header_enum(HEADER, "NxusValueType", "NxusValueType_String"),
-                   Some(ValueType::Str as u32));
-        assert_eq!(header_enum(HEADER, "NxusScanScope", "NxusScope_Tls"),
-                   Some(Scope::Tls as u32));
+        assert_eq!(
+            header_enum(HEADER, "NxusCompareMode", "NxusCmp_Between"),
+            Some(Compare::Between as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCompareMode", "NxusCmp_Unknown"),
+            Some(Compare::Unknown as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCompareMode", "NxusCmp_GreaterOrEqual"),
+            Some(Compare::GreaterOrEqual as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCompareMode", "NxusCmp_LessOrEqual"),
+            Some(Compare::LessOrEqual as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusCompareMode", "NxusCmp_Different"),
+            Some(Compare::Different as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusScanScope", "NxusScope_Ranges"),
+            Some(Scope::Ranges as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusValueType", "NxusValueType_All"),
+            Some(ValueType::All as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusValueType", "NxusValueType_String"),
+            Some(ValueType::Str as u32)
+        );
+        assert_eq!(
+            header_enum(HEADER, "NxusScanScope", "NxusScope_Tls"),
+            Some(Scope::Tls as u32)
+        );
     }
 
     #[test]
     fn scan_flags_match_the_c_header() {
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_WILDCARD"), Some(SCAN_F_WILDCARD));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_UTF16"), Some(SCAN_F_UTF16));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_ALIGNED"), Some(SCAN_F_ALIGNED));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_FLOAT"), Some(SCAN_F_FLOAT));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_NEW_SESSION"), Some(SCAN_F_NEW_SESSION));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_SIGNED"), Some(SCAN_F_SIGNED));
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_WILDCARD"),
+            Some(SCAN_F_WILDCARD)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_UTF16"),
+            Some(SCAN_F_UTF16)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_ALIGNED"),
+            Some(SCAN_F_ALIGNED)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_FLOAT"),
+            Some(SCAN_F_FLOAT)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_NEW_SESSION"),
+            Some(SCAN_F_NEW_SESSION)
+        );
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_SIGNED"),
+            Some(SCAN_F_SIGNED)
+        );
         assert_eq!(header_define(HEADER, "NXUS_SCAN_F_HEX"), Some(SCAN_F_HEX));
-        assert_eq!(header_define(HEADER, "NXUS_SCAN_F_CASE_INSENS"), Some(SCAN_F_CASE_INSENS));
+        assert_eq!(
+            header_define(HEADER, "NXUS_SCAN_F_CASE_INSENS"),
+            Some(SCAN_F_CASE_INSENS)
+        );
     }
 
     #[test]
     fn expression_evaluator_handles_arithmetic_and_symbols() {
         let main = 0x7100000000;
         let heap = 0x42CA0000;
-        assert_eq!(eval_expr("main+0x80000+0x1000", main, heap), Some(main + 0x81000));
-        assert_eq!(eval_expr("(heap + 0x1DC0) + 4", main, heap), Some(0x42CA1DC4));
-        assert_eq!(eval_expr("main + (2 * 0x40000) - 0x10", main, heap), Some(main + 0x80000 - 0x10));
+        assert_eq!(
+            eval_expr("main+0x80000+0x1000", main, heap),
+            Some(main + 0x81000)
+        );
+        assert_eq!(
+            eval_expr("(heap + 0x1DC0) + 4", main, heap),
+            Some(0x42CA1DC4)
+        );
+        assert_eq!(
+            eval_expr("main + (2 * 0x40000) - 0x10", main, heap),
+            Some(main + 0x80000 - 0x10)
+        );
         assert_eq!(eval_expr("(0x100 << 4) | 0xF", main, heap), Some(0x100F));
         assert_eq!(eval_expr("42CA1DC4", main, heap), Some(0x42CA1DC4));
         assert_eq!(eval_expr("100 / 0", main, heap), None);
         assert_eq!(disasm_arm(0x7100001000, 0xD503_201F, false), "nop");
         assert_eq!(disasm_arm(0x7100001000, 0xD65F_03C0, false), "ret");
-        assert_eq!(disasm_arm(0x7100001000, 0xB900_0401, false), "str w1, [x0, #0x4]");
-        assert_eq!(disasm_arm(0x00701000, 0xE580_1004, true), "str r1, [r0, #0x4]");
+        assert_eq!(
+            disasm_arm(0x7100001000, 0xB900_0401, false),
+            "str w1, [x0, #0x4]"
+        );
+        assert_eq!(
+            disasm_arm(0x00701000, 0xE580_1004, true),
+            "str r1, [r0, #0x4]"
+        );
     }
 
     #[test]
@@ -2821,24 +3178,93 @@ mod tests {
         assert_eq!(Status::parse(&data).proto_version, 0x09090909);
     }
 
+    #[test]
+    fn legacy_status_is_76_bytes_and_reads_no_keys_held() {
+        // An old console sends only the historical prefix.  The appended field
+        // must decode as 0 (never consume bytes from the following frame), and
+        // every legacy field must keep its offset.
+        let mut data = vec![0u8; Status::LEGACY_SIZE];
+        data[0..4].copy_from_slice(&PROTO_VERSION.to_le_bytes());
+        data[72..76].copy_from_slice(&0x0008_0000u32.to_le_bytes());
+        let status = Status::parse(&data);
+        assert_eq!(Status::LEGACY_SIZE, 76);
+        assert_eq!(status.proto_version, PROTO_VERSION);
+        assert_eq!(status.max_read, 0x0008_0000);
+        assert_eq!(
+            status.keys_held, 0,
+            "a 76-byte reply has no keys_held field"
+        );
+    }
+
+    #[test]
+    fn extended_status_reads_keys_held_at_offset_76() {
+        // A current console appends the u64 held mask.  It is little-endian, so
+        // a value above 32 bits catches a mistaken u32/endian decode.
+        let mut data = vec![0xAAu8; Status::SIZE];
+        data[..Status::KEYS_HELD_OFFSET].fill(0);
+        let keys = 0x0000_0001_8000_0003u64; // A | B | PLUS, above 32 bits
+        data[Status::KEYS_HELD_OFFSET..Status::SIZE].copy_from_slice(&keys.to_le_bytes());
+        let status = Status::parse(&data);
+        assert_eq!(Status::SIZE, 84);
+        assert_eq!(Status::KEYS_HELD_OFFSET, 76);
+        assert_eq!(status.keys_held, keys);
+        // A short tail (80 of 84 bytes) is not a valid u64: still 0.
+        assert_eq!(Status::parse(&data[..80]).keys_held, 0);
+    }
+
+    #[test]
+    fn write_flags_land_in_the_reserved_word() {
+        assert_eq!(WRITE_FLAG_ALLOW_RX, 0x01);
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+        let plain = encode_write(0x0070_0000, &data);
+        assert_eq!(plain.len(), WRITE_HEADER_SIZE + data.len());
+        assert_eq!(rd_u64(&plain, 0), 0x0070_0000);
+        assert_eq!(rd_u32(&plain, 8), data.len() as u32);
+        assert_eq!(rd_u32(&plain, 12), 0, "a normal Write must not set flags");
+        assert_eq!(&plain[WRITE_HEADER_SIZE..], &data);
+
+        let code = encode_write_flags(0x0070_0000, &data, WRITE_FLAG_ALLOW_RX);
+        assert_eq!(rd_u64(&code, 0), 0x0070_0000);
+        assert_eq!(rd_u32(&code, 8), data.len() as u32);
+        assert_eq!(rd_u32(&code, 12), WRITE_FLAG_ALLOW_RX);
+        assert_eq!(&code[16..], &data);
+        assert_eq!(encode_write(1, &[]), encode_write_flags(1, &[], 0));
+    }
+
     // ---- disassembler ----------------------------------------------------
 
     #[test]
     fn disasm_aarch32_common_instructions() {
         // data processing: immediate and register forms, with condition codes
-        assert_eq!(disasm_arm(0x0010_0000, 0xE241_1004, true), "sub r1, r1, #0x4");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE281_0008, true), "add r0, r1, #0x8");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE241_1004, true),
+            "sub r1, r1, #0x4"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE281_0008, true),
+            "add r0, r1, #0x8"
+        );
         assert_eq!(disasm_arm(0x0010_0000, 0xE351_0000, true), "cmp r1, #0x0");
-        assert_eq!(disasm_arm(0x0010_0000, 0x1281_0008, true), "addne r0, r1, #0x8");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0x1281_0008, true),
+            "addne r0, r1, #0x8"
+        );
         assert_eq!(disasm_arm(0x0010_0000, 0xE1A0_2001, true), "mov r2, r1");
         assert_eq!(disasm_arm(0x0010_0000, 0xE3A0_2001, true), "mov r2, #0x1");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE290_0001, true), "adds r0, r0, #0x1");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE290_0001, true),
+            "adds r0, r0, #0x1"
+        );
 
         // push / pop (the stmdb sp! / ldmia sp! aliases)
-        assert_eq!(disasm_arm(0x0010_0000, 0xE92D_4FF0, true),
-                   "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE8BD_8FF0, true),
-                   "pop {r4, r5, r6, r7, r8, r9, r10, r11, pc}");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE92D_4FF0, true),
+            "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE8BD_8FF0, true),
+            "pop {r4, r5, r6, r7, r8, r9, r10, r11, pc}"
+        );
 
         // branches: target = pc + 8 + (sign_extend(imm24) << 2)
         assert_eq!(disasm_arm(0x0010_0000, 0xEAFF_FFFE, true), "b 0x100000");
@@ -2846,15 +3272,36 @@ mod tests {
         assert_eq!(disasm_arm(0x0010_0000, 0x0A00_0000, true), "beq 0x100008");
 
         // loads / stores
-        assert_eq!(disasm_arm(0x0010_0000, 0xE591_0004, true), "ldr r0, [r1, #0x4]");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE511_0004, true), "ldr r0, [r1, #-0x4]");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE5D1_0003, true), "ldrb r0, [r1, #0x3]");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE791_0002, true), "ldr r0, [r1, r2]");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE1D1_00B4, true), "ldrh r0, [r1, #0x4]");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE591_0004, true),
+            "ldr r0, [r1, #0x4]"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE511_0004, true),
+            "ldr r0, [r1, #-0x4]"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE5D1_0003, true),
+            "ldrb r0, [r1, #0x3]"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE791_0002, true),
+            "ldr r0, [r1, r2]"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE1D1_00B4, true),
+            "ldrh r0, [r1, #0x4]"
+        );
 
         // wide immediates, multiply, system instructions
-        assert_eq!(disasm_arm(0x0010_0000, 0xE301_0234, true), "movw r0, #0x1234");
-        assert_eq!(disasm_arm(0x0010_0000, 0xE341_0234, true), "movt r0, #0x1234");
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE301_0234, true),
+            "movw r0, #0x1234"
+        );
+        assert_eq!(
+            disasm_arm(0x0010_0000, 0xE341_0234, true),
+            "movt r0, #0x1234"
+        );
         assert_eq!(disasm_arm(0x0010_0000, 0xE000_0291, true), "mul r0, r1, r2");
         assert_eq!(disasm_arm(0x0010_0000, 0xEF00_0001, true), "svc #0x1");
         assert_eq!(disasm_arm(0x0010_0000, 0xE7F0_00F0, true), "udf #0x0");
@@ -2887,8 +3334,14 @@ mod tests {
         assert_eq!(disasm_thumb32(0x1000, 0xF000, 0xF800), "bl 0x1004");
         assert_eq!(disasm_thumb32(0x1000, 0xF000, 0xB800), "b.w 0x1004");
         assert_eq!(disasm_thumb32(0x1000, 0xF000, 0xA800), "beq.w 0x1004");
-        assert_eq!(disasm_thumb32(0x1000, 0xF8D1, 0x0001), "ldr.w r0, [r1, #0x4]");
-        assert_eq!(disasm_thumb32(0x1000, 0xF8C2, 0x0001), "str.w r0, [r2, #0x4]");
+        assert_eq!(
+            disasm_thumb32(0x1000, 0xF8D1, 0x0001),
+            "ldr.w r0, [r1, #0x4]"
+        );
+        assert_eq!(
+            disasm_thumb32(0x1000, 0xF8C2, 0x0001),
+            "str.w r0, [r2, #0x4]"
+        );
         assert_eq!(disasm_thumb32(0x1000, 0xE92D, 0x4010), "push.w {r4, lr}");
         assert_eq!(disasm_thumb32(0x1000, 0xE8BD, 0x8010), "pop.w {r4, pc}");
         assert_eq!(disasm_thumb32(0x1000, 0xF201, 0x0002), "add.w r0, r1, #0x2");
@@ -2898,7 +3351,10 @@ mod tests {
         assert_eq!(disasm_thumb32(0x1000, 0xEB01, 0x0002), "add.w r0, r1, r2");
         assert_eq!(disasm_thumb32(0x1000, 0xEBA1, 0x0002), "sub.w r0, r1, r2");
         assert_eq!(disasm_thumb32(0x1000, 0xEA4F, 0x0001), "mov.w r0, r1");
-        assert_eq!(disasm_thumb32(0x1000, 0xF123, 0x4567), ".short 0xF123, 0x4567");
+        assert_eq!(
+            disasm_thumb32(0x1000, 0xF123, 0x4567),
+            ".short 0xF123, 0x4567"
+        );
     }
 
     #[test]
@@ -2941,7 +3397,10 @@ mod tests {
         // a limit is honoured, and a truncated tail is not decoded
         let insns = disasm_stream(0x1000, &a64, DisasmArch::AArch64, 1);
         assert_eq!(insns.len(), 1);
-        assert_eq!(disasm_stream(0x1000, &a64[..3], DisasmArch::AArch64, 8).len(), 0);
+        assert_eq!(
+            disasm_stream(0x1000, &a64[..3], DisasmArch::AArch64, 8).len(),
+            0
+        );
     }
 
     #[test]
@@ -2949,15 +3408,33 @@ mod tests {
         assert_eq!(disasm_arm(0x1000, 0x9100_0401, false), "add x1, x0, #0x1");
         assert_eq!(disasm_arm(0x1000, 0xF940_0401, false), "ldr x1, [x0, #0x8]");
         assert_eq!(disasm_arm(0x1000, 0x5400_0020, false), "b.eq 0x1004");
-        assert_eq!(disasm_arm(0x1000, 0x3640_0020, false), "tbz w0, #0x8, 0x1004");
+        assert_eq!(
+            disasm_arm(0x1000, 0x3640_0020, false),
+            "tbz w0, #0x8, 0x1004"
+        );
         assert_eq!(disasm_arm(0x1000, 0x8B02_0001, false), "add x1, x0, x2");
         assert_eq!(disasm_arm(0x1000, 0xAA01_03E0, false), "mov x0, x1");
-        assert_eq!(disasm_arm(0x1000, 0xA901_0801, false), "stp x1, x2, [x0, #0x10]");
-        assert_eq!(disasm_arm(0x1000, 0xA941_0801, false), "ldp x1, x2, [x0, #0x10]");
-        assert_eq!(disasm_arm(0x1000, 0xA9C1_0801, false), "ldp x1, x2, [x0, #0x10]!");
-        assert_eq!(disasm_arm(0x1000, 0xA8C1_0801, false), "ldp x1, x2, [x0], #0x10");
+        assert_eq!(
+            disasm_arm(0x1000, 0xA901_0801, false),
+            "stp x1, x2, [x0, #0x10]"
+        );
+        assert_eq!(
+            disasm_arm(0x1000, 0xA941_0801, false),
+            "ldp x1, x2, [x0, #0x10]"
+        );
+        assert_eq!(
+            disasm_arm(0x1000, 0xA9C1_0801, false),
+            "ldp x1, x2, [x0, #0x10]!"
+        );
+        assert_eq!(
+            disasm_arm(0x1000, 0xA8C1_0801, false),
+            "ldp x1, x2, [x0], #0x10"
+        );
         assert_eq!(disasm_arm(0x1000, 0xF840_0001, false), "ldur x1, [x0]");
-        assert_eq!(disasm_arm(0x1000, 0xF81F_8001, false), "stur x1, [x0, #-0x8]");
+        assert_eq!(
+            disasm_arm(0x1000, 0xF81F_8001, false),
+            "stur x1, [x0, #-0x8]"
+        );
         assert_eq!(disasm_arm(0x1000, 0xD61F_0000, false), "br x0");
         assert_eq!(disasm_arm(0x1000, 0xD63F_0020, false), "blr x1");
         assert_eq!(disasm_arm(0x1000, 0xD400_0001, false), "svc #0x0");
@@ -2968,23 +3445,26 @@ mod tests {
         // 24-byte header (session, count, total, value_size, mapping_count,
         // reserved) + one u64 base + one 16-byte hit, as nxus_server.c sends it.
         let mut data = Vec::new();
-        data.extend_from_slice(&7u32.to_le_bytes());      // session
-        data.extend_from_slice(&1u32.to_le_bytes());      // count
-        data.extend_from_slice(&9u32.to_le_bytes());      // total
-        data.extend_from_slice(&4u32.to_le_bytes());      // value_size
-        data.extend_from_slice(&1u32.to_le_bytes());      // mapping_count
+        data.extend_from_slice(&7u32.to_le_bytes()); // session
+        data.extend_from_slice(&1u32.to_le_bytes()); // count
+        data.extend_from_slice(&9u32.to_le_bytes()); // total
+        data.extend_from_slice(&4u32.to_le_bytes()); // value_size
+        data.extend_from_slice(&1u32.to_le_bytes()); // mapping_count
         data.extend_from_slice(&NXUS_HITBATCH_TRUNCATED.to_le_bytes()); // reserved
-        data.extend_from_slice(&0x1000_0000u64.to_le_bytes());          // base[0]
-        data.extend_from_slice(&0x24u32.to_le_bytes());   // hit.offset
-        data.extend_from_slice(&0u16.to_le_bytes());      // hit.mapping_idx
-        data.extend_from_slice(&2u16.to_le_bytes());      // hit.value_type (U32)
+        data.extend_from_slice(&0x1000_0000u64.to_le_bytes()); // base[0]
+        data.extend_from_slice(&0x24u32.to_le_bytes()); // hit.offset
+        data.extend_from_slice(&0u16.to_le_bytes()); // hit.mapping_idx
+        data.extend_from_slice(&2u16.to_le_bytes()); // hit.value_type (U32)
         data.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // hit.value
 
         let batch = HitBatch::parse(&data);
         assert_eq!(batch.session_id, 7);
         assert_eq!(batch.total, 9);
         assert!(batch.truncated, "reserved bit 0 must surface as truncated");
-        assert!(!batch.dropped, "a capped list must not also claim dropped hits");
+        assert!(
+            !batch.dropped,
+            "a capped list must not also claim dropped hits"
+        );
         assert_eq!(batch.hits.len(), 1);
         assert_eq!(batch.hits[0].address, 0x1000_0024);
 
@@ -3021,7 +3501,7 @@ mod tests {
     fn frozen_released_payload(count: u32, addresses: &[u64]) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&count.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());      // reserved
+        data.extend_from_slice(&0u32.to_le_bytes()); // reserved
         for address in addresses {
             data.extend_from_slice(&address.to_le_bytes());
         }
@@ -3077,7 +3557,11 @@ mod tests {
     // ---- the process's own address space (pointer-width evidence) -------
 
     fn metadata_with_aslr(aslr_base: u64, aslr_size: u64) -> Metadata {
-        Metadata { aslr_base, aslr_size, ..Default::default() }
+        Metadata {
+            aslr_base,
+            aslr_size,
+            ..Default::default()
+        }
     }
 
     /// dmnt hands the two architectures unmistakably different pairs, so the size
@@ -3087,15 +3571,21 @@ mod tests {
     #[test]
     fn the_address_space_size_names_the_architecture() {
         // the measured MHXX (AArch32) pair: 0x200000 + 0xFFE00000 == exactly 4 GiB
-        assert_eq!(metadata_with_aslr(0x0020_0000, 0xFFE0_0000).address_space_arch(),
-                   AddressSpaceArch::Aarch32);
+        assert_eq!(
+            metadata_with_aslr(0x0020_0000, 0xFFE0_0000).address_space_arch(),
+            AddressSpaceArch::Aarch32
+        );
         // a real AArch64 pair: 0x8000000 + 0x7FF8000000 == 512 GiB
-        assert_eq!(metadata_with_aslr(0x0800_0000, 0x7FF8_0000_00).address_space_arch(),
-                   AddressSpaceArch::Aarch64);
+        assert_eq!(
+            metadata_with_aslr(0x0800_0000, 0x7FF8_0000_00).address_space_arch(),
+            AddressSpaceArch::Aarch64
+        );
         // The same pair with the fields swapped is nonsense, not AArch32: a base
         // above 4 GiB never fits inside the 32-bit address space.
-        assert_eq!(metadata_with_aslr(0x7FF8_0000_00, 0x0800_0000).address_space_arch(),
-                   AddressSpaceArch::Unknown);
+        assert_eq!(
+            metadata_with_aslr(0x7FF8_0000_00, 0x0800_0000).address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
     }
 
     /// "No size" is UNKNOWN, never "32-bit": an old console zeroes the appended
@@ -3103,21 +3593,32 @@ mod tests {
     /// AArch32 is exactly the mismatch this rule exists to remove.
     #[test]
     fn a_missing_address_space_is_unknown() {
-        assert_eq!(Metadata::default().address_space_arch(), AddressSpaceArch::Unknown);
-        assert_eq!(metadata_with_aslr(0x0020_0000, 0).address_space_arch(),
-                   AddressSpaceArch::Unknown);
+        assert_eq!(
+            Metadata::default().address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
+        assert_eq!(
+            metadata_with_aslr(0x0020_0000, 0).address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
         // starts below 4 GiB, ends above it: this metadata cannot answer
-        assert_eq!(metadata_with_aslr(0x8000_0000, 0x9000_0000).address_space_arch(),
-                   AddressSpaceArch::Unknown);
+        assert_eq!(
+            metadata_with_aslr(0x8000_0000, 0x9000_0000).address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
     }
 
     /// A hostile aslr_base + aslr_size must not wrap into "fits in 4 GiB".
     #[test]
     fn an_overflowing_address_space_does_not_wrap_into_32bit() {
-        assert_eq!(metadata_with_aslr(0xFFFF_FFFF_0000_0000, 0x1000).address_space_arch(),
-                   AddressSpaceArch::Unknown);
-        assert_eq!(metadata_with_aslr(u64::MAX, u64::MAX).address_space_arch(),
-                   AddressSpaceArch::Aarch64);
+        assert_eq!(
+            metadata_with_aslr(0xFFFF_FFFF_0000_0000, 0x1000).address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
+        assert_eq!(
+            metadata_with_aslr(u64::MAX, u64::MAX).address_space_arch(),
+            AddressSpaceArch::Aarch64
+        );
     }
 
     /// The two fields really decode out of the fixed 0x70-byte tail (offsets 64
@@ -3125,7 +3626,7 @@ mod tests {
     #[test]
     fn metadata_decodes_the_aslr_tail() {
         let mut data = vec![0u8; Metadata::SIZE];
-        data[0..8].copy_from_slice(&0x1234u64.to_le_bytes());        // process id
+        data[0..8].copy_from_slice(&0x1234u64.to_le_bytes()); // process id
         data[64..72].copy_from_slice(&0x0020_0000u64.to_le_bytes()); // aslr_base
         data[72..80].copy_from_slice(&0xFFE0_0000u64.to_le_bytes()); // aslr_size
         let metadata = Metadata::parse(&data);
@@ -3134,7 +3635,9 @@ mod tests {
         assert_eq!(metadata.aslr_size, 0xFFE0_0000);
         assert_eq!(metadata.address_space_arch(), AddressSpaceArch::Aarch32);
         // A pre-Round console sends 0x70 bytes with the tail zeroed: unknown.
-        assert_eq!(Metadata::parse(&vec![0u8; Metadata::SIZE]).address_space_arch(),
-                   AddressSpaceArch::Unknown);
+        assert_eq!(
+            Metadata::parse(&vec![0u8; Metadata::SIZE]).address_space_arch(),
+            AddressSpaceArch::Unknown
+        );
     }
 }

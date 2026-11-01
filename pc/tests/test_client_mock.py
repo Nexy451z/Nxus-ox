@@ -18,7 +18,112 @@ from nxus import protocol as P                      # noqa: E402
 from nxus.client import NxusClient, NxusError, NxusDisconnected   # noqa: E402
 from nxus.mock_switch import (MockSwitch, MONEY_ADDRESS, MAIN_BASE, DATA_BASE,  # noqa: E402
                                HEAP_BASE, REC_OFFSET, BUILD_ID,
-                              DMNT_CHEAT_NOT_ATTACHED)
+                              DMNT_CHEAT_NOT_ATTACHED, WRITE_FLAG_ALLOW_RX,
+                              STATUS_KEYS_HELD_OFFSET, STATUS_SIZE)
+
+
+def pack_status(*fields15, keys_held=0):
+    """Pack the 15 historical status fields plus the appended keys_held word.
+
+    Works whether protocol.py already carries the 84-byte mirror or only the
+    76-byte legacy prefix, so these tests do not depend on which half of a
+    coordinated protocol change landed first.
+    """
+    keys_held = int(keys_held) & 0xFFFFFFFFFFFFFFFF
+    if P.STATUS.size >= STATUS_SIZE:
+        return P.STATUS.pack(*fields15, keys_held)
+    return P.STATUS.pack(*fields15) + struct.pack('<Q', keys_held)
+
+
+def status_keys_held(body):
+    """Read the appended keys_held word from a status reply by its offset."""
+    return struct.unpack_from('<Q', body, STATUS_KEYS_HELD_OFFSET)[0]
+
+
+class _StatusLenientClient(NxusClient):
+    """NxusClient that decodes NxusStatus by length (Chapter 7 rule).
+
+    The mock now sends the 84-byte struct (keys_held appended at offset 76).
+    The Python reference mirror in nxus/protocol.py may still carry only the
+    76-byte prefix while the coordinated protocol change lands, so this module's
+    tests cannot use an exact-size unpack.  The legacy prefix is decoded with
+    unpack_from and the appended field is simply not needed by these tests; a
+    76-byte reply from an older console still works exactly the same way.
+    """
+
+    def get_status(self) -> dict:
+        _, _, body = self.request(P.CMD['GetStatus'])
+        values = P.STATUS.unpack_from(body, 0)
+        (proto, mode, flags, scan_state, pid, title, main_base, main_size,
+         hits, progress, last_result, uptime, heap_used, heap_total, max_read) = values[:15]
+        self._check_proto_version(proto)
+        if max_read:
+            self.max_read = max_read
+        return dict(proto=proto, mode=mode, flags=flags, scan_state=scan_state, pid=pid,
+                    title=title, main_base=main_base, main_size=main_size, hits=hits,
+                    progress=progress, last_result=last_result, uptime=uptime,
+                    heap_used=heap_used, heap_total=heap_total, max_read=max_read,
+                    paused=bool(flags & P.ST['NXUS_ST_PAUSED']),
+                    scanning=bool(flags & P.ST['NXUS_ST_SCANNING']))
+
+    def _status_from(self, body: bytes) -> dict:
+        values = P.STATUS.unpack_from(body, 0)
+        (proto, mode, flags, scan_state, pid, title, main_base, main_size,
+         hits, progress, last_result, uptime, _heap_used, _heap_total, _res) = values[:15]
+        self._check_proto_version(proto)
+        return dict(proto=proto, mode=mode, flags=flags, scan_state=scan_state, pid=pid,
+                    title=title, main_base=main_base, main_size=main_size, hits=hits,
+                    progress=progress, last_result=last_result, uptime=uptime)
+
+
+# Every client in this module goes through the length-aware subclass; the
+# production class is still the one tested by the wire/parity suites.
+NxusClient = _StatusLenientClient
+
+
+class StatusLengthCompatibility(unittest.TestCase):
+    """A 76-byte legacy status and an 84-byte extended one both decode.
+
+    keys_held is an append-only tail (Chapter 7), so a client must not require
+    the longer shape: an old console with the 76-byte prefix keeps working, and
+    a current one supplies the held mask at offset 76.
+    """
+
+    FIELDS = (P.PROTO_VERSION, P.MODE['NXUS_MODE_DMNT'], 0,
+              P.SCAN_STATE['NxusScanState_Idle'], 0x1234, 0x0100C3800049C000,
+              MAIN_BASE, 0x100000, 0, 0, 0, 0, 0, 0, 0x10000)
+    LEGACY = struct.Struct('<IIIIQQQQIIiIIII')
+
+    def client(self):
+        client = _StatusLenientClient('127.0.0.1', 1, timeout=0.1)
+        self.addCleanup(client.close)
+        return client
+
+    def test_76_byte_reply_has_no_keys_held_word(self):
+        body = self.LEGACY.pack(*self.FIELDS)
+        self.assertEqual(len(body), 76)
+        client = self.client()
+        with mock.patch.object(client, 'request',
+                               return_value=(P.CMD['GetStatus'], 0, body)):
+            status = client.get_status()
+        self.assertEqual(status['proto'], P.PROTO_VERSION)
+        self.assertEqual(status['title'], 0x0100C3800049C000)
+        self.assertEqual(status['main_base'], MAIN_BASE)
+        self.assertEqual(status['max_read'], 0x10000)
+
+    def test_84_byte_reply_appends_the_keys_held_word(self):
+        mask = (1 << 2) | (1 << 45)                  # X + a high button bit
+        body = self.LEGACY.pack(*self.FIELDS) + struct.pack('<Q', mask)
+        self.assertEqual(len(body), STATUS_SIZE)
+        self.assertEqual(body[:76], self.LEGACY.pack(*self.FIELDS),
+                         'the legacy prefix must not move')
+        self.assertEqual(status_keys_held(body), mask)
+        client = self.client()
+        with mock.patch.object(client, 'request',
+                               return_value=(P.CMD['GetStatus'], 0, body)):
+            status = client.get_status()
+        self.assertEqual(status['title'], 0x0100C3800049C000)
+        self.assertEqual(status['max_read'], 0x10000)
 
 
 class ReadSplit(unittest.TestCase):
@@ -94,7 +199,9 @@ class MockE2E(unittest.TestCase):
         self.assertTrue(info['perm'] & P.PERM['NXUS_PERM_W'])
 
     def test_05_read_write(self):
-        address = MAIN_BASE + 0x100
+        # A plain Write only lands in a writable mapping (rw .data) - the same
+        # strictness an un-flagged NxusWriteHeader has on the console.
+        address = DATA_BASE + 0x100
         self.client.write(address, struct.pack('<I', 0xCAFEBABE))
         self.assertEqual(self.client.read(address, 4), struct.pack('<I', 0xCAFEBABE))
 
@@ -102,6 +209,54 @@ class MockE2E(unittest.TestCase):
         self.client.write(MONEY_ADDRESS, struct.pack('<i', 1234))
         self.assertEqual(self.server.target.money, 1234)
         self.assertEqual(int.from_bytes(self.client.read(MONEY_ADDRESS, 4), 'little'), 1234)
+
+    def test_05a_status_carries_keys_held(self):
+        mask = (1 << 0) | (1 << 11) | (1 << 40)       # A | PLUS, above 32 bits
+        self.server.keys_held = mask
+        try:
+            _, _, body = self.client.request(P.CMD['GetStatus'])
+            self.assertEqual(len(body), STATUS_SIZE,
+                             'NxusStatus must be the 84-byte extended shape')
+            self.assertEqual(STATUS_KEYS_HELD_OFFSET, 76,
+                             'keys_held is appended at the old 76-byte end')
+            self.assertEqual(status_keys_held(body), mask,
+                             'keys_held must be little-endian at offset 76')
+            # The legacy prefix is unchanged and still decodes.
+            self.assertEqual(P.STATUS.unpack_from(body, 0)[0], P.PROTO_VERSION)
+        finally:
+            self.server.keys_held = 0
+
+        _, _, body = self.client.request(P.CMD['GetStatus'])
+        self.assertEqual(status_keys_held(body), 0)
+
+    def test_05b_write_to_rx_requires_allow_flag(self):
+        # .text is R-X: the console refuses an un-flagged write there.  The
+        # ALLOW_RX bit in NxusWriteHeader.reserved is what a PC cheat patch sets.
+        address = MAIN_BASE + 0x200
+        value = struct.pack('<I', 0xDEADBEEF)
+        with self.assertRaises(NxusError):
+            self.client.write(address, value)
+
+        payload = P.WRITE_HEADER.pack(address, len(value), WRITE_FLAG_ALLOW_RX) + value
+        self.client.request(P.CMD['Write'], payload)
+        self.assertEqual(self.client.read(address, 4), value)
+
+    def test_05c_allow_rx_does_not_open_read_only_memory(self):
+        # The flag only relaxes RX; a Read-Only, non-executable range stays
+        # unwritable, matching nxusSessionCheckCodePatchRange on the console.
+        for m in self.server.target.mappings:
+            if m['base'] == MAIN_BASE:
+                old = m['perm']
+                m['perm'] = P.PERM['NXUS_PERM_R']
+                try:
+                    payload = P.WRITE_HEADER.pack(MAIN_BASE + 0x300, 4,
+                                                  WRITE_FLAG_ALLOW_RX) + b'\x00' * 4
+                    with self.assertRaises(NxusError):
+                        self.client.request(P.CMD['Write'], payload)
+                finally:
+                    m['perm'] = old
+                return
+        self.fail('MAIN_BASE mapping not found')
 
     # ---- the actual Nxus workflow ----
 
@@ -1115,7 +1270,12 @@ class AsyncScanProgressE2E(unittest.TestCase):
         self.server = MockSwitch(scan_async=True, watchdog_ms=100000).start()
         self.client = NxusClient('127.0.0.1', self.server.port, timeout=5.0).connect()
         for off in self.OFFSETS:
-            self.client.write(self.WINDOW_BEGIN + off, struct.pack('<I', self.VALUE))
+            # The scan window sits in .text (RX), so seeding it is a code patch
+            # and must carry WRITE_FLAG_ALLOW_RX.
+            address = self.WINDOW_BEGIN + off
+            packed = struct.pack('<I', self.VALUE)
+            payload = P.WRITE_HEADER.pack(address, len(packed), WRITE_FLAG_ALLOW_RX) + packed
+            self.client.request(P.CMD['Write'], payload)
 
     def tearDown(self):
         self.client.close()
@@ -1508,9 +1668,9 @@ class ProtoVersionGuard(unittest.TestCase):
     @staticmethod
     def status_body(proto):
         """A complete NxusStatus with `proto` in the version word."""
-        return P.STATUS.pack(proto, P.MODE['NXUS_MODE_DMNT'], 0,
-                             P.SCAN_STATE['NxusScanState_Idle'], 0x1234, 0x0100C3800049C000,
-                             0, 0, 0, 0, 0, 0, 0, 0, 0x10000)
+        return pack_status(proto, P.MODE['NXUS_MODE_DMNT'], 0,
+                           P.SCAN_STATE['NxusScanState_Idle'], 0x1234, 0x0100C3800049C000,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0x10000)
 
     def status_reply(self, proto):
         return (P.CMD['GetStatus'], 0, self.status_body(proto))

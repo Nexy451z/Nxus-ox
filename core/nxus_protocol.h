@@ -193,8 +193,18 @@ typedef struct NXUS_PACKED {
     u32 heap_used;
     u32 heap_total;
     u32 max_read;          /* largest single Read the server accepts (0 = unspecified) */
+    /* APPENDED (Chapter 7 rule; never insert a field above this line): live
+       HidNpadButton held mask, sampled by the HID worker for opcode-8
+       key-conditional cheat codes.  It is 0 when no key is held AND when HID is
+       not running; the PC can disambiguate with the hotkey/HID state it read at
+       connect time, exactly as it does for the rest of the status flags. */
+    u64 keys_held;
 } NxusStatus;
-NXUS_STATIC_ASSERT(sizeof(NxusStatus) == 76, "NxusStatus must be 76 bytes");
+/* Older servers sent the 76-byte prefix; clients must accept either length. */
+#define NXUS_STATUS_MIN_SIZE 76u
+NXUS_STATIC_ASSERT(sizeof(NxusStatus) == 84, "NxusStatus must be 84 bytes");
+NXUS_STATIC_ASSERT(__builtin_offsetof(NxusStatus, keys_held) == NXUS_STATUS_MIN_SIZE,
+                   "NxusStatus.keys_held must start at the old 76-byte end");
 
 /* ---- process metadata (mirrors dmnt CheatProcessMetadata, 0x70) ---- */
 typedef struct NXUS_PACKED {
@@ -248,10 +258,17 @@ typedef struct NXUS_PACKED {
     u32 reserved;
 } NxusReadRequest;
 
+/* NxusWriteHeader.reserved flags.  A normal write must land in a writable
+   mapping; a PC cheat patch that intentionally rewrites Read-Execute (.text)
+   code sets ALLOW_RX so the range only has to be readable and either writable
+   or executable (RX or RW).  The flag is opt-in, so an older client's zero
+   reserved field keeps the strict writable-range requirement. */
+#define NXUS_WRITE_FLAG_ALLOW_RX 0x01u
+
 typedef struct NXUS_PACKED {
     u64 address;
     u32 size;
-    u32 reserved;
+    u32 reserved;          /* NXUS_WRITE_FLAG_* */
     /* followed by size bytes of data */
 } NxusWriteHeader;
 

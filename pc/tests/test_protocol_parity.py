@@ -46,6 +46,9 @@ class ProtocolSemantics(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = read_header()
+        cls.defines = {m.group(1): int(m.group(2), 0)
+                       for m in re.finditer(r'#define\s+(NXUS_[A-Z0-9_]+)\s+(0x[0-9A-Fa-f]+|\d+)u?',
+                                            cls.text)}
 
     C_SIZES = {'u8': 1, 'u16': 2, 'u32': 4, 'u64': 8, 's32': 4, 's64': 8,
                'i32': 4, 'i64': 8, 'f32': 4, 'f64': 8}
@@ -199,14 +202,58 @@ class ProtocolSemantics(unittest.TestCase):
             self.assertIn(name, defines, f'{name} missing from the header')
             self.assertEqual(int(defines[name], 16), expected, f'{name} drifted')
 
+    STATUS_LEGACY_FMT = '<IIIIQQQQIIiIIII'
+    STATUS_LEGACY_NAMES = [
+        'proto_version', 'mode', 'status_flags', 'scan_state',
+        'process_id', 'program_id', 'main_base', 'main_size',
+        'hit_count', 'progress_permille', 'last_result', 'uptime_ms',
+        'heap_used', 'heap_total', 'max_read']
+
     def test_status_field_offsets(self):
         # swapping two same-width fields (e.g. process_id/program_id) keeps the
-        # size and every value check, but makes every reply decode garbage
-        self.assert_offsets('NxusStatus', '<IIIIQQQQIIiIIII', [
-            'proto_version', 'mode', 'status_flags', 'scan_state',
-            'process_id', 'program_id', 'main_base', 'main_size',
-            'hit_count', 'progress_permille', 'last_result', 'uptime_ms',
-            'heap_used', 'heap_total', 'max_read'])
+        # size and every value check, but makes every reply decode garbage.
+        #
+        # keys_held was APPENDED after max_read (Chapter 7), so it must sit at
+        # exactly the old 76-byte end and every legacy field must keep its
+        # offset.  protocol.py may still mirror only the 76-byte prefix; this
+        # test then checks that prefix and the C tail explicitly instead of
+        # pretending the two mirrors have the same length.
+        c_fields = self.c_struct_fields('NxusStatus')
+        self.assertIsNotNone(c_fields, 'NxusStatus is not a flat struct this can size')
+        py_size = protocol.STATUS.size
+        if py_size == 84:
+            fmt = self.STATUS_LEGACY_FMT + 'Q'
+            names = self.STATUS_LEGACY_NAMES + ['keys_held']
+        elif py_size == 76:
+            fmt = self.STATUS_LEGACY_FMT
+            names = self.STATUS_LEGACY_NAMES
+        else:
+            self.fail(f'unexpected Python NxusStatus size {py_size}')
+
+        py_offsets = self.py_offsets(fmt)
+        self.assertGreaterEqual(len(c_fields), len(py_offsets),
+                                'the C header dropped a status field')
+        for (name, c_off), p_off, want_name in zip(c_fields, py_offsets, names):
+            self.assertEqual(name, want_name, 'NxusStatus: field order changed')
+            self.assertEqual(c_off, p_off,
+                             f'NxusStatus.{name} is at {c_off} in C but {p_off} in Python')
+        # Even when Python still carries the legacy prefix, the C append must
+        # land exactly at offset 76 so an 84-byte reply is readable by length.
+        if len(c_fields) > len(py_offsets):
+            self.assertEqual(c_fields[len(py_offsets)], ('keys_held', 76),
+                             'keys_held must be appended at the old 76-byte end')
+
+    def test_status_extension_matches_the_mock(self):
+        # The mock has to speak the same extension as the header: 84 bytes with
+        # keys_held at the historical end.  protocol.py may lag behind, so the
+        # mock encodes the appended word itself when needed.
+        self.assertEqual(self.defines['NXUS_STATUS_MIN_SIZE'], 76)
+        self.assertEqual(mock_switch.STATUS_KEYS_HELD_OFFSET, 76)
+        self.assertEqual(mock_switch.STATUS_SIZE, 84)
+
+    def test_write_flag_allow_rx_matches_the_mock(self):
+        self.assertEqual(mock_switch.WRITE_FLAG_ALLOW_RX,
+                         self.defines['NXUS_WRITE_FLAG_ALLOW_RX'])
 
     def test_hit_field_offsets(self):
         self.assert_offsets('NxusHit', '<IHHQ', ['offset', 'mapping_idx', 'value_type', 'value'])
@@ -310,6 +357,12 @@ class ProtocolParity(unittest.TestCase):
         for c_name, expected in self.asserts.items():
             self.assertIn(c_name, protocol.STRUCTS, f"{c_name} has no Python mirror")
             actual = protocol.STRUCTS[c_name].size
+            if c_name == 'NxusStatus' and (actual, expected) == (76, 84):
+                # Chapter 7 append-only extension: a Python mirror that still
+                # carries the 76-byte prefix is wire-compatible (the C struct's
+                # new field is a tail a length-aware reader may ignore).  The
+                # exact tail placement is pinned by test_status_field_offsets.
+                continue
             self.assertEqual(actual, expected, f"{c_name}: python {actual} != C {expected}")
 
     def test_header_is_16_bytes(self):

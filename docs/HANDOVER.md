@@ -1,6 +1,6 @@
 # Nxus-ox 引き継ぎ書（エージェント向け / 完全版）
 
-最終更新: 2026-11-01
+最終更新: 2026-11-02
 対象: `C:\anyWorkspace\nx\Nxus` / branch `main` / HEAD `main` の最新コミット（`git rev-parse --short HEAD` で確認） / tag `v0.1.0-alpha`
 読み手: このプロジェクトを引き継いで「レビュー → 修正 → レビュー」を回すエージェント
 
@@ -13,7 +13,7 @@
 - リポジトリ: `C:\anyWorkspace\nx\Nxus`（remote: `https://github.com/Nexy451z/Nxus-ox.git`）
 - 実機: **`192.168.1.13`**（FTP `:5000` 匿名 / NxusTCP `7332`）
 - **最重要の運用制約: sysmodule は起動時にしかロードされない。`exefs.nsp` を入れ替えたら必ず本体を再起動。** レポートでは毎回「要再起動」と明記する。
-- 検証（ハードウェア不要）: ホスト C **1,937 checks / 9 binaries**、Rust **124**、Python E2E **122**。
+- 検証（ハードウェア不要）: ホスト C **1,976 checks / 9 binaries**、Rust **212**、Python E2E **133**。
 
 ---
 
@@ -38,22 +38,23 @@
 ## 2. 現在の状態スナップショット
 
 ```
-HEAD        main の最新コミット（レビュー&修正ラウンド後。ハッシュは `git rev-parse --short HEAD`）
+HEAD        main の最新コミット（ハッシュは `git rev-parse --short HEAD`）
 tag         v0.1.0-alpha (force-updated each release)
 branch      main (origin/main と同期・作業ツリー clean)
-dist        dist/atmosphere/contents/4200000000004E58/exefs.nsp  193,725 B
+dist        dist/atmosphere/contents/4200000000004E58/exefs.nsp  194,567 B
             dist/atmosphere/contents/4200000000004E59/exefs.nsp  110,206 B
-            dist/pc/nxus.exe
+            dist/pc/nxus.exe  11,263,488 B
+            dist/pc/NCL.exe    9,931,776 B
 metadata    source_rev = HEAD, dirty = false （dist を HEAD で再ビルド済み）
-実機 SD     4E58 = 193,725 B（最新と sha1 一致・転送済み）
+実機 SD     4E58 = 194,567 B（このビルドの値。転送は 6 章の手順で行い、読み戻しの sha256 一致を確認する）
 ```
 
 ### テスト数（README と一致していること）
 | スイート | コマンド | 数 |
 |---|---|---|
-| ホスト C | `bash tests/run_tests.sh` | **1,937 checks / 9 binaries**（scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 150, session_view 313, snapshot_owner 208） |
-| Rust | `cd pc/Nxus.Cli && cargo test` | **124** |
-| Python E2E | `cd pc && python -m unittest discover -s tests` | **122**（MockSwitch 相手） |
+| ホスト C | `bash tests/run_tests.sh` | **1,976 checks / 9 binaries**（scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 167, session_view 335, snapshot_owner 208） |
+| Rust | `cd pc/Nxus.Cli && cargo test --release` | **212** |
+| Python E2E | `cd pc && python -m unittest discover -s tests` | **133**（MockSwitch 相手） |
 
 ---
 
@@ -84,7 +85,10 @@ Nxus/
 │   └─ nxus.json                 NPDM テンプレート（allow_debug のみ。ForceDebug はビルド後 patch）
 ├─ probe/                        ← 診断用 sysmodule（タイトル 4E59）
 ├─ pc/Nxus.Cli/                  ← Rust クライアント
-│   └─ src/{main,cli,client,protocol,gui/*,pcscan,dump,edizon}.rs
+│   ├─ src/{main,cli,client,protocol,pcscan,dump,edizon}.rs
+│   ├─ src/gui/{mod,panels,hexview,cheats}.rs  ← メイン GUI（[Cheats] タブは cheats.rs）
+│   ├─ src/cheat/{model,parser,vm,manager}.rs  ← Atmosphere cheat パーサ/VM/Patch・Loop 管理
+│   └─ src/bin/ncl.rs            ← 単体チートローダー NCL.exe（同じ engine / journal）
 ├─ pc/nxus/                      ← Python 参照実装（テスト用）
 │   ├─ client.py, protocol.py, mock_switch.py
 ├─ pc/tests/                     ← Python E2E（MockSwitch 相手）
@@ -94,7 +98,7 @@ Nxus/
 └─ dist/                         ← ビルド成果物（gitignored）
 ```
 
-サイズ感（行数、**非空行**）: `nxus_server.c` 約 4,200 / `gui/mod.rs` 約 3,270 / `protocol.rs` 約 2,930 / `cli.rs` 約 2,750 / `nxus_session.c` 約 2,530 / `nxus_debug.c` 約 2,360。合計 約 46,600 行（C/Rust/Python/Shell）。
+サイズ感（行数、**非空行**）: `nxus_server.c` 約 4,200 / `gui/mod.rs` 約 3,300 / `protocol.rs` 約 2,930 / `cli.rs` 約 2,750 / `nxus_session.c` 約 2,530 / `nxus_debug.c` 約 2,360 / `cheat/manager.rs` 約 1,800。合計 約 48,000 行（C/Rust/Python/Shell）。
 
 ---
 
@@ -117,23 +121,77 @@ cd C:\anyWorkspace\nx\Nxus
 
 ### PC クライアント
 ```powershell
+cd C:\anyWorkspace\nx\Nxus
+bash tools/build_pc.sh
+```
+- `pc/Nxus.Cli/target/release/nxus.exe` と `NCL.exe` を作り、`dist/pc/`・`C:/apps/nxus/` へコピーし、`dist/pc/cheats/README.txt` を生成する。手動でやる場合:
+```powershell
 cd C:\anyWorkspace\nx\Nxus\pc
 cargo build --release --manifest-path Nxus.Cli\Cargo.toml
 Copy-Item Nxus.Cli\target\release\nxus.exe ..\dist\pc\nxus.exe -Force
+Copy-Item Nxus.Cli\target\release\NCL.exe ..\dist\pc\NCL.exe -Force
 ```
+
+---
+
+## 4.5 Atmosphere チート VM / Patch・Loop Cheat Manager / `[Cheats]` タブ / `NCL.exe`
+
+実装は `pc/Nxus.Cli/src/cheat/` に完全に閉じている（標準ライブラリのみ、Switch 側の変更なし）。
+
+| ファイル | 役割 |
+|---|---|
+| `cheat/model.rs` | `CheatDocument` / `CheatBlock` / 命令型、`save_text_atomic()`（`.tmp` → `.bak` → rename） |
+| `cheat/parser.rs` | `<16-HEX-BUILDID>.txt` のパース（`[Name]`, `:OFF`, `@off`/`--off`, コメント, master code）とオペコード decode |
+| `cheat/vm.rs` | `CheatMemoryIo` 越しのインタプリタ。1/2/4/8 byte、main/heap/alias/aslr、40-bit relative offset、keypress mask |
+| `cheat/manager.rs` | Patch/Loop のライフサイクル、original-bytes backup、owner 参照、`<BUILDID>.backup` journal、Panic Restore |
+
+### 対応オペコード（opcode 先頭ニブル / 特殊）
+`0x0` static store / `0x1` memory conditional / `0x2` end-if・else / `0x3` loop start/end /
+`0x4` load register immediate / `0x5` load register from memory / `0x6` store static to register /
+`0x7` legacy arithmetic / `0x8` keypress conditional / `0x9` register arithmetic /
+`0xA` store register to memory / `0xC0` register conditional / `0xC1` save-restore register /
+`0xC2` save-restore mask / `0xC3` static register / `0xFF0` pause process / `0xFF1` resume process。
+未対応 opcode は `Instruction::Unsupported` として **ブロック単位で issue 表示**され、黙って飛ばさない。
+
+### 安全原則（変えるときは必ず守る）
+1. **Build ID がファイル名とターゲットを結ぶ**: `<exe_dir>/cheats/<BUILDID>.txt`。Build ID は `nxus metadata` の値。
+   別タイトルのファイルを現在のプロセスへ適用しない。
+2. **書き込み前に journal**: 最初の write の前に `cheats/<BUILDID>.backup` へ original bytes を保存する。
+   PC が落ちても `nxus cheat panic-off` / `NCL` の Panic Restore で戻せる。
+3. **backup は address 単位で owner 共有**: 2 つの cheat が同じ address を触っても original は 1 つ。
+   最後の owner が OFF になったときだけ復元する。
+4. **タイトル再起動を検出したら書かない**: toggle / tick / restore の前に status（必要なら metadata）で
+   pid / program_id を照合する。違えばセッションを落とし、新しいプロセスへ古い address を書かない。
+5. **Loop の tick は 250 ms**: `status.keys_held` をそのまま VM に渡す。キー条件付きチートは
+   このマスクで gate される（別接続は不要）。
+
+### 3 つの入口（同じファイル・同じ journal）
+| 入口 | 起動 | できること |
+|---|---|---|
+| CLI | `nxus cheat list\|on <name>\|off <name>\|panic-off [--file FILE]` | 1 コマンド単位。`on` は即時 1 回実行、`off` は `:OFF` 実行または original 復元 |
+| メイン GUI | `nxus.exe --tab cheats`（タブ `[Cheats]`） | ファイル一覧・editor・保存前 parse 表示・Patch/Loop トグル・backup 表・Panic Restore All・`NCL.exe` 起動 |
+| 単体 `NCL.exe` | `NCL.exe --host <IP> [--connect] [--tab editor\|library]` | library / editor / live の 3 タブ、終了時 restore ガード、`--list FILE` / `--check FILE`（GUI 不要） |
+
+GUI の `[Cheats]` タブは**独自の worker スレッドと TCP 接続**を持つ（メイン worker の scan を止めない）。
+Loop の tick はタブを表示していない間も `App::ui` から `CheatUi::poll()` で回る。
+
+### 検証
+- Rust 212 テストのうち cheat 系が parser/VM/manager の round-trip・keypress gating・owner 共有・
+  journal 再読込・panic restore を固定している。
+- GUI 側は `--screenshot --tab cheats` で描画確認できる（デモデータなので接続不要）。
 
 ---
 
 ## 5. テスト
 
 ```powershell
-# 1) ホスト C（9 バイナリ / 1,937 checks）
+# 1) ホスト C（9 バイナリ / 1,976 checks）
 & "C:\devkitPro\msys2\usr\bin\bash.exe" -lc "cd /c/anyWorkspace/nx/Nxus/tests && bash run_tests.sh"
 
-# 2) Rust（124）
+# 2) Rust（212）
 cd C:\anyWorkspace\nx\Nxus\pc; cargo test --release --manifest-path Nxus.Cli\Cargo.toml
 
-# 3) Python E2E（122・MockSwitch）
+# 3) Python E2E（133・MockSwitch）
 cd C:\anyWorkspace\nx\Nxus\pc; python -m unittest discover -s tests
 ```
 
@@ -276,9 +334,9 @@ frozen / snapshot も incarnation 付きで所有権スタンプを持つ。
 6. 1 ラウンドの完了条件（毎回同じ）:
    ```
    make -C switch clean && bash tools/build.sh   # 警告0 / FAIL 0
-   bash tests/run_tests.sh                        # 1,937 checks
-   cargo test --release (pc)                       # 124
-   python -m unittest discover -s tests (pc)       # 122 ← exe を先にビルド
+   bash tests/run_tests.sh                        # 1,976 checks
+   cargo test --release (pc)                       # 212
+   python -m unittest discover -s tests (pc)       # 133 ← exe を先にビルド
    python release_packages\_make_packages.py       # パッケージ整合
    git add -A && git commit && git push
    # commit 後に dist を再ビルド（source_rev を HEAD に一致させる）
@@ -310,7 +368,12 @@ gh release upload v0.1.0-alpha `
   "dist/pc/nxus.exe" --clobber
 ```
 
-- **順序が重要**: 「commit → それから dist を再ビルド → package → upload」。commit 前にビルドすると `metadata.json.source_rev` が 1 つ前のコミットになり、`dirty: true` になる。
+- **順序が重要**: 「commit → それから dist を再ビルド（`tools/build.sh` + `tools/build_pc.sh`）→ package → upload」。
+  commit 前にビルドすると `metadata.json.source_rev` が 1 つ前のコミットになり、`dirty: true` になる。
+- 最終成果物の実測サイズ: `4E58/exefs.nsp` **194,567 B**、`4E59/exefs.nsp` **110,206 B**、
+  `nxus.exe` **11,263,488 B**、`NCL.exe` **9,931,776 B**。
+- Windows zip には `nxus.exe` / `NCL.exe` / `cheats/README.txt` / `nxus-gui.bat` / `README.md` が入る
+  （`_make_packages.py` は NCL と cheats README が存在するときだけ追加する）。
 - `dist/` と `release_packages/*.zip` は gitignored。`switch/pack/`・`probe/pack/` も gitignored（ビルド生成物が追跡されていた時期があり、そのせいで毎回 dirty になっていた）。
 - リリースノート: `release_packages/release-notes-v0.1.0-alpha.md`。
 
@@ -326,6 +389,7 @@ gh release upload v0.1.0-alpha `
 6. **PC のヒット paging が DROPPED ページでオフセットずれ**（レビュー Low・実機未確認）。
 7. **README の記述**: `.bss`/stack、ヒット上限、IPC 削減率、dmnt 修復範囲、ptrscan の 90 秒/150 秒、probe のフォールバックは本ラウンドで実測・実装に合わせた。機能追加時は README の数値と挙動を `grep` で再突き合わせる。
 8. **ドキュメント生成の自動化なし**: 手書きは `README.md` のみ。`README.txt` / `DO_NOT_BOOT_TOGETHER.txt` / `metadata.json` は `tools/build.sh` が生成する。文言変更時は `tools/verify_artifact.py` と `_make_packages.py` の両方を通す。
+9. **GUI `[Cheats]` タブの自動テストなし**: エンジン（parser/VM/manager）は Rust 212 本で固定されているが、タブの worker（接続・tick・restore）は `--screenshot --tab cheats` の描画確認と手動操作のみ。実機なしで回帰させるなら、MockSwitch 相手に `CheatUi` の job 列を drive するテストを足す。
 
 ---
 
@@ -410,7 +474,7 @@ gh release upload v0.1.0-alpha `
 | `docs/DEBUG_MODE.md` | デバッガの使い方 |
 | `docs/HOTKEY.md` | ホットキー / auto-continue |
 | `docs/BRIEF_WATCHPOINTS.md` | ハードウェアウォッチポイント解説 |
-| `docs/CHEAT_CODE_SEMANTICS.md` | チートコード生成の意味論 |
+| `docs/CHEAT_CODE_SEMANTICS.md` | チートコード生成の意味論（生成側。実行側は本書 4.5 章） |
 | `docs/NPDM_DEBUG_FLAGS.md` | NPDM/ACID デバッグビット |
 | `docs/MHXX_3DS_TO_SWITCH_PORTING.md` | MHXX 移植・実機検証メモ |
 | `docs/NEXT_TASKS.md` | 残タスク（本書 11 章と重複可） |

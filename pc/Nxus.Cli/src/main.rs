@@ -10,6 +10,9 @@
 //! low memory, and a redraw that only touches what is visible.
 #![allow(dead_code)]
 
+// The engine re-exports its whole public surface; the GUI/CLI use a subset.
+#[allow(unused_imports)]
+mod cheat;
 mod cli;
 mod client;
 mod dump;
@@ -25,7 +28,10 @@ fn main() {
     let wants_gui = args.is_empty()
         || args[0] == "--gui"
         || args[0] == "--screenshot"
-        || args.iter().any(|a| a == "--screenshot");
+        || args.iter().any(|a| a == "--screenshot")
+        // `nxus --tab cheats` is a GUI invocation; without this it fell through
+        // to the CLI and was rejected as an unknown command.
+        || args.iter().any(|a| a == "--tab");
 
     if wants_gui {
         let mut host: Option<String> = std::env::var("NXUS_HOST").ok().filter(|s| !s.trim().is_empty());

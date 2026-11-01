@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::client::{NxusClient, NxusError, ScanSpec, DEBUG_CONFIG_LEN};
+use crate::cheat::{CheatManager, CheatMemoryIo, MemoryRegions, TargetIdentity};
 use crate::protocol::*;
 
 type Result<T> = std::result::Result<T, NxusError>;
@@ -125,6 +126,14 @@ analysis
                     (640F) value. Omitted = automatic, the same way as ptrscan:
                     the pointer width decides BOTH (a 64-bit title no longer
                     gets 8-byte loads with a 4-byte store).
+  cheat list [--file FILE]
+  cheat on <name> [--file FILE]
+  cheat off <name> [--file FILE]
+  cheat panic-off [--file FILE]
+                    run the PC-side Atmosphere cheat engine on FILE.  Without
+                    --file it loads cheats/<16-HEX-BUILDID>.txt next to nxus.exe.
+                    on writes the cheat's patched bytes and journals the original
+                    ones; off runs its :OFF/@off block, or restores those bytes.
   watch <address> [--kind write|read|exec|access] [--size 4] [--slot 0x10]
                   [--count N] [--seconds N] [--keep] [--stop]
                   on every hit: pc / lr / sp / r0-r3, then a disassembly window
@@ -1250,6 +1259,18 @@ fn execute(opts: &Opts) -> Result<()> {
         }
 
         "cheat" => {
+            // File-cheat subcommands are only recognised when the argument is
+            // not a numeric chain index, so `nxus cheat 0 --value N` keeps its
+            // exact historical meaning.
+            if let Some(first) = opts.positional.get(1) {
+                let sub = first.to_ascii_lowercase();
+                if first.parse::<usize>().is_err()
+                    && matches!(sub.as_str(), "list" | "on" | "off" | "panic-off")
+                {
+                    run_cheat_file_command(&client, opts, &sub)?;
+                    return Ok(());
+                }
+            }
             let index = parse_number(opts.positional.get(1).ok_or_else(|| usage("cheat <index> --value N"))?)? as u32;
             let value = opts.num("value").ok_or_else(|| usage("cheat <index> --value N"))?;
             // The 540F (32-bit) load form used to be hard-coded; follow --width
@@ -2760,6 +2781,213 @@ fn print_ptrscan_chains(chains: &[PtrChain], truncated: bool, source: &str,
         } else {
             print!("{}", text);
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File-based cheat engine (nxus cheat list / on / off / panic-off)
+// ---------------------------------------------------------------------------
+
+/// One running console process, bound to the cheat document selected for it.
+///
+/// The cheat manager keys its crash-safe backup journal by this identity.  Each
+/// CLI invocation is a fresh PC process, so `off` only finds the journal written
+/// by the earlier `on` when every field is stable for the lifetime of the title
+/// process.  Neither `NxusStatus` nor `NxusMetadata` carries an incarnation
+/// counter, so the ASLR placement is used as the per-process fingerprint: it is
+/// constant while the title runs and changes when it is restarted.
+struct TargetBinding {
+    status: Status,
+    metadata: Metadata,
+    identity: TargetIdentity,
+    regions: MemoryRegions,
+}
+
+impl TargetBinding {
+    fn from_console(status: Status, metadata: Metadata) -> Result<Self> {
+        let pid = if metadata.process_id != 0 {
+            metadata.process_id
+        } else {
+            status.process_id
+        };
+        let program_id = if metadata.program_id != 0 {
+            metadata.program_id
+        } else {
+            status.program_id
+        };
+        let incarnation = metadata.main_base
+            ^ metadata.heap_base.rotate_left(17)
+            ^ metadata.alias_base.rotate_left(33)
+            ^ metadata.aslr_base.rotate_left(49);
+        let identity = TargetIdentity::new(pid, program_id, incarnation, metadata.build_id_hex())
+            .map_err(|message| NxusError { message, result: None })?;
+        let regions = MemoryRegions::new(
+            metadata.main_base,
+            metadata.heap_base,
+            metadata.alias_base,
+            metadata.aslr_base,
+        );
+        Ok(TargetBinding {
+            status,
+            metadata,
+            identity,
+            regions,
+        })
+    }
+}
+
+/// `CheatMemoryIo` over the live console connection.
+struct ClientCheatIo<'a> {
+    client: &'a NxusClient,
+}
+
+impl CheatMemoryIo for ClientCheatIo<'_> {
+    fn read_mem(&mut self, address: u64, size: u32) -> std::result::Result<Vec<u8>, String> {
+        self.client.read(address, size).map_err(|error| error.to_string())
+    }
+
+    fn write_mem(
+        &mut self,
+        address: u64,
+        data: &[u8],
+        allow_rx: bool,
+    ) -> std::result::Result<(), String> {
+        let result = if allow_rx {
+            // Cheat patches may target the title's Read-Execute .text.
+            self.client
+                .write_with_flags(address, data, WRITE_FLAG_ALLOW_RX)
+        } else {
+            self.client.write(address, data)
+        };
+        result.map_err(|error| error.to_string())
+    }
+
+    fn pause_process(&mut self) -> std::result::Result<(), String> {
+        self.client.pause().map_err(|error| error.to_string())
+    }
+
+    fn resume_process(&mut self) -> std::result::Result<(), String> {
+        self.client.resume().map_err(|error| error.to_string())
+    }
+}
+
+fn open_cheat_manager(
+    client: &NxusClient,
+    opts: &Opts,
+) -> Result<(TargetBinding, CheatManager)> {
+    let status = client.status()?;
+    let metadata = client.metadata()?;
+    let binding = TargetBinding::from_console(status, metadata)?;
+    let path = match opts.flag("file") {
+        Some(path) => PathBuf::from(path),
+        None => crate::cheat::resolve_cheat_path(&binding.identity.build_id)
+            .map_err(|message| NxusError { message, result: None })?,
+    };
+    let manager = CheatManager::open_with_path(
+        binding.identity.clone(),
+        binding.regions,
+        path,
+    )
+    .map_err(|message| NxusError { message, result: None })?;
+    Ok((binding, manager))
+}
+
+fn cheat_mode_label(mode: crate::cheat::CheatExecMode) -> &'static str {
+    match mode {
+        crate::cheat::CheatExecMode::Patch => "Patch",
+        crate::cheat::CheatExecMode::Loop => "Loop",
+    }
+}
+
+fn run_cheat_file_command(client: &NxusClient, opts: &Opts, sub: &str) -> Result<()> {
+    let (binding, mut manager) = open_cheat_manager(client, opts)?;
+    let mut io = ClientCheatIo { client };
+
+    match sub {
+        "list" => {
+            println!("cheat file : {}", manager.path().display());
+            println!("build id   : {}", binding.identity.build_id);
+            if manager.blocks().is_empty() {
+                println!("(no cheats in this file)");
+            }
+            for (index, block) in manager.blocks().iter().enumerate() {
+                println!(
+                    "[{index}] {}  mode={}  master={}  off={}  instructions={}",
+                    block.name,
+                    cheat_mode_label(block.mode),
+                    if block.is_master() { "yes" } else { "no" },
+                    if block.explicit_off || block.off.is_some() { "yes" } else { "no" },
+                    block.on.instructions.len()
+                );
+            }
+        }
+        "on" => {
+            let name = opts
+                .positional
+                .get(2)
+                .ok_or_else(|| usage("cheat on <name> [--file <path>]"))?;
+            let key = manager
+                .enable_by_name(name, &mut io)
+                .map_err(|message| NxusError { message, result: None })?;
+            let block = manager
+                .block(key)
+                .ok_or_else(|| NxusError {
+                    message: format!("cheat '{name}' disappeared after enabling it"),
+                    result: None,
+                })?;
+            println!(
+                "enabled '{}' (Patch applied once; {} instruction(s); backup journal {})",
+                block.name,
+                block.on.instructions.len(),
+                manager.journal_path().display()
+            );
+        }
+        "off" => {
+            let name = opts
+                .positional
+                .get(2)
+                .ok_or_else(|| usage("cheat off <name> [--file <path>]"))?;
+            let key = manager.find_key(name).ok_or_else(|| NxusError {
+                message: format!("cheat '{name}' not found"),
+                result: None,
+            })?;
+            let explicit_off = manager
+                .block(key)
+                .map(|block| block.explicit_off && block.off.is_some())
+                .unwrap_or(false);
+            manager
+                .disable(key, &mut io)
+                .map_err(|message| NxusError { message, result: None })?;
+            if explicit_off {
+                println!("disabled '{}' (ran its :OFF/@off block)", name);
+            } else {
+                println!("disabled '{}' (restored the backed-up original bytes)", name);
+            }
+        }
+        "panic-off" => {
+            let report = manager.restore_all_backups(&mut io);
+            println!(
+                "panic-off: restored {} backed-up address(es); cleared {} enabled cheat(s)",
+                report.restored, report.cleared_cheats
+            );
+            if !report.is_complete() {
+                let failures = report
+                    .failed
+                    .iter()
+                    .map(|(address, error)| format!("0x{address:X}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(NxusError {
+                    message: format!(
+                        "panic-off restored {} address(es) but failed for {failures}",
+                        report.restored
+                    ),
+                    result: None,
+                });
+            }
+        }
+        other => return Err(usage(&format!("cheat {other} (unknown subcommand)"))),
     }
     Ok(())
 }

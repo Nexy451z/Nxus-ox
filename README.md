@@ -1,6 +1,6 @@
 # Nxus-ox (`v0.1.0-alpha`)
 
-**Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)**.
+**Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)** that also runs Atmosphere cheat codes through a built-in **Patch/Loop cheat VM**.
 
 Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.41 MiB` plus the `32 KiB` stack — an `8.44 MiB` resident request — and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
 
@@ -160,6 +160,15 @@ error into a success — merely because a field is missing.
   - **EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN` / `FDZN` / `fFZN` `.dmp*`)**: Directly loads and decompresses (LZ8) EdiZon-SE pointer dumps (`nxus dump info <file>`, `nxus ptrscan auto --dump <file>`, or via the GUI **Scan dump...** button), and can export/convert any `NDMP` dump into a PointerSearcher-SE compatible `EDZN` dump (`nxus dump export-edizon <in.dmp> <out.dmp1> --target <ADDR>`).
 - **Block Snapshot Diff (`core/nxus_snapshot.c`)**: Hashes memory in 16 KiB blocks (`Capture A` → `Capture B` → `Diff`) to locate changed structures without dumping gigabytes over the network.
 
+### 5. Atmosphere Cheat VM, Patch/Loop Manager, `[Cheats]` Tab & `NCL.exe`
+- **Full PC-side Atmosphere cheat engine (`pc/Nxus.Cli/src/cheat/`)** — parses `<16-HEX-BUILDID>.txt` files (`[Name]` blocks, `:OFF`, `@off` / `--off` sections, comments, master codes) and executes the standard opcode families: `0x0` static store, `0x1` conditional, `0x2` else/end, `0x3` loops, `0x4`/`0x5` register load, `0x6` static-to-register store, `0x7`/`0x9` arithmetic, `0x8` keypad conditional, `0xA` register store, `0xC0` register conditional, `0xC1`/`0xC2` save/restore register (mask), `0xC3` static registers and `0xFF0`/`0xFF1` pause/resume. Widths 1/2/4/8, `main`/`heap`/`alias`/`aslr` regions and 40-bit relative offsets are supported; an unsupported opcode is reported per block instead of being silently skipped.
+- **Patch mode** writes once when enabled. The original bytes are recorded in `cheats/<BUILDID>.backup` *before* the first write (crash-safe journal, owner-counted so two cheats touching one address share one copy). Disabling writes the originals back, or runs the block's explicit `:OFF`/`@off` code.
+- **Loop mode** is re-evaluated every 250 ms. Key-conditional codes use the console's live `status.keys_held` mask, so a controller combo can gate a loop over the same connection.
+- **Panic Restore All** stops every loop, writes every journaled original byte back, clears all enabled cheats, and leaves the journal intact for a retry when a write fails.
+- **Files** live at `<exe_dir>/cheats/<16-HEX-BUILDID>.txt` (the Build ID comes from `nxus metadata`; uppercase is canonical, an existing lowercase file still loads). CLI: `nxus cheat list`, `nxus cheat on <name>`, `nxus cheat off <name>`, `nxus cheat panic-off`, all with an optional `--file <path>`.
+- **`[Cheats]` tab** in the main GUI (`nxus.exe --tab cheats`): browse/load/edit/save cheat files, see parse issues before saving, toggle Patch and Loop cheats against the live target, inspect the original-byte backup table, **Panic Restore All**, and launch the standalone loader.
+- **`NCL.exe`** is the standalone cheat loader built from the same engine and shipped in the Windows zip. It offers a library/editor/check workflow and `--host`, `--port`, `--connect`, `--tab`, `--list FILE` and `--check FILE`, and shares the exact same cheat files and `<BUILDID>.backup` journal as the main GUI and CLI, so a patch applied in one tool can be restored from another.
+
 ---
 
 ## Release Packages & Installation
@@ -169,9 +178,18 @@ In the **[GitHub Releases](https://github.com/Nexy451z/Nxus-ox/releases)** page,
 | File | Description |
 |---|---|
 | **`Nxus-ox-v0.1.0-alpha-atmosphere.zip`** | **Switch Sysmodule Package**. Extract directly to the root of your Switch SD card (`SD:/atmosphere/contents/4200000000004E58/exefs.nsp` + `flags/boot2.flag`). |
-| **`Nxus-ox-v0.1.0-alpha-windows-x64.zip`** | **Windows x64 PC Client Bundle**. Contains `nxus.exe` (unified GUI + CLI executable), `nxus-gui.bat` launcher, and documentation. |
+| **`Nxus-ox-v0.1.0-alpha-windows-x64.zip`** | **Windows x64 PC Client Bundle**. Contains `nxus.exe` (unified GUI + CLI executable), `NCL.exe` (standalone cheat loader), the `cheats/README.txt` starter folder, `nxus-gui.bat`, and documentation. |
 | **`nxus.exe`** | Standalone Windows x64 executable (identical to the binary inside the Windows zip). Runs **GUI mode** when launched without subcommands, or **CLI mode** when invoked with subcommands. |
+| **`NCL.exe`** | Standalone Windows x64 Atmosphere cheat loader (GUI + `--list`/`--check` CLI). Same files and backup journal as the `[Cheats]` tab and `nxus cheat ...`. |
 | **`Nxus-ox-v0.1.0-alpha-probe-atmosphere.zip`** | *(Optional)* Hardware diagnostic probe sysmodule (`0x4200000000004E59`). It ships **no** `flags/boot2.flag`; enable it only for a probe run, never together with `nxus` (see [Measuring the Diagnostic Probe](#3-measuring-the-diagnostic-probe-optional)). |
+
+### Final artifact sizes (this release)
+| Artifact | Exact size |
+|---|---:|
+| `dist/atmosphere/contents/4200000000004E58/exefs.nsp` | **194,567 bytes** |
+| `dist/atmosphere/contents/4200000000004E59/exefs.nsp` | **110,206 bytes** |
+| `dist/pc/nxus.exe` | **11,263,488 bytes** |
+| `dist/pc/NCL.exe` | **9,931,776 bytes** |
 
 ### 1. Switch Setup (Atmosphère / hekate)
 1. Extract **`Nxus-ox-v0.1.0-alpha-atmosphere.zip`** to the root of your SD card so that the following files exist:
@@ -221,6 +239,7 @@ Because every network assigns a different local IP address to the Switch (e.g., 
   - **Disasm**: GDB-style AArch64 / ARM32 / Thumb disassembler, live CPU register bar, **[At Current PC (Regs)]**, **[BP]** (set hardware execution breakpoint), and 1-click **[NOP]** instruction patching.
   - **Snapshot**: Block-level memory diffing (`Capture A` / `Capture B` / `Diff A->B`).
   - **Watch**: Address book / bookmarks and hardware watchpoint/breakpoint hit table (click **[Disasm PC]** on any hit to jump straight to the offending instruction in the Disasm tab).
+  - **Cheats**: Atmosphere cheat files (`<exe_dir>/cheats/<BUILDID>.txt`): load/edit/save with parse validation, toggle Patch and Loop cheats, inspect original-byte backups, **Panic Restore All**, and launch `NCL.exe`.
   - **Info**: Target process metadata (`title_id`, `pid`, `main_base`, memory mappings).
 
 #### Using the CLI
@@ -252,6 +271,12 @@ nxus break <CODE_ADDR> --seconds 30 --keep
 # 5. Live Code Patching (e.g., overwrite an ARM32 store/sub instruction with NOP E1A00000)
 nxus write <CODE_ADDR> "00 00 A0 E1"
 nxus detach
+
+# 6. Atmosphere cheat file (Patch / Loop; original bytes are journaled)
+nxus cheat list
+nxus cheat on "Infinite money"
+nxus cheat off "Infinite money"
+nxus cheat panic-off
 ```
 
 ### 3. Measuring the Diagnostic Probe (optional)
@@ -304,10 +329,11 @@ Nxus-ox/
   switch/     Main Switch sysmodule (Title ID: 0x4200000000004E58, kernel debugger in nxus_debug.c)
   probe/      Hardware diagnostic probe sysmodule (Title ID: 0x4200000000004E59)
   pc/
-    Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
+    Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler
+              + cheat/ Atmosphere cheat parser/VM/manager, bin/NCL.rs standalone loader)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (122 tests)
-  tests/      Host C unit test suite (1,937 checks across 9 test binaries)
+    tests/    Cross-language protocol parity & end-to-end test suite (133 tests)
+  tests/      Host C unit test suite (1,976 checks across 9 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
   docs/       Design, debugger, hotkey, cheat semantics and the agent handover
               (docs/HANDOVER.md is the "start here" document for a new maintainer)
@@ -332,12 +358,12 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,937 checks / 9 binaries: scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 150, session_view 313, snapshot_owner 208)
+# 1. Host C Core Tests (1,976 checks / 9 binaries: scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 167, session_view 335, snapshot_owner 208)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (124 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (212 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN, Atmosphere cheat parser/VM/manager)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (122 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (133 tests)
 cd pc && python -m unittest discover -s tests
 ```

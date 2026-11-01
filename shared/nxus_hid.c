@@ -48,6 +48,19 @@ static u32      g_HoldMs = 0;
 static u32      g_Enabled = 0;
 static u64      g_LastButtons = 0;
 
+/* Live held mask served to the server's opcode-8 key-conditional cheats.  It is
+   written by the HID worker and read from the connection thread, so it is
+   atomic: a torn u64 load would turn a held key into a released one (or the
+   other way round) and make a key-conditional cheat code fire spuriously.
+   s_PadsReady/s_PadsLive make the two PadState objects below a matched pair
+   owned by the worker: nxusHidPollCombo() never reads a pad that was not
+   initialized, and the mask is cleared before HID is torn down. */
+static atomic_ullong s_LastHeldMask;
+static PadState   s_Pad;
+static PadState   s_HandPad;
+static bool       s_PadsReady = false;          /* worker-owned */
+static atomic_bool s_PadsLive;                  /* false once HID is torn down */
+
 static NxusHotkeyCallback g_Callback = NULL;
 static void    *g_CallbackUser = NULL;
 
@@ -55,6 +68,10 @@ static Mutex    g_Mutex;
 
 void nxusHidInit(void) {
     mutexInit(&g_Mutex);
+    s_PadsReady = false;
+    atomic_init(&s_PadsLive, false);
+    atomic_init(&s_LastHeldMask, 0);
+    g_LastButtons = 0;
     atomic_init(&g_Stop, false);
     atomic_init(&g_ThreadOpen, false);
     atomic_init(&g_ThreadLive, false);
@@ -90,7 +107,37 @@ void nxusHidGetConfig(u64 *out_mask, u32 *out_hold_ms, u32 *out_enabled) {
 
 int nxusHidAvailable(void) { return g_Available ? 1 : 0; }
 Result nxusHidStatus(void) { return g_InitResult; }
-u64 nxusHidLastButtons(void) { return g_LastButtons; }
+u64 nxusHidLastButtons(void) { return (u64)nxusHidHeldMask(); }
+
+/* Atomically fetch the held mask published by the HID worker.  Host builds do
+   not link the libnx input path, so they always report "nothing held". */
+uint64_t nxusHidHeldMask(void) {
+#ifdef __SWITCH__
+    return (uint64_t)atomic_load_explicit(&s_LastHeldMask, memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+/* Poll both pads and publish ONE combined held mask.  The default pad normally
+   already covers handheld mode, but a sysmodule can also see them as separate
+   states; ORing them is safe because a button bit is 1 in both cases and the
+   mask is only ever tested with `(mask & keys_held) == mask`.  The worker calls
+   this even while the hotkey is disabled: opcode 8 needs the live mask
+   regardless of whether a pause combo is configured. */
+static u64 nxusHidPollCombo(void) {
+    u64 held = 0;
+    if (s_PadsReady && atomic_load_explicit(&s_PadsLive, memory_order_acquire)) {
+        padUpdate(&s_Pad);
+        padUpdate(&s_HandPad);
+        held = padGetButtons(&s_Pad) | padGetButtons(&s_HandPad);
+    }
+    g_LastButtons = held;
+    /* Release: the server's acquire load of the mask also observes everything
+       the reader of a key-conditional code needs from this poll. */
+    atomic_store_explicit(&s_LastHeldMask, held, memory_order_release);
+    return held;
+}
 
 /* Open the input service.  A sysmodule may or may not be allowed to; log both
    attempts so hardware day 1 tells us which path works. */
@@ -123,12 +170,20 @@ static void hidThread(void *arg) {
            waits for this return and then closes it; nxusHidStart() clears the
            flag itself before it calls threadCreate() again. */
         g_Available = false;
+        s_PadsReady = false;
+        atomic_store_explicit(&s_PadsLive, false, memory_order_release);
+        atomic_store_explicit(&s_LastHeldMask, 0, memory_order_release);
         atomic_store_explicit(&g_ThreadLive, false, memory_order_release);
         return;
     }
 
-    PadState pad;
-    padInitializeDefault(&pad);
+    /* Two pad states: the default player pad and the handheld pad.  The
+       combined mask feeds opcode 8; the hotkey below uses the same sample, so a
+       combo works in either mode. */
+    padInitializeDefault(&s_Pad);
+    padInitialize(&s_HandPad, HidNpadIdType_Handheld);
+    s_PadsReady = true;
+    atomic_store_explicit(&s_PadsLive, true, memory_order_release);
     g_Available = true;
     NXUS_LOG("hotkey: input ready");
 
@@ -138,9 +193,7 @@ static void hidThread(void *arg) {
     nxusHotkeyLatchInit(&latch);
 
     while (!atomic_load_explicit(&g_Stop, memory_order_relaxed)) {
-        padUpdate(&pad);
-        u64 buttons = padGetButtons(&pad);
-        g_LastButtons = buttons;
+        const u64 buttons = nxusHidPollCombo();
 
         u64 mask;
         u32 hold_ms, enabled;
@@ -176,6 +229,13 @@ static void hidThread(void *arg) {
         svcSleepThread(10000000ull);             /* 10ms poll */
     }
 
+    /* Stop publishing keys before the pads go away: a stale held mask after HID
+       teardown would make an opcode-8 cheat keep firing on a key the user has
+       already released. */
+    atomic_store_explicit(&s_PadsLive, false, memory_order_release);
+    s_PadsReady = false;
+    g_LastButtons = 0;
+    atomic_store_explicit(&s_LastHeldMask, 0, memory_order_release);
     if (g_Available) hidExit();
     g_Available = false;
     /* g_ThreadLive stays true on purpose on this path: only nxusHidExit() clears
@@ -229,6 +289,14 @@ void nxusHidExit(void) {
        it closed publish g_Stop = false after this store, and the worker it creates
        would keep polling through the shutdown. */
     atomic_store_explicit(&g_Stop, true, memory_order_seq_cst);
+
+    /* Clear the opcode-8 mask as soon as shutdown starts: once the pads are no
+       longer polled, the last held value must not be served as if it were live.
+       s_PadsLive is the cross-thread handshake (the worker-owned s_PadsReady is
+       NOT touched from here); the worker also clears the mask on its way out, so
+       the cleared value survives the join below. */
+    atomic_store_explicit(&s_PadsLive, false, memory_order_release);
+    atomic_store_explicit(&s_LastHeldMask, 0, memory_order_release);
 
     /* Self-join guard FIRST, before g_ThreadClosing is claimed: a callback may run
        this on the worker thread, and there is nothing safe to join or close there.

@@ -2260,6 +2260,48 @@ int nxusSessionReadMemory(u64 address, void *buffer, u32 size) {
     return sessionRead(NULL, address, buffer, size);
 }
 
+/* Query the LIVE target mapping that contains `address`.  The debug handle is
+   used while Nxus owns the process, dmnt otherwise - exactly the split
+   nxusSessionReadMemory() makes, so the permission check describes the same
+   target the write will reach. */
+static Result queryLiveMemory(u64 address, NxusMemoryInfo *out) {
+    memset(out, 0, sizeof(*out));
+    return nxusDebugIsAttached() ? nxusDebugQueryMemory(address, out)
+                                 : nxusDmntQuery(address, out);
+}
+
+/* Shared body of the two public checks.  `allow_rx` selects the cheat-code
+   policy (read + write OR execute); otherwise an optional writable requirement
+   is applied.  A range that crosses a mapping boundary is refused even when
+   both sides happen to be accessible: `svcWriteDebugProcessMemory`/dmnt take
+   ONE region's attributes for the whole write, so a straddling patch could be
+   partially applied. */
+static bool sessionRangePermits(u64 address, u64 size, bool require_writable, bool allow_rx) {
+    if (size == 0) return false;
+    if (address > 0xFFFFFFFFFFFFFFFFull - size) return false;
+
+    NxusMemoryInfo info;
+    if (R_FAILED(queryLiveMemory(address, &info))) return false;
+    if (info.size == 0 || info.base_addr > address) return false;
+
+    const u64 offset = address - info.base_addr;
+    if (offset >= info.size) return false;
+    if (size > info.size - offset) return false;
+
+    const u32 perm = info.perm & (NXUS_PERM_R | NXUS_PERM_W | NXUS_PERM_X);
+    if ((perm & NXUS_PERM_R) == 0) return false;
+    if (allow_rx) return (perm & (NXUS_PERM_W | NXUS_PERM_X)) != 0;
+    return !require_writable || (perm & NXUS_PERM_W) != 0;
+}
+
+bool nxusSessionCheckRange(u64 address, u64 size, bool require_writable) {
+    return sessionRangePermits(address, size, require_writable, false);
+}
+
+bool nxusSessionCheckCodePatchRange(u64 address, u64 size) {
+    return sessionRangePermits(address, size, false, true);
+}
+
 Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end) {
     /* NxusScope_Ranges has no list of its own here: the request that carried one is
        gone, and reusing the previous scan's list would capture the wrong memory. */

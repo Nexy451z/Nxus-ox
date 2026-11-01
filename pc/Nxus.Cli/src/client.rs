@@ -8,8 +8,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,14 +57,10 @@ pub const WIDTH_LIMIT: u64 = 0x1_0000_0000;
 // which is wider than 4 GiB)").  The branches correspond one to one with the
 // console's NXUS_PTRSCAN_WIDTH_REASON_* (core/nxus_ptrscan.h), whose own strings
 // are console-log terse ("process is 64-bit", "mapping ends").
-pub const WIDTH_REASON_PROCESS_64: &str =
-    "the process address space, which is wider than 4 GiB";
-pub const WIDTH_REASON_PROCESS_32: &str =
-    "the process address space, which fits in 4 GiB";
-pub const WIDTH_REASON_MAPPINGS_64: &str =
-    "the mapping table, whose highest end is above 4 GiB";
-pub const WIDTH_REASON_MAPPINGS_32: &str =
-    "the mapping table, whose every end is within 4 GiB";
+pub const WIDTH_REASON_PROCESS_64: &str = "the process address space, which is wider than 4 GiB";
+pub const WIDTH_REASON_PROCESS_32: &str = "the process address space, which fits in 4 GiB";
+pub const WIDTH_REASON_MAPPINGS_64: &str = "the mapping table, whose highest end is above 4 GiB";
+pub const WIDTH_REASON_MAPPINGS_32: &str = "the mapping table, whose every end is within 4 GiB";
 pub const WIDTH_REASON_MAIN_BASE_64: &str = "the main module base, at or above 4 GiB";
 pub const WIDTH_REASON_MAIN_BASE_32: &str = "the main module base, below 4 GiB";
 pub const WIDTH_REASON_DEFAULT: &str = "the AArch64 default, because nothing is known";
@@ -107,8 +103,10 @@ pub const WIDTH_REASON_DEFAULT: &str = "the AArch64 default, because nothing is 
 /// 4. **8**: nothing known at all.  AArch64 is the common case, and a wide load
 ///    on a 32-bit title only costs a failed scan while a narrow load on a 64-bit
 ///    title silently loses every chain.
-pub fn pointer_width_with_reason(metadata: &Metadata,
-                                 mappings: Option<&[Mapping]>) -> (u32, &'static str) {
+pub fn pointer_width_with_reason(
+    metadata: &Metadata,
+    mappings: Option<&[Mapping]>,
+) -> (u32, &'static str) {
     // 1. The process itself.  `Unknown` (old firmware, dmnt closed, inconsistent
     //    region) falls through instead of guessing.
     match metadata.address_space_arch() {
@@ -264,7 +262,11 @@ impl ScanSpec {
             scope: Scope::All,
             range_begin: 0,
             range_end: 0,
-            flags: if value_type.is_float() { SCAN_F_FLOAT } else { 0 },
+            flags: if value_type.is_float() {
+                SCAN_F_FLOAT
+            } else {
+                0
+            },
             pattern: Vec::new(),
             mask: Vec::new(),
             epsilon_decimals: 0,
@@ -284,8 +286,9 @@ impl ScanSpec {
 
 #[allow(non_snake_case)]
 fn buildScanPayload(spec: &ScanSpec, kind: u32) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(56 + 16 + spec.pattern.len() * 2
-                                        + spec.ranges.len() * crate::protocol::RANGE_ENTRY_SIZE);
+    let mut payload = Vec::with_capacity(
+        56 + 16 + spec.pattern.len() * 2 + spec.ranges.len() * crate::protocol::RANGE_ENTRY_SIZE,
+    );
     put_u32(&mut payload, kind);
     put_u32(&mut payload, spec.value_size);
     put_u32(&mut payload, spec.compare as u32);
@@ -294,9 +297,9 @@ fn buildScanPayload(spec: &ScanSpec, kind: u32) -> Vec<u8> {
     put_u64(&mut payload, spec.range_end);
     put_u64(&mut payload, spec.value);
     put_u64(&mut payload, spec.target2);
-    put_u32(&mut payload, 0);            // chunk size (server default)
-    // The range list travels right after the request, so the flag has to be set
-    // before the fixed header is written.
+    put_u32(&mut payload, 0); // chunk size (server default)
+                              // The range list travels right after the request, so the flag has to be set
+                              // before the fixed header is written.
     let mut flags = spec.flags;
     let use_ranges = spec.scope == crate::protocol::Scope::Ranges && !spec.ranges.is_empty();
     if use_ranges {
@@ -307,7 +310,7 @@ fn buildScanPayload(spec: &ScanSpec, kind: u32) -> Vec<u8> {
     if use_ranges {
         let count = spec.ranges.len().min(crate::protocol::MAX_SCAN_RANGES);
         put_u32(&mut payload, count as u32);
-        put_u32(&mut payload, 0);                       // reserved
+        put_u32(&mut payload, 0); // reserved
         for (begin, end) in spec.ranges.iter().take(count) {
             put_u64(&mut payload, *begin);
             put_u64(&mut payload, *end);
@@ -407,21 +410,23 @@ fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     match rx.recv_timeout(RESOLVE_TIMEOUT) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(NxusError {
-            message: format!(
-                "cannot resolve {}:{} - {}",
-                host, port, net_error_text(&e)
-            ),
+            message: format!("cannot resolve {}:{} - {}", host, port, net_error_text(&e)),
             result: None,
         }),
         Err(RecvTimeoutError::Timeout) => Err(NxusError {
             message: format!(
                 "cannot resolve {}:{} - the host name lookup did not answer within {} s",
-                host, port, RESOLVE_TIMEOUT.as_secs()
+                host,
+                port,
+                RESOLVE_TIMEOUT.as_secs()
             ),
             result: None,
         }),
         Err(RecvTimeoutError::Disconnected) => Err(NxusError {
-            message: format!("cannot resolve {}:{} - the host name lookup failed", host, port),
+            message: format!(
+                "cannot resolve {}:{} - the host name lookup failed",
+                host, port
+            ),
             result: None,
         }),
     }
@@ -559,7 +564,9 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
         9 => Some("argument outside the accepted range"),
         10 => Some("8 MiB heap budget: release the snapshots (or reset) and retry"),
         11 => Some("the console holds a debug session: detach before freezing"),
-        12 => Some("a fixed table is full (breakpoint slots or pinned views): clear something first"),
+        12 => {
+            Some("a fixed table is full (breakpoint slots or pinned views): clear something first")
+        }
         13 => Some("the previous session is still being released: retry in a moment"),
         _ => None,
     }
@@ -572,7 +579,8 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
 /// message, so that suffix is what identifies it here.
 fn is_retry_later(e: &NxusError) -> bool {
     e.result == Some(RESULT_BUSY)
-        && e.message.ends_with(&format!("(reason={})", REASON_RETRY_LATER))
+        && e.message
+            .ends_with(&format!("(reason={})", REASON_RETRY_LATER))
 }
 
 /// Build the client error for a `FLAG_ERROR` reply.
@@ -588,7 +596,7 @@ fn is_retry_later(e: &NxusError) -> bool {
 /// * libnx's `MAKERESULT`, which is **small and bit-31 clear** (`(module) |
 ///   (description << 9)`, module 345 = Module_Libnx).  Printing `0x00001759`
 ///   told the user nothing, even though it is just "bad input".
-const RESULT_MODULE_NXUS: u32 = 484;   // core/nxus_protocol.h NXUS_RESULT_MODULE
+const RESULT_MODULE_NXUS: u32 = 484; // core/nxus_protocol.h NXUS_RESULT_MODULE
 
 fn result_text(rc: u32) -> Option<&'static str> {
     // Two different layouts: libnx packs (module | description << 9) with bit 31
@@ -634,7 +642,10 @@ fn error_from_reply(cmd: u16, body: &[u8]) -> NxusError {
             None => message.push_str(&format!(" (reason={})", reason)),
         }
     }
-    NxusError { message, result: Some(rc) }
+    NxusError {
+        message,
+        result: Some(rc),
+    }
 }
 
 /// Thread id to use for `regs_get` on a held target.
@@ -678,18 +689,26 @@ impl NxusClient {
         stream.set_nodelay(true).ok();
         stream
             .set_read_timeout(Some(Duration::from_millis(200)))
-            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+            .map_err(|e| NxusError {
+                message: e.to_string(),
+                result: None,
+            })?;
         // Without a write deadline a dead link makes `write_all` block for
         // minutes: the TCP stack keeps retrying and the request never fails, so
         // the GUI would look frozen instead of noticing the console went away.
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
-        let reader_stream = stream
-            .try_clone()
-            .map_err(|e| NxusError { message: e.to_string(), result: None })?;
+            .map_err(|e| NxusError {
+                message: e.to_string(),
+                result: None,
+            })?;
+        let reader_stream = stream.try_clone().map_err(|e| NxusError {
+            message: e.to_string(),
+            result: None,
+        })?;
 
-        let pending: Arc<Mutex<HashMap<u32, Sender<Response>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u32, Sender<Response>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
@@ -724,7 +743,12 @@ impl NxusClient {
         self.request_timeout(cmd, payload, Duration::from_secs(30))
     }
 
-    pub fn request_timeout(&self, cmd: u16, payload: &[u8], timeout: Duration) -> Result<(u16, Vec<u8>)> {
+    pub fn request_timeout(
+        &self,
+        cmd: u16,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>)> {
         let seq = self.next_seq();
         let (tx, rx) = mpsc::channel::<Response>();
         lock(&self.pending).insert(seq, tx);
@@ -748,7 +772,10 @@ impl NxusClient {
         };
         if let Err(e) = sent {
             lock(&self.pending).remove(&seq);
-            return Err(NxusError { message: format!("send failed: {}", e), result: None });
+            return Err(NxusError {
+                message: format!("send failed: {}", e),
+                result: None,
+            });
         }
 
         match rx.recv_timeout(timeout) {
@@ -758,14 +785,21 @@ impl NxusClient {
                 }
                 Ok((cmd, body))
             }
-            Ok(None) => Err(NxusError { message: "connection closed".into(), result: None }),
+            Ok(None) => Err(NxusError {
+                message: "connection closed".into(),
+                result: None,
+            }),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&seq);
-                Err(NxusError { message: format!("no reply for command 0x{:04X}", cmd), result: None })
+                Err(NxusError {
+                    message: format!("no reply for command 0x{:04X}", cmd),
+                    result: None,
+                })
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(NxusError { message: "connection closed".into(), result: None })
-            }
+            Err(RecvTimeoutError::Disconnected) => Err(NxusError {
+                message: "connection closed".into(),
+                result: None,
+            }),
         }
     }
 
@@ -776,8 +810,12 @@ impl NxusClient {
     /// Pause/Resume.  Scans and pointer scans never do - a scan can run for
     /// minutes, and a pointer scan has its own RESULT_BUSY polling contract
     /// (see [`ptrscan_begin`](Self::ptrscan_begin)).
-    fn request_when_released(&self, cmd: u16, payload: &[u8],
-                             timeout: Duration) -> Result<(u16, Vec<u8>)> {
+    fn request_when_released(
+        &self,
+        cmd: u16,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>)> {
         let mut attempt = 0;
         loop {
             match self.request_timeout(cmd, payload, timeout) {
@@ -803,7 +841,11 @@ impl NxusClient {
         let event = lock(&self.events).recv_timeout(timeout).ok()?;
         if event.kind == event::DEBUG_STOPPED && event.payload.len() >= 8 {
             let thread_id = rd_u64(&event.payload, 0);
-            *lock(&self.last_stop) = if thread_id != 0 { Some(thread_id) } else { None };
+            *lock(&self.last_stop) = if thread_id != 0 {
+                Some(thread_id)
+            } else {
+                None
+            };
         }
         Some(event)
     }
@@ -840,17 +882,22 @@ impl NxusClient {
     pub fn metadata(&self) -> Result<Metadata> {
         let (_, body) = self.request(cmd::GET_METADATA, &[])?;
         if body.len() < Metadata::SIZE {
-            return Err(NxusError { message: "short metadata reply".into(), result: None });
+            return Err(NxusError {
+                message: "short metadata reply".into(),
+                result: None,
+            });
         }
         Ok(Metadata::parse(&body))
     }
 
     pub fn pause(&self) -> Result<()> {
-        self.request_when_released(cmd::PAUSE, &[], Duration::from_secs(30)).map(|_| ())
+        self.request_when_released(cmd::PAUSE, &[], Duration::from_secs(30))
+            .map(|_| ())
     }
 
     pub fn resume(&self) -> Result<()> {
-        self.request_when_released(cmd::RESUME, &[], Duration::from_secs(30)).map(|_| ())
+        self.request_when_released(cmd::RESUME, &[], Duration::from_secs(30))
+            .map(|_| ())
     }
 
     pub fn heartbeat(&self) -> Result<()> {
@@ -863,7 +910,8 @@ impl NxusClient {
     /// keep a sleeping console looking connected for half a minute, while a
     /// console that is awake answers in milliseconds.
     pub fn heartbeat_timeout(&self, timeout: Duration) -> Result<()> {
-        self.request_timeout(cmd::HEARTBEAT, &[], timeout).map(|_| ())
+        self.request_timeout(cmd::HEARTBEAT, &[], timeout)
+            .map(|_| ())
     }
 
     pub fn force_open(&self) -> Result<()> {
@@ -880,7 +928,10 @@ impl NxusClient {
     pub fn mapping_count(&self) -> Result<u64> {
         let (_, body) = self.request(cmd::GET_MAPPING_COUNT, &[])?;
         if body.len() < 8 {
-            return Err(NxusError { message: "short mapping count reply".into(), result: None });
+            return Err(NxusError {
+                message: "short mapping count reply".into(),
+                result: None,
+            });
         }
         Ok(rd_u64(&body, 0))
     }
@@ -891,7 +942,10 @@ impl NxusClient {
         put_u32(&mut payload, count);
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::GET_MAPPINGS, &payload)?;
-        Ok(body.chunks_exact(MemoryInfo::SIZE).map(MemoryInfo::parse).collect())
+        Ok(body
+            .chunks_exact(MemoryInfo::SIZE)
+            .map(MemoryInfo::parse)
+            .collect())
     }
 
     /// Largest read the server will answer.  Updated from every status reply so
@@ -904,6 +958,15 @@ impl NxusClient {
     }
 
     pub fn read(&self, address: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_timeout(address, size, Duration::from_secs(30))
+    }
+
+    /// [`read`](Self::read) with an explicit deadline per request.
+    ///
+    /// A cheat VM tick must not block for 30 seconds on an unresponsive console;
+    /// callers that poll target memory use a short timeout here.  The chunking
+    /// and short-reply handling are identical to `read`.
+    pub fn read_timeout(&self, address: u64, size: u32, timeout: Duration) -> Result<Vec<u8>> {
         // Never ask for more than the server can put in one reply: an oversized
         // request is rejected outright and the caller would see "unreadable".
         const MIN_READ: u32 = 4096;
@@ -915,15 +978,15 @@ impl NxusClient {
         while (got.len() as u32) < size {
             let want = (size - got.len() as u32).min(want_cap);
             let Some(chunk_address) = address.checked_add(offset) else {
-                break;                                  // would wrap: stop
+                break; // would wrap: stop
             };
             let mut payload = Vec::new();
             put_u64(&mut payload, chunk_address);
             put_u32(&mut payload, want);
             put_u32(&mut payload, 0);
-            let (_, body) = self.request(cmd::READ, &payload)?;
+            let (_, body) = self.request_timeout(cmd::READ, &payload, timeout)?;
             if body.is_empty() {
-                break;                                  // nothing readable here
+                break; // nothing readable here
             }
             offset += body.len() as u64;
             got.extend_from_slice(&body);
@@ -933,7 +996,7 @@ impl NxusClient {
                 // in smaller pieces instead of handing back partial data.
                 let smaller = (body.len() as u32).max(MIN_READ);
                 if smaller >= want {
-                    break;                              // no smaller step possible
+                    break; // no smaller step possible
                 }
                 want_cap = smaller;
             }
@@ -944,42 +1007,103 @@ impl NxusClient {
     pub fn read_u32(&self, address: u64) -> Result<u32> {
         let data = self.read(address, 4)?;
         if data.len() < 4 {
-            return Err(NxusError { message: "short read reply".into(), result: None });
+            return Err(NxusError {
+                message: "short read reply".into(),
+                result: None,
+            });
         }
         Ok(rd_u32(&data, 0))
     }
 
     pub fn write(&self, address: u64, data: &[u8]) -> Result<()> {
-        let mut payload = Vec::new();
-        put_u64(&mut payload, address);
-        put_u32(&mut payload, data.len() as u32);
-        put_u32(&mut payload, 0);
-        payload.extend_from_slice(data);
-        self.request(cmd::WRITE, &payload).map(|_| ())
+        self.write_timeout(address, data, Duration::from_secs(30))
+    }
+
+    /// [`write`](Self::write) with an explicit deadline.
+    pub fn write_timeout(&self, address: u64, data: &[u8], timeout: Duration) -> Result<()> {
+        self.write_with_flags_timeout(address, data, 0, timeout)
+    }
+
+    /// Write with `NxusWriteHeader.reserved` flags (see [`WRITE_FLAG_ALLOW_RX`]).
+    pub fn write_with_flags(&self, address: u64, data: &[u8], flags: u32) -> Result<()> {
+        self.write_with_flags_timeout(address, data, flags, Duration::from_secs(30))
+    }
+
+    pub fn write_with_flags_timeout(
+        &self,
+        address: u64,
+        data: &[u8],
+        flags: u32,
+        timeout: Duration,
+    ) -> Result<()> {
+        let payload = encode_write_flags(address, data, flags);
+        self.request_timeout(cmd::WRITE, &payload, timeout)
+            .map(|_| ())
+    }
+
+    /// Write a cheat/ASM patch that may target Read-Execute `.text`.
+    ///
+    /// The console only accepts a non-writable mapping when the Write header
+    /// carries `NXUS_WRITE_FLAG_ALLOW_RX`, so this is the method a PC-side cheat
+    /// VM must use for code patches.  Data writes should keep using
+    /// [`write`](Self::write).
+    pub fn write_code(&mut self, address: u64, data: &[u8]) -> std::result::Result<(), String> {
+        self.write_with_flags(address, data, WRITE_FLAG_ALLOW_RX)
+            .map_err(|e| e.to_string())
     }
 
     pub fn modules(&self) -> Result<Vec<ModuleInfo>> {
         let (_, body) = self.request(cmd::GET_MODULES, &[])?;
-        Ok(body.chunks_exact(ModuleInfo::SIZE).map(ModuleInfo::parse).collect())
+        Ok(body
+            .chunks_exact(ModuleInfo::SIZE)
+            .map(ModuleInfo::parse)
+            .collect())
     }
 
     // ---- scanning ----
 
-    pub fn scan_begin(&self, value: u64, value_size: u32, compare: Compare, scope: Scope,
-                      range_begin: u64, range_end: u64) -> Result<Status> {
+    pub fn scan_begin(
+        &self,
+        value: u64,
+        value_size: u32,
+        compare: Compare,
+        scope: Scope,
+        range_begin: u64,
+        range_end: u64,
+    ) -> Result<Status> {
         let spec = ScanSpec {
-            value, target2: 0, value_size, value_type: ValueType::U32, compare, scope,
-            range_begin, range_end, ranges: Vec::new(), flags: 0, pattern: Vec::new(),
-            mask: Vec::new(), epsilon_decimals: 0,
+            value,
+            target2: 0,
+            value_size,
+            value_type: ValueType::U32,
+            compare,
+            scope,
+            range_begin,
+            range_end,
+            ranges: Vec::new(),
+            flags: 0,
+            pattern: Vec::new(),
+            mask: Vec::new(),
+            epsilon_decimals: 0,
         };
         self.scan_begin_spec(&spec)
     }
 
     pub fn scan_next(&self, value: u64, compare: Compare) -> Result<Status> {
         let spec = ScanSpec {
-            value, target2: 0, value_size: 4, value_type: ValueType::U32, compare, scope: Scope::All,
-            range_begin: 0, range_end: 0, ranges: Vec::new(), flags: 0, pattern: Vec::new(),
-            mask: Vec::new(), epsilon_decimals: 0,
+            value,
+            target2: 0,
+            value_size: 4,
+            value_type: ValueType::U32,
+            compare,
+            scope: Scope::All,
+            range_begin: 0,
+            range_end: 0,
+            ranges: Vec::new(),
+            flags: 0,
+            pattern: Vec::new(),
+            mask: Vec::new(),
+            epsilon_decimals: 0,
         };
         self.scan_next_spec(&spec)
     }
@@ -988,9 +1112,13 @@ impl NxusClient {
     /// wildcards, range compare and alignment all go through here.
     pub fn scan_begin_spec(&self, spec: &ScanSpec) -> Result<Status> {
         let payload = buildScanPayload(spec, 0);
-        let (_, body) = self.request_timeout(cmd::SCAN_BEGIN, &payload, Duration::from_secs(600))?;
-        if body.len() < Status::SIZE {
-            return Err(NxusError { message: "short status reply".into(), result: None });
+        let (_, body) =
+            self.request_timeout(cmd::SCAN_BEGIN, &payload, Duration::from_secs(600))?;
+        if body.len() < Status::LEGACY_SIZE {
+            return Err(NxusError {
+                message: "short status reply".into(),
+                result: None,
+            });
         }
         Ok(Status::parse(&body))
     }
@@ -998,8 +1126,11 @@ impl NxusClient {
     pub fn scan_next_spec(&self, spec: &ScanSpec) -> Result<Status> {
         let payload = buildScanPayload(spec, 1);
         let (_, body) = self.request_timeout(cmd::SCAN_NEXT, &payload, Duration::from_secs(600))?;
-        if body.len() < Status::SIZE {
-            return Err(NxusError { message: "short status reply".into(), result: None });
+        if body.len() < Status::LEGACY_SIZE {
+            return Err(NxusError {
+                message: "short status reply".into(),
+                result: None,
+            });
         }
         Ok(Status::parse(&body))
     }
@@ -1009,8 +1140,11 @@ impl NxusClient {
         // A truncated reply would otherwise decode as scan_state 0 (idle) and
         // make `scan_wait` spin until its own timeout instead of reporting
         // "the console sent something broken".
-        if body.len() < Status::SIZE {
-            return Err(NxusError { message: "short status reply".into(), result: None });
+        if body.len() < Status::LEGACY_SIZE {
+            return Err(NxusError {
+                message: "short status reply".into(),
+                result: None,
+            });
         }
         Ok(Status::parse(&body))
     }
@@ -1018,8 +1152,11 @@ impl NxusClient {
     /// Like scan_wait(), but stops early when the UI asks to cancel: the worker
     /// thread is single threaded, so the cancel button can only be honoured from
     /// inside the wait itself.
-    pub fn scan_wait_cancellable(&self, timeout: Duration,
-                                 cancel: &std::sync::atomic::AtomicBool) -> Result<Status> {
+    pub fn scan_wait_cancellable(
+        &self,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Status> {
         self.scan_wait_cancellable_reporting(timeout, cancel, |_| {})
     }
 
@@ -1037,9 +1174,12 @@ impl NxusClient {
     /// those three values changes, throttled to [`SCAN_PROGRESS_REPORT`], and
     /// once more with the final status (also when the scan was cancelled) so the
     /// caller never has to guess how the walk ended.
-    pub fn scan_wait_cancellable_reporting<F>(&self, timeout: Duration,
-                                              cancel: &std::sync::atomic::AtomicBool,
-                                              mut report: F) -> Result<Status>
+    pub fn scan_wait_cancellable_reporting<F>(
+        &self,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut report: F,
+    ) -> Result<Status>
     where
         F: FnMut(&Status),
     {
@@ -1065,7 +1205,11 @@ impl NxusClient {
                 status.scan_state,
                 scan_state::DONE | scan_state::ERROR | scan_state::CANCELLED
             );
-            let seen = (status.scan_state, status.hit_count, status.progress_permille);
+            let seen = (
+                status.scan_state,
+                status.hit_count,
+                status.progress_permille,
+            );
             if finished {
                 // The final state always reaches the caller, even when it lands
                 // inside the throttle window: that is the value the UI ends on.
@@ -1082,7 +1226,10 @@ impl NxusClient {
                 report(&status);
             }
             if start.elapsed() > timeout {
-                return Err(NxusError { message: "scan did not finish".into(), result: None });
+                return Err(NxusError {
+                    message: "scan did not finish".into(),
+                    result: None,
+                });
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1104,7 +1251,10 @@ impl NxusClient {
                 _ => {}
             }
             if start.elapsed() > timeout {
-                return Err(NxusError { message: "scan did not finish".into(), result: None });
+                return Err(NxusError {
+                    message: "scan did not finish".into(),
+                    result: None,
+                });
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1118,7 +1268,10 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::SCAN_GET_HITS, &payload)?;
         if body.len() < HitBatch::HEADER_SIZE {
-            return Err(NxusError { message: "short hit batch".into(), result: None });
+            return Err(NxusError {
+                message: "short hit batch".into(),
+                result: None,
+            });
         }
         Ok(HitBatch::parse(&body))
     }
@@ -1146,7 +1299,8 @@ impl NxusClient {
     }
 
     fn set_last_scan_truncated(&self, value: bool) {
-        self.truncated.store(value, std::sync::atomic::Ordering::Relaxed);
+        self.truncated
+            .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// True when the last `scan_all_hits()` walk saw a batch that had dropped hits
@@ -1161,7 +1315,8 @@ impl NxusClient {
     }
 
     fn set_last_scan_dropped(&self, value: bool) {
-        self.dropped.store(value, std::sync::atomic::Ordering::Relaxed);
+        self.dropped
+            .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn scan_all_hits(&self, page: u32) -> Result<Vec<Hit>> {
@@ -1178,15 +1333,23 @@ impl NxusClient {
 
     pub fn scan_undo(&self) -> Result<Status> {
         let (_, body) = self.request(cmd::SCAN_UNDO, &[])?;
-        if body.len() < Status::SIZE {
-            return Err(NxusError { message: "short status reply".into(), result: None });
+        if body.len() < Status::LEGACY_SIZE {
+            return Err(NxusError {
+                message: "short status reply".into(),
+                result: None,
+            });
         }
         Ok(Status::parse(&body))
     }
 
     // ---- snapshots ----
 
-    pub fn snapshot_capture(&self, slot: u32, scope: Scope, block_size: u32) -> Result<SnapshotSummary> {
+    pub fn snapshot_capture(
+        &self,
+        slot: u32,
+        scope: Scope,
+        block_size: u32,
+    ) -> Result<SnapshotSummary> {
         let mut payload = Vec::new();
         put_u32(&mut payload, slot);
         put_u32(&mut payload, block_size);
@@ -1194,7 +1357,8 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         put_u64(&mut payload, 0);
         put_u64(&mut payload, 0);
-        let (_, body) = self.request_timeout(cmd::SNAPSHOT_CAPTURE, &payload, Duration::from_secs(300))?;
+        let (_, body) =
+            self.request_timeout(cmd::SNAPSHOT_CAPTURE, &payload, Duration::from_secs(300))?;
         Ok(SnapshotSummary::parse(&body))
     }
 
@@ -1204,7 +1368,8 @@ impl NxusClient {
         put_u32(&mut payload, to_slot);
         put_u32(&mut payload, 0);
         put_u32(&mut payload, 0);
-        let (_, body) = self.request_timeout(cmd::SNAPSHOT_DIFF, &payload, Duration::from_secs(300))?;
+        let (_, body) =
+            self.request_timeout(cmd::SNAPSHOT_DIFF, &payload, Duration::from_secs(300))?;
         Ok(SnapshotSummary::parse(&body))
     }
 
@@ -1215,7 +1380,10 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::SNAPSHOT_CHANGED, &payload)?;
-        Ok(body.chunks_exact(ChangedBlock::SIZE).map(ChangedBlock::parse).collect())
+        Ok(body
+            .chunks_exact(ChangedBlock::SIZE)
+            .map(ChangedBlock::parse)
+            .collect())
     }
 
     pub fn snapshot_changed_all(&self, page: u32) -> Result<Vec<ChangedBlock>> {
@@ -1231,9 +1399,15 @@ impl NxusClient {
 
     // ---- pointer scan / cheat export ----
 
-    pub fn ptrscan_begin(&self, target: u64, module_base: u64, max_depth: u32,
-                         max_offset: u32, max_results: u32, value_width: u32)
-                         -> Result<(Vec<PtrChain>, bool)> {
+    pub fn ptrscan_begin(
+        &self,
+        target: u64,
+        module_base: u64,
+        max_depth: u32,
+        max_offset: u32,
+        max_results: u32,
+        value_width: u32,
+    ) -> Result<(Vec<PtrChain>, bool)> {
         let mut payload = Vec::new();
         put_u64(&mut payload, target);
         put_u64(&mut payload, module_base);
@@ -1288,7 +1462,13 @@ impl NxusClient {
         Ok(parse_chains(&body))
     }
 
-    pub fn cheat_export(&self, index: u32, value: u64, value_width: u32, is_32bit: bool) -> Result<String> {
+    pub fn cheat_export(
+        &self,
+        index: u32,
+        value: u64,
+        value_width: u32,
+        is_32bit: bool,
+    ) -> Result<String> {
         let mut payload = Vec::new();
         put_u32(&mut payload, index);
         put_u32(&mut payload, value_width);
@@ -1365,7 +1545,10 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::FROZEN_ENABLE, &payload)?;
         if body.len() < 8 {
-            return Err(NxusError { message: "short frozen handle reply".into(), result: None });
+            return Err(NxusError {
+                message: "short frozen handle reply".into(),
+                result: None,
+            });
         }
         // A freeze the PC asked for is not a release when lists are compared
         // later; keep the baseline in step with it (and with `frozen_disable`).
@@ -1420,14 +1603,15 @@ impl NxusClient {
         if pid != 0 {
             put_u64(&mut payload, pid);
         }
-        let (_, body) = self.request_when_released(cmd::DEBUG_ATTACH, &payload,
-                                                   Duration::from_secs(60))?;
+        let (_, body) =
+            self.request_when_released(cmd::DEBUG_ATTACH, &payload, Duration::from_secs(60))?;
         Ok(DebugStatus::parse(&body))
     }
 
     pub fn debug_detach(&self) -> Result<()> {
         *lock(&self.last_stop) = None;
-        self.request_when_released(cmd::DEBUG_DETACH, &[], Duration::from_secs(60)).map(|_| ())
+        self.request_when_released(cmd::DEBUG_DETACH, &[], Duration::from_secs(60))
+            .map(|_| ())
     }
 
     pub fn debug_status(&self) -> Result<DebugStatus> {
@@ -1480,11 +1664,22 @@ impl NxusClient {
         put_u32(&mut payload, auto_continue);
         put_u32(&mut payload, 0);
         put_u32(&mut payload, 0);
-        debug_assert_eq!(payload.len(), DEBUG_CONFIG_LEN, "NxusDebugConfig is 16 bytes");
+        debug_assert_eq!(
+            payload.len(),
+            DEBUG_CONFIG_LEN,
+            "NxusDebugConfig is 16 bytes"
+        );
         self.request(cmd::CONFIG, &payload).map(|_| ())
     }
 
-    pub fn break_set(&self, address: u64, kind: u32, size: u32, slot: u32, ctrl: u64) -> Result<Vec<BreakEntry>> {
+    pub fn break_set(
+        &self,
+        address: u64,
+        kind: u32,
+        size: u32,
+        slot: u32,
+        ctrl: u64,
+    ) -> Result<Vec<BreakEntry>> {
         let mut payload = Vec::new();
         put_u32(&mut payload, slot);
         put_u32(&mut payload, kind);
@@ -1493,7 +1688,10 @@ impl NxusClient {
         put_u64(&mut payload, address);
         let _ = ctrl;
         let (_, body) = self.request_timeout(cmd::BREAK_SET, &payload, Duration::from_secs(60))?;
-        Ok(body.chunks_exact(BreakEntry::SIZE).map(BreakEntry::parse).collect())
+        Ok(body
+            .chunks_exact(BreakEntry::SIZE)
+            .map(BreakEntry::parse)
+            .collect())
     }
 
     pub fn break_clear(&self, slot: u32) -> Result<()> {
@@ -1504,12 +1702,18 @@ impl NxusClient {
 
     pub fn break_list(&self) -> Result<Vec<BreakEntry>> {
         let (_, body) = self.request(cmd::BREAK_LIST, &[])?;
-        Ok(body.chunks_exact(BreakEntry::SIZE).map(BreakEntry::parse).collect())
+        Ok(body
+            .chunks_exact(BreakEntry::SIZE)
+            .map(BreakEntry::parse)
+            .collect())
     }
 
     pub fn thread_list(&self) -> Result<Vec<ThreadEntry>> {
         let (_, body) = self.request(cmd::THREAD_LIST, &[])?;
-        Ok(body.chunks_exact(ThreadEntry::SIZE).map(ThreadEntry::parse).collect())
+        Ok(body
+            .chunks_exact(ThreadEntry::SIZE)
+            .map(ThreadEntry::parse)
+            .collect())
     }
 
     pub fn regs_get(&self, thread_id: u64) -> Result<ThreadContext> {
@@ -1520,7 +1724,10 @@ impl NxusClient {
         // of the legacy 100-byte layout); `ThreadContext::parse` zero-fills the
         // rest, so anything shorter would silently show made-up registers.
         if body.len() < 96 {
-            return Err(NxusError { message: "short thread context reply".into(), result: None });
+            return Err(NxusError {
+                message: "short thread context reply".into(),
+                result: None,
+            });
         }
         Ok(ThreadContext::parse(&body))
     }
@@ -1537,7 +1744,10 @@ impl NxusClient {
         put_u32(&mut payload, 0);
         put_u32(&mut payload, 0);
         let (_, body) = self.request(cmd::HIT_GET, &payload)?;
-        Ok(body.chunks_exact(BreakHit::SIZE).map(BreakHit::parse).collect())
+        Ok(body
+            .chunks_exact(BreakHit::SIZE)
+            .map(BreakHit::parse)
+            .collect())
     }
 
     pub fn hit_clear(&self) -> Result<()> {
@@ -1551,9 +1761,17 @@ impl NxusClient {
     /// when the user applies their settings: it rewrites every field, so it must
     /// NOT be used to flip a single debug flag behind the user's back - see
     /// [`set_debug_auto_continue`], which sends the 16-byte debug-only form.
-    pub fn set_config(&self, hotkey_mask: u64, hotkey_hold_ms: u32, hotkey_enabled: u32,
-                      chunk_size: u32, watchdog_ms: u32, heartbeat_ms: u32, log_level: u32,
-                      debug: Option<(u32, u32)>) -> Result<Vec<u8>> {
+    pub fn set_config(
+        &self,
+        hotkey_mask: u64,
+        hotkey_hold_ms: u32,
+        hotkey_enabled: u32,
+        chunk_size: u32,
+        watchdog_ms: u32,
+        heartbeat_ms: u32,
+        log_level: u32,
+        debug: Option<(u32, u32)>,
+    ) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         put_u64(&mut payload, hotkey_mask);
         put_u32(&mut payload, hotkey_hold_ms);
@@ -1649,13 +1867,21 @@ fn parse_chains(body: &[u8]) -> (Vec<PtrChain>, bool) {
             steps.push(rd_u32(body, pos + 16 + i * 4));
         }
         pos += 48;
-        chains.push(PtrChain { root_offset, final_offset, steps });
+        chains.push(PtrChain {
+            root_offset,
+            final_offset,
+            steps,
+        });
     }
     (chains, truncated)
 }
 
-fn reader_loop(mut stream: TcpStream, pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
-               events: Sender<Event>, running: Arc<std::sync::atomic::AtomicBool>) {
+fn reader_loop(
+    mut stream: TcpStream,
+    pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
+    events: Sender<Event>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut header = [0u8; HEADER_SIZE];
     loop {
         if !running.load(Ordering::SeqCst) {
@@ -1707,8 +1933,12 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
         match stream.read(&mut buffer[got..]) {
             Ok(0) => return false,
             Ok(n) => got += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(_) => return false,
         }
     }
@@ -1822,13 +2052,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for, result_text,
-                pointer_width_with_reason, released_addresses, select_stopped_thread, walk_all_hits,
-                Hit, HitBatch, Mapping, Metadata, NxusError, PERM_R, RESULT_BUSY,
-                WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
-                WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64, WIDTH_REASON_PROCESS_32,
-                WIDTH_REASON_PROCESS_64};
-    use crate::protocol::{put_u32, DebugStatus};
+    use super::{
+        error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
+        pointer_width_with_reason, released_addresses, result_text, select_stopped_thread,
+        walk_all_hits, Hit, HitBatch, Mapping, Metadata, NxusClient, NxusError, PERM_R,
+        RESULT_BUSY, WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
+        WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64, WIDTH_REASON_PROCESS_32,
+        WIDTH_REASON_PROCESS_64,
+    };
+    use crate::protocol::{
+        cmd, put_u32, rd_u32, DebugStatus, HEADER_SIZE, MAGIC, WRITE_FLAG_ALLOW_RX,
+    };
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
         let mut body = Vec::new();
@@ -1840,22 +2074,41 @@ mod tests {
     }
 
     fn mapping(base: u64, size: u64, perm: u32) -> Mapping {
-        Mapping { base, size, memory_type: 5, attr: 0, perm }
+        Mapping {
+            base,
+            size,
+            memory_type: 5,
+            attr: 0,
+            perm,
+        }
     }
 
     fn metadata(main_base: u64) -> Metadata {
-        Metadata { main_base, ..Default::default() }
+        Metadata {
+            main_base,
+            ..Default::default()
+        }
     }
 
     fn page_hit(index: u32) -> Hit {
-        Hit { address: index as u64, mapping_idx: 0, value_type: 0, value: index as u64 }
+        Hit {
+            address: index as u64,
+            mapping_idx: 0,
+            value_type: 0,
+            value: index as u64,
+        }
     }
 
     /// A wire-faithful `SCAN_GET_HITS` server: `dropped` indices are counted in
     /// the window but omitted from `hits`, exactly like `sendHits()` on the
     /// console.
-    fn serve_hit_page(total: u32, dropped_indices: &[u32], requests: &mut Vec<(u32, u32)>,
-                      offset: u32, count: u32) -> HitBatch {
+    fn serve_hit_page(
+        total: u32,
+        dropped_indices: &[u32],
+        requests: &mut Vec<(u32, u32)>,
+        offset: u32,
+        count: u32,
+    ) -> HitBatch {
         requests.push((offset, count));
         let start = offset.min(total);
         let end = offset.saturating_add(count).min(total);
@@ -1882,6 +2135,50 @@ mod tests {
         hits.iter().map(|hit| hit.address as u32).collect()
     }
 
+    /// The cheat path must set `NXUS_WRITE_FLAG_ALLOW_RX`, while an ordinary
+    /// write keeps the reserved word zero (an old console relies on that
+    /// strictness).  Read the actual frames off a local socket, so this pins the
+    /// wire encoding rather than only the helper functions.
+    #[test]
+    fn write_code_sets_allow_rx_but_write_does_not() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut flags = Vec::new();
+            for _ in 0..2 {
+                let mut head = [0u8; HEADER_SIZE];
+                socket.read_exact(&mut head).expect("frame header");
+                let length = rd_u32(&head, 8) as usize;
+                let seq = rd_u32(&head, 12);
+                let mut payload = vec![0u8; length];
+                socket.read_exact(&mut payload).expect("frame payload");
+                flags.push(rd_u32(&payload, 12)); // NxusWriteHeader.reserved
+                let mut reply = Vec::new();
+                put_u32(&mut reply, MAGIC);
+                reply.extend_from_slice(&cmd::WRITE.to_le_bytes());
+                reply.extend_from_slice(&0u16.to_le_bytes());
+                put_u32(&mut reply, 0); // no payload, no error
+                put_u32(&mut reply, seq);
+                socket.write_all(&reply).expect("reply");
+            }
+            flags
+        });
+
+        let mut client = NxusClient::connect("127.0.0.1", port).expect("connect");
+        client
+            .write(0x0070_0000, &[1, 2, 3, 4])
+            .expect("normal write");
+        client
+            .write_code(0x0070_0000, &[5, 6, 7, 8])
+            .expect("code write");
+        let flags = server.join().expect("server");
+        assert_eq!(flags, vec![0, WRITE_FLAG_ALLOW_RX]);
+    }
+
     /// A partial drop makes the written records shorter than the request window.
     /// The next offset must be the end of the *window*, never `all.len()`, or the
     /// walk re-reads indices and loses the tail.
@@ -1893,10 +2190,16 @@ mod tests {
         })
         .expect("page walk");
 
-        assert_eq!(requests, vec![(0, 4), (4, 4), (8, 2)],
-                   "the next request must start after the whole examined window");
-        assert_eq!(addresses(&hits), vec![0, 2, 3, 4, 5, 6, 7, 8, 9],
-                   "index 1 is dropped, all other records appear exactly once");
+        assert_eq!(
+            requests,
+            vec![(0, 4), (4, 4), (8, 2)],
+            "the next request must start after the whole examined window"
+        );
+        assert_eq!(
+            addresses(&hits),
+            vec![0, 2, 3, 4, 5, 6, 7, 8, 9],
+            "index 1 is dropped, all other records appear exactly once"
+        );
         assert!(dropped);
         assert!(!truncated);
         let mut unique = hits.iter().map(|hit| hit.address).collect::<Vec<_>>();
@@ -1913,14 +2216,26 @@ mod tests {
     fn an_all_dropped_first_page_advances_to_the_next_page() {
         let mut requests = Vec::new();
         let (hits, truncated, dropped) = walk_all_hits(4, |offset, count| {
-            Ok(serve_hit_page(10, &[0, 1, 2, 3], &mut requests, offset, count))
+            Ok(serve_hit_page(
+                10,
+                &[0, 1, 2, 3],
+                &mut requests,
+                offset,
+                count,
+            ))
         })
         .expect("page walk");
 
-        assert_eq!(requests, vec![(0, 4), (4, 4), (8, 2)],
-                   "an empty dropped page must still advance the server index");
-        assert_eq!(addresses(&hits), vec![4, 5, 6, 7, 8, 9],
-                   "the valid later pages must not be abandoned");
+        assert_eq!(
+            requests,
+            vec![(0, 4), (4, 4), (8, 2)],
+            "an empty dropped page must still advance the server index"
+        );
+        assert_eq!(
+            addresses(&hits),
+            vec![4, 5, 6, 7, 8, 9],
+            "the valid later pages must not be abandoned"
+        );
         assert!(dropped, "the drop flag must survive the whole walk");
         assert!(!truncated);
     }
@@ -1931,34 +2246,70 @@ mod tests {
         let mut requests = Vec::new();
         let (hits, _truncated, dropped) = walk_all_hits(4, |offset, count| {
             requests.push((offset, count));
-            Ok(HitBatch { session_id: 7, total: 10, value_size: 4,
-                          truncated: false, dropped: false, hits: Vec::new() })
+            Ok(HitBatch {
+                session_id: 7,
+                total: 10,
+                value_size: 4,
+                truncated: false,
+                dropped: false,
+                hits: Vec::new(),
+            })
         })
         .expect("page walk");
 
         assert!(hits.is_empty());
         assert!(!dropped);
-        assert_eq!(requests, vec![(0, 4)], "an empty non-dropped page ends the walk");
+        assert_eq!(
+            requests,
+            vec![(0, 4)],
+            "an empty non-dropped page ends the walk"
+        );
     }
 
     /// The mapping table decides: any traversable mapping ending above 4 GiB
     /// means 8-byte pointers, an end at or below it does not.
     #[test]
     fn pointer_width_follows_the_console_auto_rule() {
-        let low = 0x0070_0000u64;              // MockSwitch's main module base
-        // A 32-bit title: every mapping ends below 4 GiB.
-        assert_eq!(pointer_width_for(&metadata(low), Some(&[mapping(0x0070_0000, 0x80000, PERM_R),
-                                                            mapping(0x42CA_0000, 0x3000, PERM_R)])), 4);
+        let low = 0x0070_0000u64; // MockSwitch's main module base
+                                  // A 32-bit title: every mapping ends below 4 GiB.
+        assert_eq!(
+            pointer_width_for(
+                &metadata(low),
+                Some(&[
+                    mapping(0x0070_0000, 0x80000, PERM_R),
+                    mapping(0x42CA_0000, 0x3000, PERM_R)
+                ])
+            ),
+            4
+        );
         // A 64-bit title whose main module ASLR'd below 4 GiB: the high mapping
         // is the evidence that the address space is wide.
-        assert_eq!(pointer_width_for(&metadata(low), Some(&[mapping(low, 0x80000, PERM_R),
-                                                            mapping(0x7F_0000_0000, 0x1000, PERM_R)])), 8);
+        assert_eq!(
+            pointer_width_for(
+                &metadata(low),
+                Some(&[
+                    mapping(low, 0x80000, PERM_R),
+                    mapping(0x7F_0000_0000, 0x1000, PERM_R)
+                ])
+            ),
+            8
+        );
         // An end exactly at 4 GiB still addresses only 32-bit-reachable bytes.
-        assert_eq!(pointer_width_for(&metadata(low),
-                                     Some(&[mapping(0xFFFF_F000, 0x1000, PERM_R)])), 4);
+        assert_eq!(
+            pointer_width_for(
+                &metadata(low),
+                Some(&[mapping(0xFFFF_F000, 0x1000, PERM_R)])
+            ),
+            4
+        );
         // A mapping that wraps past the top is 64-bit evidence, not a small end.
-        assert_eq!(pointer_width_for(&metadata(low),
-                                     Some(&[mapping(u64::MAX - 0xFFF, 0x2000, PERM_R)])), 8);
+        assert_eq!(
+            pointer_width_for(
+                &metadata(low),
+                Some(&[mapping(u64::MAX - 0xFFF, 0x2000, PERM_R)])
+            ),
+            8
+        );
     }
 
     /// Without a mapping table the main module base decides, and 0 is "unknown"
@@ -1970,9 +2321,15 @@ mod tests {
         assert_eq!(pointer_width_for(&metadata(0x0780_4000), None), 4);
         assert_eq!(pointer_width_for(&metadata(0x1_0000_0000), None), 8);
         // Entries the console would not walk are not evidence either.
-        let unusable = [mapping(0x7F_0000_0000, 0x1000, 0), mapping(0x0070_0000, 0, PERM_R)];
-        assert_eq!(pointer_width_for(&metadata(0x0070_0000), Some(&unusable)), 4,
-                   "unreadable / empty mappings fall back to the main base");
+        let unusable = [
+            mapping(0x7F_0000_0000, 0x1000, 0),
+            mapping(0x0070_0000, 0, PERM_R),
+        ];
+        assert_eq!(
+            pointer_width_for(&metadata(0x0070_0000), Some(&unusable)),
+            4,
+            "unreadable / empty mappings fall back to the main base"
+        );
         assert_eq!(pointer_width_for(&metadata(0), Some(&unusable)), 8);
     }
 
@@ -1984,7 +2341,10 @@ mod tests {
     #[test]
     fn the_process_address_space_outranks_the_mappings() {
         let low = 0x0070_0000u64;
-        let low_maps = [mapping(low, 0x80000, PERM_R), mapping(0x3600_0000, 0x10_0000, PERM_R)];
+        let low_maps = [
+            mapping(low, 0x80000, PERM_R),
+            mapping(0x3600_0000, 0x10_0000, PERM_R),
+        ];
         // dmnt's AArch64 pair: 0x8000000 + 0x7FF8000000 (512 GiB).
         let wide = Metadata {
             main_base: low,
@@ -1992,9 +2352,11 @@ mod tests {
             aslr_size: 0x7FF8_0000_00,
             ..Default::default()
         };
-        assert_eq!(pointer_width_with_reason(&wide, Some(&low_maps)),
-                   (8, WIDTH_REASON_PROCESS_64),
-                   "a low mapping table must not drag a 64-bit process down to 4");
+        assert_eq!(
+            pointer_width_with_reason(&wide, Some(&low_maps)),
+            (8, WIDTH_REASON_PROCESS_64),
+            "a low mapping table must not drag a 64-bit process down to 4"
+        );
 
         // dmnt's AArch32 pair: 0x200000 + 0xFFE00000 (ends exactly at 4 GiB).
         let narrow = Metadata {
@@ -2003,20 +2365,29 @@ mod tests {
             aslr_size: 0xFFE0_0000,
             ..Default::default()
         };
-        assert_eq!(pointer_width_with_reason(&narrow, Some(&low_maps)),
-                   (4, WIDTH_REASON_PROCESS_32));
+        assert_eq!(
+            pointer_width_with_reason(&narrow, Some(&low_maps)),
+            (4, WIDTH_REASON_PROCESS_32)
+        );
         // AArch32 stays authoritative even next to a mapping the PC cannot place
         // (a 32-bit title can never hold a pointer above 4 GiB).
-        assert_eq!(pointer_width_with_reason(&narrow, Some(&[mapping(0x7F_0000_0000, 0x1000,
-                                                                      PERM_R)])),
-                   (4, WIDTH_REASON_PROCESS_32));
+        assert_eq!(
+            pointer_width_with_reason(&narrow, Some(&[mapping(0x7F_0000_0000, 0x1000, PERM_R)])),
+            (4, WIDTH_REASON_PROCESS_32)
+        );
         // No metadata answer (old console / dmnt closed): the mappings decide.
-        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&low_maps)),
-                   (4, WIDTH_REASON_MAPPINGS_32));
+        assert_eq!(
+            pointer_width_with_reason(&metadata(low), Some(&low_maps)),
+            (4, WIDTH_REASON_MAPPINGS_32)
+        );
         // ... and a high mapping still proves the wide space on its own.
-        assert_eq!(pointer_width_with_reason(&metadata(low),
-                                             Some(&[mapping(0x7F_0000_0000, 0x1000, PERM_R)])),
-                   (8, WIDTH_REASON_MAPPINGS_64));
+        assert_eq!(
+            pointer_width_with_reason(
+                &metadata(low),
+                Some(&[mapping(0x7F_0000_0000, 0x1000, PERM_R)])
+            ),
+            (8, WIDTH_REASON_MAPPINGS_64)
+        );
     }
 
     /// Every branch names its evidence, and the words line up with the value:
@@ -2026,12 +2397,26 @@ mod tests {
     fn every_width_names_its_evidence() {
         let low = 0x0070_0000u64;
         let cases: [(Metadata, Option<&[Mapping]>, u32, &str); 5] = [
-            (Metadata { aslr_base: 0x0800_0000, aslr_size: 0x7FF8_0000_00,
-                        ..Default::default() },
-             None, 8, WIDTH_REASON_PROCESS_64),
-            (Metadata { aslr_base: 0x0020_0000, aslr_size: 0xFFE0_0000,
-                        ..Default::default() },
-             None, 4, WIDTH_REASON_PROCESS_32),
+            (
+                Metadata {
+                    aslr_base: 0x0800_0000,
+                    aslr_size: 0x7FF8_0000_00,
+                    ..Default::default()
+                },
+                None,
+                8,
+                WIDTH_REASON_PROCESS_64,
+            ),
+            (
+                Metadata {
+                    aslr_base: 0x0020_0000,
+                    aslr_size: 0xFFE0_0000,
+                    ..Default::default()
+                },
+                None,
+                4,
+                WIDTH_REASON_PROCESS_32,
+            ),
             (metadata(low), None, 4, WIDTH_REASON_MAIN_BASE_32),
             (metadata(0x1_0000_0000), None, 8, WIDTH_REASON_MAIN_BASE_64),
             (metadata(0), None, 8, WIDTH_REASON_DEFAULT),
@@ -2039,20 +2424,33 @@ mod tests {
         for (md, maps, width, reason) in cases {
             let (got_width, got_reason) = pointer_width_with_reason(&md, maps);
             assert_eq!((got_width, got_reason), (width, reason));
-            assert_eq!(pointer_width_for(&md, maps), width,
-                       "the narrow wrapper must not disagree with the decision");
+            assert_eq!(
+                pointer_width_for(&md, maps),
+                width,
+                "the narrow wrapper must not disagree with the decision"
+            );
         }
         // The two mapping branches too, with a table each.
         let wide_maps = [mapping(0x7F_0000_0000, 0x1000, PERM_R)];
-        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&wide_maps)).1,
-                   WIDTH_REASON_MAPPINGS_64);
+        assert_eq!(
+            pointer_width_with_reason(&metadata(low), Some(&wide_maps)).1,
+            WIDTH_REASON_MAPPINGS_64
+        );
         let narrow_maps = [mapping(low, 0x80000, PERM_R)];
-        assert_eq!(pointer_width_with_reason(&metadata(low), Some(&narrow_maps)).1,
-                   WIDTH_REASON_MAPPINGS_32);
+        assert_eq!(
+            pointer_width_with_reason(&metadata(low), Some(&narrow_maps)).1,
+            WIDTH_REASON_MAPPINGS_32
+        );
         // No reason is empty or shared with a different width.
-        let all = [WIDTH_REASON_PROCESS_64, WIDTH_REASON_PROCESS_32, WIDTH_REASON_MAPPINGS_64,
-                   WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAIN_BASE_64,
-                   WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_DEFAULT];
+        let all = [
+            WIDTH_REASON_PROCESS_64,
+            WIDTH_REASON_PROCESS_32,
+            WIDTH_REASON_MAPPINGS_64,
+            WIDTH_REASON_MAPPINGS_32,
+            WIDTH_REASON_MAIN_BASE_64,
+            WIDTH_REASON_MAIN_BASE_32,
+            WIDTH_REASON_DEFAULT,
+        ];
         for (i, a) in all.iter().enumerate() {
             assert!(!a.is_empty());
             for b in all.iter().skip(i + 1) {
@@ -2083,55 +2481,119 @@ mod tests {
     /// counted its end.  See `without_mappings_an_unknown_base_is_64bit`.
     #[test]
     fn matches_the_console_pointer_width_rule() {
-        const A64: (u64, u64) = (0x0800_0000, 0x7FF8_0000_00);   // 512 GiB
-        const A32: (u64, u64) = (0x0020_0000, 0xFFE0_0000);      // ends exactly at 4 GiB
-        let low = [mapping(0x0070_0000, 0x80000, PERM_R),
-                   mapping(0x3600_0000, 0x10_0000, PERM_R)];
+        const A64: (u64, u64) = (0x0800_0000, 0x7FF8_0000_00); // 512 GiB
+        const A32: (u64, u64) = (0x0020_0000, 0xFFE0_0000); // ends exactly at 4 GiB
+        let low = [
+            mapping(0x0070_0000, 0x80000, PERM_R),
+            mapping(0x3600_0000, 0x10_0000, PERM_R),
+        ];
         let high = [mapping(0x7F_0000_0000, 0x1000, PERM_R)];
         let at_4gib = [mapping(0xFFFF_F000, 0x1000, PERM_R)];
         let wrapping = [mapping(u64::MAX - 0xFFF, 0x2000, PERM_R)];
         let empty_size = [mapping(0x7F_0000_0000, 0, PERM_R)];
 
         let with_aslr = |pair: (u64, u64), main_base: u64| Metadata {
-            main_base, aslr_base: pair.0, aslr_size: pair.1, ..Default::default()
+            main_base,
+            aslr_base: pair.0,
+            aslr_size: pair.1,
+            ..Default::default()
         };
 
         // (C harness output) -> (our width, our reason)
         let cases: [(Metadata, Option<&[Mapping]>, u32, &str); 13] = [
             // A64 pair + low maps: arch=2 width=8 "process is 64-bit" (max_end 0x36100000)
-            (with_aslr(A64, 0x0070_0000), Some(&low), 8, WIDTH_REASON_PROCESS_64),
+            (
+                with_aslr(A64, 0x0070_0000),
+                Some(&low),
+                8,
+                WIDTH_REASON_PROCESS_64,
+            ),
             // A64 pair + no regions: arch=2 width=8
-            (with_aslr(A64, 0x0070_0000), None, 8, WIDTH_REASON_PROCESS_64),
+            (
+                with_aslr(A64, 0x0070_0000),
+                None,
+                8,
+                WIDTH_REASON_PROCESS_64,
+            ),
             // A32 pair + low maps: arch=1 width=4 "process is AArch32"
-            (with_aslr(A32, 0x0780_4000), Some(&low), 4, WIDTH_REASON_PROCESS_32),
+            (
+                with_aslr(A32, 0x0780_4000),
+                Some(&low),
+                4,
+                WIDTH_REASON_PROCESS_32,
+            ),
             // A32 pair + high map: arch=1 width=4 (the process outranks the mapping)
-            (with_aslr(A32, 0x0070_0000), Some(&high), 4, WIDTH_REASON_PROCESS_32),
+            (
+                with_aslr(A32, 0x0070_0000),
+                Some(&high),
+                4,
+                WIDTH_REASON_PROCESS_32,
+            ),
             // straddling pair + low maps: arch=0 width=4 "mapping ends"
-            (with_aslr((0x8000_0000, 0x9000_0000), 0x0070_0000), Some(&low),
-             4, WIDTH_REASON_MAPPINGS_32),
+            (
+                with_aslr((0x8000_0000, 0x9000_0000), 0x0070_0000),
+                Some(&low),
+                4,
+                WIDTH_REASON_MAPPINGS_32,
+            ),
             // overflowing pair: arch=0 width=4
-            (with_aslr((0xFFFF_FFFF_FFFF_0000, 0x1000), 0), Some(&low),
-             4, WIDTH_REASON_MAPPINGS_32),
+            (
+                with_aslr((0xFFFF_FFFF_FFFF_0000, 0x1000), 0),
+                Some(&low),
+                4,
+                WIDTH_REASON_MAPPINGS_32,
+            ),
             // no answer + low maps: arch=0 width=4
-            (metadata(0x0070_0000), Some(&low), 4, WIDTH_REASON_MAPPINGS_32),
+            (
+                metadata(0x0070_0000),
+                Some(&low),
+                4,
+                WIDTH_REASON_MAPPINGS_32,
+            ),
             // no answer + high map: width=8
-            (metadata(0x0070_0000), Some(&high), 8, WIDTH_REASON_MAPPINGS_64),
+            (
+                metadata(0x0070_0000),
+                Some(&high),
+                8,
+                WIDTH_REASON_MAPPINGS_64,
+            ),
             // no answer + an end exactly at 4 GiB: width=4 (max_end 0x100000000)
-            (metadata(0x0070_0000), Some(&at_4gib), 4, WIDTH_REASON_MAPPINGS_32),
+            (
+                metadata(0x0070_0000),
+                Some(&at_4gib),
+                4,
+                WIDTH_REASON_MAPPINGS_32,
+            ),
             // no answer + wrapping region: width=8 (max_end 0xFFFFFFFFFFFFFFFF)
-            (metadata(0x0070_0000), Some(&wrapping), 8, WIDTH_REASON_MAPPINGS_64),
+            (
+                metadata(0x0070_0000),
+                Some(&wrapping),
+                8,
+                WIDTH_REASON_MAPPINGS_64,
+            ),
             // no answer + only zero-size regions: width=4 (they are skipped)
-            (metadata(0x0070_0000), Some(&empty_size), 4, WIDTH_REASON_MAIN_BASE_32),
+            (
+                metadata(0x0070_0000),
+                Some(&empty_size),
+                4,
+                WIDTH_REASON_MAIN_BASE_32,
+            ),
             // no answer + no regions, base 0: width=8 (the AArch64 default)
             (metadata(0), None, 8, WIDTH_REASON_DEFAULT),
             // no answer + no regions, base 4 GiB: width=8
             (metadata(0x1_0000_0000), None, 8, WIDTH_REASON_MAIN_BASE_64),
         ];
         for (metadata, mappings, width, reason) in cases {
-            assert_eq!(pointer_width_with_reason(&metadata, mappings), (width, reason),
-                       "diverged from core/nxus_ptrscan.c for aslr={:#x}+{:#x} main={:#x}: \
+            assert_eq!(
+                pointer_width_with_reason(&metadata, mappings),
+                (width, reason),
+                "diverged from core/nxus_ptrscan.c for aslr={:#x}+{:#x} main={:#x}: \
                         the console's host-run rule answers {}",
-                       metadata.aslr_base, metadata.aslr_size, metadata.main_base, width);
+                metadata.aslr_base,
+                metadata.aslr_size,
+                metadata.main_base,
+                width
+            );
         }
     }
 
@@ -2175,7 +2637,11 @@ mod tests {
                 reason
             );
         }
-        assert_eq!(error_reason_text(0), None, "0 means 'no detail', never sent");
+        assert_eq!(
+            error_reason_text(0),
+            None,
+            "0 means 'no detail', never sent"
+        );
     }
 
     #[test]
@@ -2206,7 +2672,9 @@ mod tests {
 
         // Reason 4 (scan in progress) is a real busy state, not a release window.
         let busy_scan = NxusError {
-            message: "command 0x0013 failed - busy: a scan or pause/resume is in progress (reason=4)".into(),
+            message:
+                "command 0x0013 failed - busy: a scan or pause/resume is in progress (reason=4)"
+                    .into(),
             result: Some(RESULT_BUSY),
         };
         assert!(!is_retry_later(&busy_scan));
@@ -2251,7 +2719,11 @@ mod tests {
     }
 
     fn stopped(low: u32, full: u64) -> DebugStatus {
-        DebugStatus { stopped_thread_low: low, stopped_thread: full, ..Default::default() }
+        DebugStatus {
+            stopped_thread_low: low,
+            stopped_thread: full,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2267,18 +2739,26 @@ mod tests {
     fn a_stale_event_is_never_handed_to_regs_get() {
         // The client did not drain events since an older hit on another thread.
         let status = stopped(0x2A3B, 0);
-        assert_eq!(select_stopped_thread(&status, Some(0x1_0000_1F00)),
-                   Some(0x2A3B), "the truncated half beats the wrong thread");
+        assert_eq!(
+            select_stopped_thread(&status, Some(0x1_0000_1F00)),
+            Some(0x2A3B),
+            "the truncated half beats the wrong thread"
+        );
         // A new-firmware status names the real thread even with a stale event.
         let status = stopped(0x2A3B, 0x1_0000_2A3B);
-        assert_eq!(select_stopped_thread(&status, Some(0x1_0000_1F00)),
-                   Some(0x1_0000_2A3B));
+        assert_eq!(
+            select_stopped_thread(&status, Some(0x1_0000_1F00)),
+            Some(0x1_0000_2A3B)
+        );
     }
 
     #[test]
     fn the_appended_status_field_works_without_any_event() {
         let full = 0x1_0000_2A3Bu64;
-        assert_eq!(select_stopped_thread(&stopped(full as u32, full), None), Some(full));
+        assert_eq!(
+            select_stopped_thread(&stopped(full as u32, full), None),
+            Some(full)
+        );
     }
 
     #[test]
@@ -2289,7 +2769,10 @@ mod tests {
     #[test]
     fn without_the_new_field_the_truncated_half_is_the_last_resort() {
         // Old console whose event was never polled: still the legacy behaviour.
-        assert_eq!(select_stopped_thread(&stopped(0x1001, 0), None), Some(0x1001));
+        assert_eq!(
+            select_stopped_thread(&stopped(0x1001, 0), None),
+            Some(0x1001)
+        );
     }
 
     #[test]
@@ -2309,6 +2792,10 @@ mod tests {
             Some("the console does not implement this command")
         );
         assert_eq!(result_text(0), None, "0 is never an error");
-        assert_eq!(result_text(0x1234_5678), None, "unknown module stays unlabelled");
+        assert_eq!(
+            result_text(0x1234_5678),
+            None,
+            "unknown module stays unlabelled"
+        );
     }
 }

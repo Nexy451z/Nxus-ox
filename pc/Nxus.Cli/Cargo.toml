@@ -3,10 +3,20 @@ name = "nxus"
 version = "0.1.0-alpha"
 edition = "2021"
 description = "Nxus - Nintendo Switch memory analysis (PC side)"
+default-run = "nxus"
 
 [[bin]]
 name = "nxus"
 path = "src/main.rs"
+
+# Standalone cheat loader.  It compiles the protocol/client/cheat engine in
+# directly, so it does not need nxus.exe next to it.  `test = false` keeps its
+# duplicated module tests out of `cargo test` (nxus owns the canonical suite).
+[[bin]]
+name = "NCL"
+path = "src/bin/ncl.rs"
+test = false
+bench = false
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }

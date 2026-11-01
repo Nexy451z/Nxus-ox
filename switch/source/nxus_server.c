@@ -1318,6 +1318,9 @@ static void fillStatus(NxusStatus *st) {
         st->heap_used = (u32)mi.uordblks;
         st->heap_total = (u32)mi.arena;
     }
+    /* Live held-button mask for opcode 8.  The HID worker publishes it even when
+       the pause hotkey is disabled; 0 while no worker/pad is available. */
+    st->keys_held = nxusHidHeldMask();
 
     u32 flags = 0;
     if (debug_attached) {
@@ -3268,6 +3271,25 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
             if (wh.size == 0 || length < sizeof(NxusWriteHeader) + wh.size) {
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                                  NXUS_REASON_BAD_LENGTH);
+                break;
+            }
+            /* Every write has to name a range inside ONE live mapping.  A normal
+               write requires that mapping to be writable (RW .data/heap).  A PC
+               cheat patch that sets ALLOW_RX may instead target a readable and
+               writable OR executable mapping, which is what lets it patch
+               Read-Execute (.text) code; the flag is opt-in so an older client's
+               zero reserved field keeps the strict policy. */
+            const bool rx_patch = (wh.reserved & NXUS_WRITE_FLAG_ALLOW_RX) != 0;
+            const bool range_ok = rx_patch
+                ? nxusSessionCheckCodePatchRange(wh.address, wh.size)
+                : nxusSessionCheckRange(wh.address, wh.size, true);
+            if (!range_ok) {
+                NXUS_LOG("write: refused %s range %016llX+%08X (not a single %s mapping)",
+                         rx_patch ? "RX-patch" : "writable",
+                         (unsigned long long)wh.address, (unsigned)wh.size,
+                         rx_patch ? "readable RX/RW" : "readable RW");
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
                 break;
             }
             /* While attached to the process dmnt:cht is closed, so the write

@@ -1118,6 +1118,88 @@ static void testResultClassification(void) {
 }
 
 /* ====================================================================== */
+/* (e) status tail layout + code-patch write policy                       */
+/* ====================================================================== */
+
+/* Mirrors nxus_session.c:sessionRangePermits().  A normal write requires R+W;
+   NXUS_WRITE_FLAG_ALLOW_RX accepts R + (W or X), which is how a PC cheat
+   patches RX .text without giving every write RX permission.  The range must
+   also fit inside ONE mapping: a straddling patch would be applied with one
+   region's attributes. */
+typedef struct {
+    u64 base;
+    u64 size;
+    u32 perm;
+} TestMapping;
+
+static bool testRangePermits(const TestMapping *m, u64 address, u64 size, bool allow_rx) {
+    if (m == NULL || size == 0) return false;
+    if (address > UINT64_MAX - size) return false;
+    if (m->size == 0 || m->base > address) return false;
+    const u64 offset = address - m->base;
+    if (offset >= m->size) return false;
+    if (size > m->size - offset) return false;
+
+    const u32 perm = m->perm & (NXUS_PERM_R | NXUS_PERM_W | NXUS_PERM_X);
+    if ((perm & NXUS_PERM_R) == 0) return false;
+    if (allow_rx) return (perm & (NXUS_PERM_W | NXUS_PERM_X)) != 0;
+    return (perm & NXUS_PERM_W) != 0;
+}
+
+static void testStatusLayoutAndCodePatchPolicy(void) {
+    printf("[test] NxusStatus tail, write flags, RX/RW code-patch gate\n");
+
+    /* Chapter 7 rule: fields are appended, so the old 76-byte prefix keeps its
+       layout and only the total grows to 84. */
+    CHECK(sizeof(NxusStatus) == 84u, "NxusStatus must be 84 bytes (got %u)",
+          (unsigned)sizeof(NxusStatus));
+    CHECK(offsetof(NxusStatus, keys_held) == 76u,
+          "keys_held must start at the old status end (got %u)",
+          (unsigned)offsetof(NxusStatus, keys_held));
+    CHECK(NXUS_STATUS_MIN_SIZE == 76u, "the legacy status prefix stays 76 bytes");
+    CHECK(offsetof(NxusStatus, max_read) + sizeof(u32) == NXUS_STATUS_MIN_SIZE,
+          "the 76-byte prefix must end after max_read");
+
+    NxusStatus st;
+    memset(&st, 0, sizeof(st));
+    st.max_read = 0xAABBCCDDu;
+    st.keys_held = 0x0123456789ABCDEFull;
+    CHECK(st.max_read == 0xAABBCCDDu, "max_read sits before the appended tail");
+    u64 raw_keys = 0;
+    memcpy(&raw_keys, ((const u8 *)&st) + 76u, sizeof(raw_keys));
+    CHECK(raw_keys == 0x0123456789ABCDEFull,
+          "keys_held is the u64 at byte 76 (read 0x%016llX)",
+          (unsigned long long)raw_keys);
+
+    CHECK(sizeof(NxusWriteHeader) == 16u, "NxusWriteHeader stays 16 bytes");
+    CHECK(NXUS_WRITE_FLAG_ALLOW_RX == 0x01u,
+          "NXUS_WRITE_FLAG_ALLOW_RX must be bit 0 (got 0x%X)",
+          (unsigned)NXUS_WRITE_FLAG_ALLOW_RX);
+
+    TestMapping rx = {0x7100000000ull, 0x4000ull, NXUS_PERM_R | NXUS_PERM_X};
+    TestMapping ro = {0x7200000000ull, 0x2000ull, NXUS_PERM_R};
+    TestMapping rw = {0x7300000000ull, 0x3000ull, NXUS_PERM_R | NXUS_PERM_W};
+
+    CHECK(testRangePermits(&rx, rx.base, rx.size, true),
+          "an RX .text range passes the ALLOW_RX check");
+    CHECK(!testRangePermits(&rx, rx.base, rx.size, false),
+          "the same RX .text range fails a normal writable check");
+    CHECK(testRangePermits(&rw, rw.base + 0x40, 0x10, true),
+          "RW .data passes the ALLOW_RX check");
+    CHECK(testRangePermits(&rw, rw.base, rw.size, false),
+          "RW .data passes the normal writable check");
+    CHECK(!testRangePermits(&ro, ro.base, ro.size, true),
+          "RO .rodata is never patchable");
+    CHECK(!testRangePermits(&rx, rx.base + rx.size - 0x10, 0x20, true),
+          "a patch crossing the mapping end is refused");
+    CHECK(!testRangePermits(&rx, rx.base, 0, true), "a zero-length patch is refused");
+    CHECK(!testRangePermits(&rx, UINT64_MAX, 2, true),
+          "an address+size overflow is refused");
+    CHECK(!testRangePermits(NULL, 0x1000u, 1u, true),
+          "an unmapped range is refused (no containing mapping)");
+}
+
+/* ====================================================================== */
 
 int main(void) {
     printf("=== Nxus server/session algorithm tests ===\n");
@@ -1141,6 +1223,7 @@ int main(void) {
     testWatchdogOtherStates();
 
     testResultClassification();
+    testStatusLayoutAndCodePatchPolicy();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
