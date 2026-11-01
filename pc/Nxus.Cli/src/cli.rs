@@ -1445,6 +1445,15 @@ fn run_watch(client: &NxusClient, opts: &Opts, address: u64, default_kind: u32) 
         println!("breakpoint slot {:#x}: {} size {} at {:08X}", b.slot, break_kind_name(b.kind), b.size, b.address);
     }
 
+    // A pre-reboot sysmodule drains the kernel's initial DebuggerAttached event
+    // in nxusDebugAttach() without calling svcContinueDebugEvent, so the target
+    // can still be parked here even though the attach reported success: resume it
+    // now (the watchpoint is armed, so it is live again) instead of waiting out
+    // the whole --seconds window for a hit that cannot happen.  Ignored when the
+    // target is already running: there is nothing to continue, and an error there
+    // must not abort a watch that is otherwise fine.
+    let _ = session.client.debug_continue();
+
     println!("waiting for {} hit(s) on {:08X} ...", want, address);
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut seen = 0usize;

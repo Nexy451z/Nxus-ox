@@ -182,6 +182,9 @@ static atomic_uint   g_TeardownDepth;   /* re-entry depth of g_TeardownOwner    
 #define NXUS_DEBUG_CLAIM_WAIT_MS NXUS_DEBUG_OP_DRAIN_TOTAL_MS
 
 static Result debugDetachExclusive(bool wait_for_claim);
+/* Defined below the event loop; nxusDebugAttach() needs it to acknowledge the
+   kernel's initial DebuggerAttached exception (see the call after the attach drain). */
+static Result continueAllOnce(void);
 
 static bool debugTeardownClaim(void) {
     const unsigned long long me = (unsigned long long)CUR_THREAD_HANDLE;
@@ -1521,6 +1524,27 @@ Result nxusDebugAttach(u64 pid) {
        that used to report a 64-bit title as AArch32.  The event thread drains
        whatever is left (and re-drains if the event had not landed yet). */
     drainDebugEvents(NULL);
+
+    /* The kernel stops EVERY thread when the process is taken over and queues a
+       DebugException_DebuggerAttached (type 4) exception for it; that event was
+       just consumed by the drain above.  svcContinueDebugEvent() is what releases
+       the stop, and NOTHING else here does it: the event thread only resumes when
+       it drained at least one NEW event (eventThread(), "processed == 0" branch),
+       and nxusDebugSetAutoContinue() only resumes a PUBLISHED stop - the attach
+       exception publishes none (handleDebugEvent() just counts it).  Draining the
+       event without acknowledging it therefore left the title debug-suspended from
+       attach until detach: no thread ever ran, so no watchpoint could fire, and the
+       queue stayed empty so the event loop never reached its Continue call. */
+    {
+        const Result crc = continueAllOnce();
+        if (R_FAILED(crc)) {
+            /* Level 0: an attach that reports success while the title is frozen is
+               exactly the failure this resume exists to prevent. */
+            NXUS_LOG_ERROR("debug attach: could not resume the initial "
+                           "DebuggerAttached stop rc=0x%08X - target left stopped",
+                           (unsigned)crc);
+        }
+    }
 
     /* Verify that the session really landed on the requested process.
      *

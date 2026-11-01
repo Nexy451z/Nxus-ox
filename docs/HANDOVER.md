@@ -1,15 +1,15 @@
 # Nxus-ox 引き継ぎ書（エージェント向け / 完全版）
 
 最終更新: 2026-11-02
-対象: `C:\anyWorkspace\nx\Nxus` / branch `main` / HEAD `main` の最新コミット（`git rev-parse --short HEAD` で確認） / tag `v0.1.0-alpha`
+対象: `C:\anyWorkspace\nx\Nxus` / branch `main` / HEAD `main` の最新コミット（`git rev-parse --short HEAD` で確認） / tag `v0.1.1-alpha`
 読み手: このプロジェクトを引き継いで「レビュー → 修正 → レビュー」を回すエージェント
 
 ---
 
 ## 0. 30 秒サマリ
 
-- **Nxus-ox** = Nintendo Switch（Atmosphère CFW）向けの**常駐 sysmodule** ＋ Windows 用**統合 PC クライアント**（`nxus.exe` 1 本で GUI と CLI の両方）。
-- 機能: リモートメモリスキャン（初回・絞り込み・型変換）、ポインタスキャン、ハードウェアウォッチポイント/ブレークポイント、レジスタ表示/変更、逆アセンブル、コードパッチ、アドレス凍結、スナップショット差分、チートコード生成、RAM ダンプ（Jnoexs NDMP / EdiZon-SE EDZN）相互変換。
+- **Nxus-ox** = Nintendo Switch（Atmosphère CFW）向けの**常駐 sysmodule** ＋ Windows 用**統合 PC クライアント**（`nxus.exe` 1 本で GUI と CLI の両方）＋ 単体チートランチャー **`NCL.exe`**。
+- 機能: リモートメモリスキャン（初回・絞り込み・型変換）、ポインタスキャン、ハードウェアウォッチポイント/ブレークポイント、レジスタ表示/変更、逆アセンブル、コードパッチ、アドレス凍結、スナップショット差分、PC 側 Atmosphere チート VM（Patch/Loop 管理・バックアップ自動復元）、チートコード生成、RAM ダンプ（Jnoexs NDMP / EdiZon-SE EDZN）相互変換。
 - リポジトリ: `C:\anyWorkspace\nx\Nxus`（remote: `https://github.com/Nexy451z/Nxus-ox.git`）
 - 実機: **`192.168.1.13`**（FTP `:5000` 匿名 / NxusTCP `7332`）
 - **最重要の運用制約: sysmodule は起動時にしかロードされない。`exefs.nsp` を入れ替えたら必ず本体を再起動。** レポートでは毎回「要再起動」と明記する。
@@ -24,7 +24,7 @@
 | 目的 | PC から Wi-Fi 経由で Switch のゲームメモリを解析・デバッグする。数 GB の RAM ダンプ転送を不要にする「オンデバイススキャン」が売り |
 | 対象 | Atmosphère 上の任意タイトル（32bit/AArch32・64bit/AArch64 両対応） |
 | sysmodule タイトルID | `0x4200000000004E58` = nxus（本体）, `0x4200000000004E59` = probe（診断用・既定では boot2.flag なし） |
-| 配布 | GitHub Release `v0.1.0-alpha`（atmosphere zip / probe zip / windows-x64 zip / nxus.exe 単体） |
+| 配布 | GitHub Release `v0.1.1-alpha`（atmosphere zip / probe zip / windows-x64 zip / nxus.exe / NCL.exe） |
 | ライセンス/免責 | 無保証。Alpha |
 | 主な実機検証タイトル | MHXX（`0100C3800049C000`、AArch32、固定レイアウト気味） |
 
@@ -39,14 +39,14 @@
 
 ```
 HEAD        main の最新コミット（ハッシュは `git rev-parse --short HEAD`）
-tag         v0.1.0-alpha (force-updated each release)
+tag         v0.1.1-alpha (force-updated each release)
 branch      main (origin/main と同期・作業ツリー clean)
-dist        dist/atmosphere/contents/4200000000004E58/exefs.nsp  194,567 B
+dist        dist/atmosphere/contents/4200000000004E58/exefs.nsp  194,519 B
             dist/atmosphere/contents/4200000000004E59/exefs.nsp  110,206 B
             dist/pc/nxus.exe  11,263,488 B
-            dist/pc/NCL.exe    9,931,776 B
+            dist/pc/NCL.exe    9,932,288 B
 metadata    source_rev = HEAD, dirty = false （dist を HEAD で再ビルド済み）
-実機 SD     4E58 = 194,567 B（このビルドの値。転送は 6 章の手順で行い、読み戻しの sha256 一致を確認する）
+実機 SD     4E58 = 194,519 B（このビルドの値。転送は 6 章の手順で行い、読み戻しの sha256 一致を確認する）
 ```
 
 ### テスト数（README と一致していること）
@@ -340,8 +340,8 @@ frozen / snapshot も incarnation 付きで所有権スタンプを持つ。
    python release_packages\_make_packages.py       # パッケージ整合
    git add -A && git commit && git push
    # commit 後に dist を再ビルド（source_rev を HEAD に一致させる）
-   git tag -f -a v0.1.0-alpha -m "Nxus-ox Alpha v0.1.0" && git push -f origin v0.1.0-alpha
-   gh release upload v0.1.0-alpha <zips + dist/pc/nxus.exe> --clobber
+   git tag -f -a v0.1.1-alpha -m "Nxus-ox Alpha v0.1.1" && git push -f origin v0.1.1-alpha
+   gh release upload v0.1.1-alpha <zips + dist/pc/nxus.exe + dist/pc/NCL.exe> --clobber
    FTP で実機へ転送（コンソールが起動していれば）
    ```
 7. 報告は**簡潔に**: 直したもの（重大度順）→ 検証数値の表 → 次ラウンド候補 → **要再起動**。
@@ -359,23 +359,24 @@ frozen / snapshot も incarnation 付きで所有権スタンプを持つ。
 ```powershell
 cd C:\anyWorkspace\nx\Nxus
 python release_packages\_make_packages.py        # README/metadata 検証 + zip 生成 + boot2 整合
-git tag -f -a v0.1.0-alpha -m "Nxus-ox Alpha v0.1.0"
-git push -f origin v0.1.0-alpha
-gh release upload v0.1.0-alpha `
-  "release_packages/Nxus-ox-v0.1.0-alpha-atmosphere.zip" `
-  "release_packages/Nxus-ox-v0.1.0-alpha-probe-atmosphere.zip" `
-  "release_packages/Nxus-ox-v0.1.0-alpha-windows-x64.zip" `
-  "dist/pc/nxus.exe" --clobber
+git tag -f -a v0.1.1-alpha -m "Nxus-ox Alpha v0.1.1"
+git push -f origin v0.1.1-alpha
+gh release upload v0.1.1-alpha `
+  "release_packages/Nxus-ox-v0.1.1-alpha-atmosphere.zip" `
+  "release_packages/Nxus-ox-v0.1.1-alpha-probe-atmosphere.zip" `
+  "release_packages/Nxus-ox-v0.1.1-alpha-windows-x64.zip" `
+  "dist/pc/nxus.exe" `
+  "dist/pc/NCL.exe" --clobber
 ```
 
 - **順序が重要**: 「commit → それから dist を再ビルド（`tools/build.sh` + `tools/build_pc.sh`）→ package → upload」。
   commit 前にビルドすると `metadata.json.source_rev` が 1 つ前のコミットになり、`dirty: true` になる。
-- 最終成果物の実測サイズ: `4E58/exefs.nsp` **194,567 B**、`4E59/exefs.nsp` **110,206 B**、
-  `nxus.exe` **11,263,488 B**、`NCL.exe` **9,931,776 B**。
+- 最終成果物の実測サイズ: `4E58/exefs.nsp` **194,519 B**、`4E59/exefs.nsp` **110,206 B**、
+  `nxus.exe` **11,263,488 B**、`NCL.exe` **9,932,288 B**。
 - Windows zip には `nxus.exe` / `NCL.exe` / `cheats/README.txt` / `nxus-gui.bat` / `README.md` が入る
   （`_make_packages.py` は NCL と cheats README が存在するときだけ追加する）。
 - `dist/` と `release_packages/*.zip` は gitignored。`switch/pack/`・`probe/pack/` も gitignored（ビルド生成物が追跡されていた時期があり、そのせいで毎回 dirty になっていた）。
-- リリースノート: `release_packages/release-notes-v0.1.0-alpha.md`。
+- リリースノート: `release_packages/release-notes-v0.1.1-alpha.md`。
 
 ---
 
@@ -411,6 +412,7 @@ gh release upload v0.1.0-alpha `
 - dmnt の out-count をクランプしないと壊れる。
 
 ### debug
+- `svcDebugActiveProcess` アタッチ直後はカーネルが `DebugException_DebuggerAttached` (type 4) で全スレッドを停止させるため、`nxusDebugAttach` で `drainDebugEvents(NULL)` の直後に必ず `continueAllOnce()` (`svcContinueDebugEvent`) を呼んで再開させること（呼ばないと Watchpoint/Breakpoint をセットした瞬間にゲームがフリーズする）。
 - `svcContinueDebugEvent` はイベントが溜まっていると `0xF401` を返す（正常系）。drain を忘れると detach が固まる。
 - `g_Debug` を閉じる際は**先に INVALID_HANDLE を公開**してから close（走査スレッドの UAF 回避）。
 - `SetRegs` は**アーキ判断を ctx 書き換え前**に行う（32/64 混在で SP/LR/FP が壊れる）。

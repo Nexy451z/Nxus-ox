@@ -953,6 +953,15 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Ev>, cancel: std::sync::Arc<std::sync::a
                         Cmd::Attach => {
                             let st = c.debug_attach().map_err(|e| e.to_string())?;
                             let _ = tx.send(Ev::Message(format!("debug attached (watch style {})", st.watch_style)));
+                            // A pre-reboot sysmodule drains the kernel's initial
+                            // DebuggerAttached event without svcContinueDebugEvent,
+                            // so the target can still be suspended although the
+                            // attach reported success.  Resume it right away; an
+                            // already-running target (new sysmodule) just answers
+                            // "nothing to continue", and that error is harmless.
+                            // Not done after BreakSet instead: arming while the
+                            // target is held at a hit must not release that hold.
+                            let _ = c.debug_continue();
                             // A fresh session owns whatever the previous one left
                             // parked: re-read the status so the stop badge comes
                             // from the console again, and tell the UI to drop the
