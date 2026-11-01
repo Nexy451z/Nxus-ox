@@ -116,21 +116,95 @@ u32 nxusDmntTargetIncarnation(void) {
    the counter AFTER the bump, which is what the log line (and the tests) expect. */
 static atomic_bool g_AdoptNextOpen;
 
+/* What the next open must look like for the adoption to be legitimate.  A pid is
+   reused and a title can restart with the SAME layout, so an unverified adoption
+   silently defeats the whole incarnation check: the old hit list keeps its old
+   stamp, yet every address resolves against the new process.  The latch is
+   therefore only honoured when the process dmnt actually opened has both the pid
+   and the program_id of the target the debugger just left. */
+static atomic_ullong g_AdoptPid;
+static atomic_ullong g_AdoptProgramId;
+
+/* Metadata of the most recent process dmnt described.  nxusDmntAdoptNextOpen()
+   keeps its original no-argument signature (existing callers and the host-test
+   stubs define exactly that symbol), so it snapshots this pair at call time
+   instead of taking the expected target as arguments.  The server reads metadata
+   BEFORE nxusDebugAttach() because svcDebugActiveProcess closes dmnt's cheat
+   process; that successful read is therefore the detached target's pid/title.
+   Zero means "unknown", which makes the adoption below refuse and bump. */
+static atomic_ullong g_LastPid;
+static atomic_ullong g_LastProgramId;
+
+static void dmntRememberMetadata(const NxusProcessMetadata *meta) {
+    if (meta == NULL) return;
+    atomic_store_explicit(&g_LastPid, meta->process_id, memory_order_release);
+    atomic_store_explicit(&g_LastProgramId, meta->program_id, memory_order_release);
+}
+
 /* The kernel debugger takes dmnt's process away and reopens the same one on detach.
    That reopen is not a new title instance, so callers in that path ask the next
-   successful ForceOpen to keep the current incarnation. */
+   successful ForceOpen to keep the current incarnation.
+
+   The request is only a HINT: dmntTargetOpened() compares the pid + program_id of
+   the process it really opened with the snapshot recorded here and falls back to a
+   normal incarnation bump on any mismatch (or when no metadata was available). */
 void nxusDmntAdoptNextOpen(void) {
+    const u64 pid = atomic_load_explicit(&g_LastPid, memory_order_acquire);
+    const u64 program_id = atomic_load_explicit(&g_LastProgramId, memory_order_acquire);
+    atomic_store_explicit(&g_AdoptPid, pid, memory_order_relaxed);
+    atomic_store_explicit(&g_AdoptProgramId, program_id, memory_order_relaxed);
+    /* The expected pair is stored BEFORE the release-store that publishes the
+       latch, so a ForceOpen that consumes the latch also observes the pair. */
     atomic_store_explicit(&g_AdoptNextOpen, true, memory_order_release);
 }
 
-static u32 dmntTargetOpened(void) {
-    if (atomic_exchange_explicit(&g_AdoptNextOpen, false, memory_order_acq_rel))
-        return (u32)atomic_load_explicit(&g_TargetIncarnation, memory_order_acquire);
+/* Consume the one-shot adopt latch and decide whether this open is the same target.
+   `opened` is the metadata of the process ForceOpen just created, or NULL when it
+   could not be read.  Keeping the incarnation requires a complete, matching
+   pid + program_id pair; everything else is a new target and increments normally. */
+static u32 dmntTargetOpened(const NxusProcessMetadata *opened) {
+    const bool adopt = atomic_exchange_explicit(&g_AdoptNextOpen, false,
+                                                memory_order_acq_rel);
+    if (adopt) {
+        const u64 want_pid = atomic_load_explicit(&g_AdoptPid, memory_order_acquire);
+        const u64 want_title = atomic_load_explicit(&g_AdoptProgramId, memory_order_acquire);
+        const u64 got_pid = (opened != NULL) ? opened->process_id : 0;
+        const u64 got_title = (opened != NULL) ? opened->program_id : 0;
+
+        if (opened != NULL && want_pid != 0 && want_title != 0 &&
+            got_pid == want_pid && got_title == want_title) {
+            const u32 now = (u32)atomic_load_explicit(&g_TargetIncarnation,
+                                                      memory_order_acquire);
+            NXUS_LOG("dmnt: debugger reopened the same target (pid=%llu, title=%016llX) "
+                     "- keeping incarnation %u",
+                     (unsigned long long)got_pid, (unsigned long long)got_title,
+                     (unsigned)now);
+            return now;
+        }
+
+        NXUS_LOG("dmnt: adopt refused (opened pid=%llu title=%016llX, expected pid=%llu "
+                 "title=%016llX) - treating it as a new target",
+                 (unsigned long long)got_pid, (unsigned long long)got_title,
+                 (unsigned long long)want_pid, (unsigned long long)want_title);
+    }
 
     const u32 now = (u32)atomic_fetch_add_explicit(&g_TargetIncarnation, 1u,
                                                    memory_order_release) + 1u;
     NXUS_LOG("dmnt: target incarnation %u", (unsigned)now);
     return now;
+}
+
+/* A ForceOpen that failed while an adopt request was pending must not leave the
+   latch armed for some later, unrelated open.  The old target is no longer provably
+   the one dmnt will hold, so invalidate its stamp now: a needless bump only loses a
+   hit list, while a missed one serves the previous process's addresses. */
+static void dmntAbandonAdopt(void) {
+    if (!atomic_exchange_explicit(&g_AdoptNextOpen, false, memory_order_acq_rel)) return;
+
+    const u32 now = (u32)atomic_fetch_add_explicit(&g_TargetIncarnation, 1u,
+                                                   memory_order_release) + 1u;
+    NXUS_LOG("dmnt: ForceOpen failed with an adopt pending - target incarnation %u",
+             (unsigned)now);
 }
 
 /* ---- automatic cheat-process recovery ---------------------------------- */
@@ -288,11 +362,18 @@ Result nxusDmntGetCheatProcessEvent(Handle *out_handle) {
     return rc;
 }
 
+static Result opGetMetadataLocked(NxusProcessMetadata *out) {
+    return serviceDispatchOut(&g_DmntSrv, 65002, *out);
+}
+
 static Result opGetMetadata(void *ctx) {
     NxusProcessMetadata *out = (NxusProcessMetadata *)ctx;
     dmntLock();
-    Result rc = serviceDispatchOut(&g_DmntSrv, 65002, *out);
+    Result rc = opGetMetadataLocked(out);
     dmntUnlock();
+    /* Remember the last process dmnt described: nxusDmntAdoptNextOpen() has no
+       arguments and snapshots this pair to verify the reopen after a debug detach. */
+    if (R_SUCCEEDED(rc)) dmntRememberMetadata(out);
     return rc;
 }
 
@@ -350,19 +431,43 @@ Result nxusDmntPeekMetadata(NxusProcessMetadata *out) {
  * loses a stored hit list, while a missed one lets the previous process's addresses
  * be served against the new one. */
 Result nxusDmntForceOpen(void) {
-    if (!g_DmntActive) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    if (!g_DmntActive) {
+        /* No dmnt session can honour an adopt request: abandon it now so a later
+           open after nxusDmntInitialize() cannot inherit the old incarnation. */
+        dmntAbandonAdopt();
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    }
     dmntLock();
     bool already_open = false;
     const Result probe_rc = serviceDispatchOut(&g_DmntSrv, 65000, already_open);
     Result rc = serviceDispatch(&g_DmntSrv, 65003);
+
+    /* Read the metadata of the process that was just created inside the same
+       critical section as the open.  The adoption decision needs the pid/title of
+       the process dmnt now holds, not of whatever it described earlier; if the
+       query fails the decision falls back to "new target" (bump), which is safe. */
+    NxusProcessMetadata opened;
+    bool have_opened = false;
+    if (R_SUCCEEDED(rc) && (R_FAILED(probe_rc) || !already_open)) {
+        memset(&opened, 0, sizeof(opened));
+        if (R_SUCCEEDED(opGetMetadataLocked(&opened))) {
+            have_opened = true;
+            dmntRememberMetadata(&opened);
+        }
+    }
     dmntUnlock();
 
     if (R_SUCCEEDED(rc) && (R_FAILED(probe_rc) || !already_open)) {
-        (void)dmntTargetOpened();
+        (void)dmntTargetOpened(have_opened ? &opened : NULL);
+    } else if (R_FAILED(rc)) {
+        /* The "this reopen is the same process" hint applies to ONE attempt only,
+           and a failed attempt proves nothing about the next open.  Drop the latch
+           and invalidate the old target instead of letting a later, unrelated open
+           inherit its incarnation. */
+        dmntAbandonAdopt();
     } else {
-        /* The "this reopen is the same process" hint applies to ONE attempt only.
-           Leaving it latched made the next genuinely different open inherit the old
-           incarnation, which silently disabled every staleness check. */
+        /* Successful but a no-op for dmnt (already holding the process): there is
+           no new target to stamp, so only consume the one-shot hint. */
         atomic_store_explicit(&g_AdoptNextOpen, false, memory_order_release);
     }
     return rc;

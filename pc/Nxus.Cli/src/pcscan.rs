@@ -346,9 +346,27 @@ pub fn regions_for_scope(client: &NxusClient, scope: Scope, begin: u64, end: u64
 fn load_value(bytes: &[u8], size: u32) -> u64 {
     let mut value = 0u64;
     for i in 0..size.min(8) as usize {
-        value |= (bytes[i] as u64) << (8 * i);
+        // A short read is a real possibility here (dmnt may answer with fewer
+        // bytes than requested, and a hit can sit at the end of a mapping).
+        // Missing bytes decode as zero instead of panicking on `bytes[i]`;
+        // callers that must distinguish a short reply use `checked_value`.
+        value |= (bytes.get(i).copied().unwrap_or(0) as u64) << (8 * i);
     }
     value
+}
+
+/// Decode a value from a read reply, or `None` when the reply is shorter than
+/// the requested width.
+///
+/// This is the short-read guard for the sparse refine paths: a truncated reply
+/// is counted as a failed read and the candidate is kept for a retry, never
+/// sliced/indexed out of bounds.
+fn checked_value(bytes: &[u8], size: u32) -> Option<u64> {
+    if bytes.len() < size as usize {
+        None
+    } else {
+        Some(load_value(bytes, size))
+    }
 }
 
 fn bits_to_f64(bits: u64, size: u32) -> f64 {
@@ -1069,10 +1087,22 @@ pub fn refine(client: &NxusClient, scan: &mut PcScan, compare: Compare, target: 
                 let address = scan.hits[j].address;
                 match client.read(address, size) {
                     Ok(data) => {
-                        let cur = load_value(&data, size);
-                        if compare_value(cur, scan.hits[j].value, size, compare, target, target2, flags) {
-                            scan.hits[keep] = PcHit { address, value: cur };
-                            keep += 1;
+                        match checked_value(&data, size) {
+                            Some(cur) => {
+                                if compare_value(cur, scan.hits[j].value, size, compare,
+                                                 target, target2, flags) {
+                                    scan.hits[keep] = PcHit { address, value: cur };
+                                    keep += 1;
+                                }
+                            }
+                            None => {
+                                // Short reply: keep the candidate for the next
+                                // pass instead of treating the missing bytes as
+                                // "no longer matches" (or panicking on them).
+                                scan.hits[keep] = scan.hits[j];
+                                scan.failed_reads += 1;
+                                keep += 1;
+                            }
                         }
                     }
                     Err(_) => {
@@ -1146,6 +1176,20 @@ mod tests {
 
     fn f64_bits(v: f64) -> u64 {
         v.to_bits()
+    }
+
+    /// `NxusClient::read` may return fewer bytes than requested.  The old
+    /// `load_value` indexed `bytes[i]` for the full width and panicked; the
+    /// refine path must instead treat the reply as a failed read and keep the
+    /// candidate for a retry.
+    #[test]
+    fn a_short_read_is_rejected_without_panicking() {
+        assert_eq!(checked_value(&[0x34, 0x12], 4), None);
+        assert_eq!(checked_value(&[], 8), None);
+        assert_eq!(checked_value(&[0xAB], 1), Some(0xAB));
+        // Missing bytes decode as zero if the caller does not check first.
+        assert_eq!(load_value(&[0x34, 0x12], 4), 0x1234);
+        assert_eq!(load_value(&[], 8), 0);
     }
 
     #[test]

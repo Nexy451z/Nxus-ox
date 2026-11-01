@@ -330,6 +330,14 @@ type Response = Option<(u16, u16, Vec<u8>)>;
 /// Conservative default until the server tells us its real limit.
 pub const DEFAULT_MAX_READ: u32 = 64 * 1024;
 
+/// Maximum number of hits the console admits to one `ScanGetHits` window.
+///
+/// Mirrors `NXUS_MAX_HITS_PER_BATCH` in `switch/include/nxus_server.h` (8192).
+/// Asking for more is clamped by the server, but clamping locally keeps the
+/// client's notion of the requested window identical to the server's - the page
+/// walk advances the server index by exactly that many slots.
+pub const NXUS_MAX_HITS_PER_BATCH: u32 = 8192;
+
 /// Largest payload this client will accept from the console.
 ///
 /// `shared/nxus_net.h` caps a single reply at `NXUS_NET_BUF_SIZE` (1 MiB); this
@@ -1118,10 +1126,18 @@ impl NxusClient {
     /// Upper bound on the pre-allocation [`NxusClient::scan_all_hits`] derives from
     /// the total the console reports in its first reply.
     ///
-    /// 8 M entries is the console's own `max_hits` ceiling and the PC scanner's
-    /// `DEFAULT_MAX_HITS`, so a corrupt or hostile `total` can never turn into an
-    /// arbitrarily large `Vec::with_capacity`.
+    /// Even this is only a cap on what a corrupt or hostile `total` may make the
+    /// client reserve up front; the vector still grows normally if the console
+    /// really has more hits.
     pub const MAX_ALL_HITS: usize = crate::pcscan::DEFAULT_MAX_HITS;
+
+    /// Sane upper bound on the *initial* allocation of [`NxusClient::scan_all_hits`].
+    ///
+    /// The total in the first reply is untrusted.  The console's own hit list is
+    /// far below this (around 150 k in normal builds), so 1 Mi entries is already
+    /// generous; reserving `MAX_ALL_HITS` (8 M, ~192 MB) up front from a corrupt
+    /// `total` is not.
+    pub const MAX_ALL_HITS_PREALLOC: usize = 1_048_576;
 
     /// True when the last `scan_all_hits()` reply reported a full hit list on the
     /// console, i.e. the returned set may be missing matches.
@@ -1148,69 +1164,12 @@ impl NxusClient {
         self.dropped.store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// How many consecutive *empty* dropped batches end the walk.
-    ///
-    /// An empty batch with `NXUS_HITBATCH_DROPPED` set is NOT the end of the hit
-    /// list: every record in that page came from a mapping that no longer exists,
-    /// and later pages still hold valid hits.  The page request is positioned by
-    /// the number of hits collected so far, though, which does not advance when a
-    /// whole page is dropped - so the console would answer the same empty page for
-    /// ever.  Three attempts is enough to distinguish "this page is all dropped"
-    /// from "the console keeps repeating itself" without hanging the GUI.
-    pub const MAX_EMPTY_DROPPED_PAGES: u32 = 3;
-
     pub fn scan_all_hits(&self, page: u32) -> Result<Vec<Hit>> {
-        // Collected hits are only ever appended, so every growth step used to
-        // copy everything gathered so far (thousands of pages -> ~15 reallocs and
-        // tens of millions of copied `Hit`s for a big scan).  The first reply
-        // already carries the final count, so size the vector once from it.
-        let mut all: Vec<Hit> = Vec::new();
-        let mut sized = false;
-        let mut truncated = false;
-        let mut dropped = false;
-        let mut empty_dropped_pages = 0u32;
-        loop {
-            let batch = self.scan_hits(all.len() as u32, page)?;
-            if !sized {
-                sized = true;
-                let want = (batch.total as usize).min(Self::MAX_ALL_HITS);
-                if want > all.capacity() {
-                    all.reserve_exact(want - all.capacity());
-                }
-            }
-            // The console flags "my hit list filled up" on the batch, so a cut-off
-            // result is not mistaken for the complete set.  The dropped flag is
-            // tracked separately: it says a page lost records, not that the list
-            // was capped.
-            truncated |= batch.truncated;
-            dropped |= batch.dropped;
-            if batch.hits.is_empty() {
-                if !batch.dropped {
-                    self.set_last_scan_truncated(truncated);
-                    self.set_last_scan_dropped(dropped);
-                    return Ok(all);
-                }
-                // An empty page that is empty BECAUSE the console dropped its
-                // records: earlier pages and later pages may still hold hits, so
-                // this is not "done".  The offset does not advance on such a page,
-                // though, so bound the retries instead of spinning for ever.
-                empty_dropped_pages += 1;
-                if empty_dropped_pages >= Self::MAX_EMPTY_DROPPED_PAGES {
-                    self.set_last_scan_truncated(truncated);
-                    self.set_last_scan_dropped(true);
-                    return Ok(all);
-                }
-                continue;
-            }
-            empty_dropped_pages = 0;
-            let done = all.len() + batch.hits.len() >= batch.total as usize;
-            all.extend(batch.hits);
-            if done {
-                self.set_last_scan_truncated(truncated);
-                self.set_last_scan_dropped(dropped);
-                return Ok(all);
-            }
-        }
+        let (all, truncated, dropped) =
+            walk_all_hits(page, |offset, count| self.scan_hits(offset, count))?;
+        self.set_last_scan_truncated(truncated);
+        self.set_last_scan_dropped(dropped);
+        Ok(all)
     }
 
     pub fn scan_reset(&self) -> Result<()> {
@@ -1756,11 +1715,116 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
     true
 }
 
+/// Walk the console's hit list one page at a time.
+///
+/// `fetch(offset, count)` stands in for `SCAN_GET_HITS`, which makes the walk
+/// testable without a socket.  The crucial rule is that `offset` is a
+/// *server-side index*, not the number of records collected: a page whose hits
+/// were dropped (`NXUS_HITBATCH_DROPPED`) still consumed its whole request
+/// window, and the next request must start after that window.  Advancing by
+/// `hits.len()` instead re-examines indices, yields duplicates and can miss the
+/// tail of the list.
+///
+/// Returns the collected hits plus the aggregated truncated/dropped flags.
+fn walk_all_hits<F>(page: u32, mut fetch: F) -> Result<(Vec<Hit>, bool, bool)>
+where
+    F: FnMut(u32, u32) -> Result<HitBatch>,
+{
+    let page = page.clamp(1, NXUS_MAX_HITS_PER_BATCH);
+    // Collected hits are only ever appended; reserve once from the first total
+    // (bounded, because `total` comes from the wire and may be corrupt).
+    let mut all: Vec<Hit> = Vec::new();
+    let mut sized = false;
+    let mut truncated = false;
+    let mut dropped = false;
+    let mut server_offset: u32 = 0;
+    let mut total: Option<u32> = None;
+    let mut session_id: Option<u32> = None;
+
+    loop {
+        // Once the total is known, never ask beyond the list.  `server_offset`
+        // is what the console indexes; `all.len()` may be smaller after drops.
+        let req_count = match total {
+            Some(total) => {
+                if server_offset >= total {
+                    break;
+                }
+                page.min(total - server_offset)
+            }
+            None => page,
+        };
+        if req_count == 0 {
+            break;
+        }
+
+        let batch = fetch(server_offset, req_count)?;
+        // A non-zero session id identifies the scan.  A different one mid-walk
+        // means the console started another scan and these pages do not belong
+        // to the same hit list.
+        if batch.session_id != 0 {
+            match session_id {
+                Some(expected) if expected != batch.session_id => {
+                    return Err(NxusError {
+                        message: format!(
+                            "scan session changed during the hit walk ({} -> {})",
+                            expected, batch.session_id
+                        ),
+                        result: None,
+                    });
+                }
+                None => session_id = Some(batch.session_id),
+                _ => {}
+            }
+        }
+
+        if total.is_none() {
+            total = Some(batch.total);
+        }
+        if !sized {
+            sized = true;
+            let want = (batch.total as usize).min(NxusClient::MAX_ALL_HITS_PREALLOC);
+            if want > all.capacity() {
+                all.reserve_exact(want - all.capacity());
+            }
+        }
+
+        // The flags describe the whole walk, not just the last page.
+        truncated |= batch.truncated;
+        dropped |= batch.dropped;
+        let batch_total = batch.total;
+        let hit_count = batch.hits.len() as u32;
+        all.extend(batch.hits);
+
+        if batch.dropped {
+            // The server examined this whole request window and omitted the
+            // dropped records.  Consume the window, not the written records.
+            let spanned = req_count.min(batch_total.saturating_sub(server_offset));
+            if spanned == 0 {
+                break;
+            }
+            server_offset = server_offset.saturating_add(spanned);
+        } else {
+            // No drops: every returned record occupies one server slot.  An
+            // empty page without the drop flag is the genuine end of the list.
+            if hit_count == 0 {
+                break;
+            }
+            server_offset = server_offset.saturating_add(hit_count);
+        }
+
+        if server_offset >= batch_total {
+            break;
+        }
+    }
+
+    Ok((all, truncated, dropped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{error_from_reply, error_reason_text, is_retry_later, pointer_width_for, result_text,
-                pointer_width_with_reason, released_addresses, select_stopped_thread,
-                Mapping, Metadata, NxusError, PERM_R, RESULT_BUSY,
+                pointer_width_with_reason, released_addresses, select_stopped_thread, walk_all_hits,
+                Hit, HitBatch, Mapping, Metadata, NxusError, PERM_R, RESULT_BUSY,
                 WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
                 WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64, WIDTH_REASON_PROCESS_32,
                 WIDTH_REASON_PROCESS_64};
@@ -1781,6 +1845,100 @@ mod tests {
 
     fn metadata(main_base: u64) -> Metadata {
         Metadata { main_base, ..Default::default() }
+    }
+
+    fn page_hit(index: u32) -> Hit {
+        Hit { address: index as u64, mapping_idx: 0, value_type: 0, value: index as u64 }
+    }
+
+    /// A wire-faithful `SCAN_GET_HITS` server: `dropped` indices are counted in
+    /// the window but omitted from `hits`, exactly like `sendHits()` on the
+    /// console.
+    fn serve_hit_page(total: u32, dropped_indices: &[u32], requests: &mut Vec<(u32, u32)>,
+                      offset: u32, count: u32) -> HitBatch {
+        requests.push((offset, count));
+        let start = offset.min(total);
+        let end = offset.saturating_add(count).min(total);
+        let mut hits = Vec::new();
+        let mut dropped = false;
+        for index in start..end {
+            if dropped_indices.contains(&index) {
+                dropped = true;
+            } else {
+                hits.push(page_hit(index));
+            }
+        }
+        HitBatch {
+            session_id: 7,
+            total,
+            value_size: 4,
+            truncated: false,
+            dropped,
+            hits,
+        }
+    }
+
+    fn addresses(hits: &[Hit]) -> Vec<u32> {
+        hits.iter().map(|hit| hit.address as u32).collect()
+    }
+
+    /// A partial drop makes the written records shorter than the request window.
+    /// The next offset must be the end of the *window*, never `all.len()`, or the
+    /// walk re-reads indices and loses the tail.
+    #[test]
+    fn a_partially_dropped_page_advances_by_the_server_window() {
+        let mut requests = Vec::new();
+        let (hits, truncated, dropped) = walk_all_hits(4, |offset, count| {
+            Ok(serve_hit_page(10, &[1], &mut requests, offset, count))
+        })
+        .expect("page walk");
+
+        assert_eq!(requests, vec![(0, 4), (4, 4), (8, 2)],
+                   "the next request must start after the whole examined window");
+        assert_eq!(addresses(&hits), vec![0, 2, 3, 4, 5, 6, 7, 8, 9],
+                   "index 1 is dropped, all other records appear exactly once");
+        assert!(dropped);
+        assert!(!truncated);
+        let mut unique = hits.iter().map(|hit| hit.address).collect::<Vec<_>>();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), hits.len(), "the walk produced duplicate hits");
+    }
+
+    /// A page can consist entirely of dropped records.  It is not the end of the
+    /// list: the window was still consumed, so the next page must be requested
+    /// and its valid hits returned (the old code retried the same page 3 times
+    /// and gave up).
+    #[test]
+    fn an_all_dropped_first_page_advances_to_the_next_page() {
+        let mut requests = Vec::new();
+        let (hits, truncated, dropped) = walk_all_hits(4, |offset, count| {
+            Ok(serve_hit_page(10, &[0, 1, 2, 3], &mut requests, offset, count))
+        })
+        .expect("page walk");
+
+        assert_eq!(requests, vec![(0, 4), (4, 4), (8, 2)],
+                   "an empty dropped page must still advance the server index");
+        assert_eq!(addresses(&hits), vec![4, 5, 6, 7, 8, 9],
+                   "the valid later pages must not be abandoned");
+        assert!(dropped, "the drop flag must survive the whole walk");
+        assert!(!truncated);
+    }
+
+    /// No drop flag + no hits is the only genuine end-of-list signal.
+    #[test]
+    fn an_empty_page_without_the_drop_flag_ends_the_walk() {
+        let mut requests = Vec::new();
+        let (hits, _truncated, dropped) = walk_all_hits(4, |offset, count| {
+            requests.push((offset, count));
+            Ok(HitBatch { session_id: 7, total: 10, value_size: 4,
+                          truncated: false, dropped: false, hits: Vec::new() })
+        })
+        .expect("page walk");
+
+        assert!(hits.is_empty());
+        assert!(!dropped);
+        assert_eq!(requests, vec![(0, 4)], "an empty non-dropped page ends the walk");
     }
 
     /// The mapping table decides: any traversable mapping ending above 4 GiB

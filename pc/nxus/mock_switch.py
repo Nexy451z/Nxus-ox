@@ -20,10 +20,12 @@ switch/source/nxus_server.c and core/nxus_scan.c, including:
   * a hit-list cap (hit_list_limit) that ends the published list the way
     nxusHitList stops recording at max_capacity, and sets
     NXUS_HITBATCH_TRUNCATED on ScanGetHits like sendHits() does
-  * a dropped-hit flag (hit_batch_dropped) that sets NXUS_HITBATCH_DROPPED on
-    ScanGetHits like sendHits() does when it skips hits whose mapping_idx is
-    outside the mapping table; clients must not read an empty page as "done"
-    while that bit is set
+  * a dropped-hit mode: hit_batch_dropped sets NXUS_HITBATCH_DROPPED on every
+    ScanGetHits reply, and hit_batch_drop_indices additionally omits those
+    records from the page (keeping the total), like sendHits() does when a
+    hit's mapping_idx is outside the mapping table; clients must not read an
+    empty page as "done" while that bit is set, and must advance by the
+    requested server window rather than the number of records received
   * fault injection for the PC-side error paths: fail_next (one queued Result
     per command number), drop_after_bytes (cut a reply short and hang up),
     empty_mappings (0-entry mapping table) and dmnt_not_attached (dmnt's
@@ -365,10 +367,17 @@ class MockSwitch:
     # every ScanGetHits batch carry NXUS_HITBATCH_DROPPED, the way sendHits()
     # flags a batch whose hits had no mapping left to resolve against.
     hit_batch_dropped = False
+    # Absolute hit indices to omit from ScanGetHits replies (and flag as
+    # dropped).  Unlike the flag above this models sendHits()'s actual omission,
+    # which is what makes the request offset drift: the omitted record still
+    # occupies a server-side index, so a page walk must advance past the whole
+    # requested window, not by the number of records it received.
+    hit_batch_drop_indices: frozenset = frozenset()
 
     def __init__(self, host: str = '127.0.0.1', port: int = 0, watchdog_ms: int = 15000,
                  money: int = 6440, scan_async: bool = False,
-                 hit_list_limit: int = 0, hit_batch_dropped: bool = False):
+                 hit_list_limit: int = 0, hit_batch_dropped: bool = False,
+                 hit_batch_drop_indices=None):
         # A real scan is a worker thread (nxus_session.c:891-919): ScanBegin
         # answers with NxusScanState_Running, the PC polls ScanStatus and watches
         # progress_permille climb, and ScanGetHits / SnapshotCapture /
@@ -468,6 +477,9 @@ class MockSwitch:
         # True: every hit batch says "hits were dropped because their mapping is
         # gone" (NXUS_HITBATCH_DROPPED).  Tests flip it on the instance too.
         self.hit_batch_dropped = bool(hit_batch_dropped)
+        # Indices sendHits() should omit (mapping gone) while keeping the total.
+        self.hit_batch_drop_indices = frozenset(int(i) for i in
+                                                (hit_batch_drop_indices or ()))
         # command number -> Result, answered ONCE and consumed (a single bad reply)
         self.fail_next: dict[int, int] = {}
         # >0: send that many bytes of the reply and close the connection
@@ -1785,7 +1797,17 @@ class MockSwitch:
 
     def _get_hits(self, payload: bytes):
         offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
-        count = min(count, len(self.hits) - offset) if offset < len(self.hits) else 0
+        end = min(offset + count, len(self.hits)) if offset < len(self.hits) else offset
+        window = range(offset, end)
+        # sendHits()'s drop rule: a hit whose mapping_idx is outside the mapping
+        # table is skipped instead of being resolved against a wrong base, and the
+        # batch says so.  `hit_batch_drop_indices` reproduces the actual omission;
+        # `hit_batch_dropped` keeps the older flag-only mode.  Either way the
+        # omitted records still consumed their server-side index, which is what a
+        # page walk must account for.
+        selected = [i for i in window if i not in self.hit_batch_drop_indices]
+        dropped_records = len(selected) != len(window)
+        count = len(selected)
         bases = [m['base'] for m in self.target.mappings]
         # sendHits()'s truncation rule (switch/source/nxus_server.c:699-703): a
         # list sitting at its capacity may have had hits that were never
@@ -1794,11 +1816,7 @@ class MockSwitch:
         reserved = 0
         if self.hit_list_limit and len(self.hits) >= self.hit_list_limit:
             reserved |= P.HITBATCH_TRUNCATED
-        # sendHits()'s drop rule: a hit whose mapping_idx is outside the mapping
-        # table is skipped instead of being resolved against a wrong base, and the
-        # batch says so.  The mock only carries the flag (its hits are always
-        # resolvable), which is what the client's page walk has to react to.
-        if self.hit_batch_dropped:
+        if self.hit_batch_dropped or dropped_records:
             reserved |= P.HITBATCH_DROPPED
         # The scan session id the PC matches hit batches against lives here, in
         # NxusHitBatchHeader (nxus_protocol.h:336-344) - NxusStatus has no field
@@ -1807,7 +1825,7 @@ class MockSwitch:
         header = P.HIT_BATCH_HEADER.pack(self.session_id, count, len(self.hits),
                                          self.value_size, len(bases), reserved)
         body = header + b''.join(struct.pack('<Q', b) for b in bases)
-        for i in range(offset, offset + count):
+        for i in selected:
             idx, off, value = self.hits[i]
             body += P.HIT.pack(off, idx, getattr(self, 'value_type', P.VT_U32),
                                int.from_bytes(value, 'little'))

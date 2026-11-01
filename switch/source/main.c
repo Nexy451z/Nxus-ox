@@ -295,7 +295,20 @@ void __appInit(void) {
  */
 void __appExit(void) {
     nxusHidExit();        /* 1. hotkey producer (its callback drives Pause/Resume) */
-    nxusServerExit();     /* 2. ptrscan worker + scan worker + session           */
+    /* 2. ptrscan worker + scan worker + session.  False means a drain timed out
+       and the server deliberately leaked the session because a worker/handler is
+       still reading through the debug handle and dmnt.  Closing any of them here
+       would free those resources underneath that reader (UAF), so leave them to
+       the process exit - the documented "leak, never UAF" path. */
+    bool drained = nxusServerExit();
+    if (!drained) {
+        NXUS_LOG_ERROR("exit: server did not quiesce - keeping debug handle, network "
+                       "and dmnt open (leak, never UAF)");
+        nxusLogExit();    /* log last: the warning above must reach the ring       */
+        fsdevUnmountAll();
+        fsExit();
+        return;
+    }
     nxusDebugExit();      /* 3. event thread + debug handle + dmnt hand-back     */
     nxusNetExit();        /* 4. listener + client socket + connection thread     */
     nxusDmntExit();       /* 5. dmnt:cht (re-opened by the detach above)         */
@@ -414,17 +427,18 @@ int main(int argc, char *argv[]) {
     bool ambiguous_rc_logged = false;
     for (u32 attempt = 1; ; attempt++) {
         rc = nxusNetInit(NXUS_DEFAULT_PORT, nxusServerHandle, NULL);
-        if (R_SUCCEEDED(rc)) break;
-        /* Not every non-zero Result is a failure.  A code without bit 31 is
-           success-shaped (0x00001759 was seen on hardware); retrying it would
-           park the module in this loop over a listener that may well be up, so
-           accept it - but name it once instead of letting a log reader guess
-           whether "rc=0x........" meant anything. */
-        if (!resultLooksValid(rc)) {
-            if (!ambiguous_rc_logged) {
+        /* Success is "listener up", not "Result == 0".  libnx MAKERESULT() leaves
+           bit 31 clear, and 0x00001759 was seen on hardware although the socket
+           came up: breaking only on R_SUCCEEDED() would treat that as failure,
+           while retrying it would park the module forever over a live listener.
+           So only a listener that is NOT running is retried. */
+        if (R_SUCCEEDED(rc) || nxusNetIsRunning()) {
+            if (!R_SUCCEEDED(rc) && !ambiguous_rc_logged) {
                 ambiguous_rc_logged = true;
-                NXUS_LOG("tcp: nxusNetInit returned non-zero success code 0x%08X "
-                         "(no error bit) - continuing", (unsigned)rc);
+                NXUS_LOG("tcp: nxusNetInit returned non-zero %s 0x%08X - listener is "
+                         "up, continuing",
+                         resultLooksValid(rc) ? "error code" : "success code (no error bit)",
+                         (unsigned)rc);
             }
             break;
         }

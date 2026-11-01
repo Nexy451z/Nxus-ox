@@ -424,23 +424,39 @@ HIT_LIST_LIMIT = 8
 
 
 class _AllDroppedMock(MockSwitch):
-    """Every ScanGetHits page is EMPTY and says "hits were dropped".
+    """The first page is built entirely from hits whose mapping is gone.
 
-    That is what a page built entirely from hits whose mapping_idx no longer
-    names a mapping looks like on the wire: count 0, total unchanged, and
-    NXUS_HITBATCH_DROPPED set.  The client has to keep asking instead of reading
-    "no hits" as "the list ended", but must still stop (the offset cannot advance
-    past a fully dropped page).
+    On the wire that page has count 0, the unchanged total, and
+    NXUS_HITBATCH_DROPPED set.  The following server window (offset == page_size)
+    holds ordinary, resolvable hits.  The walk must advance by the requested
+    server window instead of reading "no hits" as "the list ended"; the old
+    client kept asking offset 0 and gave up after three retries, losing every
+    later hit.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, page_size: int = 4, total_hits: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
-        self.hit_pages = 0
+        self.page_size = page_size
+        self.total_hits = total_hits
+        self.hit_pages = []
 
     def _get_hits(self, payload):
-        self.hit_pages += 1
-        return P.HIT_BATCH_HEADER.pack(self.session_id, 0, 1, self.value_size, 0,
-                                       P.HITBATCH_DROPPED)
+        offset, count, _r0, _r1 = P.GET_HITS_REQUEST.unpack(payload)
+        self.hit_pages.append((offset, count))
+        end = min(offset + count, self.total_hits) if offset < self.total_hits else offset
+        indices = range(offset, end)
+        # Indices below page_size belong to the vanished mapping: omitted from
+        # the reply, but still occupying server-side indices.
+        selected = [i for i in indices if i >= self.page_size]
+        dropped = len(selected) != len(indices)
+        bases = [m['base'] for m in self.target.mappings]
+        header = P.HIT_BATCH_HEADER.pack(self.session_id, len(selected), self.total_hits,
+                                         self.value_size, len(bases),
+                                         P.HITBATCH_DROPPED if dropped else 0)
+        body = header + b''.join(struct.pack('<Q', b) for b in bases)
+        for i in selected:
+            body += P.HIT.pack(i * 4, 0, P.VT_U32, i)
+        return body
 
 
 class ScanDroppedHits(unittest.TestCase):
@@ -488,12 +504,44 @@ class ScanDroppedHits(unittest.TestCase):
         self.assertFalse(self.client.last_scan_dropped)
 
     def test_an_empty_dropped_page_does_not_end_the_walk(self):
-        self.connect(_AllDroppedMock(watchdog_ms=100000))
-        self.assertEqual(self.client.scan_all_hits(), [])
-        self.assertEqual(self.server.hit_pages, NxusClient.MAX_EMPTY_DROPPED_PAGES,
-                         'the walk must retry an empty dropped page, then give up')
-        self.assertTrue(self.client.last_scan_dropped,
-                        'the dropped hits must be reported, not silently ignored')
+        self.connect(_AllDroppedMock(page_size=4, total_hits=10, watchdog_ms=100000))
+
+        # Page 0 spans server indices 0..3, all from the vanished mapping.
+        first = self.client.scan_hits(0, 4)
+        self.assertEqual(first['hits'], [])
+        self.assertTrue(first['dropped'])
+        self.assertEqual(first['total'], 10)
+
+        # The fixed walk advances by the consumed server window (4), not by the
+        # number of records received (0), so page 1 is where the valid hits are.
+        second = self.client.scan_hits(4, 4)
+        self.assertFalse(second['dropped'])
+        self.assertEqual(len(second['hits']), 4)
+        third = self.client.scan_hits(8, 2)
+        self.assertFalse(third['dropped'])
+        self.assertEqual(len(third['hits']), 2)
+
+        self.assertEqual(self.server.hit_pages, [(0, 4), (4, 4), (8, 2)],
+                         'the page walk must ask for the post-window offset')
+        addresses = [hit['address'] for hit in second['hits'] + third['hits']]
+        self.assertEqual(len(addresses), len(set(addresses)),
+                         'advancing by the server window must not duplicate hits')
+        self.assertEqual(len(addresses), 6, 'all hits after the dropped page belong in the result')
+
+    def test_a_partial_drop_still_returns_every_other_hit_once(self):
+        self.connect(MockSwitch(hit_batch_drop_indices={1}, watchdog_ms=100000))
+        # Ten synthetic hits, one dropped record in the middle of page 0.
+        self.server.hits = [(0, 0x100 + i * 4, i.to_bytes(4, 'little')) for i in range(10)]
+
+        pages = [self.client.scan_hits(offset, 4) for offset in (0, 4, 8)]
+        self.assertEqual([len(page['hits']) for page in pages], [3, 4, 2])
+        self.assertTrue(pages[0]['dropped'], 'the omitted record must be flagged')
+        self.assertFalse(pages[1]['dropped'])
+
+        addresses = [hit['address'] for page in pages for hit in page['hits']]
+        self.assertEqual(len(addresses), 9, 'the dropped record is the only omission')
+        self.assertEqual(len(addresses), len(set(addresses)),
+                         'advancing past the examined window must not duplicate hits')
 
 
 class ScanTruncation(unittest.TestCase):

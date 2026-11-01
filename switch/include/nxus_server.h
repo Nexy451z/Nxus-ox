@@ -48,8 +48,18 @@ void nxusServerInit(void);
    Call it from the exit path BEFORE nxusDebugExit() and nxusNetExit() - the worker
    and the connection-thread handlers read target memory through the debug handle
    and through the session, so both have to be stopped first (see __appExit in
-   main.c for the full order). */
-void nxusServerExit(void);
+   main.c for the full order).
+
+   Returns true only when the pointer-scan worker and every in-flight handler were
+   drained, i.e. the session/views were really released and no reader of the debug
+   handle or dmnt is left: the caller may then tear those down.  Returns false when
+   either drain timed out and this function deliberately leaked the session (the
+   "leak, never UAF" path).  In that case the caller MUST NOT call nxusDebugExit(),
+   nxusNetExit() or nxusDmntExit(): the stuck worker/handler still reads through
+   them.  Once the first call has completed, a later call returns its outcome; a call
+   that races the first one while it is still draining conservatively returns false
+   (not quiesced yet). */
+bool nxusServerExit(void);
 /* One packet, handled on the connection thread.
 
    The terminal gate is the first statement: once nxusServerExit() has run, every

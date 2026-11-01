@@ -2,7 +2,7 @@
 
 **Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)**.
 
-Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.40 MiB` plus the `32 KiB` stack, and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
+Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search, Nxus-ox runs a lightweight C sysmodule directly on the Switch (`pool_partition: System`: an 8 MiB inner heap, a measured `.bss` of `8.41 MiB` plus the `32 KiB` stack — an `8.44 MiB` resident request — and `system_resource_size=0` in the NPDM) that scans memory in 1 MiB chunks, coalesces sparse refinement windows, and streams compact hit lists and hardware debug events over TCP (default port `7332`).
 
 ---
 
@@ -50,7 +50,7 @@ differently:
 |---|---|---|
 | **20-byte `NxusPtrChainListHeader`** (`pointer_width` appended; chain records now start at offset 20) | ✔ Works. The 16-byte header is recognised from the reply length (it is not the `20 + count*48` shape); `pointer_width` reads `0`, so the PC falls back to its own width rule and the GUI reports *an unreported width* (its local cheat preview is disabled). Chain decoding is unaffected. | ⚠ The first 16 bytes (count / total / truncated) still decode, but the records now start at 20. A PC older than the field starts them at 16 and reads every record four bytes early — **the only silent mismatch in this table**. The length probe shipped in the same build as the field, so any PC from this release (or later) decodes both shapes; a build older than the field must be updated. |
 | **40-byte `NxusDebugStatus`** (`stopped_thread` appended) | ✔ Works. A 32-byte reply is parsed through `stopped_thread_low`; `stopped_thread` is only read when the payload is at least 40 bytes, so a stopped thread id above 4 GiB can only be read truncated (the value the old console could express anyway). | ✔ Works. The 32-byte prefix keeps its offsets (offset 28 used to be `reserved`) and the trailing `u64` is ignored. |
-| **`NXUS_RESULT_PTRSCAN_STARTED`** (`0x8003C808`) answered by `PtrScanBegin` | ✔ Works. An older console walks inside the command and answers with the chain list; the PC accepts both shapes and only starts polling `PtrScanGet` (250 ms, 150 s budget) after the new result. | ⚠ The result is unknown to it, so the command is reported as failed (`command 0x0030 failed` for the Rust CLI/GUI, `PtrScanBegin failed: result=0x8003C808` for the Python client) and the PC never polls: the walk keeps running on the console but its list is never collected. Nothing is corrupted — re-run with a current PC. |
+| **`NXUS_RESULT_PTRSCAN_STARTED`** (`0x8003C808`) answered by `PtrScanBegin` | ✔ Works. An older console walks inside the command and answers with the chain list; the PC accepts both shapes and only starts polling `PtrScanGet` (250 ms; console walk stops at 90 s, PC waits up to 150 s for the reply) after the new result. | ⚠ The result is unknown to it, so the command is reported as failed (`command 0x0030 failed` for the Rust CLI/GUI, `PtrScanBegin failed: result=0x8003C808` for the Python client) and the PC never polls: the walk keeps running on the console but its list is never collected. Nothing is corrupted — re-run with a current PC. |
 | **Reason codes 10–13** (`HEAP_BUDGET`, `DEBUG_LOCKED`, `SLOT_FULL`, `RETRY_LATER`) | ✔ Works. The tail is optional: a console that sends no reason keeps the old `command 0x.... failed` text, every code 1–13 is named, and an unknown code is still printed as `(reason=N)`. | ⚠ Informational only. An older PC names the codes it knows (1–10 in the build before this one) and prints `(reason=11..13)` without text; one older than the reason word itself ignores the extra four bytes. The `Result` is unchanged, so only the guidance/retry policy is coarser (11/12 need a user action, 13 clears by itself). |
 | **`NxusCmd_SnapshotRelease`** (`0x0072`) | ✔ Refused, loudly. The console answers `NXUS_ERR_UNSUPPORTED` (plus `NXUS_REASON_UNKNOWN_COMMAND` when it sends the tail), the CLI prints `command 0x0072 failed - unknown command: this console does not implement it (reason=6)`, and both snapshot slots stay resident — free them with `ScanReset`, or restart the module on a console that also predates the release-on-reset. | ✔ An older PC never sends `0x0072`; the console still frees both slots on `ScanReset`, so nothing changes for it. |
 
@@ -80,8 +80,8 @@ error into a success — merely because a field is missing.
 - **Uncapped Unknown Initial Scan (Dense Baseline + Zero-Block Skip + 16 KiB Hash Skip)**:
   - Instead of pushing every address into the hit list on Pass 1 (which would truncate at 150k hits), `Unknown` scans use a **2-stage Dense Baseline → Lazy Hit Materialization** pipeline on both the Switch (`sdmc:/nxus/scan_base.bin` + RAM hybrid) and the PC (`pcscan.rs`).
   - **Zero-Block Compression**: All-zero 16 KiB blocks are flagged in metadata without writing to the SD card, cutting SD I/O by 50–80%.
-  - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list (dynamically scaled up to `180k` hits for `u8`, `170k` for `u16`, `153k` for `u32`).
-- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.40 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.40 MiB` in total, inside the Switch `System` pool partition.
+  - **O(1) 16 KiB Block-Hash Skip**: On the 1st refinement (`Changed`, `Increased`, `Decreased`, `Different`), unchanged 16 KiB blocks are skipped in `O(1)` via 64-bit FNV-1a fingerprints without reading from SD or comparing individual elements, and only surviving hits are materialized into the hit list. The byte budget alone would allow ~`180k` `u8`, ~`170k` `u16` and ~`153k` `u32` rows, but the `150k` default caps those three; `u64` is clamped to `128k` so its 24 B rows still fit the 3.0 MiB budget.
+- **Strict 8 MiB Sysmodule Heap Budget**: Structure-of-Arrays (SoA) hit storage + zero-copy TCP socket transmission (`nxus_net.c`) keeps the working set inside the 8 MiB inner heap (`INNER_HEAP_SIZE`, `switch/source/main.c:48`); the host budget test's worst case — both snapshot slots held — is `6.93 MiB` against the `8.00 MiB` ceiling. The resident request is what the NPDM declares: `system_resource_size=0`, so the loader reserves the NSO's `.bss` (`8.41 MiB` = the 8 MiB heap + statics) plus the `0x8000` (`32 KiB`) main-thread stack, `8.44 MiB` in total, inside the Switch `System` pool partition. That `.bss + stack` request is why the verifier reports a WARN while `system_resource_size` stays 0; it FAILs only above 16 MiB.
 - **Incomplete results are never silent**: three independent limits can cut a result
   short, and each one is reported instead of being presented as complete —
   - hit list full → `NxusHitBatchHeader.reserved & NXUS_HITBATCH_TRUNCATED` on every
@@ -99,8 +99,8 @@ error into a success — merely because a field is missing.
 - **Seamless `dmnt:cht` Hand-off**: Automatically calls `ForceCloseCheatProcess` before attaching via `svcDebugActiveProcess`, and restores `ForceOpenCheatProcess` on detach.
 - **All-Core Hardware Register Programming**: Programs ARMv8 `DBGBCR_EL1` and `DBGWCR_EL1` across **all 4 CPU cores (Cores 0–3)** via `svcSetThreadCoreMask` migration (`setHardwareBreakPointAllCores`), ensuring hits are captured regardless of which core the game thread runs on.
 - **AArch32 & AArch64 Hardware Support**:
-  - **ContextID Breakpoint** in slot `5` (`ctrl = 0x003001E1`, `BT = 0b0011`, linked to target PID).
-  - **Linked Execution Breakpoints** in slots `0..3` (`ctrl = 0x001501E1` for ARM32/AArch64, `0x00150061`/`0x00150181` for Thumb halfwords).
+  - **ContextID Breakpoint** in slot `5` in the default `LINK5` style (slot `4` for `LINK6`), with `ctrl = 0x003001E1` (`BT = 0b0011`, linked to target PID); the control word follows the link-slot choice.
+  - **Linked Execution Breakpoints** in slots `0..3` (`ctrl = 0x001501E1` for ARM32/AArch64 in the default style, `0x00150061`/`0x00150181` for Thumb halfwords).
   - **Linked Hardware Watchpoints** (`Write`, `Read`, `Access`) in slots `0x10..0x13` with automatic 8-byte `DBGWVR_EL1` alignment (`address & ~7ULL`) and byte-lane `BAS` selection.
   - **AArch32 Register Mapping**: Automatically maps `R13 (SP)`, `R14 (LR)`, and `R11 (FP)` from `cpu_gprs[11/13/14]` when debugging 32-bit titles.
   - **Non-Stop Stepping**: Automatically performs *disarm → `svcContinueDebugEvent` → 1 ms instruction retirement sleep → re-arm* on hit so the target game does not freeze in an infinite re-trap loop.
@@ -109,7 +109,7 @@ error into a success — merely because a field is missing.
   - **CLI**: `nxus continue` (step over the trapping instruction, re-arm, resume), `nxus step [thread_id]` (single instruction), and `nxus watch <addr> --stop` / `nxus break <addr> --stop` which prints `STOPPED thread=… pc=… (main+0x…)`, the surrounding disassembly and all registers. `nxus config --auto-continue 0|1` switches back to the old auto-resume policy at runtime.
   - **GUI**: a `■ STOPPED` badge plus a banner with **[Continue] [Step]**; on every stop the GUI automatically fetches the stopped thread's registers and disassembles the code around its PC (`=>` highlight).
   - **Real freeze / pause**: `nxus pause` suspends every thread of the title. The preferred path is `dmnt:cht`'s `PauseCheatProcess` (`BreakDebugProcess` on dmnt's own debug handle, cmdid `65004`), which keeps the cheat session open so reads, scans and snapshot diffs keep working against the frozen title. If dmnt cannot stop it, the console falls back to opening its own debug session (`svcDebugActiveProcess`) and issuing `svcBreakDebugProcess`; reads/queries/mapping enumeration automatically switch to that handle. `nxus resume` mirrors whichever path was used. The GUI's *"pause target while scanning"* option drives the same mechanism.
-  - **Automatic `dmnt:cht` recovery**: when the cheat process has been dropped (`0x0032C80D`), every `dmnt:cht` command re-issues `ForceOpenCheatProcess` once and retries, so a dropped session no longer turns into a permanent error.
+  - **Automatic `dmnt:cht` recovery**: when the cheat process has been dropped (`0x0032C80D`) or a command answers `BAD_STATE`, the commands routed through `dmntRunCommand()` re-issue `ForceOpenCheatProcess` once and retry, at most once per 2 s. The read-only `status` path deliberately uses `nxusDmntPeekMetadata()` and never repairs (it must not open dmnt as a side effect).
 - **Per-session hit history**: the breakpoint/watchpoint ring behind `nxus hits` and the GUI **Watch** tab belongs to one debug session. `DebugAttach` and `DebugDetach` both wipe it (the log line is `debug: hit ring cleared (attach/detach)`) and bump an internal epoch, so a hit that was still being recorded when the session changed is dropped instead of becoming hit #0 of the next title. A freshly attached title therefore starts with an empty list, and a hit from the previous title can never be presented as this session's.
 - **Recovery matrix (what heals itself, what needs a reboot)**:
   | Situation | Behaviour |
@@ -120,7 +120,7 @@ error into a success — merely because a field is missing.
   | PC disappears in the middle of a scan | The scan keeps running for a minute so a quick reconnect can still read it, then it is **cancelled automatically** (previously it held the worker and the SCANNING flag until the process restarted). |
   | Wi-Fi drops / console sleeps | The listener is rebuilt automatically, and a boot-time network failure is retried every 3 s instead of parking the module. |
   | Hit list fills up | The reply is flagged `NXUS_HITBATCH_TRUNCATED`; refine further or raise the limit. |
-  | Pointer scan is huge | It now runs on a worker thread: `PtrScanBegin` answers immediately, the client polls `PtrScanGet` (250 ms) while the console keeps serving other commands, and the walk stops after 90 s returning the partial chains flagged as truncated. |
+  | Pointer scan is huge | It now runs on a worker thread: `PtrScanBegin` answers immediately, the client polls `PtrScanGet` (250 ms) while the console keeps serving other commands, and the console walk stops after 90 s returning the partial chains flagged as truncated (the PC waits up to 150 s for the reply). |
   | SD card missing or full | The module still starts and serves over TCP (RAM only); the log lives in the RAM ring, readable with `nxus log`. A stale `scan_base.bin` from a previous boot is deleted at startup. |
   | Something is genuinely stuck | Hold `POWER` to force-off, then boot hekate and remove `atmosphere/contents/4200000000004E58/flags/boot2.flag` to stop the module from starting. |
 
@@ -154,7 +154,7 @@ error into a success — merely because a field is missing.
 - **Live RX Code Patching**: Write directly to executable `.text` (`RX`) pages via `svcWriteDebugProcessMemory` (which performs full-system instruction cache invalidation across all cores). Includes 1-click **[NOP]** patching in the GUI (`00 00 A0 E1` for ARM32, `00 BF` / `AF F3 00 80` for Thumb, `1F 20 03 D5` for AArch64).
 
 ### 4. Pointer Scanner, Cross-Tool Dump Compatibility (`Jnoexs` & `EdiZon-SE`), & Snapshot Diff
-- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, **8-way set-associative Dead-End Subtree Memoization (`dead_set`) + 64-slot direct-mapped dereference window cache** (**~26× fewer IPC reads** (host diamond-graph test: 100 duplicate dereferences collapse to 4 reads) on shared heap graphs with zero false negatives), automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
+- **Console & Offline PC Pointer Scanner**: Discovers multi-level pointer chains with `O(log M)` binary-searched memory mappings, **8-way set-associative Dead-End Subtree Memoization (`dead_set`) + 64-slot direct-mapped dereference window cache** (**~25× fewer IPC reads** (host diamond-graph test: 100 duplicate dereferences collapse to 4 reads) on shared heap graphs with zero false negatives), automatic **32-bit (4-byte)** vs **64-bit (8-byte)** pointer width detection, and direct Atmosphère `dmnt:cht` cheat code generation.
 - **Full Jnoexs (`NDMP`) & EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN`) Dump Interoperability**:
   - **Jnoexs (`NDMP` `.dmp`)**: 100% byte-for-byte compatible with Jnoexs (`MemoryDump.java`) and Takumi4685's PointerSearcher.
   - **EdiZon-SE / PointerSearcher-SE (`EDZN` / `eFZN` / `FDZN` / `fFZN` `.dmp*`)**: Directly loads and decompresses (LZ8) EdiZon-SE pointer dumps (`nxus dump info <file>`, `nxus ptrscan auto --dump <file>`, or via the GUI **Scan dump...** button), and can export/convert any `NDMP` dump into a PointerSearcher-SE compatible `EDZN` dump (`nxus dump export-edizon <in.dmp> <out.dmp1> --target <ADDR>`).
@@ -291,8 +291,9 @@ tools/build.sh stages the same split automatically:
 
 `sdmc:/nxus/probe_started.txt` is rewritten on every probe run (the previous file
 becomes `probe_started.txt.1`), so it proves the sysmodule actually started. If the
-preferred report path is not writable, the report falls back to `sdmc:/probe.txt`
-and then `sdmc:/switch/probe.txt`, and the block records the path it used.
+preferred path is not writable, the start marker falls back to
+`sdmc:/probe_started.txt`, the report falls back to `sdmc:/probe.txt` and then
+`sdmc:/switch/probe.txt`, and the block records the report path it used.
 
 ## Repository Structure
 
@@ -305,8 +306,8 @@ Nxus-ox/
   pc/
     Nxus.Cli/ Unified Rust PC client (eframe/egui GUI + CLI + AArch64/ARM32/Thumb disassembler)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
-    tests/    Cross-language protocol parity & end-to-end test suite (121 tests)
-  tests/      Host C unit test suite (1,775 checks across 8 test binaries)
+    tests/    Cross-language protocol parity & end-to-end test suite (122 tests)
+  tests/      Host C unit test suite (1,937 checks across 9 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
   docs/       Design, debugger, hotkey, cheat semantics and the agent handover
               (docs/HANDOVER.md is the "start here" document for a new maintainer)
@@ -331,12 +332,12 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (1,775 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 51, scantypes 275, hotkey 11, session_view 313, snapshot_owner 208)
+# 1. Host C Core Tests (1,937 checks / 9 binaries: scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 150, session_view 313, snapshot_owner 208)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (120 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (124 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
-# 3. Python + Rust CLI End-to-End Tests against MockSwitch (121 tests)
+# 3. Python + Rust CLI End-to-End Tests against MockSwitch (122 tests)
 cd pc && python -m unittest discover -s tests
 ```

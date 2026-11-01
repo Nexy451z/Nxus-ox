@@ -203,6 +203,12 @@ static void identityPublish(u64 pid, u64 program_id, u64 main_base, u64 main_siz
         svcSleepThread(0);   /* let the (possibly lower priority) writer finish */
     }
     (void)atomic_fetch_add_explicit(&g_IdentitySeq, 1u, memory_order_release);  /* odd */
+    /* Store/store barrier after the "write in flight" marker, exactly like
+       viewUpdateBegin().  A release RMW only orders PRIOR operations before it, so
+       on arm64 the four plain field stores below could otherwise become visible
+       BEFORE the odd value: a reader would copy a blend of old/new fields, re-check
+       the still-even sequence and accept the torn identity. */
+    atomic_thread_fence(memory_order_release);
     g_Identity.pid = pid;
     g_Identity.program_id = program_id;
     g_Identity.main_base = main_base;
@@ -271,6 +277,90 @@ static atomic_int g_HitsStale;
 
 static bool hitsStale(void) {
     return atomic_load_explicit(&g_HitsStale, memory_order_acquire) != 0;
+}
+
+/* The owner stamp is published through its own seqlock, not as six independent
+ * plain fields.  hitsOwnerStamp() runs on the connection thread and hitsOwnerClear()
+ * can run from the 1 Hz identity tick (nxusSessionInvalidateHits), so a reader of
+ * nxusSessionHitsMatchTarget()/Identity() must never copy the pid of one stamp with
+ * the "valid" flag of the next - that is the half-armed stamp that made a cleared
+ * list look like it matched (or a new list look like it belonged to another target).
+ *
+ * The writer serialises on g_HitOwnerWriting (a handful of stores, so the tick spins
+ * only very briefly), marks odd before writing and even after the last field with
+ * "valid" stored LAST, so a complete stamp is either entirely visible or not at all.
+ * The reader copies once, fences and re-checks the sequence, like the identity
+ * seqlock above.
+ */
+typedef struct {
+    u64 pid;
+    u64 program_id;
+    u32 session_id;
+    u32 incarnation;
+    u32 mapping_generation;
+    bool valid;
+} NxusHitOwner;
+
+static atomic_uint  g_HitOwnerSeq;
+static atomic_flag  g_HitOwnerWriting = ATOMIC_FLAG_INIT;
+
+static void hitsOwnerWriteLock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_HitOwnerWriting, memory_order_acquire)) {
+        svcSleepThread(0);   /* let the current (possibly lower-priority) writer finish */
+    }
+}
+
+static void hitsOwnerWriteBegin(void) {
+    hitsOwnerWriteLock();
+    (void)atomic_fetch_add_explicit(&g_HitOwnerSeq, 1u, memory_order_release);  /* odd */
+    /* Same store/store barrier the identity and view writers need: the release RMW
+       only keeps PRIOR operations before it, so without this the fields below could
+       become visible before the "write in flight" marker. */
+    atomic_thread_fence(memory_order_release);
+}
+
+static void hitsOwnerWriteEnd(void) {
+    /* Mirror barrier: the stamp fields must be on their way out before the even
+       marker invites a reader to copy them. */
+    atomic_thread_fence(memory_order_release);
+    (void)atomic_fetch_add_explicit(&g_HitOwnerSeq, 1u, memory_order_release);  /* even */
+    atomic_flag_clear_explicit(&g_HitOwnerWriting, memory_order_release);
+}
+
+/* Copy the current stamp as ONE publication.  Never returns a torn value: a writer
+ * holds the seqlock for a handful of stores only, so this yields to it instead of
+ * turning "a writer was mid-publish" into "different target" (the ownership checks
+ * are boolean and must answer consistently). */
+static bool hitsOwnerSample(NxusHitOwner *out) {
+    for (;;) {
+        const u32 seq = atomic_load_explicit(&g_HitOwnerSeq, memory_order_acquire);
+        if ((seq & 1u) != 0) {                      /* stamp update in flight */
+            svcSleepThread(0);                      /* keep a preempted writer runnable */
+            continue;
+        }
+
+        NxusHitOwner snap;
+        snap.pid = g_Session.hits_owner_pid;
+        snap.program_id = g_Session.hits_owner_program_id;
+        snap.session_id = g_Session.hits_owner_session_id;
+        snap.incarnation = g_Session.hits_owner_incarnation;
+        snap.mapping_generation = g_Session.hits_owner_mapping_generation;
+        snap.valid = g_Session.hits_owner_valid;
+
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_HitOwnerSeq, memory_order_acquire) != seq) continue;
+
+        if (out != NULL) *out = snap;
+        return true;
+    }
+}
+
+/* Re-point only the mapping generation (after a successful rescue) through the same
+ * seqlock, so a concurrent reader cannot pair it with a half-updated stamp. */
+static void hitsOwnerSetMappingGeneration(u32 generation) {
+    hitsOwnerWriteBegin();
+    g_Session.hits_owner_mapping_generation = generation;
+    hitsOwnerWriteEnd();
 }
 
 /* ---- mapping-table generation ------------------------------------------
@@ -384,20 +474,32 @@ static void hitsStampMapBases(void);
    pid with the same layout is a NEW process, and the rescue below must never
    re-resolve these hits against it. */
 static void hitsOwnerStamp(void) {
+    /* Sample everything that is not a plain store BEFORE taking the writer lock:
+       nxusDmntTargetIncarnation() is a call, and the seqlock must stay a handful of
+       stores so a reader never has to wait on it for long. */
     const NxusTargetIdentity id = identitySample();
+    const u32 incarnation = nxusDmntTargetIncarnation();
+    const u32 generation = mappingGenerationLoad();
+    /* One seqlock write: the fields first, "valid" LAST, then the even marker.  A
+       reader therefore never sees valid=true next to a half-written pid/title. */
+    hitsOwnerWriteBegin();
     g_Session.hits_owner_pid = id.pid;
     g_Session.hits_owner_program_id = id.program_id;
     g_Session.hits_owner_session_id = g_Session.session_id;
-    g_Session.hits_owner_incarnation = nxusDmntTargetIncarnation();
-    g_Session.hits_owner_mapping_generation = mappingGenerationLoad();
+    g_Session.hits_owner_incarnation = incarnation;
+    g_Session.hits_owner_mapping_generation = generation;
     g_Session.hits_owner_valid = true;
+    hitsOwnerWriteEnd();
     hitsStampMapBases();
 }
 
 /* No list is tied to a target any more (Reset): nothing to compare, nothing to
-   refuse. */
+   refuse.  Uses the same seqlock as the stamp, so a concurrent arming writer cannot
+   interleave with the clear. */
 static void hitsOwnerClear(void) {
+    hitsOwnerWriteBegin();
     g_Session.hits_owner_valid = false;
+    hitsOwnerWriteEnd();
     /* The stamp described that list's table: without a list it must not be consulted
        by a later rescue. */
     g_Session.hit_stamp_valid = false;
@@ -412,14 +514,32 @@ static bool g_Inited;
 static void cacheProcessInfo(void);
 static Result snapshotMappings(void);
 static void buildRegions(const NxusScanRequest *req);
-/* Defined with the mapping views further down; nxusSessionHitsRevalidate() needs the
+/* One consistent mapping publication, returned BY VALUE.  The pointer the caller
+   would get from &g_Session.maps is the LIVE struct: its entries/count can be
+   replaced by the next publish between two reads, which is the stale-pair/OOB walk
+   C5 describes.  The sample freezes exactly the pair (and the generation that names
+   it) that the seqlock validated, so callers walk one known table.  The block itself
+   is kept alive by the caller's view pin (see mappingsSample()'s contract below). */
+typedef struct {
+    const NxusMappingEntry *entries;
+    u32 count;
+    u32 generation;
+} NxusMappingSample;
+
+/* Defined with the mapping views further down; the hit-rescue helpers below need the
    consistent sample before that point. */
-static const NxusMappingTable *mappingsSample(void);
+static bool mappingsSample(NxusMappingSample *out);
+/* The hit-rescue helpers pin the sampled block before walking it.  These are defined
+   with the pin accounting further down; forward-declared here because the owner stamp
+   (above the pin section) calls hitsStampMapBases(). */
+static void viewPinLegacy(void);
 
 /* ---- hit-rescue helpers (see the block above) -------------------------- */
 
-/* Record the base array of `maps` (in table order) next to the hit list. */
-static void hitsStampMapBasesFrom(const NxusMappingTable *maps) {
+/* Record the base array of the sampled table (in table order) next to the hit list.
+   It reads the frozen count/entries only, never the live g_Session.maps fields, so a
+   concurrent publish cannot make the loop run past the block it started with. */
+static void hitsStampMapBasesFrom(const NxusMappingSample *maps) {
     if (maps == NULL || maps->entries == NULL || maps->count == 0 ||
         maps->count > NXUS_SESSION_MAP_INDEX_CAP) {
         g_Session.hit_stamp_count = 0;
@@ -439,7 +559,18 @@ static void hitsStampMapBasesFrom(const NxusMappingTable *maps) {
    rescue then falls straight through to the address resolution, which is the correct
    answer anyway (it just cannot take the "no index shifted" shortcut). */
 static void hitsStampMapBases(void) {
-    hitsStampMapBasesFrom(mappingsSample());
+    /* Pin BEFORE sampling, hold the pin across the copy: mappingsSample() returns
+       the table by value, but a publish between the sample and the walk would
+       otherwise retire/free the block the sampled `entries` points into. */
+    NxusMappingSample maps;
+    viewPinLegacy();
+    if (mappingsSample(&maps)) {
+        hitsStampMapBasesFrom(&maps);
+    } else {
+        g_Session.hit_stamp_count = 0;
+        g_Session.hit_stamp_valid = false;
+    }
+    nxusSessionViewRelease();   /* compat pin + drain the ring if it was the last */
 }
 
 /* Is the table strictly ascending by base?  Only then may the resolver binary-search
@@ -938,21 +1069,28 @@ static atomic_ullong g_MappingFingerprint;
 static void mappingSnapshotPublish(NxusMappingEntry *entries, u32 count) {
     NxusMappingEntry *old;
     const u64 fingerprint = mappingFingerprint(entries, count);
-    const u64 previous =
-        atomic_load_explicit(&g_MappingFingerprint, memory_order_acquire);
     viewUpdateBegin();
+    /* Sample the previous fingerprint under the writer lock.  Reading it before
+       viewUpdateBegin() let two publishers see the same "previous"; the second
+       one could then skip a needed bump and leave hits stamped against a replaced
+       table accepted (their mapping_idx now names other regions). */
+    const u64 previous =
+        atomic_load_explicit(&g_MappingFingerprint, memory_order_relaxed);
     /* Captured under the writer lock, like mappingSnapshotDrop(): two writers must
        never both sample the same previous block and both retire it. */
     old = g_Session.map_entries;
     g_Session.map_entries = entries;
     g_Session.maps.entries = entries;
     g_Session.maps.count = count;
-    viewUpdateEnd();
-    /* Only a CONTENT change invalidates stored mapping_idx values.  Bumping on every
-       re-snapshot made a plain ptrscan or snapshot capture discard a perfectly good
-       hit list (the server answered BAD_STATE for work that had not changed). */
-    atomic_store_explicit(&g_MappingFingerprint, fingerprint, memory_order_release);
+    /* Publish the generation with the table, before the seqlock's final even
+       store: a reader must never accept the new table under the old generation
+       and resolve hits through indices that now name other regions.  Only a
+       CONTENT change invalidates stored mapping_idx values; bumping on every
+       re-snapshot made a plain ptrscan or snapshot capture discard a good hit
+       list (the server answered BAD_STATE for work that had not changed). */
     if (fingerprint != previous) mappingGenerationBump();
+    atomic_store_explicit(&g_MappingFingerprint, fingerprint, memory_order_relaxed);
+    viewUpdateEnd();
     viewRetire(old, "mappings");
 }
 
@@ -1459,12 +1597,12 @@ const NxusHitList *nxusSessionHits(void) {
  * different target no matter how well the numbers line up.  This is the check the
  * absolute-address rescue must not get around: the rescue exists for a table REBUILD
  * within one process, not for a restart. */
-static bool hitsOwnerIncarnationMatches(void) {
+static bool hitsOwnerIncarnationMatches(const NxusHitOwner *owner) {
     const u32 now = nxusDmntTargetIncarnation();
-    if (g_Session.hits_owner_incarnation == now) return true;
+    if (owner->incarnation == now) return true;
     NXUS_LOG("hits: hit list belongs to an earlier incarnation (was %u, now %u) - "
              "discarding",
-             (unsigned)g_Session.hits_owner_incarnation, (unsigned)now);
+             (unsigned)owner->incarnation, (unsigned)now);
     return false;
 }
 
@@ -1472,23 +1610,23 @@ static bool hitsOwnerIncarnationMatches(void) {
    generation), shared by the full match and by the identity-only variant the
    main-thread tick uses.  The caller has already checked hitsStale() and
    hits_owner_valid. */
-static bool hitsOwnerIdentityMatches(void) {
+static bool hitsOwnerIdentityMatches(const NxusHitOwner *owner) {
     /* A new dmnt process is a new target before any field is compared: with a reused
        pid the fields below can all be equal and still name a process that is gone. */
-    if (!hitsOwnerIncarnationMatches()) return false;
+    if (!hitsOwnerIncarnationMatches(owner)) return false;
 
     /* ONE identity snapshot for both compared fields: sampling the pid and the
        program id separately could compare the stamp against the pid of one write
        and the title of the next (the stamp itself is written from one snapshot). */
     const NxusTargetIdentity id = identitySample();
-    if (g_Session.hits_owner_pid != 0) {
+    if (owner->pid != 0) {
         /* Both sides know a pid, so that is the identity.  The program id is only
            compared when BOTH sides have one: an explicit DebugAttach can leave it 0
            (dmnt metadata unavailable then), and refusing the session's own list for
            a missing title would break the scan-then-attach flow - the same rule
            ptrChainOwnerCheck() uses for the chain list. */
-        if (g_Session.hits_owner_pid != id.pid) return false;
-        const u64 saved_title = g_Session.hits_owner_program_id;
+        if (owner->pid != id.pid) return false;
+        const u64 saved_title = owner->program_id;
         const u64 now_title = id.program_id;
         return saved_title == 0 || now_title == 0 || saved_title == now_title;
     }
@@ -1496,7 +1634,7 @@ static bool hitsOwnerIdentityMatches(void) {
     /* No pid when the scan started (dmnt had no metadata): the scan generation is
        the only per-target token the session publishes, because nxusSessionId()
        changes on every ScanBegin/Reset. */
-    return g_Session.hits_owner_session_id == g_Session.session_id;
+    return owner->session_id == g_Session.session_id;
 }
 
 /* Can the stamped list be rescued across a mapping-table rebuild?
@@ -1618,7 +1756,13 @@ static bool mapResolverFind(const NxusMapResolver *r, u64 address, u32 *out_inde
 
 bool nxusSessionHitsRevalidate(void) {
     if (hitsStale()) return false;
-    if (!g_Session.hits_owner_valid) return false;
+
+    /* ONE owner-stamp sample for every field compared below: the tick can clear the
+       stamp concurrently, and reading its fields one at a time could pair the pid of
+       one stamp with the valid flag of the next. */
+    NxusHitOwner owner;
+    if (!hitsOwnerSample(&owner)) return false;
+    if (!owner.valid) return false;
     /* The rescue repairs mapping ORDINALS; it never makes an address belong to
        another process.  A restart into the same pid and the same layout resolves
        perfectly and is still the wrong target, so a list stamped with an older
@@ -1626,27 +1770,40 @@ bool nxusSessionHitsRevalidate(void) {
        normally runs before this one.  This entry point is reachable directly
        (nxus_session.h documents it as such), and a caller must not be able to turn
        "dmnt reopened the process" into a rescue. */
-    if (!hitsOwnerIncarnationMatches()) return false;
+    if (!hitsOwnerIncarnationMatches(&owner)) return false;
     if (sessionStateLoad() == NxusScanState_Running) return false;
 
-    /* Sampled BEFORE the table: a stamp is only allowed to name a generation whose
-       table was verified.  If a rebuild slips in between, the stamp is the older of
-       the two and the next MatchTarget() simply re-runs this check. */
-    const u32 generation = mappingGenerationLoad();
     NxusHitList *hits = &g_Session.hits;
     const u32 count = hits->count;
 
     if (count == 0) {
         /* Nothing to verify: an empty list is valid against any table, and only the
-           stamp update makes it servable again. */
-        g_Session.hits_owner_mapping_generation = generation;
-        hitsStampMapBases();
+           stamp update makes it servable again.  Still sample the table (and pin it)
+           so the generation/base stamp name one publication. */
+        NxusMappingSample empty;
+        viewPinLegacy();
+        const bool have_table = mappingsSample(&empty);
+        hitsOwnerSetMappingGeneration(have_table ? empty.generation : mappingGenerationLoad());
+        if (have_table) {
+            hitsStampMapBasesFrom(&empty);
+        } else {
+            g_Session.hit_stamp_count = 0;
+            g_Session.hit_stamp_valid = false;
+        }
+        nxusSessionViewRelease();
         NXUS_LOG("hits: revalidated %u hit(s) across a mapping rebuild", 0u);
         return true;
     }
 
-    const NxusMappingTable *maps = mappingsSample();
-    if (maps == NULL || maps->entries == NULL || maps->count == 0) {
+    /* One frozen sample, taken UNDER a view pin: entries/count/generation all name
+       the same publication, and the block the sampled `entries` points into cannot
+       be freed by a concurrent publish while the compaction below walks it.  The
+       live &g_Session.maps fields would be re-read (and could grow/shrink) between
+       the checks. */
+    NxusMappingSample maps;
+    viewPinLegacy();
+    if (!mappingsSample(&maps)) {
+        nxusSessionViewRelease();
         /* No table at all: not one recorded address can be resolved against it. */
         NXUS_LOG("hits: %u hit(s) can no longer be resolved - dropped", (unsigned)count);
         return false;
@@ -1658,9 +1815,9 @@ bool nxusSessionHitsRevalidate(void) {
        and the table describe the same walk; a rebuilt table with identical bases in
        identical order has identical indices.) */
     bool same_order = g_Session.hit_stamp_valid &&
-                      g_Session.hit_stamp_count == maps->count;
-    for (u32 i = 0; same_order && i < maps->count; i++) {
-        if (maps->entries[i].base != g_Session.hit_stamp_bases[i]) same_order = false;
+                      g_Session.hit_stamp_count == maps.count;
+    for (u32 i = 0; same_order && i < maps.count; i++) {
+        if (maps.entries[i].base != g_Session.hit_stamp_bases[i]) same_order = false;
     }
 
     /* Step 2: otherwise resolve by ADDRESS against the CURRENT table.  The index is
@@ -1668,7 +1825,7 @@ bool nxusSessionHitsRevalidate(void) {
     NxusMapResolver resolver;
     bool have_resolver = false;
     if (!same_order) {
-        have_resolver = mapResolverInit(&resolver, maps->entries, maps->count);
+        have_resolver = mapResolverInit(&resolver, maps.entries, maps.count);
     }
 
     const u32 value_size = hits->value_size;
@@ -1684,8 +1841,8 @@ bool nxusSessionHitsRevalidate(void) {
 
         if (same_order) {
             idx = (u32)cur.mapping_idx;
-            if (idx < maps->count) {
-                const NxusMappingEntry *m = &maps->entries[idx];
+            if (idx < maps.count) {
+                const NxusMappingEntry *m = &maps.entries[idx];
                 offset = (u64)cur.offset;
                 /* The VALUE has to fit too: a hit whose window straddles the end of
                    its mapping would be replayed (refine / next compare) as a read of
@@ -1700,11 +1857,11 @@ bool nxusSessionHitsRevalidate(void) {
         } else if (have_resolver && mapResolverFind(&resolver, cur.address, &idx)) {
             /* The recorded address is the ground truth; the offset is measured from
                the mapping base, never from a clipped region start (addr_base). */
-            offset = cur.address - maps->entries[idx].base;
+            offset = cur.address - maps.entries[idx].base;
             /* Same bound as above: the 32-bit wire offset AND the value within the
                mapping (mapResolverFind already proved offset < size). */
             ok = offset <= 0xFFFFFFFFull &&
-                 (u64)value_size <= maps->entries[idx].size - offset;
+                 (u64)value_size <= maps.entries[idx].size - offset;
         }
 
         if (!ok) { dropped++; continue; }
@@ -1729,22 +1886,27 @@ bool nxusSessionHitsRevalidate(void) {
     if (dropped != 0) {
         hits->count = keep;
         /* Undo rewinds to prev_count: it must not resurrect the dropped slots (their
-           values were overwritten by the compaction above). */
+           values were overwritten by the compaction above).  This path only clamps
+           (the dropped tail cannot be restored either way); the classic refine path
+           handles the stronger "disable Undo" rule in scanThread(). */
         if (hits->prev_count > keep) hits->prev_count = keep;
     }
 
     if (keep == 0) {
         /* Not one address survives: nothing is left to refine or serve, so report the
            list as unservable and let the caller discard it (BAD_STATE). */
+        nxusSessionViewRelease();
         NXUS_LOG("hits: %u hit(s) can no longer be resolved - dropped", (unsigned)dropped);
         return false;
     }
 
     /* Re-point the owner stamp and re-record the bases from the table that was just
        verified, so the pair matches again and a later rebuild is compared with this
-       one. */
-    g_Session.hits_owner_mapping_generation = generation;
-    hitsStampMapBasesFrom(maps);
+       one.  The generation is the SAMPLED one (the publication the entries above were
+       validated against), not a later independent load. */
+    hitsOwnerSetMappingGeneration(maps.generation);
+    hitsStampMapBasesFrom(&maps);
+    nxusSessionViewRelease();
     NXUS_LOG("hits: revalidated %u hit(s) across a mapping rebuild", (unsigned)keep);
     /* Last, so the loss (the actionable line) ends the block instead of being buried
        above the summary. */
@@ -1764,12 +1926,26 @@ bool nxusSessionHitsMatchTarget(void) {
        refused in the meantime (the arrays are still there, see
        nxusSessionInvalidateHits). */
     if (hitsStale()) return false;
-    /* Nothing was ever built for a target: nothing can be stale. */
-    if (!g_Session.hits_owner_valid) return true;
+
+    /* ONE seqlock sample: never a half-armed stamp (valid flag from one write, fields
+       from the next).  A failed sample means "cannot prove it matches", so refuse
+       instead of serving a possibly-wrong list. */
+    NxusHitOwner owner;
+    if (!hitsOwnerSample(&owner)) return false;
+    /* Re-check AFTER the stamp: a tick that invalidated the list while this reader
+       was copying must not be overwritten by the "matches" conclusion below. */
+    if (hitsStale()) return false;
+
+    /* No stamp AND no list: nothing was ever built for a target, nothing can be
+       stale.  A CLEARED stamp with hits still in the arrays is not "no list": the tick
+       clears the owner first (nxusSessionInvalidateHits) and the arrays are only
+       reclaimed by the next Begin/Reset/Exit, so treating it as a match would serve a
+       list that is being discarded - the C3 ownership bypass. */
+    if (!owner.valid) return g_Session.hits.count == 0;
 
     /* A different target is NEVER rescueable: its addresses belong to a process
        that is gone, whatever the numbers resolve to. */
-    if (!hitsOwnerIdentityMatches()) return false;
+    if (!hitsOwnerIdentityMatches(&owner)) return false;
 
     /* The mapping snapshot was replaced after this list was stamped.  mapping_idx is
        an ordinal into that table, so the list is offered to
@@ -1778,7 +1954,7 @@ bool nxusSessionHitsMatchTarget(void) {
        more and re-points the stamp at the new generation.  False when nothing
        survives: that is the old "discard" answer (the server logs the rebuild and
        answers BAD_STATE). */
-    if (g_Session.hits_owner_mapping_generation != mappingGenerationLoad()) {
+    if (owner.mapping_generation != mappingGenerationLoad()) {
         return nxusSessionHitsRevalidate();
     }
 
@@ -1794,8 +1970,13 @@ bool nxusSessionHitsMatchTarget(void) {
    compare the generation, so nothing is served stale. */
 bool nxusSessionHitsMatchTargetIdentity(void) {
     if (hitsStale()) return false;
-    if (!g_Session.hits_owner_valid) return true;
-    return hitsOwnerIdentityMatches();
+    NxusHitOwner owner;
+    if (!hitsOwnerSample(&owner)) return false;
+    /* Same second check as the full match: an invalidate that raced the stamp copy
+       wins over the identity answer. */
+    if (hitsStale()) return false;
+    if (!owner.valid) return g_Session.hits.count == 0;
+    return hitsOwnerIdentityMatches(&owner);
 }
 
 /* Was the stored list refused ONLY because the table was rebuilt under it?  This
@@ -1805,12 +1986,14 @@ bool nxusSessionHitsMatchTargetIdentity(void) {
    rebuild. */
 bool nxusSessionHitsMappingGenerationChanged(u32 *owner_generation, u32 *current_generation) {
     const u32 current = mappingGenerationLoad();
-    const bool stamped = g_Session.hits_owner_valid;
-    const u32 owner = stamped ? g_Session.hits_owner_mapping_generation : 0;
-    if (owner_generation != NULL) *owner_generation = owner;
+    NxusHitOwner owner;
+    const bool have_stamp = hitsOwnerSample(&owner);
+    const bool stamped = have_stamp && owner.valid;
+    const u32 owner_gen = stamped ? owner.mapping_generation : 0;
+    if (owner_generation != NULL) *owner_generation = owner_gen;
     if (current_generation != NULL) *current_generation = current;
     if (hitsStale() || !stamped) return false;
-    return owner != current;
+    return owner_gen != current;
 }
 
 void nxusSessionInvalidateHitsEx(bool drop_tables) {
@@ -1852,35 +2035,60 @@ void nxusSessionInvalidateHits(void) {
     nxusSessionInvalidateHitsEx(true);
 }
 
-/* Never returns a dangling table: the pair is only readable while g_ViewSeq is
-   stable, mappingSnapshotDrop() clears it before the block is retired, and the
-   retry loop rejects a sample that raced with an update - so the caller sees
-   either one consistent snapshot or an empty view.  Callers must tolerate NULL
-   (= no snapshot / after Exit) and must run behind the BUSY gate (the pointer
-   scan and the module walk read the array the worker is using).
+/* Never returns a torn pair: the fields are only readable while g_ViewSeq is
+   stable, mappingSnapshotDrop() clears them before the block is retired, and the
+   retry loop rejects a sample that raced with an update.  The result is a BY-VALUE
+   snapshot (entries + count + generation from the same publication), not a pointer
+   to the live g_Session.maps struct whose fields a later publish can replace between
+   two dereferences.  False means "no table right now" (not yet built, after Exit,
+   dropped, or the reader kept losing the race).
  *
- * The sample itself takes NO pin: every caller already holds one (a token via
- * nxusSessionViewPinCurrent(), or the compat pin taken by nxusSessionMappings()).
- * Taking a second one here is what made a forgotten release invisible, and it
- * would also make the token and the sample disagree about ownership. */
-static const NxusMappingTable *mappingsSample(void) {
+ * The sample itself takes NO pin: every caller holds one (a token via
+ * nxusSessionViewPinCurrent(), the compat pin taken by nxusSessionMappings(), or the
+ * internal pin taken by the hit-rescue helpers).  Taking a second one here is what
+ * made a forgotten release invisible, and it would also make the token and the
+ * sample disagree about ownership. */
+static bool mappingsSample(NxusMappingSample *out) {
+    if (out == NULL) return false;
+    out->entries = NULL;
+    out->count = 0;
+    out->generation = 0;
+
     for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
         const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
         if ((seq & 1u) != 0) continue;              /* update in progress */
-        NxusMappingEntry *const entries = g_Session.maps.entries;
+        const NxusMappingEntry *entries = g_Session.maps.entries;
         const u32 count = g_Session.maps.count;
+        /* Snapshot the generation INSIDE the stable window too: comparing a table
+           against a generation loaded after the pair would let a publish in between
+           name one table with the generation of the next. */
+        const u32 generation =
+            (u32)atomic_load_explicit(&g_MappingGeneration, memory_order_relaxed);
         /* Load/load barrier, the same shape as nxusSessionTargetIdentity(): the
            acquire load above only keeps LATER accesses after itself, so without this
-           fence arm64 may retire the two plain loads above after the re-check below.
+           fence arm64 may retire the plain loads above after the re-check below.
            The sample would then be accepted although it paired the count of one
            publication with the entries pointer of the next - a count larger than the
            block it points at, i.e. an out-of-bounds walk for the caller. */
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
-        if (count == 0 || entries == NULL) return NULL;   /* empty view */
-        return &g_Session.maps;
+        if (count == 0 || entries == NULL) return false;   /* empty view */
+        out->entries = entries;
+        out->count = count;
+        out->generation = generation;
+        return true;
     }
-    return NULL;   /* kept losing the race: report "no table" instead of a torn pair */
+    return false;   /* kept losing the race: report "no table" instead of a torn pair */
+}
+
+/* Compat pointer view: the sample is validated first, then the caller gets the
+   published table.  It still points at the live struct - the documented compat
+   contract (capture entries/count immediately, behind a pin) - but no internal
+   caller relies on that any more: the hit-rescue path uses NxusMappingSample. */
+static const NxusMappingTable *mappingsSampleLive(void) {
+    NxusMappingSample sample;
+    if (!mappingsSample(&sample)) return NULL;
+    return &g_Session.maps;
 }
 
 /* Compat sample: takes one anonymous pin, dropped by nxusSessionViewRelease().  A
@@ -1889,7 +2097,7 @@ static const NxusMappingTable *mappingsSample(void) {
    takes no pin, so it must not be released. */
 const NxusMappingTable *nxusSessionMappings(void) {
     viewPinLegacy();            /* pin BEFORE sampling: retire then sees a reader */
-    const NxusMappingTable *table = mappingsSample();
+    const NxusMappingTable *table = mappingsSampleLive();
     if (table == NULL) viewReleaseLegacy();
     return table;
 }
@@ -1902,7 +2110,7 @@ const NxusMappingTable *nxusSessionMappingsPinned(const NxusViewPin *pin) {
         NXUS_LOG("view: mappings sampled without a live pin - refused");
         return NULL;
     }
-    return mappingsSample();
+    return mappingsSampleLive();
 }
 
 void nxusSessionSetPaused(bool paused) {
@@ -2072,13 +2280,22 @@ Result nxusSessionPrepareRegions(u32 scope, u64 range_begin, u64 range_end) {
 
 /* Same contract as nxusSessionHits(): consumers (the snapshot service) run
    behind the server's BUSY gate, because preparing a new scan rebuilds this list
-   under the running engine.  The pair is sampled behind the seqlock, so a clear
-   or a rebuild is reported as one consistent (NULL, 0) / (list, count) instead of
-   a pointer from one publication paired with the count of another.
+   under the running engine.  The pair is sampled behind the seqlock and returned BY
+   VALUE, so a clear or a rebuild can never pair the list of one publication with the
+   count of another (or with a later live count the caller re-reads).
  *
  * Like mappingsSample(), the sample itself takes no pin: the caller's pin (token or
  * compat) is what keeps the list alive across the next publish. */
-static const NxusScanRegion *regionsSample(u32 *out_count) {
+typedef struct {
+    const NxusScanRegion *regions;
+    u32 count;
+} NxusRegionSample;
+
+static bool regionsSample(NxusRegionSample *out) {
+    if (out == NULL) return false;
+    out->regions = NULL;
+    out->count = 0;
+
     for (u32 attempt = 0; attempt < NXUS_VIEW_RETRY; attempt++) {
         const u32 seq = atomic_load_explicit(&g_ViewSeq, memory_order_acquire);
         if ((seq & 1u) != 0) continue;              /* update in progress */
@@ -2089,24 +2306,27 @@ static const NxusScanRegion *regionsSample(u32 *out_count) {
            whose count comes from a newer publication than the list. */
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_ViewSeq, memory_order_acquire) != seq) continue;
-        if (regions == NULL || count == 0) {
-            if (out_count != NULL) *out_count = 0;
-            return NULL;
-        }
-        if (out_count != NULL) *out_count = count;
-        return regions;
+        if (regions == NULL || count == 0) return false;
+        out->regions = regions;
+        out->count = count;
+        return true;
     }
-    if (out_count != NULL) *out_count = 0;
-    return NULL;   /* kept losing the race: report "no list" instead of a torn pair */
+    return false;   /* kept losing the race: report "no list" instead of a torn pair */
 }
 
 /* Compat sample: one anonymous pin, dropped by nxusSessionViewRelease(); NULL
    takes no pin (out_count is then 0). */
 const NxusScanRegion *nxusSessionRegions(u32 *out_count) {
     viewPinLegacy();            /* pin BEFORE sampling: retire then sees a reader */
-    const NxusScanRegion *regions = regionsSample(out_count);
-    if (regions == NULL) viewReleaseLegacy();
-    return regions;
+    NxusRegionSample sample;
+    const bool have = regionsSample(&sample);
+    if (!have) {
+        viewReleaseLegacy();
+        if (out_count != NULL) *out_count = 0;
+        return NULL;
+    }
+    if (out_count != NULL) *out_count = sample.count;
+    return sample.regions;
 }
 
 /* Token sample behind the caller's pin (no extra pin taken). */
@@ -2116,7 +2336,13 @@ const NxusScanRegion *nxusSessionRegionsPinned(const NxusViewPin *pin, u32 *out_
         if (out_count != NULL) *out_count = 0;
         return NULL;
     }
-    return regionsSample(out_count);
+    NxusRegionSample sample;
+    if (!regionsSample(&sample)) {
+        if (out_count != NULL) *out_count = 0;
+        return NULL;
+    }
+    if (out_count != NULL) *out_count = sample.count;
+    return sample.regions;
 }
 
 Result nxusSessionRefreshMappings(void) {
@@ -2376,6 +2602,25 @@ static void scanThread(void *arg) {
                             sessionRead, NULL, window, g_Session.window_size,
                             g_Session.gap_threshold, &stats,
                             (int *)&g_Session.cancel);
+    }
+
+    /* A classic refine compacts survivors forward IN PLACE: a dropped entry in the
+       middle is overwritten by the next survivor, so the previous pass's slots no
+       longer form a complete address/value set.  The engine still records
+       prev_count = initial_count, which would let Undo rewind to a list where a
+       resurrected slot is a duplicate with a stale value (H1).  Detect the drop here,
+       while the pass is still unpublished, and disable Undo instead: prev_count is
+       the only thing Undo reads.  A baseline refine APPENDS its hits, so its
+       prev_count stays below count and is unaffected. */
+    if (!first_pass && rc == NXUS_SCAN_OK) {
+        const u32 prev = g_Session.hits.prev_count;
+        const u32 now = g_Session.hits.count;
+        if (prev > now) {
+            g_Session.hits.prev_count = 0;
+            NXUS_LOG("refine: %u hit(s) dropped - Undo disabled for this pass (the "
+                     "compacted slots cannot be restored)",
+                     (unsigned)(prev - now));
+        }
     }
 
     /* The store belongs to the session, so the engine could only report a failed

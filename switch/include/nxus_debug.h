@@ -42,7 +42,7 @@ void   nxusDebugExit(void);
  * thread underneath a teardown that is still draining and closing the old handle. */
 Result nxusDebugAttach(u64 pid);
 /* Release the session: join the event thread, drain the counted debug operations,
- * close the debug handle and hand the process back to dmnt.  This is the one
+ * publish INVALID_HANDLE and hand the process back to dmnt.  This is the one
  * teardown, and it runs EXACTLY ONCE even when several callers ask for it at the same
  * time (DebugDetach request, idle reap, Pause/Resume hand-back, exit collection):
  *
@@ -51,6 +51,12 @@ Result nxusDebugAttach(u64 pid);
  *     budget as the handle drain, with a short spin and a log line - and then either
  *     finds the session already released (no-op) or completes the release itself;
  *   - the shutdown path (nxusDebugExit()) does not wait at all, as documented there.
+ *
+ * If the 2 s drain still finds counted operations, the handle is deliberately LEAKED
+ * and never passed to svcCloseHandle(): a late svc*Debug* call that already loaded
+ * the handle value must not land on a recycled handle or on the next session's
+ * process.  Leak-over-UAF is the project rule; nxusDebugAttach() additionally refuses
+ * to publish a new session handle until those stale operations have returned.
  *
  * Returns 0 once the session is released; a concurrent teardown is reported as
  * "released" rather than as an error, because that is what the caller asked for. */
@@ -78,7 +84,10 @@ bool   nxusDebugTargetIs64BitKnown(void);
  * Every entry point below that hands the session handle to an svc*Debug* call is
  * counted by debugOpBegin()/debugOpEnd() in nxus_debug.c, and nxusDebugDetach()
  * waits for that counter to reach zero (a bounded two-stage drain (500 ms, then 1500 ms more; 2 s total)) before
- * it closes the handle.  That covers BreakSet/BreakClear (hardware arm through the
+ * it closes the handle.  If the count is still non-zero after that budget the handle
+ * is LEAKED rather than closed, because svcCloseHandle() frees the handle number for
+ * reuse and a late syscall would then name an unrelated object (or the next
+ * session's process).  That covers BreakSet/BreakClear (hardware arm through the
  * handle), Continue, Step, Break, ThreadList, RegsGet/RegsSet and the debug-mode
  * ContextID re-arm in nxusDebugConfigure(), as well as the memory accessors.
  *

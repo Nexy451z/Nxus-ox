@@ -86,17 +86,31 @@ Result nxusDmntForceClose(void);
  * This counter is the missing token: it changes exactly when dmnt takes on a new
  * process, so a hit list / chain list stamped with an older value is refused.
  *
- * It is bumped ONLY by a successful EXPLICIT open of a process dmnt did not already
+ * It is bumped by a successful EXPLICIT open of a process dmnt did not already
  * hold (nxusDmntForceOpen(), including the repair retry inside dmntRunCommand).  A
  * ForceOpen against the process that is already open is a no-op and must NOT change
  * the value: every caller that re-asserts "dmnt should own it" would otherwise
  * invalidate the results it is about to use.
  *
+ * One conservative exception: a ForceOpen that FAILS while an adopt request is
+ * pending bumps too.  The old target is then no longer provably the process dmnt
+ * will hold, so its stamp is invalidated rather than left to match a later,
+ * unrelated open.  A needless bump only loses a hit list; a missed one is unsafe.
+ *
  * Reads are acquire loads, bumps release => a reader that observes the new value
  * also observes the process it describes.  Logged as "dmnt: target incarnation N". */
 u32    nxusDmntTargetIncarnation(void);
-/* The next successful ForceOpen keeps the current incarnation: used when the
-   kernel debugger reopens the very same process on detach. */
+/* Ask the next successful ForceOpen to keep the current incarnation - but only if
+   it really opens the SAME process.  The no-argument signature is retained for
+   existing callers and the host-test stubs.
+ *
+ * The request is verified, not trusted: when ForceOpen actually creates a process,
+ * nxusDmntForceOpen() reads its metadata and nxusDmntAdoptNextOpen() snapshots the
+ * last pid/program_id dmnt reported.  The incarnation is preserved only when both
+ * the pid AND the title (program_id) match; a different pid/title, unreadable
+ * metadata, or a failed ForceOpen clears the latch and bumps the incarnation like
+ * any other new target.  That keeps "same pid, restarted title with the same
+ * layout" from inheriting the old hit list's ownership stamp. */
 void   nxusDmntAdoptNextOpen(void);
 /* Pause/Resume the cheat process through dmnt itself.  These are the real
    commands (65004/65005): Atmosphère implements them as svc::BreakDebugProcess /

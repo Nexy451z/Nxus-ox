@@ -57,4 +57,4 @@ if __name__ == '__main__':
         raise SystemExit(__doc__)
     for section, off, before, after in patch(sys.argv[1]):
         print(f"  {section}: flags byte at {off}: {before} -> {after}")
-    print("NPDM debug capabilities forced on (bits 17|18|19)")
+    print("NPDM ForceDebug (0x08) forced on; allow_debug/force_debug_prod bits cleared")

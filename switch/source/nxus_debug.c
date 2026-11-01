@@ -32,6 +32,19 @@ typedef struct {
 
 static Handle g_Debug = INVALID_HANDLE;
 static bool   g_Attached = false;
+
+/* g_Attached is read by other threads (status queries, the event loop, the scan
+ * worker) while attach/detach publish it here.  A plain bool let a reader observe
+ * "attached" before the g_Debug it describes was visible - and after a detach, the
+ * reverse.  Publish with release and read with acquire; g_Debug is stored before
+ * g_Attached=true in nxusDebugAttach(), and INVALID_HANDLE before the close in
+ * debugReleaseHandleDrained(), so a reader that sees the flag also sees its handle. */
+static inline bool debugAttached(void) {
+    return __atomic_load_n(&g_Attached, __ATOMIC_ACQUIRE);
+}
+static inline void debugPublishAttached(bool attached) {
+    __atomic_store_n(&g_Attached, attached, __ATOMIC_RELEASE);
+}
 static Thread g_EventThread;
 static bool   g_EventThreadLive = false;
 static atomic_bool g_StopLoop;
@@ -85,11 +98,17 @@ static atomic_bool g_HandoffBusy;
  *     g_Debug, so no closed handle can reach the kernel through them. */
 static atomic_int  g_DebugOpUsers;
 static atomic_bool g_DebugClosing;
+/* Set when the staged drain timed out with operations still counted and the handle
+   was deliberately LEAKED instead of closed.  A handle left open is harmless; closing
+   it under a live svc*Debug* call would free its number for reuse and let that call
+   land on an unrelated object (or on the next session's process).  nxusDebugAttach()
+   refuses to start a new session while the leaked handle may still be referenced. */
+static atomic_bool g_DebugHandleLeaked;
 
-/* In-flight drain budget used by nxusDebugDetach() before it closes the handle,
-   in 1 ms steps and in two stages: 500 ms first (the original, unchanged budget),
-   then - only when something is still counted - a further 1500 ms, i.e. 2 s in
-   total.  Widening the guard to more commands must not make a healthy detach wait
+/* In-flight drain budget used by nxusDebugDetach() before it closes (or, on timeout,
+   deliberately leaks) the handle, in 1 ms steps and in two stages: 500 ms first (the
+   original, unchanged budget), then - only when something is still counted - a
+   further 1500 ms, i.e. 2 s in total.  Widening the guard to more commands must not make a healthy detach wait
    longer, so stage 1 keeps its old length and stage 2 is only entered when stage 1
    did not drain. */
 #define NXUS_DEBUG_OP_DRAIN_MS        500
@@ -103,7 +122,7 @@ static Result debugOpBegin(void) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
     atomic_fetch_add_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
-    if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire) || !g_Attached) {
+    if (atomic_load_explicit(&g_DebugClosing, memory_order_acquire) || !debugAttached()) {
         atomic_fetch_sub_explicit(&g_DebugOpUsers, 1, memory_order_acq_rel);
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
@@ -888,12 +907,12 @@ static void disarmAllBreaks(void) {
    physically impossible for a late rearm to reprogram a core after the detach
    has wiped the registers. */
 static void rearmAllBreaks(void) {
-    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+    if (!debugAttached() || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         return;
     }
     mutexLock(&g_Mutex);
-    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+    if (!debugAttached() || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         mutexUnlock(&g_Mutex);
         return;
@@ -986,7 +1005,7 @@ static bool handleDebugEvent(const DebugEventInfo *event) {
                collected must not inherit them). */
             atomic_store_explicit(&g_Is64Bit, false, memory_order_release);
             atomic_store_explicit(&g_Is64BitKnown, false, memory_order_release);
-            g_Attached = false;
+            debugPublishAttached(false);
             nxusDmntSetAutoReopen(true);
             NXUS_LOG("debug: process exited (reason=%u) - session released, dmnt reopened "
                      "by the server tick",
@@ -1027,7 +1046,7 @@ static u32 drainDebugEvents(bool *had_break) {
 static void eventThread(void *arg) {
     (void)arg;
     while (!atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
-        if (!g_Attached || g_Debug == INVALID_HANDLE) break;
+        if (!debugAttached() || g_Debug == INVALID_HANDLE) break;
 
         /* Take EVERY queued event before calling ContinueDebugEvent: one unread
            event is enough for the kernel to return 0xF401 and leave all threads
@@ -1128,10 +1147,10 @@ static void eventThread(void *arg) {
            then re-arm what the PC still has enabled.  Skipped when the hit was a
            hot slot that recordHit() auto-disarmed (nothing left to re-arm) and
            whenever a detach has already started. */
-        if (had_break && g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+        if (had_break && debugAttached() && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
             if (anyBreakEnabled()) {
                 svcSleepThread(1000000ull);
-                if (g_Attached && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
+                if (debugAttached() && !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
                     rearmAllBreaks();
                 }
             }
@@ -1161,8 +1180,8 @@ void nxusDebugInit(void) {
     g_Config.auto_continue = 0;
     atomic_init(&g_Is64Bit, false);
     atomic_init(&g_Is64BitKnown, false);
-    g_Attached = false;
-    g_Debug = INVALID_HANDLE;
+    debugPublishAttached(false);
+    __atomic_store_n(&g_Debug, INVALID_HANDLE, __ATOMIC_RELEASE);
     atomic_init(&g_StopLoop, true);
     if (!g_EventMutexReady) {
         rmutexInit(&g_EventMutex);
@@ -1175,6 +1194,7 @@ void nxusDebugInit(void) {
     atomic_init(&g_TeardownDepth, 0u);
     atomic_init(&g_DebugOpUsers, 0);
     atomic_init(&g_DebugClosing, false);
+    atomic_init(&g_DebugHandleLeaked, false);
     atomic_init(&g_Stopped, false);
     atomic_init(&g_StoppedThread, 0);
     atomic_init(&g_StopReason, (unsigned)StopReason_Hit);
@@ -1194,7 +1214,7 @@ void nxusDebugExit(void) {
     (void)debugDetachExclusive(false);
 }
 
-bool nxusDebugIsAttached(void) { return g_Attached; }
+bool nxusDebugIsAttached(void) { return debugAttached(); }
 
 /* The target's own architecture, as learned from the kernel's CreateProcess
    event.  "Unknown" and "AArch32" must stay distinguishable: the pointer-width
@@ -1211,7 +1231,7 @@ bool nxusDebugTargetIs64BitKnown(void) {
     /* A session that was released (or has not been established) has no answer; the
        flag is cleared on detach/exit as well, and this guard keeps a reader that
        races the release from seeing the previous target's architecture. */
-    if (!g_Attached) return false;
+    if (!debugAttached()) return false;
     return atomic_load_explicit(&g_Is64BitKnown, memory_order_acquire);
 }
 
@@ -1255,24 +1275,24 @@ bool nxusDmntHandoffBlocked(void) {
  *      stays set across both stages: no new operation can enter while the count is
  *      going down.
  *
- *      Why closing after the 2 s total is still safe when something IS counted:
+ *      The 2 s total is a BOUND, not a licence to close: if the count is still
+ *      non-zero when both stages have elapsed, the handle is LEAKED (published as
+ *      INVALID_HANDLE, never passed to svcCloseHandle).  The project rule is
+ *      "leak allowed, UAF/handle-reuse forbidden", and a close here is exactly the
+ *      forbidden case:
  *        - debugOpBegin() refuses every new operation from the moment the flag is
  *          set, so the counted set can only shrink; nothing can join it during
  *          either stage and no fresh syscall can be started on the handle.
- *        - an already counted operation has at most a handful of non-blocking
- *          svc*Debug* calls left.  Its longest internal wait is the bounded
- *          step/stop wait (~42 ms), so 2 s is roughly fifty times the worst
- *          legitimate holding time: a count that is still non-zero here means a
- *          wedged thread or a leaked counter, not a syscall that is genuinely in
- *          progress, and waiting longer would block the teardown for ever without
- *          making the close any safer.
- *        - g_Debug is published as INVALID_HANDLE BEFORE the close below, so an
- *          operation that reaches its syscall late cannot pick the old number up
- *          again - it reads "no handle" and fails cleanly instead of naming a
- *          recycled one.
- *      The only theoretical residue is a thread that already loaded the old handle
- *      value and was then starved for the whole 2 s before issuing the call; the
- *      flag above keeps that from turning into a new user of the session.
+ *        - an already counted operation may have loaded the handle value before
+ *          the flag and been starved for the whole 2 s.  Closing the handle frees
+ *          its number, and a later svc*Debug* call then names a recycled object -
+ *          or, after the next attach, a different process.  Leaving the handle
+ *          open keeps that late call operating on the object it was loaded for.
+ *        - g_Debug is published as INVALID_HANDLE BEFORE either action, so an
+ *          operation that has not loaded it yet fails cleanly.
+ *      g_DebugHandleLeaked records the leak so nxusDebugAttach() can refuse to
+ *      publish a new session handle until the stale counted operations have all
+ *      returned (a new session would otherwise be the new target of a late call).
  *
  * The session state around it (g_Attached, the break/thread tables, the stop state,
  * dmnt's auto-reopen) stays the CALLER's job: this helper only guarantees that no
@@ -1288,7 +1308,7 @@ bool nxusDmntHandoffBlocked(void) {
  * helper used to make possible.
  */
 static void debugReleaseHandleDrained(void) {
-    const Handle handle = g_Debug;
+    const Handle handle = (Handle)__atomic_load_n(&g_Debug, __ATOMIC_ACQUIRE);
     if (handle == INVALID_HANDLE) return;
 
     /* Drain the queue and acknowledge every pending exception as handled before
@@ -1326,24 +1346,34 @@ static void debugReleaseHandleDrained(void) {
             drained = true;
         }
     }
+    bool leaked = false;
     if (!drained) {
-        /* Level 0: closing the handle below can let a still-running operation land
-           on a recycled handle (a different kernel object).  Nothing else in the log
-           records this, so keep it at level 0 - and leave a breadcrumb in
-           g_LastResult as well: the next status reply then shows BUSY instead of the
-           last operation's Result, which is the only in-band evidence a client has
-           that the session was released while an operation was still counted. */
-        NXUS_LOG_ERROR("debug close: %d debug op(s) still in flight after %u ms "
-                       "(2 s staged drain) - closing the debug handle anyway",
-                       (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire),
-                       (unsigned)NXUS_DEBUG_OP_DRAIN_TOTAL_MS);
-        g_LastResult = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+        /* Re-check once more: the last millisecond of stage 2 may have drained it. */
+        const int users = (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire);
+        if (users > 0) {
+            /* Level 0: the handle is intentionally leaked.  Closing it here is the
+               one thing this path must never do - a counted operation may already
+               hold the old handle value and would then issue its syscall against a
+               recycled handle (or the next session's process). */
+            leaked = true;
+            NXUS_LOG_ERROR("debug close: %d debug op(s) still in flight after %u ms "
+                           "(2 s staged drain) - LEAKING debug handle 0x%X instead of "
+                           "closing it under a live syscall",
+                           users, (unsigned)NXUS_DEBUG_OP_DRAIN_TOTAL_MS,
+                           (unsigned)handle);
+            g_LastResult = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+            atomic_store_explicit(&g_DebugHandleLeaked, true, memory_order_release);
+        } else {
+            drained = true;
+        }
     }
-    /* Publish "no handle" BEFORE the close: an operation that is already counted but
-       has not issued its syscall yet then finds INVALID_HANDLE and fails cleanly,
-       instead of issuing a call with a number the close is about to free for reuse. */
-    g_Debug = INVALID_HANDLE;
-    svcCloseHandle(handle);   /* detaches and resumes the target */
+    /* Publish "no handle" BEFORE the close (or the leak): an operation that is
+       already counted but has not loaded g_Debug yet then finds INVALID_HANDLE and
+       fails cleanly, instead of issuing a call with the old number. */
+    __atomic_store_n(&g_Debug, INVALID_HANDLE, __ATOMIC_RELEASE);
+    if (!leaked) {
+        svcCloseHandle(handle);   /* detaches and resumes the target */
+    }
     atomic_store_explicit(&g_DebugClosing, false, memory_order_release);
 }
 
@@ -1362,7 +1392,25 @@ Result nxusDebugAttach(u64 pid) {
                                                           memory_order_relaxed));
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
     }
-    if (g_Attached) {
+    /* A teardown that timed out LEAKED the handle on purpose (see
+       debugReleaseHandleDrained).  A counted operation may still be holding the old
+       handle value; publishing a new g_Debug before it returns would redirect that
+       late call at this new process.  Refuse until the stale count has drained, then
+       clear the latch - the leaked handle itself stays open forever (leak allowed,
+       reuse forbidden). */
+    if (atomic_load_explicit(&g_DebugHandleLeaked, memory_order_acquire)) {
+        const int users = (int)atomic_load_explicit(&g_DebugOpUsers, memory_order_acquire);
+        if (users != 0) {
+            NXUS_LOG("debug attach: %d op(s) from the leaked-handle teardown are still "
+                     "in flight - not publishing a new session handle", users);
+            debugTeardownRelease();
+            return (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY);
+        }
+        atomic_store_explicit(&g_DebugHandleLeaked, false, memory_order_release);
+        NXUS_LOG("debug attach: leaked debug handle is no longer referenced - "
+                 "starting a new session");
+    }
+    if (debugAttached()) {
         debugTeardownRelease();
         return 0;
     }
@@ -1444,8 +1492,12 @@ Result nxusDebugAttach(u64 pid) {
     mutexUnlock(&g_Mutex);
     NXUS_LOG("debug: hit ring cleared (attach/detach)");
 
-    g_Debug = debug;
-    g_Attached = true;
+    /* Publish the handle BEFORE "attached", both with release: a status/read thread
+       that observes attached == true must observe the handle it belongs to, not the
+       previous session's INVALID_HANDLE.  The reverse order (which plain stores let
+       the compiler produce) passes a stale handle to svcReadDebugProcessMemory. */
+    __atomic_store_n(&g_Debug, debug, __ATOMIC_RELEASE);
+    debugPublishAttached(true);
     g_BreakCount = 0;
     g_ThreadCount = 0;
     /* A stop left over from a previous session must not make the event loop hold
@@ -1551,7 +1603,7 @@ Result nxusDebugAttach(u64 pid) {
             g_Breaks[i].window_start_tick = 0;
         }
         g_BreakCount = 0;
-        g_Attached = false;
+        debugPublishAttached(false);
         clearThreadTableLocked();
         /* armContextIdBreakpoint() already programmed the link slot: do not leave it
            behind when the event thread cannot be created. */
@@ -1644,7 +1696,7 @@ static Result debugDetachExclusive(bool wait_for_claim) {
         NXUS_LOG("debug detach: the concurrent hand-off finished - completing the release");
     }
 
-    if (!g_Attached && !g_EventThreadLive) {
+    if (!debugAttached() && !g_EventThreadLive) {
         atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
         /* Nothing is attached, so nothing is known: keep the two flags consistent
            with that even on this no-op path. */
@@ -1686,7 +1738,7 @@ static Result debugDetachExclusive(bool wait_for_claim) {
         g_Breaks[i].window_start_tick = 0;
     }
     g_BreakCount = 0;
-    g_Attached = false;
+    debugPublishAttached(false);
     /* The thread table is per session as well: the detach that just joined the event
        thread leaves g_ThreadCount pointing at the previous title's threads, which the
        cached branch of nxusDebugGetThreads() would keep serving (see
@@ -1710,22 +1762,34 @@ static Result debugDetachExclusive(bool wait_for_claim) {
     /* Nothing is held once the session is gone; a stale stop would make the next
        attach believe the target is frozen. */
     clearStopState();
+    const bool target_exited = atomic_load_explicit(&g_ExitSeen, memory_order_relaxed);
     atomic_store_explicit(&g_ExitSeen, false, memory_order_relaxed);
 
     /* Close the handle through the shared drain: ack the queued events, wait for the
-       counted debug operations, publish INVALID_HANDLE and only then close.  The
-       reasoning behind that order (including why a 2 s drain is enough and why
-       closing after it is still safe) is documented at debugReleaseHandleDrained().
-       This is the path that USED to be the only correct one; the attach
-       threadCreate() failure path now uses the same helper. */
+       counted debug operations, publish INVALID_HANDLE and only then close.  If the
+       count never reaches zero the helper LEAKS the handle instead of closing it
+       under a live syscall; the reasoning is documented at
+       debugReleaseHandleDrained().  This is the path that USED to be the only correct
+       one; the attach threadCreate() failure path now uses the same helper. */
     debugReleaseHandleDrained();
 
     /* dmnt may still be tearing the old cheat process down: give it 50 ms, then
        one 100 ms retry instead of leaving the cheat VM closed for the session. */
     svcSleepThread(50000000ull);
-    /* Reopening the process we just left is not a new title instance: keep the
-       scan incarnation so attach -> detach does not throw the hit list away. */
-    nxusDmntAdoptNextOpen();
+    /* Reopening the process we just left is normally the same target, so ask for the
+       incarnation to be preserved.  The dmnt wrapper verifies that the process it
+       really opens has the SAME pid and title (program_id) as the one recorded
+       before the attach; a restart, a different target or unreadable metadata falls
+       back to a normal incarnation bump instead of inheriting the old hit list.
+       A debugee that EXITED during the session is never "the same target", even when
+       the replacement happens to reuse its pid and title: skip the adopt request so
+       the reopen takes the normal bump. */
+    if (!target_exited) {
+        nxusDmntAdoptNextOpen();
+    } else {
+        NXUS_LOG("debug detach: target exited during the session - dmnt reopen will "
+                 "count as a new target");
+    }
     Result rc = nxusDmntForceOpen();
     if (R_FAILED(rc)) {
         NXUS_LOG("dmnt ForceOpenCheatProcess first attempt rc=0x%08X - retrying in 100 ms",
@@ -1769,7 +1833,7 @@ Result nxusDebugDetach(void) {
 void nxusDebugGetStatus(NxusDebugStatus *out) {
     if (out == NULL) return;
     memset(out, 0, sizeof(*out));
-    out->attached = g_Attached ? 1 : 0;
+    out->attached = debugAttached() ? 1 : 0;
     out->watch_style = g_Config.style;
     out->auto_continue = g_Config.auto_continue;
     out->last_result = g_LastResult;
@@ -1818,7 +1882,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
        registers.  Draining events must not happen here (recordHit() takes this
        same non-recursive mutex). */
     mutexLock(&g_Mutex);
-    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+    if (!debugAttached() || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         mutexUnlock(&g_Mutex);
         debugOpEnd();
@@ -1932,7 +1996,7 @@ Result nxusDebugSetBreak(const NxusBreakRequest *request) {
        re-arming it here the newly set breakpoint silently never fires.  The
        session is re-checked under the mutex, so a detach that got here first is
        respected instead of being undone. */
-    if (g_Attached && g_Debug != INVALID_HANDLE &&
+    if (debugAttached() && g_Debug != INVALID_HANDLE &&
         !atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         armContextIdBreakpoint();
     }
@@ -1971,7 +2035,7 @@ Result nxusDebugClearBreak(u32 slot) {
        detach wiped them, and a clear that loses the race must not touch the
        hardware at all. */
     mutexLock(&g_Mutex);
-    if (!g_Attached || g_Debug == INVALID_HANDLE ||
+    if (!debugAttached() || g_Debug == INVALID_HANDLE ||
         atomic_load_explicit(&g_StopLoop, memory_order_relaxed)) {
         mutexUnlock(&g_Mutex);
         debugOpEnd();
@@ -1996,7 +2060,7 @@ Result nxusDebugClearBreak(u32 slot) {
        ResultBusy 0xF401).  While a GDB-style stop is published, however, removing
        a breakpoint must NOT resume the title: the stop is what the user is
        looking at. */
-    if (g_Attached && g_Debug != INVALID_HANDLE && !nxusDebugIsStopped()) {
+    if (debugAttached() && g_Debug != INVALID_HANDLE && !nxusDebugIsStopped()) {
         drainDebugEvents(NULL);
         for (int retry = 0; retry < 4; retry++) {
             Result crc = svcContinueDebugEvent(g_Debug, 4u | 2u | 1u, NULL, 0);
@@ -2223,7 +2287,7 @@ bool nxusDebugSetAutoContinue(u32 enabled) {
     /* Switching back to auto-continue while the stop mode is holding the target
        has to release it here: the event loop only ever resumes the process from a
        fresh debug event, so nothing else would send the pending Continue. */
-    if (want && g_Attached && nxusDebugIsStopped()) {
+    if (want && debugAttached() && nxusDebugIsStopped()) {
         Result rc = nxusDebugContinueAll();
         if (R_FAILED(rc)) {
             NXUS_RESULT("debug: resume after auto_continue=1", rc);
@@ -2234,7 +2298,7 @@ bool nxusDebugSetAutoContinue(u32 enabled) {
 }
 
 Result nxusDebugContinueAll(void) {
-    if (!g_Attached || g_Debug == INVALID_HANDLE) {
+    if (!debugAttached() || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
     /* Counted against detach for the whole resume sequence: the drains,
@@ -2361,7 +2425,7 @@ static Result stepResumeAndStop(bool hardware_step) {
 }
 
 Result nxusDebugStep(u64 thread_id) {
-    if (!g_Attached || g_Debug == INVALID_HANDLE) {
+    if (!debugAttached() || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
     /* Counted against detach: the thread lookup, the context read/write and the
@@ -2452,7 +2516,7 @@ Result nxusDebugStep(u64 thread_id) {
 }
 
 Result nxusDebugBreak(void) {
-    if (!g_Attached || g_Debug == INVALID_HANDLE) {
+    if (!debugAttached() || g_Debug == INVALID_HANDLE) {
         return (Result)NXUS_MAKE_RESULT(NXUS_ERR_NOT_ATTACHED);
     }
     /* svcBreakDebugProcess(g_Debug): counted against detach.  Without this a pause

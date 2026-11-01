@@ -50,6 +50,10 @@
 #include "nxus_scan.h"
 #include "nxus_snapshot.h"
 #include "nxus_ptrscan.h"
+/* The production budget is defined in this header, not in the test: including the
+   real header makes a changed default/budget a BUILD/TEST failure instead of two
+   copies silently drifting apart.  tests/stubs/switch.h supplies <switch.h>. */
+#include "../switch/include/nxus_session.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -64,17 +68,27 @@ static int g_checks = 0;
         }                                                            \
     } while (0)
 
-/* ---- mirror of the switch-side constants ------------------------------ */
+/* ---- production constants (aliases, not copies) ----------------------- */
 #define BUDGET_BYTES             (8u * 1024u * 1024u)
 #define NET_BUF_BYTES            (1024u * 1024u)          /* NXUS_NET_BUF_SIZE */
 #define MAX_MAPPINGS             4096u                    /* nxus_session.c cap */
 #define MAX_REGIONS              4096u                    /* nxus_session.c cap */
-#define HIT_BUDGET_BYTES         (3000u * 1024u)          /* NXUS_SESSION_HIT_BUDGET_BYTES */
-#define DEFAULT_MAXHITS          150000u                  /* NXUS_SESSION_DEFAULT_MAXHITS */
-#define SESSION_CHUNK_BYTES      (1024u * 1024u)          /* NXUS_SESSION_DEFAULT_CHUNK */
-#define SESSION_WINDOW_BYTES     (1024u * 1024u)          /* NXUS_SESSION_DEFAULT_WINDOW */
+/* Direct aliases: if the header renames or changes either value, this file
+   fails to compile/the checks below fail instead of testing a stale copy. */
+#define HIT_BUDGET_BYTES         NXUS_SESSION_HIT_BUDGET_BYTES
+#define DEFAULT_MAXHITS          NXUS_SESSION_DEFAULT_MAXHITS
+#define SESSION_CHUNK_BYTES      NXUS_SESSION_DEFAULT_CHUNK
+#define SESSION_WINDOW_BYTES     NXUS_SESSION_DEFAULT_WINDOW
 #define SNAPSHOT_CAPTURE_BYTES   (256u * 1024u)           /* nxus_snapshot_srv.c */
 #define PTRSCAN_SCRATCH_BYTES    (256u * 1024u)           /* handlePtrScanBegin */
+
+/* The row stride the hit budget is divided by.  The production header does not
+   name it yet, so when NXUS_HIT_BYTES_PER_ENTRY is added next to the budget this
+   asserts it directly against sizeof(NxusHitAddress); until then the real
+   sizeof() keeps the arithmetic pinned without inventing a second constant. */
+#ifndef NXUS_HIT_BYTES_PER_ENTRY
+#define NXUS_HIT_BYTES_PER_ENTRY (sizeof(NxusHitAddress))
+#endif
 
 static u64 persistentBytes(void) {
     return (u64)NET_BUF_BYTES +
@@ -136,6 +150,21 @@ int main(void) {
     CHECK(sizeof(NxusPtrRegion) == 24, "NxusPtrRegion is %u B",
           (unsigned)sizeof(NxusPtrRegion));
 
+    printf("[test] production budget macros from switch/include/nxus_session.h\n");
+    CHECK(NXUS_SESSION_HIT_BUDGET_BYTES == 3072000u,
+          "NXUS_SESSION_HIT_BUDGET_BYTES is %u (expected 3072000)",
+          (unsigned)NXUS_SESSION_HIT_BUDGET_BYTES);
+    CHECK(NXUS_SESSION_DEFAULT_MAXHITS == 150000u,
+          "NXUS_SESSION_DEFAULT_MAXHITS is %u (expected 150000)",
+          (unsigned)NXUS_SESSION_DEFAULT_MAXHITS);
+    CHECK((u64)NXUS_HIT_BYTES_PER_ENTRY == (u64)sizeof(NxusHitAddress),
+          "NXUS_HIT_BYTES_PER_ENTRY is %llu B but sizeof(NxusHitAddress) is %u B",
+          (unsigned long long)NXUS_HIT_BYTES_PER_ENTRY,
+          (unsigned)sizeof(NxusHitAddress));
+    CHECK((u64)NXUS_HIT_BYTES_PER_ENTRY == 16ull,
+          "NXUS_HIT_BYTES_PER_ENTRY is %llu B (expected the 16 B NxusHitAddress)",
+          (unsigned long long)NXUS_HIT_BYTES_PER_ENTRY);
+
     printf("[test] snapshot slot = NXUS_SNAPSHOT_MAX_BLOCKS * 2 arrays * 8 B\n");
     const u64 slot = oneSlotBytes();
     CHECK(slot == 262144ull, "one snapshot slot is %llu B (expected 262144)",
@@ -159,6 +188,16 @@ int main(void) {
         const u64 cap = (u64)DEFAULT_MAXHITS < budgeted ? (u64)DEFAULT_MAXHITS : budgeted;
         CHECK(cap == (u64)expected[i], "u%u: cap is %llu hits (expected %u)",
               (unsigned)(widths[i] * 8u), (unsigned long long)cap,
+              (unsigned)expected[i]);
+        /* Call the production inline instead of re-deriving only the test copy:
+           this is what catches a changed default or byte budget. */
+        CHECK((u64)nxusSessionHitLimit(widths[i]) == cap,
+              "u%u: real nxusSessionHitLimit() is %u, test formula says %llu",
+              (unsigned)(widths[i] * 8u), (unsigned)nxusSessionHitLimit(widths[i]),
+              (unsigned long long)cap);
+        CHECK((u64)nxusSessionHitLimit(widths[i]) == (u64)expected[i],
+              "u%u: real nxusSessionHitLimit() is %u (expected %u)",
+              (unsigned)(widths[i] * 8u), (unsigned)nxusSessionHitLimit(widths[i]),
               (unsigned)expected[i]);
         CHECK(cap <= (u64)DEFAULT_MAXHITS, "u%u: cap %llu exceeds the default floor",
               (unsigned)(widths[i] * 8u), (unsigned long long)cap);

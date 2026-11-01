@@ -30,9 +30,19 @@ run_test() {
 run_test test_scan test_scan.c ../core/nxus_scan.c
 run_test test_ptrscan test_ptrscan.c ../core/nxus_ptrscan.c ../core/nxus_scan.c
 run_test test_snapshot test_snapshot.c ../core/nxus_snapshot.c ../core/nxus_scan.c
-run_test test_budget test_budget.c
+# The budget test includes the REAL switch/include/nxus_session.h (so its caps
+# cannot drift from the production macros); the stub supplies the small libnx
+# surface that header pulls in through <switch.h>.
+TEST_INCS="-I./stubs -I../switch/include" \
+    run_test test_budget test_budget.c
 run_test test_scantypes test_scantypes.c ../core/nxus_scan.c
 run_test test_hotkey test_hotkey.c ../core/nxus_hotkey.c
+# Server/session algorithms that nxus_server.c cannot expose to the host: the
+# page-cache clamp/zero-fill, the frozen ownership table, the tick's scan-vs-
+# command watchdog evaluation, and the NXUS/libnx result-code encodings.  This
+# harness is self-contained on purpose, so it stays runnable while the server
+# translation unit itself is being edited.
+run_test test_server_logic test_server_logic.c
 # The session is a Switch unit (libnx).  stubs/switch.h supplies the small libnx
 # surface it uses, so the real pin/retire code is compiled and exercised on the
 # host instead of being skipped.

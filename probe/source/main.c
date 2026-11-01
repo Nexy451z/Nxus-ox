@@ -254,14 +254,36 @@ static void out(const char *fmt, ...) {
     spoolAppend(line, (size_t)n);
 }
 
-/* Called once, after the verdict: this is where the details reach the file. */
-static void reportFlushDetails(void) {
-    if (g_Out == NULL) return;
-    if (g_SpoolLen > 0) fwrite(g_Spool, 1, g_SpoolLen, g_Out);
-    if (g_SpoolFull)
-        fputs("(詳細が上限に達したため、以降の詳細は省略されました)\n", g_Out);
-    fflush(g_Out);
-    g_SpoolLen = 0;
+/* Called once, after the verdict: this is where the details reach the file.
+ *
+ * A full/read-only card used to make fwrite() write nothing while g_SpoolLen was
+ * cleared anyway, so the only copy of the details was lost and the report looked
+ * complete.  Keep whatever did not reach the stream instead: on a partial write
+ * only the unwritten tail stays in the spool, so a retry cannot duplicate the
+ * prefix.  Returns false when the spool was not fully committed. */
+static bool reportFlushDetails(void) {
+    if (g_Out == NULL) return false;
+
+    bool ok = true;
+    const size_t pending = g_SpoolLen;
+    if (pending > 0) {
+        const size_t wrote = fwrite(g_Spool, 1, pending, g_Out);
+        if (wrote < pending) {
+            ok = false;
+            if (wrote > 0) {
+                memmove(g_Spool, g_Spool + wrote, pending - wrote);
+                g_SpoolLen = pending - wrote;
+            }
+        }
+    }
+    if (g_SpoolFull) {
+        if (fputs("(詳細が上限に達したため、以降の詳細は省略されました)\n", g_Out) < 0)
+            ok = false;
+    }
+    if (fflush(g_Out) != 0) ok = false;
+    if (ferror(g_Out)) ok = false;
+    if (ok) g_SpoolLen = 0;
+    return ok;
 }
 
 static void rec(const char *name, Result rc, u64 d0, u64 d1) {
@@ -281,27 +303,38 @@ static bool reportOpenAppend(const char *path) {
     if (g_Out == NULL) return false;
 
     long size = 0;
-    if (fseek(g_Out, 0, SEEK_END) == 0) size = ftell(g_Out);
+    if (fseek(g_Out, 0, SEEK_END) == 0) {
+        size = ftell(g_Out);
+        if (size < 0) size = 0;
+    }
     if (size > 0 && (u64)size > PROBE_LOG_MAX_BYTES) {
         char old_path[96];
         snprintf(old_path, sizeof(old_path), "%s.1", path);
         /* The previous ".1" is dropped: one old run is worth keeping for a
            comparison, more are not worth the card space. */
-        fclose(g_Out);
+        (void)fclose(g_Out);
         g_Out = NULL;
-        remove(old_path);
+        (void)remove(old_path);
         if (rename(path, old_path) == 0) {
             g_Out = fopen(path, "ab");
-            /* Say it out loud: the file the reader is looking at starts empty, and
-               the run before this one is in ".1", not gone. */
             if (g_Out != NULL) {
+                /* Say it out loud: the file the reader is looking at starts empty,
+                   and the run before this one is in ".1", not gone. */
                 reportLive("(report was over %u KiB: the previous block was rotated to %s)",
                            (unsigned)(PROBE_LOG_MAX_BYTES / 1024u), old_path);
+            } else if (rename(old_path, path) == 0) {
+                /* The rename moved the old report away but the fresh path could not
+                   be opened; put it back and keep appending rather than losing it. */
+                g_Out = fopen(path, "ab");
             }
         } else {
-            /* A failed rename (e.g. read-only card) must still not let the report
-               grow forever, so truncate instead.  This is the only "wb" left. */
-            g_Out = fopen(path, "wb");
+            /* A failed rename (e.g. read-only card) must never silently truncate the
+               only copy of the previous runs: keep appending and say that rotation
+               failed, even if the file then grows past the cap for this boot. */
+            g_Out = fopen(path, "ab");
+            if (g_Out != NULL) {
+                reportLive("(report rotation failed: continuing to append to %s)", path);
+            }
         }
         if (g_Out == NULL) return false;
     }
@@ -1165,6 +1198,13 @@ int main(int argc, char *argv[]) {
                    log_paths[used_path]);
     }
 
+    /* Timestamp of this run.  The header line is written after the target wait
+       (it carries the title id), so the time is taken here, where the run starts.
+       The boot marker below records the same value, so two boots of the same build
+       can be told apart from the marker alone. */
+    char run_iso[32];
+    isoNow(run_iso, sizeof(run_iso));
+
     /* Written and flushed immediately: if this file is missing after a reboot the
        sysmodule simply did not run (boot2 not honoured / not the emuMMC that has it),
        which is otherwise indistinguishable from "it ran but produced no output". */
@@ -1172,28 +1212,48 @@ int main(int argc, char *argv[]) {
         static const char *const markers[] = { "sdmc:/nxus/probe_started.txt",
                                                "sdmc:/probe_started.txt" };
         for (unsigned i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
-            /* Rotate the previous run's marker first: the file only means "this
-               boot wrote it" if it was not left behind by an older run. */
-            {
-                char prev[96];
-                snprintf(prev, sizeof(prev), "%s.1", markers[i]);
-                remove(prev);
-                rename(markers[i], prev);
-            }
-            FILE *m = fopen(markers[i], "wb");
+            char tmp[96];
+            char prev[96];
+            snprintf(tmp, sizeof(tmp), "%s.tmp", markers[i]);
+            snprintf(prev, sizeof(prev), "%s.1", markers[i]);
+
+            /* Stage the new marker first.  The old marker and its ".1" backup are
+               not touched until the staged file is known to be complete and on the
+               card: a failed open/write/close must not destroy the only evidence
+               that an earlier boot ran. */
+            FILE *m = fopen(tmp, "wb");
             if (m == NULL) continue;
-            u32 v = hosversionGet();
-            fprintf(m, "probe sysmodule started\nbuild: %s %s\nfirmware: %u.%u.%u\n",
-                    __DATE__, __TIME__, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
-            fclose(m);
+            const u32 v = hosversionGet();
+            bool ok = fprintf(m,
+                              "probe sysmodule started\n"
+                              "run: %s\n"
+                              "tick: 0x%llX\n"
+                              "build: %s %s\n"
+                              "firmware: %u.%u.%u\n",
+                              run_iso, (unsigned long long)armGetSystemTick(),
+                              __DATE__, __TIME__,
+                              (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF) > 0;
+            if (fflush(m) != 0) ok = false;
+            if (ferror(m)) ok = false;
+            if (fclose(m) != 0) ok = false;
+            if (!ok) {
+                (void)remove(tmp);
+                continue;
+            }
+
+            /* The staged marker is good; only now rotate the previous run aside.
+               If the final rename fails, restore the old marker instead of leaving
+               the path empty. */
+            (void)remove(prev);
+            const bool moved = (rename(markers[i], prev) == 0);
+            if (rename(tmp, markers[i]) != 0) {
+                if (moved) (void)rename(prev, markers[i]);
+                (void)remove(tmp);
+                continue;
+            }
             break;
         }
     }
-
-    /* Timestamp of this run.  The header line is written after the target wait
-       (it carries the title id), so the time is taken here, where the run starts. */
-    char run_iso[32];
-    isoNow(run_iso, sizeof(run_iso));
 
     /* 30 s instead of 120 s: see waitForTarget().  Its progress goes to the report
        live, so a boot that is stuck in the wait is visible on the card. */

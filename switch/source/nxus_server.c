@@ -21,8 +21,11 @@ static NxusConfig g_Config;
    (main thread) and the HID thread's hotkey callback load it. */
 static atomic_bool g_CommandActive;
 /* When the current command started, so a handler that never returns (blocked dmnt
-   call, stalled send) cannot suppress the watchdog and reaper for the whole boot. */
-static volatile u64  g_CommandStartedMs;
+   call, stalled send) cannot suppress the watchdog and reaper for the whole boot.
+   Atomic: the connection thread stores it, the tick (main thread) loads it.  It is
+   published BEFORE g_CommandActive, so a tick that observes active == true can
+   never pair it with the previous command's timestamp (see dispatchCommand). */
+static atomic_ullong g_CommandStartedMs;
 #define NXUS_COMMAND_GRACE_MS 120000u
 
 /* Break-list reply size.  The debugger tracks every hardware slot now (ten: six
@@ -1013,7 +1016,7 @@ void nxusServerInit(void) {
        flight here (the listener does not exist yet and the previous Exit drained
        what it could), so clearing it cannot race a reader. */
     atomic_store_explicit(&g_CommandActive, false, memory_order_release);
-    g_CommandStartedMs = 0;
+    atomic_store_explicit(&g_CommandStartedMs, 0, memory_order_relaxed);
 }
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -1043,9 +1046,20 @@ static void replyErrorReason(int fd, u16 type, u32 seq, Result rc, u32 reason) {
 
 /* True when rc is one of Nxus's own NXUS_ERR_* codes.  Used to decide whether a
    BUSY deserves a reason: libnx's own "busy" (LibnxError_Busy) must keep going
-   out as a bare Result, because it means something different (a service call). */
+   out as a bare Result, because it means something different (a service call).
+
+   NXUS_MAKE_RESULT() does NOT use the HOS field layout: it puts the module in the
+   DESCRIPTION field (bits 9-21) and the descriptor in the MODULE field (bits 0-8).
+   Decoding it with libnx's R_MODULE()/R_DESCRIPTION() therefore compares the
+   descriptor against 484 and is false for every NXUS code - the helper used to be
+   dead code, so Pause/Resume/BreakSet/DebugAttach never attached their reason.
+   Decode the actual wire layout here instead (wire compatibility: the value itself
+   is unchanged; see core/nxus_protocol.h:27-28). */
 static bool resultIsNxusError(Result rc, u32 desc) {
-    return (R_MODULE(rc) == NXUS_RESULT_MODULE) && (R_DESCRIPTION(rc) == desc);
+    const u32 raw = (u32)rc;
+    if ((raw & 0x80000000u) == 0u) return false;          /* not an error result */
+    if (((raw >> 9) & 0x1FFu) != NXUS_RESULT_MODULE) return false;
+    return (raw & 0x1FFu) == (desc & 0x1FFu);
 }
 
 /* Transient "another operation owns this": retrying later is the fix. */
@@ -1059,6 +1073,18 @@ static bool resultIsBusyRetryable(Result rc) {
    Result (wire-compatible, see replyErrorReason). */
 static void replyBusyReason(int fd, u16 type, u32 seq, u32 reason) {
     replyErrorReason(fd, type, seq, (Result)NXUS_MAKE_RESULT(NXUS_ERR_BUSY), reason);
+}
+
+/* True while the session's scan worker owns the hit arrays and is rebuilding the
+   mapping/region views.  Every connection-thread handler that walks either one
+   must check this first: nxusSessionScanNext() revalidates the mapping table in
+   place (rewriting map_entries) while the worker runs, so a GetMappings page or
+   a module walk that starts mid-scan can read a half-updated table.  The answer
+   is a retryable BUSY with NXUS_REASON_BUSY_STATE, the same refusal ScanGetHits
+   / SnapshotCapture / PtrScanBegin already used before this helper centralised
+   the test. */
+static bool isScanWorkerBusy(void) {
+    return nxusSessionIsRunning();
 }
 
 /* Drop the stored scan results when they belong to an earlier target, or when the
@@ -1817,6 +1843,14 @@ static atomic_bool g_PtrThreadReaping;
    boot state: false, i.e. "running". */
 static atomic_bool g_ServerExited;
 
+/* Result of the last nxusServerExit(): true only when the pointer-scan worker AND
+   every in-flight handler were drained, i.e. the session and its views were really
+   released.  False means the exit took the deliberate "leak, never UAF" path and a
+   worker/handler may still be reading through the debug handle or dmnt.  The caller
+   must then NOT tear those resources down (see nxusServerExit's contract in the
+   header).  Cleared by serverExitGateReset() for the next lifetime. */
+static atomic_bool g_ServerExitQuiesced;
+
 /* Handlers currently inside dispatchCommand(), i.e. past the gate and before the
    last thing nxusServerHandle() does.  nxusServerExit() raises the gate and then
    waits for this to reach zero before it lets nxusSessionExit() free the mapping /
@@ -1853,6 +1887,9 @@ static void serverExitGateReset(void) {
        previous Exit gave up on - one that never returned - would otherwise make
        every later Exit wait the full drain timeout and skip its release again. */
     atomic_store_explicit(&g_HandlersInFlight, 0u, memory_order_release);
+    /* No exit of this lifetime has run yet: a query before the first Exit must not
+       report the previous round's outcome. */
+    atomic_store_explicit(&g_ServerExitQuiesced, false, memory_order_release);
 }
 
 /* How long nxusServerExit() is willing to wait for the worker Thread slot, and the
@@ -2962,8 +2999,12 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
        instead of resuming the target mid-operation.  A pointer scan that DID get a
        worker answers at once, so this flag only covers its setup: the polled
        PtrScanGet then feeds the watchdog like any other traffic. */
+    /* Timestamp first: a tick between the two stores must not see the new
+       "active" with the previous command's timestamp and clear a live handler. */
+    atomic_store_explicit(&g_CommandStartedMs,
+                          armTicksToNs(armGetSystemTick()) / 1000000ull,
+                          memory_order_relaxed);
     atomic_store_explicit(&g_CommandActive, true, memory_order_release);
-    g_CommandStartedMs = armTicksToNs(armGetSystemTick()) / 1000000ull;
 
     switch (type) {
         case NxusCmd_Nop:
@@ -3053,6 +3094,12 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
         }
 
         case NxusCmd_GetMappingCount: {
+            /* The scan worker revalidates map_entries in place (and a ScanNext
+               rebuilds the views); a count read under it is not atomic either. */
+            if (isScanWorkerBusy()) {
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+                break;
+            }
             u64 count = 0;
             if (nxusDebugIsAttached()) {
                 /* dmnt is closed: answer from the snapshot the session built with
@@ -3081,6 +3128,13 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
         }
 
         case NxusCmd_GetMappings: {
+            /* Same gate as GetMappingCount/GetModules: the page is copied from
+               map_entries while a running scan may be rewriting that array in
+               place (see isScanWorkerBusy). */
+            if (isScanWorkerBusy()) {
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+                break;
+            }
             if (length < sizeof(NxusMappingsRequest)) {
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                                  NXUS_REASON_BAD_LENGTH);
@@ -3234,7 +3288,7 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
                first - the same gate ScanGetHits / SnapshotCapture / PtrScanBegin
                use.  Without it a GetModules arriving mid-scan reads a table that
                is being re-published and can report a half-built module list. */
-            if (nxusSessionScanState() == NxusScanState_Running) {
+            if (isScanWorkerBusy()) {
                 replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
@@ -3403,9 +3457,8 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
         case NxusCmd_ScanGetHits: {
             /* The worker reallocs the hit arrays while it runs; reading them from
                the connection thread would be a use-after-free. */
-            if (nxusSessionScanState() == NxusScanState_Running) {
-                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
-                                 NXUS_REASON_BUSY_STATE);
+            if (isScanWorkerBusy()) {
+                replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
             if (length < sizeof(NxusGetHitsRequest)) {
@@ -3422,7 +3475,7 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
         case NxusCmd_SnapshotCapture: {
             /* Snapshot preparation rebuilds the mapping/region arrays the scan
                worker is reading, so a running scan must be refused first. */
-            if (nxusSessionScanState() == NxusScanState_Running) {
+            if (isScanWorkerBusy()) {
                 replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
@@ -3568,7 +3621,7 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
         case NxusCmd_PtrScanBegin:
             /* Same reason as SnapshotCapture: the pointer scan walks the mapping
                snapshot the worker rebuilds under it. */
-            if (nxusSessionScanState() == NxusScanState_Running) {
+            if (isScanWorkerBusy()) {
                 replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
                 break;
             }
@@ -4269,17 +4322,18 @@ void nxusServerTick(void) {
        the debug handle the handler is reading through. */
     if (atomic_load_explicit(&g_CommandActive, memory_order_acquire)) {
         /* Protect a long legitimate handler, but never for ever: if it is stuck
-           the target would stay paused with no watchdog and no reaper. */
-        const u64 started = g_CommandStartedMs;
+           the target would stay paused with no watchdog and no reaper.  A running
+           scan is allowed to hold the connection thread for its own budget, but
+           that exemption is bounded by the same 120 s grace (the scan worker's
+           90 s budget + 30 s slack expires first), so the unconditional
+           "scan Running -> return" that made the bound unreachable is gone. */
+        const u64 started = atomic_load_explicit(&g_CommandStartedMs,
+                                                 memory_order_acquire);
         const u64 now = armTicksToNs(armGetSystemTick()) / 1000000ull;
-        /* Never declare a running scan "stuck": it legitimately holds the
-           connection thread for minutes, and clearing the flag here would let the
-           reaper close the debug handle under it (the use-after-free the grace
-           period exists to prevent). */
-        if (nxusSessionScanState() == NxusScanState_Running) return;
-        if (started != 0 && now - started < NXUS_COMMAND_GRACE_MS) return;
+        const u64 elapsed = (started != 0 && now >= started) ? now - started : 0;
+        if (started != 0 && elapsed < NXUS_COMMAND_GRACE_MS) return;
         NXUS_LOG("a command has been running for %llu ms - watchdog re-enabled",
-                 (unsigned long long)(now - started));
+                 (unsigned long long)elapsed);
         atomic_store_explicit(&g_CommandActive, false, memory_order_release);
     }
     reapExitedDebugSession();
@@ -4401,7 +4455,7 @@ void nxusServerTick(void) {
  * (nxusDmntExit) are deliberately NOT stopped here: they belong to other modules
  * and they are sequenced by __appExit() (main.c), which calls this function first.
  */
-void nxusServerExit(void) {
+bool nxusServerExit(void) {
     /* The compare-exchange is both the "already exited" guard and the flag the
        connection thread reads: only the first caller proceeds.  Sequentially
        consistent: it is the "store the gate" half of the handshake documented on
@@ -4411,7 +4465,7 @@ void nxusServerExit(void) {
     if (!atomic_compare_exchange_strong_explicit(&g_ServerExited, &expected, true,
                                                  memory_order_seq_cst, memory_order_acquire)) {
         NXUS_LOG_DEBUG("server: exit already done - ignored");
-        return;
+        return atomic_load_explicit(&g_ServerExitQuiesced, memory_order_acquire);
     }
 
     /* 1. pointer-scan walk: cancel, take the slot with a short deadline, join
@@ -4469,7 +4523,11 @@ void nxusServerExit(void) {
                        "session views NOT released (a walk may still read them; the "
                        "process is exiting)",
                        (unsigned)NXUS_PTRSCAN_EXIT_CLAIM_TOTAL_MS);
-        return;
+        /* Not quiesced: the caller must keep the debug handle, the network and
+           dmnt open.  Closing them here would free resources the still-claimed
+           walk reads through. */
+        atomic_store_explicit(&g_ServerExitQuiesced, false, memory_order_release);
+        return false;
     }
 
     /* 2. the handlers the gate could not stop.  A command that passed the gate just
@@ -4500,7 +4558,10 @@ void nxusServerExit(void) {
                        "snapshot slots NOT released (a handler may still read them; the "
                        "process is exiting)",
                        handlers_left, (unsigned)NXUS_EXIT_HANDLER_DRAIN_TOTAL_MS);
-        return;
+        /* Not quiesced: a handler is still inside a dmnt/debug read, so the caller
+           must not close the debug handle, the network or dmnt underneath it. */
+        atomic_store_explicit(&g_ServerExitQuiesced, false, memory_order_release);
+        return false;
     }
 
     /* 3. a running scan, then the session itself.  Only reached once neither the
@@ -4517,4 +4578,9 @@ void nxusServerExit(void) {
        is dropped without a dmnt write. */
     snapshotReleaseSlots("server exit");
     frozenOwnedForgetAll("server exit");
+
+    /* Both readers proved gone and the session released: the caller may now close
+       the debug handle, the network and dmnt. */
+    atomic_store_explicit(&g_ServerExitQuiesced, true, memory_order_release);
+    return true;
 }
