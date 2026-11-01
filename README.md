@@ -308,6 +308,8 @@ Nxus-ox/
     tests/    Cross-language protocol parity & end-to-end test suite (121 tests)
   tests/      Host C unit test suite (1,775 checks across 8 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
+  docs/       Design, debugger, hotkey, cheat semantics and the agent handover
+              (docs/HANDOVER.md is the "start here" document for a new maintainer)
 ```
 
 ---
@@ -332,7 +334,7 @@ bash tools/build_pc.sh
 # 1. Host C Core Tests (1,775 checks / 8 binaries: scan 797, ptrscan 45, snapshot 75, budget 51, scantypes 275, hotkey 11, session_view 313, snapshot_owner 208)
 cd tests && bash run_tests.sh
 
-# 2. Rust Unit Tests (117 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
+# 2. Rust Unit Tests (120 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN)
 cd pc/Nxus.Cli && cargo test --release
 
 # 3. Python + Rust CLI End-to-End Tests against MockSwitch (121 tests)
