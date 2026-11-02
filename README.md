@@ -335,8 +335,6 @@ Nxus-ox/
     tests/    Cross-language protocol parity & end-to-end test suite (133 tests)
   tests/      Host C unit test suite (1,976 checks across 9 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
-  docs/       Design, debugger, hotkey, cheat semantics, agent handover and playbook
-              (docs/HANDOVER.md is the "start here" document for a new maintainer)
 ```
 
 ---
