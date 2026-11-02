@@ -482,6 +482,7 @@ gh release upload v0.1.1-alpha `
 | `docs/NEXT_TASKS.md` | 残タスク（本書 11 章と重複可） |
 | `docs/HARDWARE_DAY1.md` | 実機初日メモ |
 | `docs/REVIEW_LOG.md` | ラウンドごとのレビュー履歴（判断の経緯） |
+| `docs/AGENT_PLAYBOOK.md` | **司令塔向けプロンプト設計**（ワーカーの分担・テンプレ・アンチパターン） |
 
 ---
 
