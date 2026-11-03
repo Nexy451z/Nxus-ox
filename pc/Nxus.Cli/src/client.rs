@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -330,6 +330,24 @@ fn buildScanPayload(spec: &ScanSpec, kind: u32) -> Vec<u8> {
 
 type Response = Option<(u16, u16, Vec<u8>)>;
 
+/// One in-flight request: where its reply goes and when it gives up.
+///
+/// `deadline` exists for the reader, not for the waiter.  A `ScanBegin` reply
+/// legitimately takes minutes, so "no bytes for 20 s" must not kill the link
+/// while such a request is outstanding; the reader waits until the latest
+/// pending deadline before it calls the link dead.
+struct Pending {
+    tx: Sender<Response>,
+    deadline: Instant,
+    /// Whether this deadline may drive the reader's "silence means dead" rule.
+    ///
+    /// A keepalive `Heartbeat` is excluded: missing one is not a disconnect, the
+    /// next one retries.  If it counted, a single lost reply would kill the link
+    /// at the heartbeat's 3 s deadline and the "two misses in a row" tolerance
+    /// below would never get a chance.
+    guards_idle: bool,
+}
+
 /// Conservative default until the server tells us its real limit.
 pub const DEFAULT_MAX_READ: u32 = 64 * 1024;
 
@@ -365,6 +383,84 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// lookup therefore runs on its own (detached) thread and this is how long the
 /// caller waits for the answer before giving up.
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Deadline for a plain [`NxusClient::request`] (status, metadata, freeze, ...).
+///
+/// 30 s was far too long for a command that a healthy LAN console answers in
+/// milliseconds: one NCL operation issues dozens of requests, so a console that
+/// stopped answering turned into "30 s x N" - the window looked hung.  Ten
+/// seconds still leaves room for a slow console and a busy `dmnt`, while long
+/// operations (scan, snapshot, pointer scan) pass their own, longer deadline.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for one cheat-VM memory access.
+///
+/// A cheat instruction reads/writes several times, and a block is tens of
+/// instructions: the 10 s default (let alone the old 30 s) turns a block into
+/// minutes.  Three seconds is "a live console always answers within it"; when
+/// the console is really gone, the link's `dead` flag makes the *next* access
+/// fail immediately instead of waiting again.
+pub const CHEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long the reader tolerates hearing nothing while no request is waiting.
+///
+/// The keepalive below sends a `Heartbeat` every few seconds, so a *live* link
+/// never stays quiet for 20 s.  While a long command is outstanding (one
+/// `ScanBegin` reply can take 600 s) the reader waits for that request's own
+/// deadline instead, so this value only applies to a link that should be idle.
+const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the link may be silent before the keepalive sends a `Heartbeat`.
+///
+/// The console's own watchdog is 15 s (`watchdog_timeout_ms = 15000` in
+/// `switch/source/nxus_server.c`) and it resumes a paused target when it hears
+/// nothing, so an idle PC has to keep talking - the GUI already heartbeats every
+/// 4 s for exactly that reason.  Five seconds also keeps the reader's 20 s
+/// "silence means dead" rule honest, with room for one lost reply.
+const LINK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long one keepalive `Heartbeat` waits for its reply.
+const LINK_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Retry delay after a heartbeat went unanswered (the link may just be slow).
+const LINK_KEEPALIVE_RETRY: Duration = Duration::from_secs(2);
+
+/// Consecutive unanswered heartbeats before the link is declared dead.
+const LINK_KEEPALIVE_MISSES: u32 = 2;
+
+/// How often the keepalive thread re-reads the link state.
+const LINK_KEEPALIVE_TICK: Duration = Duration::from_millis(500);
+
+/// Reader/keepalive timings, injectable so tests do not have to wait 20 s.
+///
+/// Production uses [`LinkTiming::default`].  The tests build the same client
+/// with milliseconds instead, which is the only way to exercise the "silent
+/// peer" and "keepalive" paths without making the suite take half a minute.
+#[derive(Clone, Copy)]
+struct LinkTiming {
+    /// How long the reader tolerates silence while nothing is pending.
+    idle_timeout: Duration,
+    /// How long the link may be quiet before a heartbeat is sent.
+    keepalive_interval: Duration,
+    /// Deadline for one heartbeat reply.
+    keepalive_timeout: Duration,
+    /// Retry delay after an unanswered heartbeat.
+    keepalive_retry: Duration,
+    /// Unanswered heartbeats in a row before the link is declared dead.
+    keepalive_misses: u32,
+}
+
+impl Default for LinkTiming {
+    fn default() -> Self {
+        Self {
+            idle_timeout: LINK_IDLE_TIMEOUT,
+            keepalive_interval: LINK_KEEPALIVE_INTERVAL,
+            keepalive_timeout: LINK_KEEPALIVE_TIMEOUT,
+            keepalive_retry: LINK_KEEPALIVE_RETRY,
+            keepalive_misses: LINK_KEEPALIVE_MISSES,
+        }
+    }
+}
 
 /// Lock a mutex, ignoring poisoning.
 ///
@@ -494,13 +590,26 @@ pub struct NxusClient {
     /// hits whose mapping is gone, so the collected list is lossy (see
     /// scan_all_hits).
     dropped: std::sync::atomic::AtomicBool,
-    stream: Mutex<TcpStream>,
-    pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
+    /// Shared (`Arc`) with the keepalive thread: both write whole frames, and a
+    /// single mutex is what keeps a heartbeat from landing between a request's
+    /// header and its payload.
+    stream: Arc<Mutex<TcpStream>>,
+    pending: Arc<Mutex<HashMap<u32, Pending>>>,
     events: Mutex<Receiver<Event>>,
-    seq: Mutex<u32>,
+    /// Shared with the keepalive thread: one sequence space for every frame that
+    /// expects an answer.  A separate counter would eventually hand a caller's
+    /// reply to a heartbeat (or the other way round).
+    seq: Arc<Mutex<u32>>,
     /// Shared with the reader thread; an `AtomicBool` (not a `Mutex<bool>`) so `Drop`
     /// can flag it without ever blocking behind a busy lock.
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Set the moment the link is known to be gone: EOF, a protocol violation, a
+    /// read deadline that expired, or a failed send.  Every later request fails
+    /// with "connection lost" instead of spending its own timeout first.
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    /// When the last frame was written (request or keepalive).  The keepalive
+    /// thread reads it to decide whether the link has been quiet for too long.
+    last_tx: Arc<Mutex<Instant>>,
     /// Addresses the previous `frozen_list()` reported.  Kept so a later reply can
     /// be compared against it; see [`NxusClient::frozen_list_diff`].
     last_frozen: Mutex<Vec<u64>>,
@@ -683,8 +792,76 @@ fn select_stopped_thread(status: &DebugStatus, event: Option<u64>) -> Option<u64
     }
 }
 
+/// A cheat instruction's time budget.
+///
+/// One cheat instruction is not one request: a pointer walk plus a read plus a
+/// compare is several round trips, and a block of tens of instructions multiplies
+/// all of them.  The VM therefore gets to say "this instruction has N ms" and the
+/// client clamps *every* chunk of it to what is left, so the block's worst case is
+/// `instructions x budget` instead of `instructions x requests x request-timeout`.
+///
+/// An exhausted budget is *not* a dead link: it only means the console is slower
+/// than this instruction was allowed to be, and the next instruction may still
+/// work.  Link death is decided elsewhere (EOF, a protocol violation, a read
+/// deadline, a failed send, unanswered heartbeats), never by a budget alone.
+pub struct InstructionBudget {
+    deadline: Instant,
+}
+
+impl InstructionBudget {
+    /// Start a budget of `per_instruction` from now.
+    pub fn new(per_instruction: Duration) -> Self {
+        let deadline = Instant::now()
+            .checked_add(per_instruction)
+            // An absurd duration must not panic; a day is "effectively no limit".
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        Self { deadline }
+    }
+
+    /// What is left of the budget (zero once it is used up).
+    pub fn remaining(&self) -> Duration {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
+    }
+
+    /// True once the whole instruction budget has been spent.
+    pub fn expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    /// Deadline to hand to one request inside this budget.
+    fn request_timeout(&self) -> Option<Duration> {
+        let left = self.remaining();
+        if left.is_zero() {
+            None
+        } else {
+            Some(left)
+        }
+    }
+}
+
+/// Error for a request that never ran because its instruction budget was gone.
+fn budget_exhausted() -> NxusError {
+    NxusError {
+        message: "instruction budget exhausted".into(),
+        result: None,
+    }
+}
+
 impl NxusClient {
     pub fn connect(host: &str, port: u16) -> Result<NxusClient> {
+        Self::connect_with_timing(host, port, LinkTiming::default())
+    }
+
+    /// Connect with test timings (see [`LinkTiming`]).  Not part of the API: a
+    /// caller never wants a sub-second idle deadline, only the tests do.
+    #[cfg(test)]
+    fn connect_for_test(host: &str, port: u16, timing: LinkTiming) -> Result<NxusClient> {
+        Self::connect_with_timing(host, port, timing)
+    }
+
+    fn connect_with_timing(host: &str, port: u16, timing: LinkTiming) -> Result<NxusClient> {
         let stream = connect_with_timeout(host, port)?;
         stream.set_nodelay(true).ok();
         stream
@@ -707,40 +884,78 @@ impl NxusClient {
             result: None,
         })?;
 
-        let pending: Arc<Mutex<HashMap<u32, Sender<Response>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u32, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_tx = Arc::new(Mutex::new(Instant::now()));
+        let seq = Arc::new(Mutex::new(0u32));
+        let stream = Arc::new(Mutex::new(stream));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 
         {
             let pending = Arc::clone(&pending);
             let running = Arc::clone(&running);
-            thread::spawn(move || reader_loop(reader_stream, pending, event_tx, running));
+            let dead = Arc::clone(&dead);
+            // A named thread makes a debugger dump say what stalled.
+            if let Err(e) = thread::Builder::new()
+                .name("nxus-reader".into())
+                .spawn(move || reader_loop(reader_stream, pending, event_tx, running, dead, timing))
+            {
+                return Err(NxusError {
+                    message: format!("cannot start the reader thread: {}", e),
+                    result: None,
+                });
+            }
+        }
+        {
+            let stream = Arc::clone(&stream);
+            let pending = Arc::clone(&pending);
+            let seq = Arc::clone(&seq);
+            let last_tx = Arc::clone(&last_tx);
+            let running = Arc::clone(&running);
+            let dead = Arc::clone(&dead);
+            if let Err(e) = thread::Builder::new()
+                .name("nxus-keepalive".into())
+                .spawn(move || {
+                    keepalive_loop(stream, pending, seq, last_tx, running, dead, timing)
+                })
+            {
+                return Err(NxusError {
+                    message: format!("cannot start the keepalive thread: {}", e),
+                    result: None,
+                });
+            }
         }
 
         Ok(NxusClient {
             max_read: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_READ),
             truncated: std::sync::atomic::AtomicBool::new(false),
             dropped: std::sync::atomic::AtomicBool::new(false),
-            stream: Mutex::new(stream),
+            stream,
             pending,
             events: Mutex::new(event_rx),
-            seq: Mutex::new(0),
+            seq,
             running,
+            dead,
+            last_tx,
             last_frozen: Mutex::new(Vec::new()),
             released_frozen: Mutex::new(Vec::new()),
             last_stop: Mutex::new(None),
         })
     }
 
-    fn next_seq(&self) -> u32 {
-        let mut seq = lock(&self.seq);
-        *seq = seq.wrapping_add(1);
-        *seq
+    /// True once the link is known to be gone.
+    ///
+    /// Every request after this fails with "connection lost" without touching the
+    /// socket, so a GUI/CLI can show "disconnected" instead of waiting out a
+    /// request timeout per button press.  Reconnecting means building a new
+    /// [`NxusClient`]: a dead link is never revived.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     pub fn request(&self, cmd: u16, payload: &[u8]) -> Result<(u16, Vec<u8>)> {
-        self.request_timeout(cmd, payload, Duration::from_secs(30))
+        self.request_timeout(cmd, payload, DEFAULT_REQUEST_TIMEOUT)
     }
 
     pub fn request_timeout(
@@ -749,58 +964,21 @@ impl NxusClient {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<(u16, Vec<u8>)> {
-        let seq = self.next_seq();
-        let (tx, rx) = mpsc::channel::<Response>();
-        lock(&self.pending).insert(seq, tx);
-
-        let mut header = Vec::with_capacity(HEADER_SIZE);
-        put_u32(&mut header, MAGIC);
-        put_u16(&mut header, cmd);
-        put_u16(&mut header, 0);
-        put_u32(&mut header, payload.len() as u32);
-        put_u32(&mut header, seq);
-
-        // The write happens with no reply registered yet, so a failed send has to
-        // unregister the request itself: the reader thread never will, and the
-        // map would grow by one dead entry per failed request on a dying link.
-        let sent = {
-            let mut stream = lock(&self.stream);
-            stream
-                .write_all(&header)
-                .and_then(|_| stream.write_all(payload))
-                .and_then(|_| stream.flush())
-        };
-        if let Err(e) = sent {
-            lock(&self.pending).remove(&seq);
-            return Err(NxusError {
-                message: format!("send failed: {}", e),
-                result: None,
-            });
+        // 死んだ接続に書いても読んでも意味は無い。ここで即座に返すことで、
+        // 1 命令ごとに read/write するチート VM が「10 秒 × 命令数」待つのを防ぐ。
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(connection_lost());
         }
-
-        match rx.recv_timeout(timeout) {
-            Ok(Some((_kind, flags, body))) => {
-                if flags & FLAG_ERROR != 0 {
-                    return Err(error_from_reply(cmd, &body));
-                }
-                Ok((cmd, body))
-            }
-            Ok(None) => Err(NxusError {
-                message: "connection closed".into(),
-                result: None,
-            }),
-            Err(RecvTimeoutError::Timeout) => {
-                lock(&self.pending).remove(&seq);
-                Err(NxusError {
-                    message: format!("no reply for command 0x{:04X}", cmd),
-                    result: None,
-                })
-            }
-            Err(RecvTimeoutError::Disconnected) => Err(NxusError {
-                message: "connection closed".into(),
-                result: None,
-            }),
-        }
+        request_on(
+            &self.stream,
+            &self.pending,
+            &self.seq,
+            &self.last_tx,
+            &self.dead,
+            cmd,
+            payload,
+            timeout,
+        )
     }
 
     /// Send a short command, retrying it while the console is still releasing
@@ -967,6 +1145,42 @@ impl NxusClient {
     /// callers that poll target memory use a short timeout here.  The chunking
     /// and short-reply handling are identical to `read`.
     pub fn read_timeout(&self, address: u64, size: u32, timeout: Duration) -> Result<Vec<u8>> {
+        self.read_chunks(address, size, || Ok(timeout))
+    }
+
+    /// Cheat-VM read: [`CHEAT_REQUEST_TIMEOUT`] instead of `read`'s 30 s.
+    ///
+    /// チートは 1 命令で何度も read するので、ここを 3 秒にしておかないと
+    /// 数十命令のブロックが数分かかる。無音のコンソールでは 2 命令目以降は
+    /// `dead` フラグで即エラーになる（[`NxusClient::is_dead`]）。
+    pub fn read_for_cheat(&self, address: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_timeout(address, size, CHEAT_REQUEST_TIMEOUT)
+    }
+
+    /// Read under a whole-instruction budget (see [`InstructionBudget`]).
+    ///
+    /// Every chunk gets "whatever is left of the budget" as its own deadline, so
+    /// a multi-chunk read cannot spend more than the instruction was granted.
+    /// An exhausted budget is reported as a plain error and does *not* mark the
+    /// link dead: the console may simply be slow, and the next instruction can
+    /// still work.
+    pub fn read_with_budget(
+        &self,
+        address: u64,
+        size: u32,
+        budget: &InstructionBudget,
+    ) -> Result<Vec<u8>> {
+        self.read_chunks(address, size, || {
+            budget.request_timeout().ok_or_else(budget_exhausted)
+        })
+    }
+
+    /// [`read_timeout`](Self::read_timeout)'s body: the per-chunk deadline comes
+    /// from `timeout_for`, which lets the budget variant shrink it as it is spent.
+    fn read_chunks<F>(&self, address: u64, size: u32, mut timeout_for: F) -> Result<Vec<u8>>
+    where
+        F: FnMut() -> Result<Duration>,
+    {
         // Never ask for more than the server can put in one reply: an oversized
         // request is rejected outright and the caller would see "unreadable".
         const MIN_READ: u32 = 4096;
@@ -980,6 +1194,7 @@ impl NxusClient {
             let Some(chunk_address) = address.checked_add(offset) else {
                 break; // would wrap: stop
             };
+            let timeout = timeout_for()?;
             let mut payload = Vec::new();
             put_u64(&mut payload, chunk_address);
             put_u32(&mut payload, want);
@@ -1039,6 +1254,42 @@ impl NxusClient {
         let payload = encode_write_flags(address, data, flags);
         self.request_timeout(cmd::WRITE, &payload, timeout)
             .map(|_| ())
+    }
+
+    /// Cheat-VM write: [`CHEAT_REQUEST_TIMEOUT`] instead of `write`'s 30 s.
+    ///
+    /// RX フラグは付けない（データ書き込み用）。コードパッチは
+    /// [`write_code_for_cheat`](Self::write_code_for_cheat) を使う。
+    pub fn write_for_cheat(&self, address: u64, data: &[u8]) -> Result<()> {
+        self.write_with_flags_timeout(address, data, 0, CHEAT_REQUEST_TIMEOUT)
+    }
+
+    /// Cheat-VM code patch (Read-Execute target) with the short deadline.
+    pub fn write_code_for_cheat(&self, address: u64, data: &[u8]) -> Result<()> {
+        self.write_with_flags_timeout(address, data, WRITE_FLAG_ALLOW_RX, CHEAT_REQUEST_TIMEOUT)
+    }
+
+    /// Write under a whole-instruction budget (see [`InstructionBudget`]).
+    pub fn write_with_budget(
+        &self,
+        address: u64,
+        data: &[u8],
+        budget: &InstructionBudget,
+    ) -> Result<()> {
+        self.write_with_flags_budget(address, data, 0, budget)
+    }
+
+    /// [`write_with_budget`](Self::write_with_budget) with explicit write flags.
+    pub fn write_with_flags_budget(
+        &self,
+        address: u64,
+        data: &[u8],
+        flags: u32,
+        budget: &InstructionBudget,
+    ) -> Result<()> {
+        // 予算切れは「送る前に諦める」。0 秒で送ると pending を汚すだけ。
+        let timeout = budget.request_timeout().ok_or_else(budget_exhausted)?;
+        self.write_with_flags_timeout(address, data, flags, timeout)
     }
 
     /// Write a cheat/ASM patch that may target Read-Execute `.text`.
@@ -1876,18 +2127,233 @@ fn parse_chains(body: &[u8]) -> (Vec<PtrChain>, bool) {
     (chains, truncated)
 }
 
+/// 接続死を確定する。
+///
+/// 1. `dead` を立てる: 以後の `request_timeout` は入口で即 "connection lost"。
+/// 2. 待機中の要求すべてに `None` を流して起こす（`request_timeout` は
+///    "connection closed" で戻る）。reader が終了するときの後始末と同じ経路で、
+///    これが無いと待っている側は自分の締切まで気づけない。
+///
+/// `dead` は「この接続ではもう通信できない」の意味で、一度立ったら戻さない。
+/// 復帰は [`NxusClient`] を作り直す（GUI の再接続）だけ。
+fn mark_dead(
+    dead: &std::sync::atomic::AtomicBool,
+    pending: &Mutex<HashMap<u32, Pending>>,
+) {
+    dead.store(true, Ordering::SeqCst);
+    for (_, entry) in lock(pending).drain() {
+        let _ = entry.tx.send(None);
+    }
+}
+
+/// 死んだ接続に対する共通のエラー。
+fn connection_lost() -> NxusError {
+    NxusError {
+        message: "connection lost".into(),
+        result: None,
+    }
+}
+
+fn next_seq(seq: &Mutex<u32>) -> u32 {
+    let mut seq = lock(seq);
+    *seq = seq.wrapping_add(1);
+    *seq
+}
+
+/// 待機中の要求のうち、いちばん遅い締切。
+///
+/// reader はこれを見て「無音をどこまで許すか」を決める。長いコマンド
+/// （`ScanBegin` の応答は 600 秒かかりうる）の返事待ちの間は、サーバが
+/// 何も送ってこないのが正常なので、ここが無いと健全な接続を殺してしまう。
+/// keepalive の Heartbeat は [`Pending::guards_idle`] で除外する。
+fn pending_deadline(pending: &Mutex<HashMap<u32, Pending>>) -> Option<Instant> {
+    lock(pending)
+        .values()
+        .filter(|entry| entry.guards_idle)
+        .map(|entry| entry.deadline)
+        .max()
+}
+
+/// 1 コマンドぶんの送受信（[`NxusClient::request_timeout`] と keepalive の共通部）。
+///
+/// `dead` を受け取るのは、送信に失敗した時点で「この接続はもう使えない」を
+/// 確定させるため: 送れなかった要求の後始末だけして黙って返すと、次の要求が
+/// また自分の締切まで待ってしまう。
+#[allow(clippy::too_many_arguments)]
+fn request_on(
+    stream: &Mutex<TcpStream>,
+    pending: &Mutex<HashMap<u32, Pending>>,
+    seq_counter: &Mutex<u32>,
+    last_tx: &Mutex<Instant>,
+    dead: &std::sync::atomic::AtomicBool,
+    cmd: u16,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>)> {
+    let seq = next_seq(seq_counter);
+    let (tx, rx) = mpsc::channel::<Response>();
+    // reader が「この要求のための無音」をこの時刻まで許す。
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+    // Heartbeat は生存確認そのものなので、その短い締切で reader の無音判定を
+    // 縮めない（1 回の取りこぼしで即・接続死にしないため）。
+    let guards_idle = cmd != cmd::HEARTBEAT;
+    lock(pending).insert(
+        seq,
+        Pending {
+            tx,
+            deadline,
+            guards_idle,
+        },
+    );
+
+    let mut header = Vec::with_capacity(HEADER_SIZE);
+    put_u32(&mut header, MAGIC);
+    put_u16(&mut header, cmd);
+    put_u16(&mut header, 0);
+    put_u32(&mut header, payload.len() as u32);
+    put_u32(&mut header, seq);
+
+    // ヘッダと payload は同じロックの中で書く: keepalive の Heartbeat が
+    // この 2 つの間に割り込むと、フレームが壊れて以後すべてデシンクする。
+    let sent = {
+        let mut stream = lock(stream);
+        stream
+            .write_all(&header)
+            .and_then(|_| stream.write_all(payload))
+            .and_then(|_| stream.flush())
+    };
+    if let Err(e) = sent {
+        // 送信できない = 相手はいない。ここで死を確定しないと、次の要求が
+        // また 10 秒待ってから同じ失敗を繰り返す。
+        mark_dead(dead, pending);
+        return Err(NxusError {
+            message: format!("send failed: {}", e),
+            result: None,
+        });
+    }
+    *lock(last_tx) = Instant::now();
+
+    match rx.recv_timeout(timeout) {
+        Ok(Some((_kind, flags, body))) => {
+            if flags & FLAG_ERROR != 0 {
+                return Err(error_from_reply(cmd, &body));
+            }
+            Ok((cmd, body))
+        }
+        Ok(None) => Err(NxusError {
+            message: "connection closed".into(),
+            result: None,
+        }),
+        // 締切超過は「このコマンドが返らなかった」であって、接続死の判定は
+        // reader に任せる: 長いスキャンの返事待ちを、そのコマンド自身の
+        // タイムアウトで「死」にしてはいけない。
+        Err(RecvTimeoutError::Timeout) => {
+            lock(pending).remove(&seq);
+            Err(NxusError {
+                message: format!("no reply for command 0x{:04X}", cmd),
+                result: None,
+            })
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(NxusError {
+            message: "connection closed".into(),
+            result: None,
+        }),
+    }
+}
+
+/// 無音の接続に `Heartbeat` を送り、返事が来なければ接続死を確定する。
+///
+/// OS の SO_KEEPALIVE は Windows の既定で 2 時間 idle なので検出には使えない。
+/// プロトコル自身の Heartbeat（サーバは `NxusCmd_Heartbeat` を実装済み）なら
+/// 数秒で分かるうえ、コンソール側 watchdog（15 秒）も同時に満たせる。
+///
+/// 長いコマンドの返事待ちの間は Heartbeat を積まない: サーバの接続スレッドは
+/// 1 本で、スキャン中はコマンドを読めないため、積むと自分の Heartbeat が
+/// タイムアウトして健全な接続を殺してしまう。
+fn keepalive_loop(
+    stream: Arc<Mutex<TcpStream>>,
+    pending: Arc<Mutex<HashMap<u32, Pending>>>,
+    seq: Arc<Mutex<u32>>,
+    last_tx: Arc<Mutex<Instant>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    timing: LinkTiming,
+) {
+    let mut misses = 0u32;
+    // 見回りは Heartbeat 間隔より細かくする。本番は 500 ms で十分だが、
+    // テストは 200 ms 間隔なので、固定値のままだと「次に送るまで」が
+    // 間隔より長くなってタイミングの検証ができない。
+    let tick = timing
+        .keepalive_interval
+        .min(LINK_KEEPALIVE_TICK)
+        .max(Duration::from_millis(20));
+    loop {
+        thread::sleep(tick);
+        if !running.load(Ordering::SeqCst) || dead.load(Ordering::SeqCst) {
+            break;
+        }
+        // 1 回目の失敗のあとは短い間隔で再試行する（一時的な取りこぼしと
+        // 本当の切断を、2 回目の成否で分ける）。
+        let wait = if misses == 0 {
+            timing.keepalive_interval
+        } else {
+            timing.keepalive_retry
+        };
+        if lock(&last_tx).elapsed() < wait {
+            continue;
+        }
+        if !lock(&pending).is_empty() {
+            continue;
+        }
+        match request_on(
+            &stream,
+            &pending,
+            &seq,
+            &last_tx,
+            &dead,
+            cmd::HEARTBEAT,
+            &[],
+            timing.keepalive_timeout,
+        ) {
+            Ok(_) => misses = 0,
+            // エラー応答でも「返事が来た」= 相手は生きている。プロトコルを
+            // 実装していない古いコンソールを誤って切断しないための判定。
+            Err(e) if e.result.is_some() => misses = 0,
+            Err(_) => {
+                misses += 1;
+                if misses >= timing.keepalive_misses {
+                    mark_dead(&dead, &pending);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn reader_loop(
     mut stream: TcpStream,
-    pending: Arc<Mutex<HashMap<u32, Sender<Response>>>>,
+    pending: Arc<Mutex<HashMap<u32, Pending>>>,
     events: Sender<Event>,
     running: Arc<std::sync::atomic::AtomicBool>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    timing: LinkTiming,
 ) {
     let mut header = [0u8; HEADER_SIZE];
     loop {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        if !read_exact(&mut stream, &mut header) {
+        if read_frame(
+            &mut stream,
+            &mut header,
+            &pending,
+            &running,
+            timing.idle_timeout,
+        )
+        .is_err()
+        {
             break;
         }
         let magic = rd_u32(&header, 0);
@@ -1907,7 +2373,16 @@ fn reader_loop(
             break;
         }
         let mut payload = vec![0u8; length as usize];
-        if length > 0 && !read_exact(&mut stream, &mut payload) {
+        if length > 0
+            && read_frame(
+                &mut stream,
+                &mut payload,
+                &pending,
+                &running,
+                timing.idle_timeout,
+            )
+            .is_err()
+        {
             break;
         }
 
@@ -1915,34 +2390,98 @@ fn reader_loop(
             let _ = events.send(Event { kind, payload });
         } else {
             let sender = lock(&pending).remove(&seq);
-            if let Some(tx) = sender {
-                let _ = tx.send(Some((kind, flags, payload)));
+            if let Some(entry) = sender {
+                let _ = entry.tx.send(Some((kind, flags, payload)));
             }
         }
     }
-    // Wake anyone still waiting.
-    let mut map = lock(&pending);
-    for (_, tx) in map.drain() {
-        let _ = tx.send(None);
+    // ここに来た = EOF・プロトコル違反・締切超過・実行中断のいずれか。
+    // どれも「この接続ではもうフレームを組み立てられない」なので、待って
+    // いる全員を起こして以後の要求を即エラーにする。
+    mark_dead(&dead, &pending);
+}
+
+/// フレーム 1 つぶんの受信（ヘッダでも payload でも同じ規則）。
+///
+/// - 待機中の要求が無いとき: [`LINK_IDLE_TIMEOUT`] の無音で接続死。
+///   （keepalive が数秒ごとに Heartbeat を送るので、生きていれば無音にならない）
+/// - 長いコマンドの返事待ちのとき: その要求自身の締切まで待つ。
+/// - 途中で長い要求が登録された場合: 締切を延ばして待ち直す。接続直後の
+///   idle 待ちの最中にスキャンを始めると、これが無いと 20 秒で誤判定する。
+fn read_frame(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    pending: &Mutex<HashMap<u32, Pending>>,
+    running: &std::sync::atomic::AtomicBool,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
+    loop {
+        let deadline = match pending_deadline(pending) {
+            Some(deadline) if deadline > Instant::now() => deadline,
+            _ => Instant::now() + idle_timeout,
+        };
+        match read_exact(stream, buffer, deadline, running) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::TimedOut => {
+                if pending_deadline(pending).is_some_and(|d| d > Instant::now()) {
+                    continue;
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
-fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
+/// バッファが埋まるまで読む。タイムアウトは **締切まで** 再試行する。
+///
+/// 以前は `WouldBlock` / `TimedOut` を `continue` で捨てていたため、フレームの
+/// 途中でピアが黙ると reader スレッドが永久に回り続けた（200 ms の
+/// `set_read_timeout` が「無通信の検出」にまったく寄与していなかった）。
+/// 締切を持たせることで、無音のピアは必ず [`read_frame`] の「接続断」判定に
+/// 落ち、`running` が false になったら [`ErrorKind::Interrupted`] で即座に
+/// 抜ける（GUI の再接続が古い reader を引きずらない）。
+///
+/// 途中まで読めたバイトは `buffer` にそのまま残す（呼び出し側のバッファへ
+/// 直接書く）。部分フレームは復元できないので、呼び出し側は失敗後に
+/// そのバッファを捨てる前提。
+fn read_exact(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    running: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
     let mut got = 0;
     while got < buffer.len() {
+        if !running.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "the client is shutting down",
+            ));
+        }
         match stream.read(&mut buffer[got..]) {
-            Ok(0) => return false,
-            Ok(n) => got += n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the peer closed the connection",
+                ))
             }
-            Err(_) => return false,
+            Ok(n) => got += n,
+            // set_read_timeout(200ms) で戻ってくるだけ。捨てずに締切を
+            // 確かめるのが要点で、締切が無いと永久に回り続ける。
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "no byte from the peer before the deadline",
+                    ));
+                }
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    true
+    Ok(())
 }
 
 /// Walk the console's hit list one page at a time.
@@ -2054,15 +2593,16 @@ where
 mod tests {
     use super::{
         error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
-        pointer_width_with_reason, released_addresses, result_text, select_stopped_thread,
-        walk_all_hits, Hit, HitBatch, Mapping, Metadata, NxusClient, NxusError, PERM_R,
-        RESULT_BUSY, WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32, WIDTH_REASON_MAIN_BASE_64,
-        WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64, WIDTH_REASON_PROCESS_32,
-        WIDTH_REASON_PROCESS_64,
+        pointer_width_with_reason, read_exact, released_addresses, result_text,
+        select_stopped_thread, walk_all_hits, Hit, HitBatch, LinkTiming, Mapping, Metadata,
+        NxusClient, NxusError, PERM_R, RESULT_BUSY, WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32,
+        WIDTH_REASON_MAIN_BASE_64, WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64,
+        WIDTH_REASON_PROCESS_32, WIDTH_REASON_PROCESS_64,
     };
     use crate::protocol::{
-        cmd, put_u32, rd_u32, DebugStatus, HEADER_SIZE, MAGIC, WRITE_FLAG_ALLOW_RX,
+        cmd, put_u16, put_u32, rd_u16, rd_u32, DebugStatus, HEADER_SIZE, MAGIC, WRITE_FLAG_ALLOW_RX,
     };
+    use std::time::{Duration, Instant};
 
     fn error_body(rc: u32, reason: Option<u32>) -> Vec<u8> {
         let mut body = Vec::new();
@@ -2797,5 +3337,315 @@ mod tests {
             None,
             "unknown module stays unlabelled"
         );
+    }
+
+    // ---- link liveness / deadlines -------------------------------------
+    //
+    // 本番の締切（idle 20 秒 / heartbeat 5 秒）をそのまま待つと 1 本 20 秒
+    // かかってしまい、テストが実質「実行しない」ものになる。同じコードを
+    // ミリ秒のタイミングで組み立てて、判定そのものを固定する。
+
+    fn fast_timing() -> LinkTiming {
+        LinkTiming {
+            idle_timeout: Duration::from_millis(800),
+            keepalive_interval: Duration::from_millis(200),
+            keepalive_timeout: Duration::from_millis(150),
+            keepalive_retry: Duration::from_millis(100),
+            keepalive_misses: 2,
+        }
+    }
+
+    /// ローカルの TCP 対（戻り値の 2 番目がサーバ役）。
+    fn socket_pair(read_timeout: Duration) -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let accept = std::thread::spawn(move || listener.accept().expect("accept").0);
+        let client = std::net::TcpStream::connect(address).expect("connect");
+        client
+            .set_read_timeout(Some(read_timeout))
+            .expect("read timeout");
+        let server = accept.join().expect("accept thread");
+        (client, server)
+    }
+
+    /// サーバが返す 1 フレームを組み立てる。
+    fn frame_bytes(kind: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
+        put_u32(&mut frame, MAGIC);
+        put_u16(&mut frame, kind);
+        put_u16(&mut frame, flags);
+        put_u32(&mut frame, body.len() as u32);
+        put_u32(&mut frame, seq);
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// サーバ役として 1 フレーム読む。
+    fn read_frame_from(stream: &mut std::net::TcpStream) -> Option<(u16, u16, u32, Vec<u8>)> {
+        use std::io::Read;
+
+        let mut header = [0u8; HEADER_SIZE];
+        stream.read_exact(&mut header).ok()?;
+        let kind = rd_u16(&header, 4);
+        let flags = rd_u16(&header, 6);
+        let length = rd_u32(&header, 8) as usize;
+        let seq = rd_u32(&header, 12);
+        let mut body = vec![0u8; length];
+        if length > 0 {
+            stream.read_exact(&mut body).ok()?;
+        }
+        Some((kind, flags, seq, body))
+    }
+
+    /// 接続死に気づくまで待つ（テスト用タイミングなら 1 秒前後）。
+    fn wait_until_dead(client: &NxusClient) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_dead() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.is_dead(), "the client never noticed the dead link");
+    }
+
+    /// 締切の無い `read_exact` は無音のピアで永久に回っていた（200 ms の
+    /// read timeout を `continue` で捨てていた）。締切で必ず戻ることを固定する。
+    #[test]
+    fn read_exact_gives_up_at_its_deadline_instead_of_spinning_forever() {
+        use std::sync::atomic::AtomicBool;
+
+        let (mut stream, _server) = socket_pair(Duration::from_millis(20));
+        let running = AtomicBool::new(true);
+        let started = Instant::now();
+
+        let error = read_exact(
+            &mut stream,
+            &mut [0u8; HEADER_SIZE],
+            started + Duration::from_millis(150),
+            &running,
+        )
+        .expect_err("a silent peer must not satisfy read_exact");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() >= Duration::from_millis(140),
+            "gave up before the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a 150 ms deadline took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 途中まで読めたバイトは呼び出し側のバッファに残す（部分フレームは
+    /// 復元できないので、呼び出し側は失敗後に捨てる）。`running == false` は
+    /// 締切より優先して即座に Interrupted。
+    #[test]
+    fn read_exact_keeps_the_partial_frame_and_stops_when_asked_to_quit() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut stream, mut server) = socket_pair(Duration::from_millis(20));
+        server.write_all(&[0xAA, 0xBB, 0xCC]).expect("partial frame");
+        server.flush().expect("flush");
+
+        let running = AtomicBool::new(true);
+        let mut buffer = [0u8; 8];
+        let error = read_exact(
+            &mut stream,
+            &mut buffer,
+            Instant::now() + Duration::from_millis(120),
+            &running,
+        )
+        .expect_err("a 3-byte frame cannot complete an 8-byte read");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(&buffer[..3], &[0xAA, 0xBB, 0xCC], "partial bytes kept");
+        assert_eq!(buffer[3], 0, "nothing past the received bytes");
+
+        running.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        let error = read_exact(
+            &mut stream,
+            &mut buffer,
+            started + Duration::from_secs(30),
+            &running,
+        )
+        .expect_err("a shutdown interrupts the read");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the shutdown check must not wait for the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 何も返さないピア（スリープ / Wi-Fi 断 / 本体ハング）。以前は全要求が
+    /// 自分の締切まで待ち、次の要求もまた待った。いまは接続死が立ち、2 回目
+    /// 以降は 1 バイトも書かずに即エラーになる。
+    #[test]
+    fn a_silent_peer_is_declared_dead_and_later_requests_fail_fast() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().expect("accept");
+            // 接続は保持したまま黙る。
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+
+        let client =
+            NxusClient::connect_for_test("127.0.0.1", port, fast_timing()).expect("connect");
+        let started = Instant::now();
+        let _ = client.request_timeout(cmd::GET_STATUS, &[], Duration::from_millis(500));
+        wait_until_dead(&client);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?} to notice a silent peer",
+            started.elapsed()
+        );
+
+        let fast = Instant::now();
+        let error = client.request(cmd::GET_STATUS, &[]).expect_err("dead link");
+        assert_eq!(error.message, "connection lost");
+        assert!(
+            fast.elapsed() < Duration::from_millis(100),
+            "a dead link still waited {:?}",
+            fast.elapsed()
+        );
+
+        drop(client);
+        let _ = server.join();
+    }
+
+    /// 途中で切るピア: ヘッダだけ送って FIN。部分フレームは復元できないので、
+    /// その場で接続死にして以後の要求を即エラーにする。
+    #[test]
+    fn a_peer_that_closes_mid_frame_kills_the_link() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            // 「64 バイトの payload が来る」と宣言するヘッダだけ送って閉じる。
+            let mut header = Vec::new();
+            put_u32(&mut header, MAGIC);
+            put_u16(&mut header, cmd::HEARTBEAT);
+            put_u16(&mut header, 0);
+            put_u32(&mut header, 64);
+            put_u32(&mut header, 1);
+            socket.write_all(&header).expect("partial frame");
+            socket.flush().expect("flush");
+            // drop(socket) が FIN になる。
+        });
+
+        let client =
+            NxusClient::connect_for_test("127.0.0.1", port, fast_timing()).expect("connect");
+        wait_until_dead(&client);
+
+        let fast = Instant::now();
+        let error = client.request(cmd::GET_STATUS, &[]).expect_err("dead link");
+        assert_eq!(error.message, "connection lost");
+        assert!(
+            fast.elapsed() < Duration::from_millis(100),
+            "a dead link still waited {:?}",
+            fast.elapsed()
+        );
+
+        drop(client);
+        let _ = server.join();
+    }
+
+    /// 長い要求（スキャン等）の返事待ちを無音判定で殺さない。
+    ///
+    /// サーバの接続スレッドは 1 本で、`ScanBegin` は処理し終えるまで何も
+    /// 送ってこない。要求自身の締切までは待つ、という規則が無いと、健全な
+    /// スキャンが 20 秒（テストでは 800 ms）で「接続死」になる。
+    #[test]
+    fn a_long_request_is_not_killed_by_the_idle_rule() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let (kind, _flags, seq, _body) =
+                read_frame_from(&mut socket).expect("the request frame");
+            // idle_timeout(800 ms) より長く黙ってから返す: 遅いスキャンの代役。
+            std::thread::sleep(Duration::from_millis(1200));
+            socket
+                .write_all(&frame_bytes(kind, 0, seq, &[]))
+                .expect("late reply");
+            // 返信直後に閉じると、クライアントは（正しく）EOF を接続死として
+            // 拾う。このテストが見たいのは「遅い返事」だけなので、判定が
+            // 終わるまで接続を保持する。
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let client =
+            NxusClient::connect_for_test("127.0.0.1", port, fast_timing()).expect("connect");
+        let (_, body) = client
+            .request_timeout(cmd::GET_STATUS, &[], Duration::from_secs(3))
+            .expect("a long request must wait for its own deadline");
+        assert!(body.is_empty());
+        assert!(
+            !client.is_dead(),
+            "waiting for a slow reply is not a dead link"
+        );
+
+        drop(client);
+        let _ = server.join();
+    }
+
+    /// 無音でも健全な接続は殺さない: keepalive が Heartbeat を送り、応答が
+    /// 返る限り reader の無音判定（本番 20 秒）は発火しない。
+    /// 同時に「送信が止まった接続に Heartbeat が実際に出る」ことも固定する。
+    #[test]
+    fn the_keepalive_keeps_a_quiet_but_healthy_link_alive() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<u16>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            while let Some((kind, _flags, seq, _body)) = read_frame_from(&mut socket) {
+                let _ = frame_tx.send(kind);
+                if kind != cmd::HEARTBEAT {
+                    continue;
+                }
+                // コンソールと同じく、Heartbeat には空の応答を返す。
+                if socket.write_all(&frame_bytes(kind, 0, seq, &[])).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let client =
+            NxusClient::connect_for_test("127.0.0.1", port, fast_timing()).expect("connect");
+        let first = frame_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the keepalive must send a Heartbeat on a quiet link");
+        assert_eq!(first, cmd::HEARTBEAT);
+
+        // 応答が返り続けている限り、無音を「接続死」にしない。
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !client.is_dead(),
+            "an answered heartbeat must keep the link alive"
+        );
+        let mut more = 0;
+        while frame_rx.try_recv().is_ok() {
+            more += 1;
+        }
+        assert!(
+            more >= 1,
+            "the keepalive must repeat while the link stays quiet"
+        );
+
+        drop(client);
+        let _ = server.join();
     }
 }

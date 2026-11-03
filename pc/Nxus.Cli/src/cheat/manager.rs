@@ -8,12 +8,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::model::{CheatBlock, CheatDocument, CheatExecMode, CheatKey};
 use super::parser;
 use super::vm::{self, CheatMemoryIo, MemoryRegions, VmReport, VmState};
 
 pub const JOURNAL_MAGIC: &str = "NXUS-CHEAT-BACKUP 1";
+
+/// Default wall-clock budget for one ON block.
+///
+/// A single block must never be able to hang the UI forever; the interpreter
+/// aborts (and rolls the block back) once this elapses.  Callers that know
+/// their link is slower can change it with
+/// [`CheatManager::set_block_budget`], or pass an explicit budget to
+/// [`CheatManager::enable_block`].  `None` disables the limit.
+pub const DEFAULT_BLOCK_BUDGET: Option<Duration> = Some(Duration::from_secs(10));
 
 // ---------------------------------------------------------------------------
 // Target identity
@@ -166,9 +176,13 @@ pub fn resolve_cheat_path(build_id: &str) -> Result<PathBuf, String> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackupState {
-    /// Original recorded, write not confirmed.
+    /// Original recorded, but the bytes were not journalled yet (the write has
+    /// not been issued either).  Only transient inside one block.
     Pending,
-    /// Patched bytes confirmed written.
+    /// The journal on disk records this write.  The record is flushed *before*
+    /// the memory write, so recovering from a crash always restores the
+    /// original bytes; replaying an original that never got overwritten is a
+    /// harmless no-op.
     Committed,
 }
 
@@ -211,12 +225,33 @@ pub struct RestoreReport {
     pub restored: usize,
     /// Addresses still holding a backup because restoring failed.
     pub failed: Vec<(u64, String)>,
+    /// `failed.len()`; kept as a field for callers that only need the count.
+    pub failed_addresses: usize,
     pub cleared_cheats: usize,
+    /// The sidecar journal could not be rewritten, so the on-disk restore
+    /// record is stale.
+    pub journal_error: Option<String>,
+    /// The cheat file could not be rewritten, so it still claims the cheats
+    /// are on.
+    pub save_error: Option<String>,
 }
 
 impl RestoreReport {
+    /// True only when every original byte is back **and** the sidecar journal
+    /// that describes them was rewritten.  Never true while anything is left
+    /// to restore, so a caller cannot report a half-finished panic-off as done.
+    ///
+    /// [`RestoreReport::save_error`] is deliberately *not* part of this: the
+    /// bytes are back either way, and a failed cheat-file write must not keep
+    /// a session from disconnecting.  Callers that show the file state check
+    /// that field (and [`CheatManager::last_error`]) separately.
     pub fn is_complete(&self) -> bool {
-        self.failed.is_empty()
+        self.failed.is_empty() && self.journal_error.is_none()
+    }
+
+    /// Number of addresses whose original bytes are not back yet.
+    pub fn failed_count(&self) -> usize {
+        self.failed.len()
     }
 }
 
@@ -237,6 +272,34 @@ pub struct CheatSnapshot {
     pub backups: usize,
     pub issues: usize,
     pub last_error: Option<String>,
+    /// `true` while the target may still hold patched bytes that this manager
+    /// is responsible for restoring (see [`CheatManager::dirty`]).
+    pub dirty: bool,
+}
+
+/// State of one address before the block that is currently executing wrote it.
+///
+/// Captured on first touch inside a block so a failed (or timed-out) block can
+/// be written back exactly to the state it found.
+#[derive(Clone, Debug)]
+struct PreWrite {
+    /// Bytes the address held before this block wrote it (a still-unwritten
+    /// backup counts as its original bytes).
+    previous: Vec<u8>,
+    /// Whether a backup already existed before the block.
+    existed: bool,
+    /// Owner set before the block.
+    owners: BTreeSet<CheatKey>,
+    /// Journalled `written` bytes before the block.
+    written: Vec<u8>,
+    /// Journalled state before the block.
+    state: BackupState,
+}
+
+/// Result of one block evaluation, including what it wrote (for rollback).
+struct CodeRun {
+    result: Result<VmReport, String>,
+    writes: Vec<(u64, PreWrite)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +319,10 @@ pub struct CheatManager {
     vm_state: VmState,
     auto_save: bool,
     last_error: Option<String>,
+    /// `true` while the target may hold patched bytes this manager owns.
+    dirty: bool,
+    /// Wall-clock budget for one ON/OFF block; `None` means no limit.
+    block_budget: Option<Duration>,
 }
 
 impl CheatManager {
@@ -291,10 +358,15 @@ impl CheatManager {
             vm_state: VmState::default(),
             auto_save: true,
             last_error: None,
+            dirty: false,
+            block_budget: DEFAULT_BLOCK_BUDGET,
         };
         if let Err(error) = manager.load_journal() {
             manager.last_error = Some(format!("backup journal ignored: {error}"));
         }
+        // A journal for this exact target means the target may still be
+        // patched; until every original is back, the manager is dirty.
+        manager.settle_dirty();
         Ok(manager)
     }
 
@@ -322,10 +394,15 @@ impl CheatManager {
             vm_state: VmState::default(),
             auto_save: true,
             last_error: None,
+            dirty: false,
+            block_budget: DEFAULT_BLOCK_BUDGET,
         };
         if let Err(error) = manager.load_journal() {
             manager.last_error = Some(format!("backup journal ignored: {error}"));
         }
+        // A journal for this exact target means the target may still be
+        // patched; until every original is back, the manager is dirty.
+        manager.settle_dirty();
         Ok(manager)
     }
 
@@ -401,6 +478,28 @@ impl CheatManager {
         self.auto_save = auto_save;
     }
 
+    /// `true` while the target may hold patched bytes this manager owns.
+    ///
+    /// It is set the moment an ON attempt starts (before the first write) and
+    /// cleared only when every recorded original byte is back.  A failed
+    /// enable that was fully rolled back clears it again; a failed enable that
+    /// could not be rolled back keeps it set *and* returns an error, so
+    /// "patched but reported off" cannot happen silently.
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Wall-clock budget applied to one ON/OFF block by [`Self::enable`] and
+    /// [`Self::tick`] (the default is [`DEFAULT_BLOCK_BUDGET`]).
+    pub fn block_budget(&self) -> Option<Duration> {
+        self.block_budget
+    }
+
+    /// Change the per-block budget; `None` removes the limit.
+    pub fn set_block_budget(&mut self, budget: Option<Duration>) {
+        self.block_budget = budget;
+    }
+
     pub fn snapshot(&self) -> CheatSnapshot {
         let mut loops = 0;
         let mut patches = 0;
@@ -420,6 +519,7 @@ impl CheatManager {
             backups: self.backups.len(),
             issues: self.document.issues_with_block().len(),
             last_error: self.last_error.clone(),
+            dirty: self.dirty,
         }
     }
 
@@ -428,6 +528,7 @@ impl CheatManager {
         self.document = load_document(&self.path, &self.identity.build_id)?;
         self.enabled.clear();
         self.errors.clear();
+        self.settle_dirty();
         Ok(())
     }
 
@@ -480,6 +581,9 @@ impl CheatManager {
         self.path = resolve_in_cheats_dir(&self.cheats_dir, &self.identity.build_id)?;
         self.journal_path = self.cheats_dir.join(self.identity.backup_file_name());
         self.document = load_document(&self.path, &self.identity.build_id)?;
+        // The old process is gone; its patches died with it, so nothing here
+        // is left to restore.
+        self.settle_dirty();
         self.last_error = None;
         Ok(TargetChange {
             changed: true,
@@ -488,10 +592,41 @@ impl CheatManager {
     }
 
     /// Enable one cheat.  Patch and Loop both execute once immediately.
+    ///
+    /// Uses [`Self::block_budget`]; see [`Self::enable_block`] for the
+    /// budgeted variant with a progress callback.
     pub fn enable<M: CheatMemoryIo + ?Sized>(
         &mut self,
         key: CheatKey,
         io: &mut M,
+    ) -> Result<(), String> {
+        let budget = self.block_budget;
+        self.enable_block(key, io, budget, &mut |_, _| {})
+    }
+
+    /// Enable one cheat with an explicit per-block budget and progress callback.
+    ///
+    /// * `budget` bounds the wall clock of the whole ON block.  When it is
+    ///   exceeded, every byte this block already wrote is written back to the
+    ///   state it found (see [`Self::rollback_block`]) and an error whose
+    ///   message contains `timed out` is returned.  A half-applied patch is
+    ///   therefore never left behind silently.
+    /// * `on_progress(done, total)` receives the interpreter's progress, so a
+    ///   slow link can drive a progress bar instead of looking frozen.
+    ///
+    /// On error the manager keeps `errors()` and `last_error()` populated and
+    /// tells the caller the truth:
+    ///
+    /// * `is_enabled(key)` is `false` when the block did not apply (rolled back),
+    /// * `dirty()` is `true` whenever anything still needs restoring,
+    /// * a save failure is returned as `Err` while the bytes stay applied, so
+    ///   the caller can see that the file does not describe memory.
+    pub fn enable_block<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        key: CheatKey,
+        io: &mut M,
+        budget: Option<Duration>,
+        on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<(), String> {
         if self.enabled.contains(&key) {
             return Ok(());
@@ -508,14 +643,31 @@ impl CheatManager {
                 .map(|issue| issue.to_string())
                 .unwrap_or_else(|| "cheat has no executable ON code".to_string());
             self.errors.insert(key, message.clone());
+            self.last_error = Some(message.clone());
             return Err(message);
         }
 
-        if let Err(error) = self.run_code(key, &block.on, 0, true, io) {
-            let _ = self.restore_owned(key, io);
-            self.errors.insert(key, error.clone());
-            self.last_error = Some(error.clone());
-            return Err(error);
+        // From here the target may be patched, so the manager is dirty until
+        // the block settles (success keeps it, a full rollback clears it).
+        self.dirty = true;
+        let run = self.run_code(key, &block.on, 0, true, io, budget, on_progress);
+        if let Err(error) = run.result {
+            let rollback = self.rollback_block(run.writes, io);
+            self.enabled.remove(&key);
+            self.errors.remove(&key);
+            if let Some(block) = self.document.block_mut(key) {
+                block.enabled = false;
+            }
+            self.settle_dirty();
+            let message = match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; rollback also failed: {rollback_error}")
+                }
+            };
+            self.errors.insert(key, message.clone());
+            self.last_error = Some(message.clone());
+            return Err(message);
         }
 
         self.enabled.insert(key);
@@ -523,8 +675,13 @@ impl CheatManager {
         if let Some(block) = self.document.block_mut(key) {
             block.enabled = true;
         }
+        self.settle_dirty();
         if let Err(error) = self.save_document() {
-            self.last_error = Some(format!("cheat file save failed: {error}"));
+            let message = format!(
+                "cheat enabled in memory, but the cheat file could not be saved: {error}"
+            );
+            self.last_error = Some(message.clone());
+            return Err(message);
         }
         Ok(())
     }
@@ -546,6 +703,11 @@ impl CheatManager {
     /// With an explicit `:OFF` / `@off` block the restore program is executed
     /// and the backup references are dropped.  Otherwise the original bytes
     /// are written back for every address this cheat exclusively owns.
+    ///
+    /// Every failure is returned as `Err`: a broken OFF block whose fallback
+    /// restore also failed, a restore that could not write, an unusable
+    /// journal, or a cheat file that could not be updated.  `dirty()` stays
+    /// `true` whenever bytes are still not back.
     pub fn disable<M: CheatMemoryIo + ?Sized>(
         &mut self,
         key: CheatKey,
@@ -558,15 +720,23 @@ impl CheatManager {
         if !self.enabled.contains(&key) && !owns_backups {
             // Turning an already-off cheat off is a no-op in memory; only the
             // file state may need updating.
-            if let Some(block) = self.document.block_mut(key) {
-                if block.enabled {
+            let marked = self
+                .document
+                .block(key)
+                .map(|block| block.enabled)
+                .unwrap_or(false);
+            if marked {
+                if let Some(block) = self.document.block_mut(key) {
                     block.enabled = false;
-                    if let Err(error) = self.save_document() {
-                        self.last_error = Some(format!("cheat file save failed: {error}"));
-                    }
+                }
+                if let Err(error) = self.save_document() {
+                    let message = format!("cheat file save failed: {error}");
+                    self.last_error = Some(message.clone());
+                    return Err(message);
                 }
             }
             self.errors.remove(&key);
+            self.settle_dirty();
             return Ok(());
         }
 
@@ -575,39 +745,73 @@ impl CheatManager {
             .as_ref()
             .map(|block| block.explicit_off && block.off.is_some())
             .unwrap_or(false);
+        let budget = self.block_budget;
 
         if has_explicit_off {
             let Some(off) = block.as_ref().and_then(|block| block.off.as_ref()).cloned() else {
                 return Err("explicit OFF block disappeared".to_string());
             };
-            match self.run_code(key, &off, 0, false, io) {
+            let run = self.run_code(key, &off, 0, false, io, budget, &mut |_, _| {});
+            match run.result {
                 Ok(_) => {
                     if let Err(error) = self.release_owner(key) {
-                        self.last_error = Some(error.clone());
+                        self.enabled.remove(&key);
+                        if let Some(block) = self.document.block_mut(key) {
+                            block.enabled = false;
+                        }
+                        self.settle_dirty();
+                        let message = format!(
+                            "cheat turned off in memory, but the backup journal was not updated: {error}"
+                        );
+                        if let Err(save_error) = self.save_document() {
+                            self.last_error = Some(format!(
+                                "{message}; cheat file save failed: {save_error}"
+                            ));
+                        } else {
+                            self.last_error = Some(message.clone());
+                        }
+                        self.errors.insert(key, message.clone());
+                        return Err(message);
                     }
                 }
                 Err(error) => {
                     // A broken OFF block must not leave the target patched.
                     let fallback = self.restore_owned(key, io);
-                    self.enabled.remove(&key);
-                    self.errors.insert(key, error.clone());
-                    if let Some(block) = self.document.block_mut(key) {
-                        block.enabled = false;
+                    let mut message = error;
+                    match &fallback {
+                        Ok(()) => {
+                            // The originals are back, so the cheat really is off.
+                            self.enabled.remove(&key);
+                            if let Some(block) = self.document.block_mut(key) {
+                                block.enabled = false;
+                            }
+                        }
+                        Err(restore_error) => {
+                            // Bytes may still be patched: keep the cheat marked
+                            // ON so the UI matches memory, and let it be retried.
+                            message = format!(
+                                "{message}; fallback restore also failed: {restore_error}"
+                            );
+                        }
                     }
-                    let _ = self.save_document();
-                    self.last_error = Some(error.clone());
-                    return match fallback {
-                        Ok(()) => Err(error),
-                        Err(restore_error) => Err(format!(
-                            "{error}; fallback restore also failed: {restore_error}"
-                        )),
-                    };
+                    self.settle_dirty();
+                    self.errors.insert(key, message.clone());
+                    self.last_error = Some(message.clone());
+                    if let Err(save_error) = self.save_document() {
+                        message = format!("{message}; cheat file save failed: {save_error}");
+                        self.last_error = Some(message.clone());
+                    }
+                    return Err(message);
                 }
             }
         } else if let Err(error) = self.restore_owned(key, io) {
-            self.enabled.remove(&key);
+            // The original bytes are not back, so this cheat stays enabled:
+            // reporting it off while it is patched is exactly the silent
+            // failure this path must not have.  The backup (and `dirty`) stay
+            // so the next disable or panic-off retries the restore.
             self.errors.insert(key, error.clone());
             self.last_error = Some(error.clone());
+            self.settle_dirty();
             return Err(error);
         }
 
@@ -616,8 +820,12 @@ impl CheatManager {
         if let Some(block) = self.document.block_mut(key) {
             block.enabled = false;
         }
+        self.settle_dirty();
         if let Err(error) = self.save_document() {
-            self.last_error = Some(format!("cheat file save failed: {error}"));
+            let message =
+                format!("cheat disabled in memory, but the cheat file could not be saved: {error}");
+            self.last_error = Some(message.clone());
+            return Err(message);
         }
         Ok(())
     }
@@ -661,6 +869,10 @@ impl CheatManager {
     }
 
     /// Evaluate every enabled Loop-mode cheat once.
+    ///
+    /// Each block runs under [`Self::block_budget`]; a block that overruns (or
+    /// fails) is reported in [`TickReport::errors`] and its backups are kept,
+    /// because the loop stays enabled and must still be restorable.
     pub fn tick<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M, keys_held: u64) -> TickReport {
         let mut report = TickReport::default();
         let keys: Vec<CheatKey> = self
@@ -670,6 +882,7 @@ impl CheatManager {
             .filter(|block| self.enabled.contains(&block.key) && block.mode == CheatExecMode::Loop)
             .map(|block| block.key)
             .collect();
+        let budget = self.block_budget;
 
         for key in keys {
             let code = match self.document.block(key) {
@@ -683,7 +896,8 @@ impl CheatManager {
                 }
                 None => continue,
             };
-            match self.run_code(key, &code, keys_held, true, io) {
+            let run = self.run_code(key, &code, keys_held, true, io, budget, &mut |_, _| {});
+            match run.result {
                 Ok(_) => {
                     report.executed += 1;
                     self.errors.remove(&key);
@@ -696,10 +910,17 @@ impl CheatManager {
                 }
             }
         }
+        self.settle_dirty();
         report
     }
 
     /// Panic OFF: stop all loops, then restore every recorded original byte.
+    ///
+    /// `is_complete()` is only true when every original byte is back *and* the
+    /// sidecar journal that describes them was rewritten; failures are kept in
+    /// `failed` (with a count in `failed_addresses`) so the caller can retry
+    /// instead of believing a half-finished restore.  A cheat-file write
+    /// failure is reported in `save_error` without blocking the restore.
     pub fn restore_all_backups<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M) -> RestoreReport {
         let addresses: Vec<u64> = self.backups.keys().copied().collect();
         let cleared_cheats = self.enabled.len();
@@ -725,12 +946,23 @@ impl CheatManager {
                 }
             }
         }
+        report.failed_addresses = report.failed.len();
 
         for block in &mut self.document.blocks {
             block.enabled = false;
         }
-        let _ = self.persist_journal();
-        let _ = self.save_document();
+        // A restore is not complete just because the writes succeeded: the
+        // sidecar must lose those entries, otherwise the next run would replay
+        // them against a target that no longer needs them.
+        if let Err(error) = self.persist_journal() {
+            self.last_error = Some(format!("backup journal update failed: {error}"));
+            report.journal_error = Some(error);
+        }
+        if let Err(error) = self.save_document() {
+            self.last_error = Some(format!("cheat file save failed: {error}"));
+            report.save_error = Some(error);
+        }
+        self.settle_dirty();
         report
     }
 
@@ -740,6 +972,13 @@ impl CheatManager {
 
     // -- internals ---------------------------------------------------------
 
+    /// `dirty` can only be cleared when nothing is left to restore.
+    fn settle_dirty(&mut self) {
+        self.dirty = !self.backups.is_empty();
+    }
+
+    /// Run one block, collecting what it wrote so a failure can be rolled back.
+    #[allow(clippy::too_many_arguments)]
     fn run_code<M: CheatMemoryIo + ?Sized>(
         &mut self,
         key: CheatKey,
@@ -747,36 +986,102 @@ impl CheatManager {
         keys_held: u64,
         record_backups: bool,
         io: &mut M,
-    ) -> Result<VmReport, String> {
+        budget: Option<Duration>,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> CodeRun {
         if !code.is_executable() {
-            return Err(code
-                .first_issue()
-                .map(|issue| issue.to_string())
-                .unwrap_or_else(|| "code is empty or invalid".to_string()));
+            return CodeRun {
+                result: Err(code
+                    .first_issue()
+                    .map(|issue| issue.to_string())
+                    .unwrap_or_else(|| "code is empty or invalid".to_string())),
+                writes: Vec::new(),
+            };
         }
         let regions = self.regions;
         let mut state = std::mem::take(&mut self.vm_state);
-        let result = {
+        let (result, writes) = {
             let mut recorder = RecordingIo {
                 manager: self,
                 io,
                 key,
                 record_backups,
+                writes: Vec::new(),
+                journal_flushed: false,
             };
-            vm::execute(
+            let result = vm::execute_with_budget(
                 &code.instructions,
                 &code.jumps,
                 &mut recorder,
                 &regions,
                 keys_held,
                 &mut state,
-            )
+                budget,
+                on_progress,
+            );
+            (result.map_err(|error| error.to_string()), recorder.writes)
         };
         self.vm_state = state;
-        result.map_err(|error| error.to_string())
+        CodeRun { result, writes }
     }
 
-    /// Ensure the original bytes for `address` are journalled before a write.
+    /// Write back every byte a failed block applied and restore the backup
+    /// bookkeeping it changed.
+    ///
+    /// Addresses whose backup already existed keep their previous owner set
+    /// and journalled bytes; addresses whose backup was created by this block
+    /// lose the backup again.  When a write-back fails the backup is *kept*
+    /// (so a later `panic_off` can still restore it) and the failure is
+    /// returned, never swallowed.
+    fn rollback_block<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        writes: Vec<(u64, PreWrite)>,
+        io: &mut M,
+    ) -> Result<(), String> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut failures: Vec<(u64, String)> = Vec::new();
+        for (address, pre) in writes.into_iter().rev() {
+            match io.write_mem(address, &pre.previous, true) {
+                Ok(()) => {
+                    if pre.existed {
+                        if let Some(entry) = self.backups.get_mut(&address) {
+                            entry.owners = pre.owners;
+                            entry.written = pre.written;
+                            entry.state = pre.state;
+                        }
+                    } else {
+                        self.backups.remove(&address);
+                    }
+                }
+                Err(error) => {
+                    // The target still holds our bytes: keep the restore data.
+                    failures.push((address, error));
+                }
+            }
+        }
+        let journal_error = self.persist_journal().err();
+        if failures.is_empty() && journal_error.is_none() {
+            return Ok(());
+        }
+        let mut summary = failures
+            .iter()
+            .map(|(address, error)| format!("0x{address:X}: {error}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(error) = journal_error {
+            if !summary.is_empty() {
+                summary.push_str(", ");
+            }
+            summary.push_str(&format!("journal: {error}"));
+        }
+        Err(format!("rollback failed for {summary}"))
+    }
+
+    /// Ensure the original bytes for `address` are recorded.  Returns `true`
+    /// when a new backup entry was created; its durable journal record is
+    /// written by the caller before the memory write.
     fn ensure_backup<M: CheatMemoryIo + ?Sized>(
         &mut self,
         io: &mut M,
@@ -784,8 +1089,8 @@ impl CheatManager {
         address: u64,
         width: u8,
         written: &[u8],
-    ) -> Result<(), String> {
-        if let Some(entry) = self.backups.get_mut(&address) {
+    ) -> Result<bool, String> {
+        let created = if let Some(entry) = self.backups.get_mut(&address) {
             if entry.width != width {
                 return Err(format!(
                     "address 0x{address:X} is already backed up with width {} but this write uses {width}",
@@ -793,6 +1098,7 @@ impl CheatManager {
                 ));
             }
             entry.owners.insert(key);
+            false
         } else {
             let original = io
                 .read_mem(address, u32::from(width))
@@ -809,33 +1115,31 @@ impl CheatManager {
                     address,
                     width,
                     original,
-                    written: Vec::new(),
+                    written: written.to_vec(),
                     owners: BTreeSet::from([key]),
-                    state: BackupState::Pending,
+                    state: BackupState::Committed,
                 },
             );
-            if let Err(error) = self.persist_journal() {
-                // Never write without a durable restore record.
-                self.backups.remove(&address);
-                return Err(format!("backup journal write failed: {error}"));
-            }
-        }
+            true
+        };
 
         if let Some(entry) = self.backups.get_mut(&address) {
             entry.written = written.to_vec();
-            entry.state = BackupState::Pending;
+            entry.state = BackupState::Committed;
         }
-        self.persist_journal()
-            .map_err(|error| format!("backup journal update failed: {error}"))
+        Ok(created)
     }
 
+    /// Record that the write was issued.
+    ///
+    /// The journal already holds these bytes: they are written to disk *before*
+    /// the memory write (see [`RecordingIo::prepare_write`]), so this is a
+    /// memory-only update.  That keeps a block at one fsync per new address
+    /// instead of three per write.
     fn mark_written(&mut self, address: u64, data: &[u8]) {
         if let Some(entry) = self.backups.get_mut(&address) {
             entry.written = data.to_vec();
             entry.state = BackupState::Committed;
-        }
-        if let Err(error) = self.persist_journal() {
-            self.last_error = Some(format!("backup journal commit failed: {error}"));
         }
     }
 
@@ -886,6 +1190,7 @@ impl CheatManager {
         }
 
         if failures.is_empty() {
+            self.settle_dirty();
             Ok(())
         } else {
             let summary = failures
@@ -893,7 +1198,9 @@ impl CheatManager {
                 .map(|(address, error)| format!("0x{address:X}: {error}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(format!("restore failed for {summary}"))
+            let message = format!("restore failed for {summary}");
+            self.last_error = Some(message.clone());
+            Err(message)
         }
     }
 
@@ -991,6 +1298,77 @@ struct RecordingIo<'a, M: CheatMemoryIo + ?Sized> {
     io: &'a mut M,
     key: CheatKey,
     record_backups: bool,
+    /// Addresses this block wrote, with the state they had before the block.
+    writes: Vec<(u64, PreWrite)>,
+    /// The journal was already flushed for this block.
+    journal_flushed: bool,
+}
+
+impl<'a, M: CheatMemoryIo + ?Sized> RecordingIo<'a, M> {
+    /// Snapshot the pre-block state, extend the backup table, then flush the
+    /// journal **before** the memory write.
+    ///
+    /// Flushing once per new address (instead of the old three writes per
+    /// write: insert, re-state, commit) keeps the "never write without a
+    /// durable restore record" guarantee while cutting the fsync count of a
+    /// one-write block from three to one.
+    fn prepare_write(&mut self, address: u64, width: u8, data: &[u8]) -> Result<(), String> {
+        let tracked = self.writes.iter().any(|(candidate, _)| *candidate == address);
+        let before = if tracked {
+            None
+        } else {
+            self.manager.backups.get(&address).cloned()
+        };
+        let created = self
+            .manager
+            .ensure_backup(self.io, self.key, address, width, data)?;
+        if !tracked {
+            match before {
+                Some(entry) => {
+                    let previous = if entry.written.is_empty() {
+                        entry.original.clone()
+                    } else {
+                        entry.written.clone()
+                    };
+                    self.writes.push((
+                        address,
+                        PreWrite {
+                            previous,
+                            existed: true,
+                            owners: entry.owners,
+                            written: entry.written,
+                            state: entry.state,
+                        },
+                    ));
+                }
+                None => {
+                    let previous = self
+                        .manager
+                        .backups
+                        .get(&address)
+                        .map(|entry| entry.original.clone())
+                        .unwrap_or_default();
+                    self.writes.push((
+                        address,
+                        PreWrite {
+                            previous,
+                            existed: false,
+                            owners: BTreeSet::new(),
+                            written: Vec::new(),
+                            state: BackupState::Pending,
+                        },
+                    ));
+                }
+            }
+        }
+        if created || !self.journal_flushed {
+            self.manager
+                .persist_journal()
+                .map_err(|error| format!("backup journal write failed: {error}"))?;
+            self.journal_flushed = true;
+        }
+        Ok(())
+    }
 }
 
 impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for RecordingIo<'_, M> {
@@ -1005,8 +1383,7 @@ impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for RecordingIo<'_, M> {
         let width = u8::try_from(data.len())
             .map_err(|_| format!("cheat write of {} bytes is too large", data.len()))?;
         if self.record_backups {
-            self.manager
-                .ensure_backup(self.io, self.key, address, width, data)?;
+            self.prepare_write(address, width, data)?;
         }
         self.io.write_mem(address, data, allow_rx)?;
         if self.record_backups {
@@ -1220,6 +1597,10 @@ mod tests {
         probe: Option<PathBuf>,
         probe_seen: Vec<bool>,
         paused: bool,
+        /// Writes to this address fail, like a target that rejects the write.
+        fail_write_at: Option<u64>,
+        /// Sleep after the Nth write, to simulate a slow console link.
+        slow_writes: Option<(usize, Duration)>,
     }
 
     impl Default for TestIo {
@@ -1230,6 +1611,8 @@ mod tests {
                 probe: None,
                 probe_seen: Vec::new(),
                 paused: false,
+                fail_write_at: None,
+                slow_writes: None,
             }
         }
     }
@@ -1273,6 +1656,9 @@ mod tests {
         }
 
         fn write_mem(&mut self, address: u64, data: &[u8], allow_rx: bool) -> Result<(), String> {
+            if self.fail_write_at == Some(address) {
+                return Err(format!("write to 0x{address:X} rejected by the target"));
+            }
             self.writes.push((address, data.to_vec(), allow_rx));
             self.probe_seen.push(
                 self.probe
@@ -1282,6 +1668,11 @@ mod tests {
             );
             for (offset, byte) in data.iter().enumerate() {
                 self.memory.insert(address + offset as u64, *byte);
+            }
+            if let Some((index, delay)) = self.slow_writes {
+                if self.writes.len() == index {
+                    std::thread::sleep(delay);
+                }
             }
             Ok(())
         }
@@ -1831,5 +2222,211 @@ mod tests {
         let report = manager.tick(&mut io, 1);
         assert_eq!(report.executed, 2);
         assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn stale_journal_makes_the_restore_incomplete() {
+        let dir = TempDir::new("journal-failure");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        // The sidecar cannot be updated (or removed) any more: the on-disk
+        // restore record is stale, so the restore is not complete.
+        let journal = manager.journal_path().to_path_buf();
+        fs::remove_file(&journal).unwrap();
+        fs::create_dir(&journal).unwrap();
+
+        let report = manager.restore_all_backups(&mut io);
+        assert_eq!(report.restored, 1);
+        assert!(report.failed.is_empty());
+        assert!(report.journal_error.is_some(), "{report:?}");
+        assert!(
+            !report.is_complete(),
+            "a stale journal must not be reported as a complete restore"
+        );
+        assert!(!manager.dirty());
+        assert!(manager.last_error().unwrap().contains("journal"));
+    }
+
+    #[test]
+    fn failed_restore_is_incomplete_and_keeps_the_manager_dirty() {
+        let dir = TempDir::new("restore-failure");
+        let text = "\
+[One]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("One").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert!(manager.dirty());
+        assert_eq!(manager.backup_count(), 2);
+
+        // The target refuses one of the two originals.
+        io.fail_write_at = Some(ADDRESS + 4);
+        let report = manager.restore_all_backups(&mut io);
+        assert!(!report.is_complete(), "{report:?}");
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.failed_addresses, 1);
+        assert_eq!(report.failed_count(), 1);
+        assert!(manager.dirty(), "a failed restore must not clear dirty");
+        assert_eq!(manager.backup_count(), 1);
+        assert!(manager.last_error().is_some());
+        // The journal still describes the address that is not back yet.
+        let journal = fs::read_to_string(manager.journal_path()).unwrap();
+        assert!(journal.contains("addr="), "{journal}");
+    }
+
+    #[test]
+    fn failed_disable_restore_is_reported_and_keeps_dirty() {
+        let dir = TempDir::new("disable-failure");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        io.fail_write_at = Some(ADDRESS);
+        let error = manager.disable(key, &mut io).unwrap_err();
+        assert!(error.contains("restore failed"), "{error}");
+        assert!(manager.dirty());
+        assert_eq!(manager.backup_count(), 1);
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        // The cheat stays marked ON: reporting it off while its bytes are
+        // still patched is the silent failure this path must never have.
+        assert!(manager.is_enabled(key));
+    }
+
+    #[test]
+    fn save_failure_is_returned_as_an_error() {
+        let dir = TempDir::new("save-failure");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        // Replace the cheat file with a directory: the atomic save has nowhere
+        // to rename its temporary file to.
+        let path = manager.path().to_path_buf();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let error = manager.enable(key, &mut io).unwrap_err();
+        assert!(error.contains("could not be saved"), "{error}");
+        // The bytes are applied and the manager says so, instead of pretending
+        // the toggle failed cleanly.
+        assert!(manager.is_enabled(key));
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert!(manager.dirty());
+        assert!(manager.last_error().unwrap().contains("could not be saved"));
+    }
+
+    #[test]
+    fn pause_opcode_is_released_after_the_block() {
+        let dir = TempDir::new("pause-release");
+        let text = "\
+[Frozen]
+FF000000
+04400000 00001234 00000063
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Frozen").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert!(
+            !io.paused,
+            "0xFF0 must not outlive the block; the console would stay frozen"
+        );
+    }
+
+    #[test]
+    fn budget_overrun_rolls_the_block_back() {
+        let dir = TempDir::new("budget-rollback");
+        let text = "\
+[Slow]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        // Simulate a slow console: the first write takes longer than the whole
+        // budget, so the second instruction sees an expired deadline.
+        io.slow_writes = Some((1, Duration::from_millis(30)));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Slow").unwrap();
+        let mut progress_calls = 0usize;
+        let error = manager
+            .enable_block(
+                key,
+                &mut io,
+                Some(Duration::from_millis(1)),
+                &mut |_, _| progress_calls += 1,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("timed out"), "{error}");
+        assert!(progress_calls > 0);
+        // The write that did land was written back...
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(io.value_u32(ADDRESS + 4), 0);
+        // ...and nothing is left to restore.
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+        assert!(manager.errors().contains_key(&key));
+        assert!(
+            !manager.journal_path().exists(),
+            "an empty backup table must not leave a sidecar behind"
+        );
+    }
+
+    #[test]
+    fn explicit_off_failure_falls_back_to_the_original_bytes_and_saves_the_file() {
+        let dir = TempDir::new("off-failure");
+        let text = "\
+[Value]
+04400000 00001234 00000063
+--off
+B4000000 00000000
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        let error = manager.disable(key, &mut io).unwrap_err();
+        assert!(
+            error.contains("unsupported") || error.contains("invalid"),
+            "{error}"
+        );
+        // The broken OFF block must not leave the target patched.
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+        // The file must record the disabled state, not just memory.
+        let text = fs::read_to_string(manager.path()).unwrap();
+        assert!(text.contains("@off"), "{text}");
     }
 }

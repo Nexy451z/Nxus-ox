@@ -1,4 +1,4 @@
-# Nxus-ox (`v0.1.1-alpha`)
+# Nxus-ox (`v0.1.2-alpha`)
 
 **Nxus-ox** is a headless remote memory scanner, pointer chain analyzer, and multi-core kernel hardware debugger & disassembler for **Nintendo Switch (Atmosphère CFW)**, paired with a unified **Rust PC Client (GUI + CLI)** and standalone **Nxus Cheat Launcher (`NCL.exe`)** that execute Atmosphere cheat codes through a built-in **Patch/Loop cheat VM**.
 
@@ -10,7 +10,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 
 > **IMPORTANT — PLEASE READ CAREFULLY BEFORE USE:**
 >
-> 1. **Alpha Testing Stage (`v0.1.1-alpha`)**: This software is in an early **Alpha testing phase**. Features, wire protocols, and configurations are experimental and may change or break without notice.
+> 1. **Alpha Testing Stage (`v0.1.2-alpha`)**: This software is in an early **Alpha testing phase**. Features, wire protocols, and configurations are experimental and may change or break without notice.
 > 2. **No Warranty / No Guarantee of Operation**: This software is provided **"AS IS"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. **There is no guarantee that this software will function correctly, safely, or at all on your hardware.**
 > 3. **Limitation of Liability**: In no event shall the authors or contributors be liable for any claim, damages, data loss, save corruption, console ban, or other liability arising from the use of this software.
 > 4. **Safe Usage Requirements**:
@@ -30,7 +30,7 @@ Instead of transferring multi-gigabyte raw RAM dumps over Wi-Fi for every search
 
 | Component / Environment | Version / Specification | Notes |
 |---|---|---|
-| **Release Version** | **Alpha `v0.1.1` (`v0.1.1-alpha`)** | Wire Protocol `v1` (TCP port `7332`) |
+| **Release Version** | **Alpha `v0.1.2` (`v0.1.2-alpha`)** | Wire Protocol `v1` (TCP port `7332`) |
 | **Switch System Firmware** | Tested up to **HOS 23.0.1** | Built with FW 21.0.0+ TLS/ABI support |
 | **Custom Firmware** | **Atmosphère 1.12.1+** / **hekate 6.5.4+** | Uses `dmnt:cht` for cheat VM & kernel `svcDebugActiveProcess` for hardware debugging |
 | **Toolchain** | **devkitA64 r29.2-1** / **libnx 4.12.0-1** | Note: Homebrew/sysmodules built with `libnx < 4.10.0` crash on FW 21.0.0+ |
@@ -167,7 +167,13 @@ error into a success — merely because a field is missing.
 - **Panic Restore All** stops every loop, writes every journaled original byte back, clears all enabled cheats, and leaves the journal intact for a retry when a write fails.
 - **Files** live at `<exe_dir>/cheats/<16-HEX-BUILDID>.txt` (the Build ID comes from `nxus metadata`; uppercase is canonical, an existing lowercase file still loads). CLI: `nxus cheat list`, `nxus cheat on <name>`, `nxus cheat off <name>`, `nxus cheat panic-off`, all with an optional `--file <path>`.
 - **`[Cheats]` tab** in the main GUI (`nxus.exe --tab cheats`): browse/load/edit/save cheat files, see parse issues before saving, toggle Patch and Loop cheats against the live target, inspect the original-byte backup table, **Panic Restore All**, and launch the standalone loader.
-- **`NCL.exe`** is the standalone cheat loader built from the same engine and shipped in the Windows zip. It offers a library/editor/check workflow and `--host`, `--port`, `--connect`, `--tab`, `--list FILE` and `--check FILE`, and shares the exact same cheat files and `<BUILDID>.backup` journal as the main GUI and CLI, so a patch applied in one tool can be restored from another.
+- **`NCL.exe`** is the standalone cheat loader built from the same engine and shipped in the Windows zip.
+- **Never-stuck contract (`v0.1.2-alpha`)**: cheat I/O now uses short per-instruction
+  deadlines (3 s) instead of the 30 s default, a dead link is detected in ~13 s
+  (keepalive) and fails fast afterwards, the busy state is an enum whose only exit is
+  its own completion event, any wait over 10 s shows `Abort`, and **Disconnect /
+  Abort / Panic Restore stay clickable while busy** (60 s hard abort). A block also
+  runs under a 10 s budget and rolls back its own writes when it expires. It offers a library/editor/check workflow and `--host`, `--port`, `--connect`, `--tab`, `--list FILE` and `--check FILE`, and shares the exact same cheat files and `<BUILDID>.backup` journal as the main GUI and CLI, so a patch applied in one tool can be restored from another.
 
 ---
 
@@ -177,22 +183,22 @@ In the **[GitHub Releases](https://github.com/Nexy451z/Nxus-ox/releases)** page,
 
 | File | Description |
 |---|---|
-| **`Nxus-ox-v0.1.1-alpha-atmosphere.zip`** | **Switch Sysmodule Package**. Extract directly to the root of your Switch SD card (`SD:/atmosphere/contents/4200000000004E58/exefs.nsp` + `flags/boot2.flag`). |
-| **`Nxus-ox-v0.1.1-alpha-windows-x64.zip`** | **Windows x64 PC Client Bundle**. Contains `nxus.exe` (unified GUI + CLI executable), `NCL.exe` (standalone cheat loader), the `cheats/README.txt` starter folder, `nxus-gui.bat`, and documentation. |
+| **`Nxus-ox-v0.1.2-alpha-atmosphere.zip`** | **Switch Sysmodule Package**. Extract directly to the root of your Switch SD card (`SD:/atmosphere/contents/4200000000004E58/exefs.nsp` + `flags/boot2.flag`). |
+| **`Nxus-ox-v0.1.2-alpha-windows-x64.zip`** | **Windows x64 PC Client Bundle**. Contains `nxus.exe` (unified GUI + CLI executable), `NCL.exe` (standalone cheat loader), the `cheats/README.txt` starter folder, `nxus-gui.bat`, and documentation. |
 | **`nxus.exe`** | Standalone Windows x64 executable (identical to the binary inside the Windows zip). Runs **GUI mode** when launched without subcommands, or **CLI mode** when invoked with subcommands. |
 | **`NCL.exe`** | Standalone Windows x64 Atmosphere cheat loader (GUI + `--list`/`--check` CLI). Same files and backup journal as the `[Cheats]` tab and `nxus cheat ...`. |
-| **`Nxus-ox-v0.1.1-alpha-probe-atmosphere.zip`** | *(Optional)* Hardware diagnostic probe sysmodule (`0x4200000000004E59`). It ships **no** `flags/boot2.flag`; enable it only for a probe run, never together with `nxus` (see [Measuring the Diagnostic Probe](#3-measuring-the-diagnostic-probe-optional)). |
+| **`Nxus-ox-v0.1.2-alpha-probe-atmosphere.zip`** | *(Optional)* Hardware diagnostic probe sysmodule (`0x4200000000004E59`). It ships **no** `flags/boot2.flag`; enable it only for a probe run, never together with `nxus` (see [Measuring the Diagnostic Probe](#3-measuring-the-diagnostic-probe-optional)). |
 
 ### Final artifact sizes (this release)
 | Artifact | Exact size |
 |---|---:|
 | `dist/atmosphere/contents/4200000000004E58/exefs.nsp` | **194,519 bytes** |
 | `dist/atmosphere/contents/4200000000004E59/exefs.nsp` | **110,206 bytes** |
-| `dist/pc/nxus.exe` | **11,263,488 bytes** |
-| `dist/pc/NCL.exe` | **9,932,288 bytes** |
+| `dist/pc/nxus.exe` | **11,326,976 bytes** |
+| `dist/pc/NCL.exe` | **10,000,896 bytes** |
 
 ### 1. Switch Setup (Atmosphère / hekate)
-1. Extract **`Nxus-ox-v0.1.1-alpha-atmosphere.zip`** to the root of your SD card so that the following files exist:
+1. Extract **`Nxus-ox-v0.1.2-alpha-atmosphere.zip`** to the root of your SD card so that the following files exist:
    ```text
    SD:/atmosphere/contents/4200000000004E58/exefs.nsp
    SD:/atmosphere/contents/4200000000004E58/flags/boot2.flag
@@ -281,7 +287,7 @@ nxus cheat panic-off
 
 ### 3. Measuring the Diagnostic Probe (optional)
 
-`Nxus-ox-v0.1.1-alpha-probe-atmosphere.zip` contains the optional diagnostic probe
+`Nxus-ox-v0.1.2-alpha-probe-atmosphere.zip` contains the optional diagnostic probe
 (`0x4200000000004E59`). It opens **no TCP port** and appends its verdict to
 `sdmc:/nxus/probe.txt`; the PC client is not involved. It must **never** run at the
 same time as the main module: both take the single `dmnt:cht` cheat process, so the

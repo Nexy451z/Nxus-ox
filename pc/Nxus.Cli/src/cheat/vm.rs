@@ -5,6 +5,7 @@
 //! or an in-memory mock.  Every evaluation has a hard step cap.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use super::model::{
     ArithmeticOp, ArithmeticOperand, ConditionalOperand, Instruction, JumpInfo, MemoryRegion,
@@ -152,7 +153,7 @@ pub struct VmReport {
     pub writes: usize,
 }
 
-/// Execute one ON/OFF program.
+/// Execute one ON/OFF program with the default limits (no wall-clock budget).
 ///
 /// `jumps` must be the metadata produced by the parser for `instructions`.
 pub fn execute(
@@ -163,6 +164,89 @@ pub fn execute(
     keys_held: u64,
     state: &mut VmState,
 ) -> Result<VmReport, VmError> {
+    execute_with_budget(
+        instructions,
+        jumps,
+        io,
+        regions,
+        keys_held,
+        state,
+        None,
+        &mut |_, _| {},
+    )
+}
+
+/// Execute one ON/OFF program with a per-block budget and a progress callback.
+///
+/// * `budget` bounds the wall clock of the whole block.  The deadline is
+///   checked between instructions, so an overrun ends with an error whose
+///   message contains `timed out` as soon as the pending memory access
+///   returns.  The access itself still uses the caller's own request timeout,
+///   which is why this is a *block* budget and not a per-instruction one.
+/// * `on_progress(done, total)` reports how far into the program the
+///   interpreter has reached (`0 <= done <= total`).  It is called once before
+///   the first instruction and once after the last one of a valid program;
+///   loops keep `done` at the furthest instruction reached instead of going
+///   backwards.
+///
+/// A `0xFF0` pause never outlives the block: before returning, the process is
+/// resumed when the block left it paused.  A paused process cannot resume
+/// itself, so a block that pauses and fails (or simply never emits `0xFF1`)
+/// would otherwise freeze the console with no way to recover.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_budget(
+    instructions: &[Instruction],
+    jumps: &[JumpInfo],
+    io: &mut dyn CheatMemoryIo,
+    regions: &MemoryRegions,
+    keys_held: u64,
+    state: &mut VmState,
+    budget: Option<Duration>,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<VmReport, VmError> {
+    let outcome = run_program(
+        instructions,
+        jumps,
+        io,
+        regions,
+        keys_held,
+        state,
+        budget,
+        on_progress,
+    );
+    if !state.paused {
+        return outcome;
+    }
+    match io.resume_process() {
+        Ok(()) => {
+            state.paused = false;
+            outcome
+        }
+        Err(error) => {
+            // Keep `state.paused` set: a later block can still retry the resume.
+            let message = format!("resume after block failed: {error}");
+            Err(match outcome {
+                Ok(_) => VmError::without_pc(message),
+                Err(original) => VmError {
+                    pc: original.pc,
+                    message: format!("{}; {message}", original.message),
+                },
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_program(
+    instructions: &[Instruction],
+    jumps: &[JumpInfo],
+    io: &mut dyn CheatMemoryIo,
+    regions: &MemoryRegions,
+    keys_held: u64,
+    state: &mut VmState,
+    budget: Option<Duration>,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<VmReport, VmError> {
     if instructions.len() != jumps.len() {
         return Err(VmError::without_pc(format!(
             "control-flow metadata has {} entries for {} instructions",
@@ -172,10 +256,19 @@ pub fn execute(
     }
 
     state.reset_transient();
+    let total = instructions.len();
+    // An absurd budget (near `Duration::MAX`) must not overflow the instant.
+    let deadline = budget.and_then(|limit| {
+        Instant::now()
+            .checked_add(limit)
+            .map(|deadline| (deadline, limit))
+    });
     let mut report = VmReport::default();
     let mut pc = 0usize;
     let mut loops: Vec<LoopFrame> = Vec::new();
     let mut loop_restarts = 0usize;
+    let mut reported = 0usize;
+    on_progress(0, total);
 
     while pc < instructions.len() {
         if report.steps >= VM_STEP_LIMIT {
@@ -183,6 +276,18 @@ pub fn execute(
                 pc,
                 format!("instruction step limit ({VM_STEP_LIMIT}) exceeded"),
             ));
+        }
+        if let Some((deadline, limit)) = deadline {
+            if Instant::now() >= deadline {
+                return Err(VmError::new(
+                    pc,
+                    format!("timed out after {} ms", limit.as_millis()),
+                ));
+            }
+        }
+        if pc > reported {
+            reported = pc;
+            on_progress(reported, total);
         }
         report.steps += 1;
 
@@ -706,6 +811,7 @@ pub fn execute(
         }
     }
 
+    on_progress(total, total);
     Ok(report)
 }
 
@@ -1400,6 +1506,97 @@ mod tests {
         assert_eq!(io.pause_calls, 1);
         assert_eq!(io.resume_calls, 1);
         assert!(!io.paused);
+    }
+
+    #[test]
+    fn pause_is_released_at_the_end_of_the_block() {
+        // 0xFF0 without a matching 0xFF1 must not leave the target frozen.
+        let mut io = MockIo::default();
+        run(
+            &["FF000000", "04400000 00000020 0000002A"],
+            &mut io,
+            0,
+        );
+        assert_eq!(io.pause_calls, 1);
+        assert_eq!(io.resume_calls, 1);
+        assert!(!io.paused);
+
+        // A block that fails after pausing is still resumed.
+        let mut io = MockIo::default();
+        io.short_read = true;
+        let program = code(&[
+            "FF000000",
+            "14050000 00000010 00000001",
+            "04000000 00000020 00000001",
+            "20000000",
+        ]);
+        let mut state = VmState::default();
+        let error = execute(
+            &program.instructions,
+            &program.jumps,
+            &mut io,
+            &regions(),
+            0,
+            &mut state,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("short read"), "{error}");
+        assert_eq!(io.pause_calls, 1);
+        assert_eq!(io.resume_calls, 1);
+        assert!(!io.paused);
+        assert!(!state.paused);
+    }
+
+    #[test]
+    fn budget_overrun_aborts_the_block() {
+        let program = code(&["04400000 00000020 0000002A"]);
+        let mut io = MockIo::default();
+        let mut state = VmState::default();
+        let error = execute_with_budget(
+            &program.instructions,
+            &program.jumps,
+            &mut io,
+            &regions(),
+            0,
+            &mut state,
+            Some(Duration::ZERO),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(error.message.contains("timed out"), "{error}");
+        assert_eq!(io.writes_to(MAIN + 0x20), 0);
+    }
+
+    #[test]
+    fn progress_reports_the_furthest_instruction() {
+        let program = code(&[
+            "40010000 00000000 00000003",
+            "30020000 00000003",
+            "94020100 00000001",
+            "31020000",
+        ]);
+        assert!(program.is_valid(), "{:?}", program.issues);
+        let total = program.instructions.len();
+        let mut io = MockIo::default();
+        let mut state = VmState::default();
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        execute_with_budget(
+            &program.instructions,
+            &program.jumps,
+            &mut io,
+            &regions(),
+            0,
+            &mut state,
+            None,
+            &mut |done, total| seen.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(seen.first(), Some(&(0, total)));
+        assert_eq!(seen.last(), Some(&(total, total)));
+        assert!(
+            seen.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "progress must never go backwards: {seen:?}"
+        );
     }
 
     #[test]

@@ -37,8 +37,9 @@ mod protocol;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -49,12 +50,20 @@ use cheat::{
     MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
 };
 use client::NxusClient;
-use protocol::{Metadata, Status, WRITE_FLAG_ALLOW_RX};
+use protocol::{Metadata, Status};
 
 const APP_NAME: &str = "NCL";
 const DEFAULT_PORT: u16 = 7332;
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_LINES: usize = 500;
+
+/// A job that has not answered after this long is already a bug (a hung
+/// console call, a stuck tick).  The UI says so and offers the abort.
+const BUSY_WATCHDOG: Duration = Duration::from_secs(10);
+
+/// Hard limit: past this the UI aborts on its own.  No click may ever leave the
+/// window "busy forever" again - that was the original hang.
+const BUSY_HARD_LIMIT: Duration = Duration::from_secs(60);
 
 const ACCENT: Color32 = Color32::from_rgb(96, 174, 255);
 const GREEN: Color32 = Color32::from_rgb(104, 208, 128);
@@ -211,6 +220,161 @@ fn make_view(manager: &CheatManager) -> LiveView {
 // Worker
 // ---------------------------------------------------------------------------
 
+/// What the app is waiting for.
+///
+/// This used to be a `String` compared with `==`: the automatic tick wrote
+/// `"tick"`, the "Tick now" button wrote `"ticking"`, and the only code that
+/// cleared the label looked for `"tick"`.  One manual tick therefore left the
+/// window "busy" for the rest of the session, and because [`NclApp::submit`]
+/// refused every job while busy, Disconnect, Refresh and the ON/OFF checkboxes
+/// were all dead.  An enum cannot be spelled wrong, the label shown to the user
+/// is derived from it, and the only transition out of a state is the completion
+/// event of *that* job (see [`Ev::Done`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Busy {
+    Connecting,
+    Disconnecting,
+    Refreshing,
+    Enabling,
+    Disabling,
+    Ticking,
+    Restoring,
+    Reloading,
+}
+
+impl Busy {
+    fn label(self) -> &'static str {
+        match self {
+            Busy::Connecting => "connecting",
+            Busy::Disconnecting => "disconnecting",
+            Busy::Refreshing => "refreshing",
+            Busy::Enabling => "enabling",
+            Busy::Disabling => "disabling",
+            Busy::Ticking => "ticking",
+            Busy::Restoring => "restoring",
+            Busy::Reloading => "reloading",
+        }
+    }
+
+    /// A loop tick is a short unit of work: other jobs may queue behind it.
+    /// Everything else must finish (or be aborted) before the next job starts.
+    fn is_soft(self) -> bool {
+        matches!(self, Busy::Ticking)
+    }
+}
+
+/// The job in flight, and since when (the watchdog reads `since`).
+#[derive(Clone, Copy, Debug)]
+struct BusyJob {
+    kind: Busy,
+    since: Instant,
+}
+
+impl BusyJob {
+    fn new(kind: Busy) -> BusyJob {
+        BusyJob {
+            kind,
+            since: Instant::now(),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.since.elapsed()
+    }
+}
+
+/// The worker thread plus both of its channels.
+///
+/// The `JoinHandle` used to be dropped, so a worker that panicked left the
+/// window with a live-looking channel, a session nobody could end and every
+/// button dead.  Keeping the handle lets [`NclApp::poll_worker`] notice the end
+/// of the thread and start a fresh one.
+struct Worker {
+    jobs: Sender<Job>,
+    events: Receiver<Ev>,
+    /// A copy of the event sender for short-lived helper threads (the library
+    /// scan, the screenshot encoder), tagged with this generation: after a
+    /// restart their results are dropped instead of reviving stale state.
+    events_tx: Sender<Ev>,
+    /// Set by an abort so a worker stuck in a long console call exits as soon
+    /// as that call returns instead of processing more jobs.
+    abort: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    fn spawn() -> Worker {
+        let (jobs, job_rx) = mpsc::channel::<Job>();
+        let (events_tx, events) = mpsc::channel::<Ev>();
+        let abort = Arc::new(AtomicBool::new(false));
+        let thread_abort = Arc::clone(&abort);
+        let thread_tx = events_tx.clone();
+        let handle = std::thread::Builder::new()
+            .name("ncl-worker".to_string())
+            .spawn(move || run_worker(job_rx, thread_tx, thread_abort))
+            .expect("cannot start the NCL worker thread");
+        Worker {
+            jobs,
+            events,
+            events_tx,
+            abort,
+            handle: Some(handle),
+        }
+    }
+
+    fn send(&self, job: Job) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+
+    /// Next event, without holding a borrow of the worker across the handler.
+    fn next_event(&self) -> Option<Ev> {
+        self.events.try_recv().ok()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(true)
+    }
+
+    /// Stop this generation without waiting for it: the flag covers a worker
+    /// inside a console call, the dropped channels cover one idle in `recv`.
+    /// Either way the thread exits on its own and drops the session (and with
+    /// it the socket) as soon as the current call returns.
+    fn retire(self) {
+        self.abort.store(true, Ordering::SeqCst);
+        drop(self.jobs);
+        drop(self.events);
+    }
+}
+
+/// Text of a caught panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Send one event from a detached helper thread (file I/O that is too slow for
+/// a frame).  The sender belongs to the current worker generation, so a result
+/// that arrives after a restart is dropped instead of reviving stale state.
+fn spawn_io<F>(tx: Sender<Ev>, name: &str, task: F) -> bool
+where
+    F: FnOnce() -> Ev + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = tx.send(task());
+        })
+        .is_ok()
+}
+
 enum Job {
     Connect { host: String, port: u16 },
     Disconnect,
@@ -221,6 +385,31 @@ enum Job {
     ReloadFile,
 }
 
+impl Job {
+    /// The busy state this job puts the UI in.
+    ///
+    /// Derived from the job itself (never passed in by the caller) so the state
+    /// and the completion event that clears it cannot disagree - that mismatch
+    /// was the original "busy forever" bug.
+    fn kind(&self) -> Busy {
+        match self {
+            Job::Connect { .. } => Busy::Connecting,
+            Job::Disconnect => Busy::Disconnecting,
+            Job::Refresh => Busy::Refreshing,
+            Job::Toggle { on: true, .. } => Busy::Enabling,
+            Job::Toggle { on: false, .. } => Busy::Disabling,
+            Job::Tick => Busy::Ticking,
+            Job::PanicOff => Busy::Restoring,
+            Job::ReloadFile => Busy::Reloading,
+        }
+    }
+
+    /// Disconnect and panic-off must never wait for a stuck job.
+    fn is_priority(&self) -> bool {
+        matches!(self, Job::Disconnect | Job::PanicOff)
+    }
+}
+
 enum Ev {
     Opened(LiveView, String),
     Updated(LiveView, String),
@@ -228,6 +417,16 @@ enum Ev {
     /// not be written, in which case the quit modal must stay open.
     Restored(LiveView, String, bool),
     Ticked(LiveView),
+    /// The job with this kind has finished - whatever it sent before.  The UI
+    /// only clears `busy` here, and only when the kind matches the job it is
+    /// waiting for, so an unrelated `Error` can no longer release a live job.
+    Done(Busy),
+    /// Result of the background library scan (it parses every file in
+    /// `cheats/`, which is far too slow for a UI frame).
+    Library {
+        files: Vec<LibFile>,
+        error: Option<String>,
+    },
     Error(String),
     Disconnected(String),
     Log(String),
@@ -248,17 +447,20 @@ struct ClientCheatIo<'a> {
 
 impl CheatMemoryIo for ClientCheatIo<'_> {
     fn read_mem(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
+        // Cheat I/O is interactive: a console that stops answering must fail the
+        // block within seconds, not park the worker for the 30 s default.  A 61
+        // instruction block is 61 of these, so the old timeout turned "enabling"
+        // into minutes of frozen UI.
         self.client
-            .read(address, size)
+            .read_for_cheat(address, size)
             .map_err(|error| error.to_string())
     }
 
     fn write_mem(&mut self, address: u64, data: &[u8], allow_rx: bool) -> Result<(), String> {
         let result = if allow_rx {
-            self.client
-                .write_with_flags(address, data, WRITE_FLAG_ALLOW_RX)
+            self.client.write_code_for_cheat(address, data)
         } else {
-            self.client.write(address, data)
+            self.client.write_for_cheat(address, data)
         };
         result.map_err(|error| error.to_string())
     }
@@ -419,10 +621,57 @@ fn retire(session: &mut Session) -> Result<String, String> {
     ))
 }
 
-fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>) {
+fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
+    // A panicking job (a bug in a cheat, a broken manager invariant count) used
+    // to kill the worker silently: the channel stayed open, `busy` stayed set
+    // and every button was dead.  The panic is caught here, reported as an
+    // event, and `NclApp::poll_worker` replaces the thread on the next frame.
+    let report = tx.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        worker_loop(rx, tx, abort);
+    }));
+    if let Err(payload) = outcome {
+        let _ = report.send(Ev::Error(format!(
+            "the worker panicked: {}",
+            panic_text(payload.as_ref())
+        )));
+    }
+}
+
+/// Sends [`Ev::Done`] when a job ends, however it ends.
+///
+/// Several arms below bail out with `continue` (the `let ... else` ones too),
+/// which is exactly how "not connected" used to leave `busy` set forever.  A
+/// guard releases the state on *every* exit path, including a `break` out of
+/// the loop.
+struct DoneGuard {
+    tx: Sender<Ev>,
+    kind: Busy,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        // Not while unwinding: a panicking job leaves the session unusable and
+        // the UI learns about it from the panic report instead.
+        if !std::thread::panicking() {
+            let _ = self.tx.send(Ev::Done(self.kind));
+        }
+    }
+}
+
+fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
     let mut session: Option<Session> = None;
 
     while let Ok(job) = rx.recv() {
+        if abort.load(Ordering::SeqCst) {
+            // An abort retired this generation; the job in flight has finished,
+            // so nothing else may touch the console through it.
+            break;
+        }
+        let _done = DoneGuard {
+            tx: tx.clone(),
+            kind: job.kind(),
+        };
         match job {
             Job::Connect { host, port } => {
                 if let Some(mut old) = session.take() {
@@ -524,13 +773,9 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>) {
                 };
                 match current.manager.toggle(key, on, &mut io) {
                     Ok(()) => {
-                        if on {
-                            current.dirty = true;
-                        } else if current.manager.enabled_keys().is_empty()
-                            && current.manager.backups().is_empty()
-                        {
-                            current.dirty = false;
-                        }
+                        // The manager owns the truth about leftover patches: a toggle that returned
+                        // Ok after a failed restore used to look clean and was then never restored.
+                        current.dirty = current.manager.dirty();
                         let view = make_view(&current.manager);
                         session = Some(current);
                         let message = if on {
@@ -541,6 +786,7 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>) {
                         let _ = tx.send(Ev::Updated(view, message));
                     }
                     Err(error) => {
+                        current.dirty = current.manager.dirty();
                         let view = make_view(&current.manager);
                         session = Some(current);
                         let _ = tx.send(Ev::Updated(view, format!("could not toggle '{name}'")));
@@ -550,6 +796,11 @@ fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>) {
             }
             Job::Tick => {
                 let Some(mut current) = session.take() else {
+                    // No session at all (a tick still queued from just before a
+                    // disconnect).  Say so instead of returning silently: a
+                    // silent bail-out is how `busy` used to stay set forever.
+                    // `Ev::Done` for this tick is sent by the guard.
+                    let _ = tx.send(Ev::Log("tick skipped: not connected".to_string()));
                     continue;
                 };
                 // Key-conditional cheats need the live button mask; the same
@@ -828,9 +1079,11 @@ struct NclApp {
     port: String,
     auto_tick: bool,
 
-    tx: Sender<Job>,
-    rx: Receiver<Ev>,
-    busy: Option<String>,
+    worker: Worker,
+    /// The job in flight, or `None`.  Never a `String` any more: see [`Busy`].
+    busy: Option<BusyJob>,
+    /// The 10 s watchdog warning was already logged for the current job.
+    watchdog_warned: bool,
     message: String,
 
     live: Option<LiveView>,
@@ -838,6 +1091,9 @@ struct NclApp {
 
     editor: EditorState,
     library: LibraryState,
+    /// Background library scans in flight; each one keeps the frame clock
+    /// running so its result is painted when it lands.
+    scans: u32,
 
     filter: String,
     only_enabled: bool,
@@ -857,6 +1113,9 @@ struct NclApp {
     auto_connect: bool,
     frames: u64,
     shot_requested: bool,
+    /// Frames spent waiting for the encoder thread; bounded so `--screenshot`
+    /// can never keep the process alive forever.
+    shot_wait_frames: u32,
     shot_saved: Arc<AtomicBool>,
 }
 
@@ -877,33 +1136,26 @@ impl NclApp {
             style.spacing.interact_size.y = 22.0;
         });
 
-        let (tx, job_rx) = mpsc::channel::<Job>();
-        let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
-        std::thread::Builder::new()
-            .name("ncl-worker".to_string())
-            .spawn(move || run_worker(job_rx, ev_tx))
-            .expect("cannot start the NCL worker thread");
-
         let dir = cheat::cheats_directory().unwrap_or_else(|_| PathBuf::from("cheats"));
-        let (files, library_error) = scan_library(&dir);
 
         let mut app = NclApp {
             tab: Tab::Cheats,
             host: prefs.host,
             port: prefs.port,
             auto_tick: prefs.auto_tick,
-            tx,
-            rx: ev_rx,
+            worker: Worker::spawn(),
             busy: None,
+            watchdog_warned: false,
             message: "ready".to_string(),
             live: None,
             live_text: None,
             editor: EditorState::default(),
             library: LibraryState {
                 dir,
-                files,
-                error: library_error,
+                files: Vec::new(),
+                error: None,
             },
+            scans: 0,
             filter: String::new(),
             only_enabled: false,
             log: VecDeque::new(),
@@ -919,6 +1171,7 @@ impl NclApp {
             auto_connect,
             frames: 0,
             shot_requested: false,
+            shot_wait_frames: 0,
             shot_saved: Arc::new(AtomicBool::new(false)),
         };
         if let Some(tab) = start_tab {
@@ -929,9 +1182,9 @@ impl NclApp {
             env!("CARGO_PKG_VERSION"),
             app.library.dir.display()
         ));
-        if let Some(error) = app.library.error.clone() {
-            app.log(format!("warning: {error}"));
-        }
+        // Parsing every cheat file takes long enough to be seen as a hang, so
+        // even the startup scan runs off the UI thread.
+        app.refresh_library();
         if let Some(path) = initial_file {
             app.open_file(path);
         }
@@ -950,27 +1203,213 @@ impl NclApp {
         }
     }
 
-    fn submit(&mut self, label: &str, job: Job) {
-        // A periodic loop tick is a short, cancellable unit: let a real user
-        // action queue behind it instead of being swallowed four times a second.
-        if self
-            .busy
-            .as_deref()
-            .map(|busy| busy != "tick")
-            .unwrap_or(false)
-        {
-            self.message = format!("busy: {}", self.busy.as_deref().unwrap_or(""));
+    /// Send a job and start waiting for it.
+    ///
+    /// A job that is already in flight is not silently dropped any more (that
+    /// is what made every click after a stuck job vanish): a short loop tick
+    /// can be queued behind, anything else answers with the current state plus
+    /// the way out.  The priority jobs - Disconnect, Panic OFF and Quit - never
+    /// come through here while busy; they call [`NclApp::abort_busy`] first.
+    fn submit(&mut self, job: Job) -> bool {
+        let kind = job.kind();
+        if let Some(busy) = self.busy {
+            if kind.is_soft() && busy.kind.is_soft() {
+                // "Tick now" while a tick is in flight: do nothing at all.  It
+                // must not rewrite the state, or the tick that is really
+                // running would never clear it.
+                self.message = "a loop tick is already running".to_string();
+                return false;
+            }
+            if !busy.kind.is_soft() {
+                self.message = format!(
+                    "busy: {} for {} s - press Disconnect to abort it",
+                    busy.kind.label(),
+                    busy.elapsed().as_secs()
+                );
+                if job.is_priority() {
+                    // A priority job that reaches here is a programming error:
+                    // the callers use `abort_busy` instead.  Say so instead of
+                    // dropping it silently.
+                    self.log(format!(
+                        "warning: {} was submitted while {} was running",
+                        kind.label(),
+                        busy.kind.label()
+                    ));
+                }
+                return false;
+            }
+        }
+        self.start(job)
+    }
+
+    fn start(&mut self, job: Job) -> bool {
+        let kind = job.kind();
+        if !self.worker.send(job) {
+            self.log("the worker is gone - restarting it");
+            self.restart_worker();
+            self.message = "the worker was restarted; try again".to_string();
+            return false;
+        }
+        self.busy = Some(BusyJob::new(kind));
+        self.watchdog_warned = false;
+        // A tick must not overwrite the log line the user is reading four times
+        // a second.
+        if !kind.is_soft() {
+            self.message = kind.label().to_string();
+        }
+        true
+    }
+
+    /// Abort the job in flight, drop the console session it owns and start a
+    /// fresh worker - without waiting for the stuck call to return.
+    ///
+    /// Returns false when nothing had to be aborted, so the caller can take the
+    /// normal (restore, then disconnect) path instead.
+    fn abort_busy(&mut self, why: &str) -> bool {
+        let Some(busy) = self.busy else {
+            return false;
+        };
+        // A loop tick is over in milliseconds; only a stuck one is worth
+        // aborting.
+        if busy.kind.is_soft() && busy.elapsed() < BUSY_WATCHDOG {
+            return false;
+        }
+        let seconds = busy.elapsed().as_secs();
+        self.log(format!(
+            "abort ({why}): {} did not finish within {seconds} s; dropping the console session",
+            busy.kind.label()
+        ));
+        self.busy = None;
+        self.watchdog_warned = false;
+        // The session belongs to the aborted generation: it is not ours to show
+        // any more, and its socket is about to be closed.
+        self.live = None;
+        self.live_text = None;
+        self.restart_worker();
+        self.last_tick = Instant::now();
+        self.message = format!(
+            "aborted {} after {seconds} s - the console session was abandoned (patches were not \
+             restored here); connect again and press Panic OFF",
+            busy.kind.label()
+        );
+        true
+    }
+
+    fn restart_worker(&mut self) {
+        let old = std::mem::replace(&mut self.worker, Worker::spawn());
+        old.retire();
+        // A scan started by the old generation can no longer answer.
+        self.scans = 0;
+    }
+
+    /// Disconnect, the one button that must always work.
+    fn disconnect(&mut self) {
+        if self.abort_busy("disconnect") {
             return;
         }
-        match self.tx.send(job) {
-            Ok(()) => {
-                self.busy = Some(label.to_string());
-                self.message = label.to_string();
-            }
-            Err(error) => {
-                self.message = format!("worker stopped: {error}");
-                self.log(self.message.clone());
-            }
+        self.submit(Job::Disconnect);
+    }
+
+    /// Panic OFF must always be reachable.  If a job is stuck the restore
+    /// cannot run through it, so the connection is aborted instead and the
+    /// backup journal (on disk) is left for the next connect.
+    fn panic_off(&mut self) {
+        self.panic_confirm = false;
+        if self.abort_busy("panic off") {
+            return;
+        }
+        self.submit(Job::PanicOff);
+    }
+
+    /// Replace a worker that exited (a panic, a failed spawn) so the window can
+    /// never keep pointing at a dead thread - that used to look exactly like a
+    /// hung connection.
+    fn poll_worker(&mut self) {
+        if !self.worker.is_finished() {
+            return;
+        }
+        self.restart_worker();
+        self.busy = None;
+        self.watchdog_warned = false;
+        self.live = None;
+        self.live_text = None;
+        self.log("the worker exited unexpectedly - started a fresh one");
+        self.message =
+            "the worker stopped (it crashed); a fresh one is ready - connect again".to_string();
+    }
+
+    /// 10 s without an answer is already a bug or a dead console: say so.  At
+    /// 60 s the window aborts by itself, because a "busy" state nobody can
+    /// clear is the exact failure this code exists to prevent.
+    fn poll_watchdog(&mut self) {
+        let Some(busy) = self.busy else {
+            return;
+        };
+        let elapsed = busy.elapsed();
+        if elapsed >= BUSY_HARD_LIMIT {
+            self.abort_busy("watchdog");
+            return;
+        }
+        if elapsed >= BUSY_WATCHDOG && !self.watchdog_warned {
+            self.watchdog_warned = true;
+            self.log(format!(
+                "warning: {} has been running for {} s - press Disconnect to stop waiting",
+                busy.kind.label(),
+                elapsed.as_secs()
+            ));
+        }
+    }
+
+    /// True when a job may be queued behind the current one (nothing running,
+    /// or a short loop tick).
+    fn can_queue(&self) -> bool {
+        self.busy.map(|busy| busy.kind.is_soft()).unwrap_or(true)
+    }
+
+    /// The elapsed time of a job that has overstayed the watchdog.
+    fn stuck_for(&self) -> Option<Duration> {
+        let busy = self.busy?;
+        let elapsed = busy.elapsed();
+        if elapsed >= BUSY_WATCHDOG {
+            Some(elapsed)
+        } else {
+            None
+        }
+    }
+
+    /// Status text: the message, or what is running and for how long - the
+    /// "busy since N s" the watchdog is about.
+    fn busy_text(&self) -> String {
+        match self.busy {
+            Some(busy) if !busy.kind.is_soft() => format!(
+                "{} ... {} s{}",
+                busy.kind.label(),
+                busy.elapsed().as_secs(),
+                if busy.elapsed() >= BUSY_WATCHDOG {
+                    " - stuck? press Disconnect"
+                } else {
+                    ""
+                }
+            ),
+            _ => self.message.clone(),
+        }
+    }
+
+    /// Scan `cheats/` on a helper thread.
+    ///
+    /// The scan parses every file in the directory; doing that inside the frame
+    /// that asked for it froze the window for as long as the disk took.
+    fn refresh_library(&mut self) {
+        self.scans = self.scans.saturating_add(1);
+        let dir = self.library.dir.clone();
+        let tx = self.worker.events_tx.clone();
+        let started = spawn_io(tx, "ncl-library-scan", move || {
+            let (files, error) = scan_library(&dir);
+            Ev::Library { files, error }
+        });
+        if !started {
+            self.scans = self.scans.saturating_sub(1);
+            self.log("cannot start the library scan thread");
         }
     }
 
@@ -981,7 +1420,7 @@ impl NclApp {
             return;
         }
         let port = self.port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
-        self.submit("connecting", Job::Connect { host, port });
+        self.submit(Job::Connect { host, port });
     }
 
     fn any_enabled(&self) -> bool {
@@ -992,85 +1431,98 @@ impl NclApp {
     }
 
     fn drain_events(&mut self) {
-        loop {
-            match self.rx.try_recv() {
-                Ok(Ev::Opened(view, text)) => {
-                    self.busy = None;
-                    self.message = format!("opened {}", view.target.path.display());
-                    self.log(self.message.clone());
-                    self.editor.path = view.target.path.clone();
-                    self.editor.build_id = view.target.build_id.clone();
-                    if self.editor.dirty() {
-                        self.log(
-                            "editor has unsaved changes; kept them (use \"Use target file\" to replace)",
-                        );
-                    } else {
-                        self.editor.set_text(text.clone());
-                    }
-                    self.live_text = Some(text);
-                    self.live = Some(view);
-                    self.last_tick = Instant::now();
+        // `next_event` gives the event back before the handler runs, so the
+        // worker is not borrowed while a handler calls another `&mut self`
+        // method (which is why this is not a `match self.worker.next_event()`).
+        while let Some(event) = self.worker.next_event() {
+            self.handle_event(event);
+        }
+    }
+
+    fn handle_event(&mut self, event: Ev) {
+        match event {
+            Ev::Opened(view, text) => {
+                self.message = format!("opened {}", view.target.path.display());
+                self.log(self.message.clone());
+                self.editor.path = view.target.path.clone();
+                self.editor.build_id = view.target.build_id.clone();
+                if self.editor.dirty() {
+                    self.log(
+                        "editor has unsaved changes; kept them (use \"Use target file\" to replace)",
+                    );
+                } else {
+                    self.editor.set_text(text.clone());
                 }
-                Ok(Ev::Updated(view, message)) => {
-                    self.busy = None;
-                    self.message = message.clone();
-                    self.log(message);
-                    self.live = Some(view);
-                }
-                Ok(Ev::Restored(view, message, complete)) => {
-                    self.busy = None;
-                    self.message = message.clone();
-                    self.log(message);
-                    self.live = Some(view);
-                    if complete {
-                        if self.quit_after_restore {
-                            self.quit_after_restore = false;
-                            self.allow_close = true;
-                            self.quit_confirm = false;
-                            self.pending_close = true;
-                        }
-                    } else {
-                        // Keep the quit confirmation visible so the user can retry
-                        // instead of closing with patches still in place.
+                self.live_text = Some(text);
+                self.live = Some(view);
+                self.last_tick = Instant::now();
+                self.refresh_library();
+            }
+            Ev::Updated(view, message) => {
+                self.message = message.clone();
+                self.log(message);
+                self.live = Some(view);
+            }
+            Ev::Restored(view, message, complete) => {
+                self.message = message.clone();
+                self.log(message);
+                self.live = Some(view);
+                if complete {
+                    if self.quit_after_restore {
                         self.quit_after_restore = false;
+                        self.allow_close = true;
+                        self.quit_confirm = false;
+                        self.pending_close = true;
                     }
+                } else {
+                    // Keep the quit confirmation visible so the user can retry
+                    // instead of closing with patches still in place.
+                    self.quit_after_restore = false;
                 }
-                Ok(Ev::Ticked(view)) => {
-                    if self.busy.as_deref() == Some("tick") {
-                        self.busy = None;
-                    }
-                    self.live = Some(view);
-                }
-                Ok(Ev::Error(error)) => {
+            }
+            Ev::Ticked(view) => {
+                self.live = Some(view);
+            }
+            Ev::Done(kind) => {
+                // The only way out of a busy state: the completion of the very
+                // job the UI is waiting for.
+                if self.busy.map(|busy| busy.kind == kind).unwrap_or(false) {
                     self.busy = None;
-                    self.message = error.clone();
-                    self.log(format!("error: {error}"));
+                    self.watchdog_warned = false;
                 }
-                Ok(Ev::Disconnected(message)) => {
-                    self.busy = None;
-                    self.message = message.clone();
-                    self.log(message);
-                    self.live = None;
-                    self.live_text = None;
+            }
+            Ev::Library { files, error } => {
+                self.scans = self.scans.saturating_sub(1);
+                self.library.files = files;
+                if let Some(error) = &error {
+                    // The scan runs off the UI thread now, so this is where a
+                    // directory that cannot be read becomes visible.
+                    self.log(format!("warning: {error}"));
                 }
-                Ok(Ev::Log(message)) => {
-                    // A broken Loop cheat would otherwise repeat the same error
-                    // four times a second and flush the whole log.
-                    if message.starts_with("loop:")
-                        && self.last_loop_error.as_deref() == Some(&message)
-                    {
-                        continue;
+                self.library.error = error;
+            }
+            Ev::Error(error) => {
+                // No longer clears `busy`: an error that belongs to some other
+                // job must not release the one in flight.
+                self.message = error.clone();
+                self.log(format!("error: {error}"));
+            }
+            Ev::Disconnected(message) => {
+                self.message = message.clone();
+                self.log(message);
+                self.live = None;
+                self.live_text = None;
+            }
+            Ev::Log(message) => {
+                // A broken Loop cheat would otherwise repeat the same error
+                // four times a second and flush the whole log.
+                if message.starts_with("loop:") {
+                    if self.last_loop_error.as_deref() == Some(&message) {
+                        return;
                     }
-                    if message.starts_with("loop:") {
-                        self.last_loop_error = Some(message.clone());
-                    }
-                    self.log(message);
+                    self.last_loop_error = Some(message.clone());
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.busy = None;
-                    break;
-                }
+                self.log(message);
             }
         }
     }
@@ -1086,10 +1538,9 @@ impl NclApp {
             return;
         }
         self.last_tick = Instant::now();
-        self.busy = Some("tick".to_string());
-        if self.tx.send(Job::Tick).is_err() {
-            self.busy = None;
-        }
+        // Through `start` so the state and the `Ev::Done` that clears it are the
+        // same value by construction.
+        self.start(Job::Tick);
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -1206,14 +1657,13 @@ impl NclApp {
                 self.editor.path = path.clone();
                 self.editor.last_saved = self.editor.text.clone();
                 self.refresh_parse();
-                let (files, error) = scan_library(&self.library.dir);
-                self.library.files = files;
-                self.library.error = error;
+                // Off the UI thread: this parses every file in `cheats/`.
+                self.refresh_library();
                 self.message = format!("saved {}", path.display());
                 self.log(self.message.clone());
                 if let Some(live) = &self.live {
                     if live.target.path == path {
-                        self.submit("reloading the target file", Job::ReloadFile);
+                        self.submit(Job::ReloadFile);
                     }
                 }
             }
@@ -1272,12 +1722,22 @@ impl NclApp {
                 ui.label("port");
                 ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(55.0));
                 if self.live.is_some() {
+                    // Never disabled: while a job is stuck this aborts it, which
+                    // is the whole point of the escape hatch.
+                    let label = if self.can_queue() {
+                        "Disconnect".to_string()
+                    } else {
+                        "Disconnect (abort)".to_string()
+                    };
                     if ui
-                        .button("Disconnect")
-                        .on_hover_text("restore patches this session enabled, then disconnect")
+                        .button(label)
+                        .on_hover_text(
+                            "restore the patches this session enabled, then disconnect; \
+                             while a job is stuck this aborts it instead",
+                        )
                         .clicked()
                     {
-                        self.submit("disconnecting", Job::Disconnect);
+                        self.disconnect();
                     }
                 } else if ui
                     .add(egui::Button::new(RichText::new("Connect").strong()))
@@ -1286,10 +1746,26 @@ impl NclApp {
                     self.connect();
                 }
                 if ui
-                    .add_enabled(self.live.is_some(), egui::Button::new("Refresh"))
+                    .add_enabled(
+                        self.live.is_some() && self.can_queue(),
+                        egui::Button::new("Refresh"),
+                    )
                     .clicked()
                 {
-                    self.submit("refreshing", Job::Refresh);
+                    self.submit(Job::Refresh);
+                }
+                if let Some(stuck) = self.stuck_for() {
+                    let label = format!("Abort ({} s)", stuck.as_secs());
+                    if ui
+                        .add(egui::Button::new(RichText::new(label).strong().color(RED)))
+                        .on_hover_text(
+                            "stop waiting for the job in flight: the console session is \
+                             dropped without restoring patches",
+                        )
+                        .clicked()
+                    {
+                        self.abort_busy("user abort");
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(live) = &self.live {
@@ -1353,7 +1829,27 @@ impl NclApp {
                 if self.busy.is_some() {
                     ui.spinner();
                 }
-                ui.label(RichText::new(&self.message).color(DIM));
+                // "busy since N s": the watchdog state is visible, not just a
+                // message that never changes while a job hangs.
+                let stuck = self.stuck_for();
+                ui.label(
+                    RichText::new(self.busy_text())
+                        .color(if stuck.is_some() { RED } else { DIM }),
+                );
+                if stuck.is_some() {
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new("Abort").small().color(RED),
+                        ))
+                        .on_hover_text(
+                            "drop the stuck job and its console session (patches are not \
+                             restored; reconnect and use Panic OFF)",
+                        )
+                        .clicked()
+                    {
+                        self.abort_busy("user abort");
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.editor.dirty() {
                         ui.label(RichText::new("editor: UNSAVED").color(YELLOW));
@@ -1423,15 +1919,24 @@ impl NclApp {
                     live.target.backups > 0 || live.any_enabled(),
                     egui::Button::new(RichText::new("Panic OFF").strong().color(RED)),
                 )
-                .on_hover_text("restore every original byte recorded in the backup journal");
+                .on_hover_text(
+                    "restore every original byte recorded in the backup journal; if a job is \
+                     stuck this aborts it instead (the journal stays on disk)",
+                );
             if panic.clicked() {
                 self.panic_confirm = true;
             }
             if ui
-                .add_enabled(live.has_loops(), egui::Button::new("Tick now"))
+                .add_enabled(
+                    live.has_loops() && self.can_queue(),
+                    egui::Button::new("Tick now"),
+                )
+                .on_hover_text("evaluate the Loop cheats once, right now")
                 .clicked()
             {
-                self.submit("ticking", Job::Tick);
+                // Refused (and the state left untouched) while a tick is in
+                // flight; see `NclApp::submit`.
+                self.submit(Job::Tick);
             }
         });
         if let Some(error) = &live.target.last_error {
@@ -1461,7 +1966,9 @@ impl NclApp {
 
         let filter = self.filter.trim().to_lowercase();
         let only_enabled = self.only_enabled;
-        let busy = self.busy.is_some();
+        // Checkboxes stay usable during a loop tick (a soft job) and are
+        // disabled only while a real job is in flight.
+        let busy = !self.can_queue();
         let mut toggle: Option<(CheatKey, bool)> = None;
         let mut open_editor = false;
 
@@ -1606,10 +2113,7 @@ impl NclApp {
             });
 
         if let Some((key, on)) = toggle {
-            self.submit(
-                if on { "enabling" } else { "disabling" },
-                Job::Toggle { key, on },
-            );
+            self.submit(Job::Toggle { key, on });
         }
         if open_editor {
             if !self.editor.dirty() {
@@ -1769,10 +2273,13 @@ impl NclApp {
                     .monospace()
                     .color(ACCENT),
             );
-            if ui.button("Refresh").clicked() {
-                let (files, error) = scan_library(&self.library.dir);
-                self.library.files = files;
-                self.library.error = error;
+            if ui
+                .add_enabled(self.scans == 0, egui::Button::new("Refresh"))
+                .on_hover_text("re-read cheats/ (runs on a helper thread)")
+                .clicked()
+            {
+                // Off the UI thread: the scan parses every file in the folder.
+                self.refresh_library();
             }
             if ui.button("Open folder").clicked() {
                 let _ = std::process::Command::new("explorer")
@@ -1885,8 +2392,9 @@ impl NclApp {
                             ))
                             .clicked()
                         {
-                            self.panic_confirm = false;
-                            self.submit("restoring every patch", Job::PanicOff);
+                            // Priority: a stuck job is aborted rather than
+                            // waited for (the journal stays on disk).
+                            self.panic_off();
                         }
                         if ui.button("Cancel").clicked() {
                             self.panic_confirm = false;
@@ -1922,6 +2430,17 @@ impl NclApp {
                             .color(YELLOW),
                         );
                     }
+                    if self.busy.is_some() {
+                        ui.label(
+                            RichText::new(format!(
+                                "A job is still running ({}).  \"Restore && quit\" stays \
+                                 unavailable until it finishes; quitting without restoring \
+                                 leaves the console patched until the title restarts.",
+                                self.busy_text()
+                            ))
+                            .color(YELLOW),
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if enabled > 0
@@ -1930,11 +2449,17 @@ impl NclApp {
                                     self.busy.is_none(),
                                     egui::Button::new(RichText::new("Restore && quit").strong()),
                                 )
+                                .on_hover_text(
+                                    "restore every patch, then close; unavailable while a job \
+                                     is stuck in the worker",
+                                )
                                 .clicked()
                         {
                             self.quit_after_restore = true;
-                            self.submit("restoring before quit", Job::PanicOff);
+                            self.submit(Job::PanicOff);
                         }
+                        // Always enabled: a stuck job must never trap the user
+                        // in a window that will not close.
                         if ui
                             .add(egui::Button::new(
                                 RichText::new(if enabled > 0 {
@@ -1944,8 +2469,11 @@ impl NclApp {
                                 })
                                 .color(RED),
                             ))
+                            .on_hover_text("always available, even while a job is stuck")
                             .clicked()
                         {
+                            // Make the log honest before the process goes away.
+                            self.abort_busy("quit");
                             self.allow_close = true;
                             self.quit_confirm = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1967,7 +2495,7 @@ impl NclApp {
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F9)) {
             if self.live.is_some() {
-                self.submit("refreshing", Job::Refresh);
+                self.submit(Job::Refresh);
             }
         }
     }
@@ -1996,6 +2524,16 @@ impl NclApp {
             return;
         }
         if self.shot_requested {
+            // The encoder runs on its own thread (a full-window PNG is tens of
+            // milliseconds of pure CPU); keep the frame clock going until it
+            // sets the flag, but never let it hold the process open forever.
+            self.shot_wait_frames += 1;
+            if self.shot_wait_frames > 600 {
+                eprintln!("screenshot: the encoder thread did not finish; giving up");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            ctx.request_repaint_after(Duration::from_millis(30));
             return;
         }
         // With --connect, wait for the worker to open the target (or give up) so
@@ -2010,21 +2548,31 @@ impl NclApp {
         let flag = Arc::clone(&self.shot_saved);
         let path_text = path.to_string_lossy().to_string();
         ctx.request_screenshot(move |image| {
-            let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
-            for pixel in &image.pixels {
-                rgba.extend_from_slice(&pixel.to_array());
-            }
-            match png::write_png(
-                &path_text,
-                image.width() as u32,
-                image.height() as u32,
-                &rgba,
-            ) {
-                Ok(()) => {
-                    println!("screenshot written: {path_text}");
-                    flag.store(true, Ordering::Relaxed);
-                }
-                Err(error) => eprintln!("screenshot failed: {error}"),
+            // Encoding and writing the PNG is far too much work for the frame
+            // that produced it, so it goes to a helper thread.
+            let path_text = path_text.clone();
+            let spawned = std::thread::Builder::new()
+                .name("ncl-screenshot".to_string())
+                .spawn(move || {
+                    let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
+                    for pixel in &image.pixels {
+                        rgba.extend_from_slice(&pixel.to_array());
+                    }
+                    match png::write_png(
+                        &path_text,
+                        image.width() as u32,
+                        image.height() as u32,
+                        &rgba,
+                    ) {
+                        Ok(()) => {
+                            println!("screenshot written: {path_text}");
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        Err(error) => eprintln!("screenshot failed: {error}"),
+                    }
+                });
+            if spawned.is_err() {
+                eprintln!("screenshot: cannot start the encoder thread");
             }
         });
         ctx.request_repaint();
@@ -2043,6 +2591,8 @@ impl eframe::App for NclApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.poll_worker();
+        self.poll_watchdog();
         if self.pending_close {
             self.pending_close = false;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2053,7 +2603,8 @@ impl eframe::App for NclApp {
         self.handle_screenshot(ui.ctx());
 
         // Parse while the user pauses, so diagnostics stay current without
-        // re-parsing a large file on every keystroke.
+        // re-parsing a large file on every keystroke.  The 400 ms debounce
+        // needs a frame to fire in, so ask for one while text is unvalidated.
         if self.editor.validated_text != self.editor.text {
             let due = self
                 .editor
@@ -2062,7 +2613,13 @@ impl eframe::App for NclApp {
                 .unwrap_or(true);
             if due && self.editor.text.len() <= 262_144 {
                 self.refresh_parse();
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(120));
             }
+        }
+        // A background library scan cannot wake the frame clock by itself.
+        if self.scans > 0 {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
         self.top_bar(ui);
