@@ -8,11 +8,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::model::{CheatBlock, CheatDocument, CheatExecMode, CheatKey};
 use super::parser;
-use super::vm::{self, CheatMemoryIo, MemoryRegions, VmReport, VmState};
+use super::vm::{self, CheatMemoryIo, FailureKind, MemoryRegions, VmReport, VmState};
 
 pub const JOURNAL_MAGIC: &str = "NXUS-CHEAT-BACKUP 1";
 
@@ -24,6 +24,19 @@ pub const JOURNAL_MAGIC: &str = "NXUS-CHEAT-BACKUP 1";
 /// [`CheatManager::set_block_budget`], or pass an explicit budget to
 /// [`CheatManager::enable_block`].  `None` disables the limit.
 pub const DEFAULT_BLOCK_BUDGET: Option<Duration> = Some(Duration::from_secs(10));
+
+/// How many writes one block may plan and still have the target paused for the
+/// apply phase.
+///
+/// Pausing freezes the whole console, so it only pays off for a block small
+/// enough to finish while paused (a hook plus a cave).  A bulk write of many
+/// hundreds of bytes would keep the console frozen for far longer than the
+/// window it tries to protect.
+const PAUSE_WRITE_LIMIT: usize = 16;
+
+/// Page size used only to order the apply phase; addresses inside one page are
+/// never reordered.
+const APPLY_PAGE_SHIFT: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // Target identity
@@ -297,9 +310,48 @@ struct PreWrite {
 }
 
 /// Result of one block evaluation, including what it wrote (for rollback).
+///
+/// A block is now evaluated in two phases: the plan phase (see [`PlanIo`])
+/// records the writes and never touches memory, and the apply phase publishes
+/// them.  `applied` therefore lists what actually reached the target, which is
+/// what a rollback has to undo.
 struct CodeRun {
     result: Result<VmReport, String>,
     writes: Vec<(u64, PreWrite)>,
+    /// Addresses the apply phase wrote, in apply order.
+    applied: Vec<u64>,
+    /// The console reported that the target process is gone while applying.
+    target_gone: bool,
+}
+
+/// One write the block asked for, in the order it was first requested.
+///
+/// A block that writes the same address twice keeps only the last value: the
+/// intermediate values never reach memory, so replaying them would only cost
+/// extra link round-trips without changing the result.
+struct PlannedWrite {
+    address: u64,
+    data: Vec<u8>,
+    allow_rx: bool,
+}
+
+/// Why the apply phase stopped.
+struct ApplyFailure {
+    message: String,
+    /// The console reported that the process is gone, so a rollback cannot work.
+    target_gone: bool,
+}
+
+/// What the apply phase did, so the caller can roll the block back.
+#[derive(Default)]
+struct ApplyReport {
+    /// Addresses the target accepted, in apply order.
+    applied: Vec<u64>,
+    error: Option<ApplyFailure>,
+    /// The target could not be paused; the writes were still applied.
+    pause_error: Option<String>,
+    /// The pause was held but releasing it failed.
+    resume_error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +663,11 @@ impl CheatManager {
     ///   state it found (see [`Self::rollback_block`]) and an error whose
     ///   message contains `timed out` is returned.  A half-applied patch is
     ///   therefore never left behind silently.
+    /// * The block is evaluated twice: first against a planning adapter that
+    ///   only records its writes (and overlays them for its own reads), then --
+    ///   only if the block succeeded -- published by [`apply_plan`] with a
+    ///   preflight, an optional pause, cave-before-hook ordering and a
+    ///   read-back check.  A block that fails or overruns writes nothing.
     /// * `on_progress(done, total)` receives the interpreter's progress, so a
     ///   slow link can drive a progress bar instead of looking frozen.
     ///
@@ -651,20 +708,32 @@ impl CheatManager {
         // the block settles (success keeps it, a full rollback clears it).
         self.dirty = true;
         let run = self.run_code(key, &block.on, 0, true, io, budget, on_progress);
-        if let Err(error) = run.result {
-            let rollback = self.rollback_block(run.writes, io);
+        let CodeRun {
+            result,
+            writes,
+            applied,
+            target_gone,
+        } = run;
+        if let Err(error) = result {
+            let rollback = if target_gone {
+                // The console says the process is gone.  A rollback would only
+                // repeat the same error once per address, and the bytes we did
+                // write died with the process.  Drop this block's restore
+                // records without a single store, so the manager can settle.
+                self.rollback_block(writes, &[], io)
+            } else {
+                // Only addresses that really reached the target are written
+                // back; a block that failed during planning (or preflight)
+                // applied nothing and must not store anything at all.
+                self.rollback_block(writes, &applied, io)
+            };
             self.enabled.remove(&key);
             self.errors.remove(&key);
             if let Some(block) = self.document.block_mut(key) {
                 block.enabled = false;
             }
             self.settle_dirty();
-            let message = match rollback {
-                Ok(()) => error,
-                Err(rollback_error) => {
-                    format!("{error}; rollback also failed: {rollback_error}")
-                }
-            };
+            let message = merge_rollback_error(error, rollback, target_gone);
             self.errors.insert(key, message.clone());
             self.last_error = Some(message.clone());
             return Err(message);
@@ -752,7 +821,12 @@ impl CheatManager {
                 return Err("explicit OFF block disappeared".to_string());
             };
             let run = self.run_code(key, &off, 0, false, io, budget, &mut |_, _| {});
-            match run.result {
+            let CodeRun {
+                result,
+                target_gone,
+                ..
+            } = run;
+            match result {
                 Ok(_) => {
                     if let Err(error) = self.release_owner(key) {
                         self.enabled.remove(&key);
@@ -775,23 +849,35 @@ impl CheatManager {
                     }
                 }
                 Err(error) => {
-                    // A broken OFF block must not leave the target patched.
-                    let fallback = self.restore_owned(key, io);
                     let mut message = error;
-                    match &fallback {
-                        Ok(()) => {
-                            // The originals are back, so the cheat really is off.
-                            self.enabled.remove(&key);
-                            if let Some(block) = self.document.block_mut(key) {
-                                block.enabled = false;
-                            }
+                    if target_gone {
+                        // The console has no process left, so a fallback restore
+                        // could only fail once per address.  The bytes died with
+                        // the process; treat the cheat as off without writing.
+                        self.enabled.remove(&key);
+                        if let Some(block) = self.document.block_mut(key) {
+                            block.enabled = false;
                         }
-                        Err(restore_error) => {
-                            // Bytes may still be patched: keep the cheat marked
-                            // ON so the UI matches memory, and let it be retried.
-                            message = format!(
-                                "{message}; fallback restore also failed: {restore_error}"
-                            );
+                    } else {
+                        // A broken OFF block must not leave the target patched.
+                        let fallback = self.restore_owned(key, io);
+                        match &fallback {
+                            Ok(()) => {
+                                // The originals are back, so the cheat really is
+                                // off.
+                                self.enabled.remove(&key);
+                                if let Some(block) = self.document.block_mut(key) {
+                                    block.enabled = false;
+                                }
+                            }
+                            Err(restore_error) => {
+                                // Bytes may still be patched: keep the cheat
+                                // marked ON so the UI matches memory, and let it
+                                // be retried.
+                                message = format!(
+                                    "{message}; fallback restore also failed: {restore_error}"
+                                );
+                            }
                         }
                     }
                     self.settle_dirty();
@@ -870,9 +956,12 @@ impl CheatManager {
 
     /// Evaluate every enabled Loop-mode cheat once.
     ///
-    /// Each block runs under [`Self::block_budget`]; a block that overruns (or
-    /// fails) is reported in [`TickReport::errors`] and its backups are kept,
-    /// because the loop stays enabled and must still be restorable.
+    /// Each block goes through the same plan-then-apply path as
+    /// [`Self::enable`]: a block that fails or overruns during planning wrote
+    /// nothing, and a partially applied one is rolled back so the loop's next
+    /// tick starts from the state the target really has.  The loop stays
+    /// enabled either way and its failure is reported in
+    /// [`TickReport::errors`].
     pub fn tick<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M, keys_held: u64) -> TickReport {
         let mut report = TickReport::default();
         let keys: Vec<CheatKey> = self
@@ -897,16 +986,30 @@ impl CheatManager {
                 None => continue,
             };
             let run = self.run_code(key, &code, keys_held, true, io, budget, &mut |_, _| {});
-            match run.result {
+            let CodeRun {
+                result,
+                writes,
+                applied,
+                target_gone,
+            } = run;
+            match result {
                 Ok(_) => {
                     report.executed += 1;
                     self.errors.remove(&key);
                 }
                 Err(error) => {
-                    self.errors.insert(key, error.clone());
-                    self.last_error = Some(error.clone());
+                    let rollback = if target_gone {
+                        // Nothing in a dead process can be restored: drop the
+                        // records on paper only.
+                        self.rollback_block(writes, &[], io)
+                    } else {
+                        self.rollback_block(writes, &applied, io)
+                    };
+                    let message = merge_rollback_error(error, rollback, target_gone);
+                    self.errors.insert(key, message.clone());
+                    self.last_error = Some(message.clone());
                     report.failed += 1;
-                    report.errors.push((key, error));
+                    report.errors.push((key, message));
                 }
             }
         }
@@ -977,7 +1080,17 @@ impl CheatManager {
         self.dirty = !self.backups.is_empty();
     }
 
-    /// Run one block, collecting what it wrote so a failure can be rolled back.
+    /// Run one block in two phases and publish what it asked for.
+    ///
+    /// 1. *Plan*: the block executes against [`PlanIo`], which records the
+    ///    writes instead of issuing them and overlays them for later reads.
+    ///    A block that fails or overruns therefore leaves memory untouched.
+    /// 2. *Apply*: only if the block succeeded, [`apply_plan`] preflights every
+    ///    address, optionally pauses the target, writes the plan in
+    ///    cave-before-hook order and verifies the result by reading it back.
+    ///
+    /// The returned [`CodeRun`] carries the memory rollback bookkeeping and the
+    /// exact list of addresses that reached the target.
     #[allow(clippy::too_many_arguments)]
     fn run_code<M: CheatMemoryIo + ?Sized>(
         &mut self,
@@ -996,37 +1109,79 @@ impl CheatManager {
                     .map(|issue| issue.to_string())
                     .unwrap_or_else(|| "code is empty or invalid".to_string())),
                 writes: Vec::new(),
+                applied: Vec::new(),
+                target_gone: false,
             };
         }
         let regions = self.regions;
+        // The apply phase finishes the same block, so it shares the budget.
+        let deadline = budget.and_then(|limit| Instant::now().checked_add(limit));
         let mut state = std::mem::take(&mut self.vm_state);
-        let (result, writes) = {
-            let mut recorder = RecordingIo {
+        let (planned, writes, plan) = {
+            let mut planner = PlanIo {
                 manager: self,
                 io,
                 key,
                 record_backups,
                 writes: Vec::new(),
+                plan: Vec::new(),
+                shadow: BTreeMap::new(),
                 journal_flushed: false,
             };
             let result = vm::execute_with_budget(
                 &code.instructions,
                 &code.jumps,
-                &mut recorder,
+                &mut planner,
                 &regions,
                 keys_held,
                 &mut state,
                 budget,
                 on_progress,
             );
-            (result.map_err(|error| error.to_string()), recorder.writes)
+            (result, planner.writes, planner.plan)
         };
         self.vm_state = state;
-        CodeRun { result, writes }
+
+        let mut result = planned.map_err(|error| error.to_string());
+        let mut applied = Vec::new();
+        let mut target_gone = false;
+        if result.is_ok() {
+            let report = apply_plan(io, &plan, deadline);
+            if let Some(error) = report.pause_error {
+                // Not fatal: the ordered writes still protect most of the
+                // window, so the block continues unpaused (the caller sees why).
+                self.last_error = Some(error);
+            }
+            if let Some(error) = report.resume_error {
+                self.last_error = Some(error);
+            }
+            for address in &report.applied {
+                if let Some(write) = plan.iter().find(|write| write.address == *address) {
+                    self.mark_written(*address, &write.data);
+                }
+            }
+            applied = report.applied;
+            if let Some(failure) = report.error {
+                target_gone = failure.target_gone;
+                result = Err(failure.message);
+            }
+        }
+        CodeRun {
+            result,
+            writes,
+            applied,
+            target_gone,
+        }
     }
 
     /// Write back every byte a failed block applied and restore the backup
     /// bookkeeping it changed.
+    ///
+    /// Only `applied` addresses are written back: an address the plan recorded
+    /// but the target never accepted already holds its previous bytes, so
+    /// writing it again would be a pointless (and possibly fatal) extra store.
+    /// Its bookkeeping is still restored, so a preflight failure -- where
+    /// `applied` is empty -- leaves no backup and no journal entry behind.
     ///
     /// Addresses whose backup already existed keep their previous owner set
     /// and journalled bytes; addresses whose backup was created by this block
@@ -1036,14 +1191,21 @@ impl CheatManager {
     fn rollback_block<M: CheatMemoryIo + ?Sized>(
         &mut self,
         writes: Vec<(u64, PreWrite)>,
+        applied: &[u64],
         io: &mut M,
     ) -> Result<(), String> {
         if writes.is_empty() {
             return Ok(());
         }
+        let applied: BTreeSet<u64> = applied.iter().copied().collect();
         let mut failures: Vec<(u64, String)> = Vec::new();
         for (address, pre) in writes.into_iter().rev() {
-            match io.write_mem(address, &pre.previous, true) {
+            let restored = if applied.contains(&address) {
+                io.write_mem(address, &pre.previous, true)
+            } else {
+                Ok(())
+            };
+            match restored {
                 Ok(()) => {
                     if pre.existed {
                         if let Some(entry) = self.backups.get_mut(&address) {
@@ -1290,30 +1452,269 @@ impl CheatManager {
 }
 
 // ---------------------------------------------------------------------------
-// Recording IO
+// Plan / apply
 // ---------------------------------------------------------------------------
 
-struct RecordingIo<'a, M: CheatMemoryIo + ?Sized> {
+/// Where each planned write sits in the apply order.
+///
+/// **Cave first, hook last.**  A cheat that installs a hook normally writes the
+/// code cave and then the branch that jumps into it.  If the hook went in
+/// first, the game could branch into cave bytes that are still half written --
+/// the classic "the game dies while the patch is being written" crash.  Ordering
+/// the stores by descending 4 KB page lets the (usually far away, often higher)
+/// cave land before the hook page.
+///
+/// The guarantee is a *heuristic*, not a proof: nothing in the cheat format
+/// marks which store is the hook, and a cave that lives below the hook page, or
+/// a game thread that is already executing inside the target page, can still
+/// observe a partial patch.  It only reduces the window; the conditional pause
+/// in [`apply_plan`] closes it for small blocks.
+///
+/// Writes inside the same 4 KB page keep their original order: they cannot be
+/// merged into one store, so reordering them would only make overlapping
+/// writes (e.g. a 4-byte and a 1-byte patch on the same address) land in an
+/// order the cheat author did not write.
+fn apply_order(plan: &[PlannedWrite]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..plan.len()).collect();
+    order.sort_by_key(|index| {
+        (
+            std::cmp::Reverse(plan[*index].address >> APPLY_PAGE_SHIFT),
+            *index,
+        )
+    });
+    order
+}
+
+/// The one-line report for a process that vanished while bytes were landing.
+fn target_gone_message(applied: usize) -> String {
+    format!(
+        "target is gone (console reports no process) - {applied} write(s) may have been applied"
+    )
+}
+
+/// Combine a block error with the result of undoing it.
+///
+/// A target-gone failure never wrote a rollback (there is nothing to write to),
+/// so the only thing that can fail is the local journal update.
+fn merge_rollback_error(error: String, rollback: Result<(), String>, target_gone: bool) -> String {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) if target_gone => {
+            format!("{error}; restore journal update failed: {rollback_error}")
+        }
+        Err(rollback_error) => format!("{error}; rollback also failed: {rollback_error}"),
+    }
+}
+
+/// Releases a pause taken for the apply phase on every exit path.
+///
+/// A paused console cannot resume itself, so the guard is deliberately a
+/// `Drop` impl: success, early error return and a panic all run it.  Failures
+/// are reported to the caller through [`ResumeGuard::resume_now`]; the drop path
+/// is best effort because there is no caller left to tell.
+struct ResumeGuard<'a, M: CheatMemoryIo + ?Sized> {
+    io: &'a mut M,
+    armed: bool,
+}
+
+impl<M: CheatMemoryIo + ?Sized> ResumeGuard<'_, M> {
+    /// Resume now and disarm the guard so `Drop` does not resume twice.
+    fn resume_now(&mut self) -> Result<(), String> {
+        self.armed = false;
+        self.io.resume_process()
+    }
+}
+
+impl<M: CheatMemoryIo + ?Sized> Drop for ResumeGuard<'_, M> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            // Best effort: leaving the console frozen is worse than losing this
+            // error message.
+            let _ = self.io.resume_process();
+        }
+    }
+}
+
+/// Publish a block's planned writes.
+///
+/// 1. *Preflight*: read every planned address first.  A target that rejects one
+///    of them would reject the later store too, so nothing is written when any
+///    read fails -- not one byte.
+/// 2. *Pause* (conditional): freeze the process when the block is small and
+///    touches executable (`allow_rx`) pages, because those are the bytes the
+///    game may jump to.  A failed pause is not fatal: the ordered stores below
+///    still apply.
+/// 3. *Write* in cave-before-hook order (see [`apply_order`]).
+/// 4. *Verify*: read every address back.  A mismatch is a silent bit flip and
+///    is reported so the caller can roll the block back.
+fn apply_plan<M: CheatMemoryIo + ?Sized>(
+    io: &mut M,
+    plan: &[PlannedWrite],
+    deadline: Option<Instant>,
+) -> ApplyReport {
+    let mut report = ApplyReport::default();
+    if plan.is_empty() {
+        return report;
+    }
+    let order = apply_order(plan);
+
+    // Preflight: a target that cannot be read right now cannot be written.
+    for index in &order {
+        let write = &plan[*index];
+        let size = u32::try_from(write.data.len()).unwrap_or(u32::MAX);
+        if let Err(error) = io.read_mem(write.address, size) {
+            report.error = Some(ApplyFailure {
+                message: format!(
+                    "preflight read failed at 0x{:X}: {error}; no byte was written",
+                    write.address
+                ),
+                target_gone: false,
+            });
+            return report;
+        }
+    }
+
+    let pause_wanted = plan.iter().any(|write| write.allow_rx) && plan.len() <= PAUSE_WRITE_LIMIT;
+    let mut paused = false;
+    if pause_wanted {
+        match io.pause_process() {
+            Ok(()) => paused = true,
+            Err(error) => {
+                // Not fatal: ordered stores still reduce the window.
+                report.pause_error = Some(format!(
+                    "pause before applying writes failed: {error}; applying without pausing"
+                ));
+            }
+        }
+    }
+
+    {
+        let mut guard = ResumeGuard { io, armed: paused };
+        for index in &order {
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    report.error = Some(ApplyFailure {
+                        message: format!(
+                            "block timed out during apply after {} write(s)",
+                            report.applied.len()
+                        ),
+                        target_gone: false,
+                    });
+                    break;
+                }
+            }
+            let write = &plan[*index];
+            match guard
+                .io
+                .write_mem(write.address, &write.data, write.allow_rx)
+            {
+                Ok(()) => report.applied.push(write.address),
+                Err(error) => {
+                    let target_gone = guard.io.failure_kind(&error) == FailureKind::TargetGone;
+                    report.error = Some(ApplyFailure {
+                        message: if target_gone {
+                            target_gone_message(report.applied.len())
+                        } else {
+                            format!("write 0x{:X} failed during apply: {error}", write.address)
+                        },
+                        target_gone,
+                    });
+                    break;
+                }
+            }
+        }
+
+        // Read back while the target is still paused: this is the only point
+        // where nobody can change the watched bytes between store and check.
+        if report.error.is_none() {
+            let mut mismatches: Vec<String> = Vec::new();
+            let mut target_gone = false;
+            for index in &order {
+                let write = &plan[*index];
+                let size = u32::try_from(write.data.len()).unwrap_or(u32::MAX);
+                match guard.io.read_mem(write.address, size) {
+                    Ok(bytes) if bytes.as_slice() == write.data.as_slice() => {}
+                    Ok(bytes) => mismatches.push(format!(
+                        "0x{:X}: wrote {} but read {}",
+                        write.address,
+                        hex(&write.data),
+                        hex(&bytes)
+                    )),
+                    Err(error) => {
+                        if guard.io.failure_kind(&error) == FailureKind::TargetGone {
+                            target_gone = true;
+                        }
+                        mismatches.push(format!(
+                            "0x{:X}: verify read failed: {error}",
+                            write.address
+                        ));
+                    }
+                }
+            }
+            if target_gone {
+                report.error = Some(ApplyFailure {
+                    message: target_gone_message(report.applied.len()),
+                    target_gone: true,
+                });
+            } else if !mismatches.is_empty() {
+                report.error = Some(ApplyFailure {
+                    message: format!("read-back verification failed: {}", mismatches.join(", ")),
+                    target_gone: false,
+                });
+            }
+        }
+
+        if paused {
+            if let Err(error) = guard.resume_now() {
+                report.resume_error = Some(format!("resume after apply failed: {error}"));
+            }
+        }
+    }
+
+    report
+}
+
+// ---------------------------------------------------------------------------
+// Planning IO
+// ---------------------------------------------------------------------------
+
+/// Planning half of the two-phase write.
+///
+/// The block runs against this adapter: `write_mem` records the store, updates
+/// the shadow overlay (so a later read in the same block sees the new value,
+/// exactly as it would after a real store) and touches no target memory.
+/// `read_mem` starts from the real bytes and overlays the pending writes, which
+/// keeps "read the current memory" semantics for everything the block did not
+/// plan to change.
+struct PlanIo<'a, M: CheatMemoryIo + ?Sized> {
     manager: &'a mut CheatManager,
     io: &'a mut M,
     key: CheatKey,
     record_backups: bool,
     /// Addresses this block wrote, with the state they had before the block.
     writes: Vec<(u64, PreWrite)>,
+    /// The stores to publish, in first-touch order, last value per address.
+    plan: Vec<PlannedWrite>,
+    /// Byte-level overlay of `plan`, so reads inside the block see new values.
+    shadow: BTreeMap<u64, u8>,
     /// The journal was already flushed for this block.
     journal_flushed: bool,
 }
 
-impl<'a, M: CheatMemoryIo + ?Sized> RecordingIo<'a, M> {
+impl<'a, M: CheatMemoryIo + ?Sized> PlanIo<'a, M> {
     /// Snapshot the pre-block state, extend the backup table, then flush the
-    /// journal **before** the memory write.
+    /// journal **before** the block can write anything.
     ///
     /// Flushing once per new address (instead of the old three writes per
     /// write: insert, re-state, commit) keeps the "never write without a
     /// durable restore record" guarantee while cutting the fsync count of a
     /// one-write block from three to one.
     fn prepare_write(&mut self, address: u64, width: u8, data: &[u8]) -> Result<(), String> {
-        let tracked = self.writes.iter().any(|(candidate, _)| *candidate == address);
+        let tracked = self
+            .writes
+            .iter()
+            .any(|(candidate, _)| *candidate == address);
         let before = if tracked {
             None
         } else {
@@ -1371,9 +1772,15 @@ impl<'a, M: CheatMemoryIo + ?Sized> RecordingIo<'a, M> {
     }
 }
 
-impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for RecordingIo<'_, M> {
+impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for PlanIo<'_, M> {
     fn read_mem(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
-        self.io.read_mem(address, size)
+        let mut bytes = self.io.read_mem(address, size)?;
+        for (offset, byte) in bytes.iter_mut().enumerate() {
+            if let Some(planned) = self.shadow.get(&address.wrapping_add(offset as u64)) {
+                *byte = *planned;
+            }
+        }
+        Ok(bytes)
     }
 
     fn write_mem(&mut self, address: u64, data: &[u8], allow_rx: bool) -> Result<(), String> {
@@ -1385,9 +1792,22 @@ impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for RecordingIo<'_, M> {
         if self.record_backups {
             self.prepare_write(address, width, data)?;
         }
-        self.io.write_mem(address, data, allow_rx)?;
-        if self.record_backups {
-            self.manager.mark_written(address, data);
+        // Keep one entry per address: the last value wins and the first-touch
+        // position (the order the cheat author wrote) is preserved.
+        if let Some(existing) = self.plan.iter_mut().find(|write| write.address == address) {
+            existing.data.clear();
+            existing.data.extend_from_slice(data);
+            existing.allow_rx = allow_rx;
+        } else {
+            self.plan.push(PlannedWrite {
+                address,
+                data: data.to_vec(),
+                allow_rx,
+            });
+        }
+        for (offset, byte) in data.iter().enumerate() {
+            self.shadow
+                .insert(address.wrapping_add(offset as u64), *byte);
         }
         Ok(())
     }
@@ -1398,6 +1818,10 @@ impl<M: CheatMemoryIo + ?Sized> CheatMemoryIo for RecordingIo<'_, M> {
 
     fn resume_process(&mut self) -> Result<(), String> {
         self.io.resume_process()
+    }
+
+    fn failure_kind(&self, error: &str) -> FailureKind {
+        self.io.failure_kind(error)
     }
 }
 
@@ -1601,6 +2025,19 @@ mod tests {
         fail_write_at: Option<u64>,
         /// Sleep after the Nth write, to simulate a slow console link.
         slow_writes: Option<(usize, Duration)>,
+        /// Every failure is classified as "the process is gone".
+        target_gone: bool,
+        /// Writes to this address are accepted but silently dropped, like a
+        /// target whose bytes never change (a read-back mismatch).
+        ignore_write_at: Option<u64>,
+        /// Reads of `fail_read_at` fail, but only after `fail_read_after`
+        /// reads were served -- the plan phase reads every new address once.
+        fail_read_at: Option<u64>,
+        fail_read_after: usize,
+        reads: usize,
+        pause_fails: bool,
+        pause_calls: usize,
+        resume_calls: usize,
     }
 
     impl Default for TestIo {
@@ -1613,6 +2050,14 @@ mod tests {
                 paused: false,
                 fail_write_at: None,
                 slow_writes: None,
+                target_gone: false,
+                ignore_write_at: None,
+                fail_read_at: None,
+                fail_read_after: 0,
+                reads: 0,
+                pause_fails: false,
+                pause_calls: 0,
+                resume_calls: 0,
             }
         }
     }
@@ -1641,10 +2086,18 @@ mod tests {
         fn write_count(&self) -> usize {
             self.writes.len()
         }
+
+        fn written_addresses(&self) -> Vec<u64> {
+            self.writes.iter().map(|(address, _, _)| *address).collect()
+        }
     }
 
     impl CheatMemoryIo for TestIo {
         fn read_mem(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
+            self.reads += 1;
+            if self.fail_read_at == Some(address) && self.reads > self.fail_read_after {
+                return Err(format!("read from 0x{address:X} rejected by the target"));
+            }
             Ok((0..size)
                 .map(|offset| {
                     self.memory
@@ -1666,8 +2119,10 @@ mod tests {
                     .map(|path| path.exists())
                     .unwrap_or(false),
             );
-            for (offset, byte) in data.iter().enumerate() {
-                self.memory.insert(address + offset as u64, *byte);
+            if self.ignore_write_at != Some(address) {
+                for (offset, byte) in data.iter().enumerate() {
+                    self.memory.insert(address + offset as u64, *byte);
+                }
             }
             if let Some((index, delay)) = self.slow_writes {
                 if self.writes.len() == index {
@@ -1678,13 +2133,26 @@ mod tests {
         }
 
         fn pause_process(&mut self) -> Result<(), String> {
+            self.pause_calls += 1;
+            if self.pause_fails {
+                return Err("pause rejected by the target".to_string());
+            }
             self.paused = true;
             Ok(())
         }
 
         fn resume_process(&mut self) -> Result<(), String> {
+            self.resume_calls += 1;
             self.paused = false;
             Ok(())
+        }
+
+        fn failure_kind(&self, _error: &str) -> FailureKind {
+            if self.target_gone {
+                FailureKind::TargetGone
+            } else {
+                FailureKind::Other
+            }
         }
     }
 
@@ -1756,10 +2224,13 @@ mod tests {
         manager.enable(key, &mut io).unwrap();
         let writes_after_enable = io.write_count();
         assert_eq!(manager.backup_count(), 1);
-        assert_eq!(writes_after_enable, 3);
+        // The loop stores the same address three times, but the plan keeps the
+        // last value only: one target store per block instead of three
+        // identical ones.
+        assert_eq!(writes_after_enable, 1);
 
         manager.tick(&mut io, 0);
-        assert_eq!(io.write_count(), writes_after_enable + 3);
+        assert_eq!(io.write_count(), writes_after_enable + 1);
         assert_eq!(manager.backup_count(), 1);
     }
 
@@ -2428,5 +2899,279 @@ B4000000 00000000
         // The file must record the disabled state, not just memory.
         let text = fs::read_to_string(manager.path()).unwrap();
         assert!(text.contains("@off"), "{text}");
+    }
+
+    // -- two-phase (plan/apply) writes -------------------------------------
+
+    #[test]
+    fn plan_applies_writes_in_descending_page_order() {
+        let dir = TempDir::new("apply-order");
+        let text = "\
+[Order]
+04400000 00001000 11111111
+04400000 00002000 22222222
+04400000 00001004 33333333
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::default();
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Order").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        // 0x2000 lives on a higher page and goes first; the two writes on page
+        // 0x1000 keep the order the cheat author wrote them in.
+        assert_eq!(
+            io.written_addresses(),
+            vec![0x2000, 0x1000, 0x1004],
+            "cave pages must be written before the hook page"
+        );
+        assert_eq!(io.memory[&0x1000], 0x11);
+        assert_eq!(io.memory[&0x2000], 0x22);
+        assert_eq!(io.memory[&0x1004], 0x33);
+    }
+
+    #[test]
+    fn preflight_failure_writes_nothing() {
+        let dir = TempDir::new("preflight");
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        // The plan phase reads each new address once to record its original
+        // bytes (2 reads); fail only the later preflight read of the first one.
+        io.fail_read_at = Some(ADDRESS);
+        io.fail_read_after = 2;
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+
+        assert!(error.contains("preflight read failed at 0x1234"), "{error}");
+        assert!(
+            io.writes.is_empty(),
+            "preflight must abort before the first byte: {:?}",
+            io.writes
+        );
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(io.value_u32(ADDRESS + 4), 0);
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+        assert!(
+            !manager.journal_path().exists(),
+            "a plan that never applied must not leave a journal behind"
+        );
+    }
+
+    #[test]
+    fn read_back_mismatch_rolls_the_block_back() {
+        let dir = TempDir::new("read-back");
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        // The target accepts the store but the byte never changes.
+        io.ignore_write_at = Some(ADDRESS + 4);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+
+        assert!(error.contains("read-back verification failed"), "{error}");
+        assert!(error.contains("0x1238"), "{error}");
+        // The accepted half of the block was written back.
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(io.value_u32(ADDRESS + 4), 0);
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+    }
+
+    #[test]
+    fn target_gone_is_reported_once_and_never_rolled_back() {
+        let dir = TempDir::new("target-gone");
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        // The first store lands, the second one discovers the process is gone.
+        io.fail_write_at = Some(ADDRESS + 4);
+        io.target_gone = true;
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+
+        assert_eq!(
+            error.lines().count(),
+            1,
+            "one line, not one per address: {error}"
+        );
+        assert!(
+            error.contains("target is gone (console reports no process)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("1 write(s) may have been applied"),
+            "{error}"
+        );
+        assert_eq!(
+            io.write_count(),
+            1,
+            "a dead process must not be asked to roll back: {:?}",
+            io.writes
+        );
+        // The applied byte is still there; the process took it with it.
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(manager.backup_count(), 0);
+        assert!(
+            !manager.dirty(),
+            "nothing can be restored in a process that no longer exists"
+        );
+        assert!(manager.errors().contains_key(&key));
+    }
+
+    #[test]
+    fn pause_is_taken_for_small_rx_blocks_and_released_on_error() {
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        let dir = TempDir::new("pause-success");
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.pause_calls, 1);
+        assert_eq!(io.resume_calls, 1);
+        assert!(!io.paused);
+
+        // The same block failing mid-apply must release the pause as well.
+        let dir = TempDir::new("pause-error");
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        io.fail_write_at = Some(ADDRESS + 4);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        manager.enable(key, &mut io).unwrap_err();
+        assert_eq!(io.pause_calls, 1, "the pause was taken before the stores");
+        assert_eq!(io.resume_calls, 1, "an error path must still resume");
+        assert!(!io.paused, "the console must never be left frozen");
+    }
+
+    #[test]
+    fn pause_is_skipped_for_blocks_over_the_write_limit() {
+        let dir = TempDir::new("pause-limit");
+        let mut text = String::from("[Many]\n");
+        for index in 0..=PAUSE_WRITE_LIMIT as u64 {
+            text.push_str(&format!("04400000 {:08X} 00000001\n", 0x100 + index * 4));
+        }
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::default();
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Many").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        assert_eq!(io.write_count(), PAUSE_WRITE_LIMIT + 1);
+        assert_eq!(
+            io.pause_calls, 0,
+            "a bulk write must not freeze the console for its whole duration"
+        );
+        assert!(!io.paused);
+    }
+
+    #[test]
+    fn failed_pause_still_applies_and_is_reported() {
+        let dir = TempDir::new("pause-fails");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        io.pause_fails = true;
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(io.pause_calls, 1);
+        assert_eq!(
+            io.resume_calls, 0,
+            "nothing was paused, so nothing to resume"
+        );
+        assert!(
+            manager.last_error().unwrap().contains("pause"),
+            "the failed pause must stay visible: {:?}",
+            manager.last_error()
+        );
+    }
+
+    #[test]
+    fn plan_io_shadow_sees_pending_writes_and_keeps_the_last_value() {
+        let dir = TempDir::new("shadow");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        {
+            let mut planner = PlanIo {
+                manager: &mut manager,
+                io: &mut io,
+                key,
+                record_backups: true,
+                writes: Vec::new(),
+                plan: Vec::new(),
+                shadow: BTreeMap::new(),
+                journal_flushed: false,
+            };
+            planner
+                .write_mem(ADDRESS, &[0xAA, 0xBB, 0xCC, 0xDD], true)
+                .unwrap();
+            // Reads overlapping the pending store see the new bytes...
+            assert_eq!(
+                planner.read_mem(ADDRESS, 4).unwrap(),
+                vec![0xAA, 0xBB, 0xCC, 0xDD]
+            );
+            assert_eq!(planner.read_mem(ADDRESS + 1, 2).unwrap(), vec![0xBB, 0xCC]);
+            // ...while bytes outside it still read the real memory.
+            assert_eq!(planner.read_mem(ADDRESS + 4, 1).unwrap(), vec![0]);
+            // A second store to the same address wins without a new entry.
+            planner
+                .write_mem(ADDRESS, &[0x11, 0x22, 0x33, 0x44], true)
+                .unwrap();
+            assert_eq!(planner.plan.len(), 1);
+            assert_eq!(planner.plan[0].data, vec![0x11, 0x22, 0x33, 0x44]);
+            assert_eq!(
+                planner.read_mem(ADDRESS, 4).unwrap(),
+                vec![0x11, 0x22, 0x33, 0x44]
+            );
+        }
+        // Nothing reached the target: the plan is only applied after the block.
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(io.write_count(), 0);
+        assert_eq!(manager.backup_count(), 1);
     }
 }

@@ -47,6 +47,7 @@ use egui::{Color32, RichText};
 
 use cheat::{
     normalize_build_id, save_text_atomic, CheatDocument, CheatKey, CheatManager, CheatMemoryIo,
+    FailureKind,
     MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
 };
 use client::NxusClient;
@@ -463,6 +464,19 @@ impl CheatMemoryIo for ClientCheatIo<'_> {
             self.client.write_for_cheat(address, data)
         };
         result.map_err(|error| error.to_string())
+    }
+
+    fn failure_kind(&self, error: &str) -> FailureKind {
+        // 0x8003C806 = BAD_STATE (the process is no longer in a state we can
+        // touch), 0x8003C805 = NO_PROCESS, 0x0032C80D = dmnt CheatNotAttached.
+        if error.contains("0x8003C806")
+            || error.contains("0x8003C805")
+            || error.contains("0x0032C80D")
+        {
+            FailureKind::TargetGone
+        } else {
+            FailureKind::Other
+        }
     }
 
     fn pause_process(&mut self) -> Result<(), String> {

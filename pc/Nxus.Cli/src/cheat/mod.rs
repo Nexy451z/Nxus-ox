@@ -45,4 +45,4 @@ pub use model::{
     VM_STEP_LIMIT,
 };
 pub use parser::{parse_code, parse_code_lines, parse_document, parse_file};
-pub use vm::{execute, CheatMemoryIo, MemoryRegions, VmError, VmReport, VmState};
+pub use vm::{execute, CheatMemoryIo, FailureKind, MemoryRegions, VmError, VmReport, VmState};

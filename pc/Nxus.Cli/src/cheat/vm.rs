@@ -16,11 +16,29 @@ use super::model::{
 ///
 /// `allow_rx` is passed to the writer so a live implementation may permit
 /// executable (`R-X`) pages, exactly as Atmosphère's own cheat VM does.
+/// Why a memory operation failed, as far as the writer can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    Other,
+    /// The console says the target process is gone (the title was closed or it
+    /// crashed).  Nothing can be restored at that point: the bytes that were
+    /// already written died with the process, so retrying a rollback only
+    /// produces a wall of identical errors.
+    TargetGone,
+}
+
 pub trait CheatMemoryIo {
     fn read_mem(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String>;
     fn write_mem(&mut self, address: u64, data: &[u8], allow_rx: bool) -> Result<(), String>;
     fn pause_process(&mut self) -> Result<(), String>;
     fn resume_process(&mut self) -> Result<(), String>;
+
+    /// Classify an error string this object produced.  The default keeps every
+    /// failure in [`FailureKind::Other`]; a live client overrides it when the
+    /// console's result code says the process disappeared.
+    fn failure_kind(&self, _error: &str) -> FailureKind {
+        FailureKind::Other
+    }
 }
 
 impl<T: CheatMemoryIo + ?Sized> CheatMemoryIo for &mut T {
@@ -38,6 +56,10 @@ impl<T: CheatMemoryIo + ?Sized> CheatMemoryIo for &mut T {
 
     fn resume_process(&mut self) -> Result<(), String> {
         (**self).resume_process()
+    }
+
+    fn failure_kind(&self, error: &str) -> FailureKind {
+        (**self).failure_kind(error)
     }
 }
 
