@@ -8,6 +8,9 @@
 //!
 //! The GUI is hand-drawn on plain Win32 (no framework, no GPU): instant start,
 //! low memory, and a redraw that only touches what is visible.
+// A double-clicked GUI must not flash a console window; CLI mode takes the parent
+// console back in `console::ensure_cli_output()`.  Debug builds keep the console so a
+// developer sees panics and logs immediately.
 #![allow(dead_code)]
 
 // The engine re-exports its whole public surface; the GUI/CLI use a subset.
@@ -15,6 +18,7 @@
 mod cheat;
 mod cli;
 mod client;
+mod console;
 mod dump;
 mod edizon;
 mod gui;
@@ -34,6 +38,8 @@ fn main() {
         || args.iter().any(|a| a == "--tab");
 
     if wants_gui {
+        // Release GUI has no console; a debug build does, and it must not show it.
+        console::hide_own_console();
         let mut host: Option<String> = std::env::var("NXUS_HOST").ok().filter(|s| !s.trim().is_empty());
         let mut port: Option<u16> = std::env::var("NXUS_PORT").ok().and_then(|s| s.trim().parse().ok());
         let mut screenshot: Option<String> = None;
@@ -72,6 +78,10 @@ fn main() {
         }
         std::process::exit(gui::run(host, port, screenshot, start_tab));
     }
+
+    // CLI mode: attach the console this GUI-subsystem binary did not get.  Must run
+    // before the first println! so the handle is in place when stdout is first used.
+    console::ensure_cli_output();
 
     std::process::exit(cli::run(&args));
 }

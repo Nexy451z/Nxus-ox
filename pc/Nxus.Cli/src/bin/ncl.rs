@@ -27,6 +27,8 @@
 mod cheat;
 #[path = "../client.rs"]
 mod client;
+#[path = "../console.rs"]
+mod console;
 #[path = "../pcscan.rs"]
 mod pcscan;
 #[path = "../png.rs"]
@@ -2845,6 +2847,20 @@ fn font_definitions() -> egui::FontDefinitions {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `--list` / `--check` / `--help` print to stdout: give them a console (or keep an
+    // inherited pipe).  Everything else is the GUI, which must stay console-free.
+    let cli_like = args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--list" | "--check" | "--help" | "-help" | "-h" | "help" | "/?" | "--version" | "-V"
+        )
+    });
+    if cli_like {
+        console::ensure_cli_output();
+    } else {
+        console::hide_own_console();
+    }
 
     if let Some(code) = parse_cli(&args) {
         std::process::exit(code);
