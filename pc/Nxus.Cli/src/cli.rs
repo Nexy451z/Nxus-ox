@@ -308,8 +308,29 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+/// Every top-level command the dispatcher below understands.
+///
+/// Kept next to the dispatcher (not derived from it) so an unknown word can be
+/// rejected before dialling the console.  `every_documented_command_is_accepted`
+/// fails when this list and the usage text drift apart - `pids` was missing once and
+/// the CLI answered "is the console running?" for a perfectly good command.
+const COMMANDS: &[&str] = &[
+    "attach", "break", "cheat", "config", "continue", "detach", "disasm", "dump", "events",
+    "forceopen", "freeze", "frozen", "list", "log", "mappings", "metadata", "modules", "off",
+    "on", "panic-off", "pause", "pids", "processes", "ptrscan", "read", "regs", "resume",
+    "scan", "snapshot", "status", "step", "threads", "unfreeze", "watch", "write",
+];
+
 fn execute(opts: &Opts) -> Result<()> {
     let command = opts.positional.first().map(|s| s.as_str()).unwrap_or("");
+
+    // Reject an unknown command BEFORE dialling the console: `nxus bogus` used to
+    // wait two seconds for a connection error ("is the console running?") instead of
+    // telling the user the command is not a command.
+    if !command.is_empty() && !COMMANDS.contains(&command) {
+        print!("{}", USAGE);
+        return Err(usage("unknown command"));
+    }
 
     // Offline commands that operate purely on a dump file on disk:
     if command == "dump" && opts.positional.get(1).map(|s| s.as_str()) == Some("info") {
@@ -2999,6 +3020,49 @@ fn run_cheat_file_command(client: &NxusClient, opts: &Opts, sub: &str) -> Result
         other => return Err(usage(&format!("cheat {other} (unknown subcommand)"))),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod command_list_tests {
+    use super::{COMMANDS, USAGE};
+
+    /// Section headings and prose that also start a line in the usage text.
+    const NOT_COMMANDS: &[&str] = &["session", "memory", "scanning", "snapshots", "analysis", "addresses"];
+
+    #[test]
+    fn every_documented_command_is_accepted() {
+        let mut missing = Vec::new();
+        for line in USAGE.lines() {
+            // Command lines start with two spaces and a lowercase word.
+            let Some(rest) = line.strip_prefix("  ") else { continue };
+            if rest.starts_with(' ') {
+                continue;
+            }
+            let Some(word) = rest.split(|c: char| !(c.is_ascii_lowercase() || c == '-')).next() else {
+                continue;
+            };
+            if word.is_empty() || NOT_COMMANDS.contains(&word) {
+                continue;
+            }
+            if !COMMANDS.contains(&word) {
+                missing.push(word.to_string());
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "usage documents commands the dispatcher rejects: {missing:?}");
+    }
+
+    #[test]
+    fn every_accepted_command_is_documented() {
+        let mut undocumented = Vec::new();
+        for command in COMMANDS {
+            if !USAGE.contains(command) {
+                undocumented.push(*command);
+            }
+        }
+        assert!(undocumented.is_empty(), "dispatcher accepts commands the usage never mentions: {undocumented:?}");
+    }
 }
 
 #[cfg(test)]
