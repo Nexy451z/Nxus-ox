@@ -1343,6 +1343,15 @@ impl ChainOwner {
     }
 }
 
+/// One open inline editor in the Results list.
+pub struct HitEdit {
+    pub hit_index: usize,
+    pub address: u64,
+    /// Byte width taken from the hit's own value type (falling back to the scan width).
+    pub width: u32,
+    pub text: String,
+}
+
 pub struct State {
     pub connected: bool,
     pub busy: bool,
@@ -1372,6 +1381,11 @@ pub struct State {
     pub scan_hits: u32,
     pub value_size: u32,
     pub selected: Option<usize>,
+    /// Inline value editor for the Results list.  The user asked why a hit could be
+    /// frozen and watched but not *changed*; every other view (hex, watchlist, disasm)
+    /// could write, so the list needs its own editor rather than a trip through the
+    /// hex view.
+    pub hit_edit: Option<HitEdit>,
     pub filter: String,
     pub sort_desc: bool,
     /// Bumped whenever the hit list itself changes (not when the filter does).
@@ -1444,6 +1458,7 @@ impl State {
             scan_hits: 0,
             value_size: 4,
             selected: None,
+            hit_edit: None,
             filter: String::new(),
             sort_desc: false,
             hits_generation: 0,

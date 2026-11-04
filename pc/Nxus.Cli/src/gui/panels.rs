@@ -873,6 +873,13 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
     let mut freeze: Option<(u64, u32)> = None;
     let mut watch: Option<u64> = None;
     let mut bookmark: Option<crate::protocol::Hit> = None;
+    // Inline value editor (see State::hit_edit): collected here and applied after the
+    // table so the borrow of `app` inside the row closures stays immutable.
+    let editing_index = app.st.hit_edit.as_ref().map(|edit| edit.hit_index);
+    let mut edit_text = app.st.hit_edit.as_ref().map(|edit| edit.text.clone()).unwrap_or_default();
+    let mut edit_start: Option<(usize, u64, u32, String)> = None;
+    let mut edit_commit = false;
+    let mut edit_cancel = false;
     let frozen = app.st.frozen.clone();
     let main_base = app.st.main_base();
     let selected = app.st.selected;
@@ -906,8 +913,39 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
                 row.col(|ui| {
-                    let text = hit.display_value(value_size as u32);
-                    ui.label(RichText::new(text).monospace().color(GREEN));
+                    if editing_index == Some(hit_index) {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut edit_text)
+                                .desired_width(80.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            edit_commit = true;
+                        }
+                        if ui.small_button("set").clicked() {
+                            edit_commit = true;
+                        }
+                        if ui.small_button("cancel").clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            edit_cancel = true;
+                        }
+                    } else {
+                        let text = hit.display_value(value_size as u32);
+                        let width = hit_width(hit.value_type, app.st.value_size);
+                        // Clicking the value starts an edit: the list could freeze and
+                        // watch a hit but never change one, which is the first thing
+                        // anyone wants to do with a found address.
+                        if ui
+                            .add(egui::Label::new(RichText::new(text).monospace().color(GREEN))
+                                .sense(egui::Sense::click()))
+                            .on_hover_text("click to edit this value")
+                            .clicked()
+                        {
+                            edit_start =
+                                Some((hit_index, address, width, hit.display_value(width)));
+                        }
+                    }
                 });
                 row.col(|ui| {
                     ui.label(RichText::new(format!("main+{:#x}", offset)).monospace().color(DIM));
@@ -929,6 +967,15 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
                         if ui.small_button("freeze").clicked() {
                             freeze = Some((address, hit_width(hit.value_type, app.st.value_size)));
                         }
+                        if ui
+                            .small_button("set")
+                            .on_hover_text("edit this value")
+                            .clicked()
+                        {
+                            let width = hit_width(hit.value_type, app.st.value_size);
+                            edit_start =
+                                Some((hit_index, address, width, hit.display_value(width)));
+                        }
                         if ui.small_button("copy").clicked() {
                             ui.ctx().copy_text(format!("{:08X}", address));
                         }
@@ -939,6 +986,43 @@ fn results_tab(app: &mut App, ui: &mut egui::Ui) {
                 });
             });
         });
+
+    // ---- inline value editor ----
+    if let Some((hit_index, address, width, text)) = edit_start {
+        app.st.hit_edit = Some(super::HitEdit { hit_index, address, width, text });
+        app.st.selected = Some(hit_index);
+    } else if let Some(edit) = app.st.hit_edit.as_mut() {
+        edit.text = edit_text;
+    }
+    if edit_cancel {
+        app.st.hit_edit = None;
+    }
+    if edit_commit {
+        if let Some(edit) = app.st.hit_edit.take() {
+            let value = parse_value(&edit.text, edit.width);
+            // Write exactly the hit's own width: a fixed 4 bytes would clobber the
+            // neighbours of a u8/u16 field (the same bug the freeze path fixed).
+            let data: Vec<u8> = (0..edit.width)
+                .map(|byte| ((value >> (byte * 8)) & 0xFF) as u8)
+                .collect();
+            app.send(
+                Cmd::Write { address: edit.address, data },
+                "writing value",
+            );
+            // Show the new value immediately; the console may still be applying it,
+            // but the list would otherwise keep the old number until the next scan.
+            if let Some(hit) = app.st.hits.get_mut(edit.hit_index) {
+                hit.value = value;
+            }
+            app.st.log(format!(
+                "wrote {:0width$X} to {:08X} ({} byte(s))",
+                value,
+                edit.address,
+                edit.width,
+                width = (edit.width as usize) * 2
+            ));
+        }
+    }
 
     if let Some((hit_index, address)) = pending {
         app.st.selected = Some(hit_index);
