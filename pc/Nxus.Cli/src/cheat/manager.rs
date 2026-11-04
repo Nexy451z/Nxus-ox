@@ -26,15 +26,6 @@ pub const JOURNAL_MAGIC: &str = "NXUS-CHEAT-BACKUP 1";
 /// [`CheatManager::enable_block`].  `None` disables the limit.
 pub const DEFAULT_BLOCK_BUDGET: Option<Duration> = Some(Duration::from_secs(10));
 
-/// How many writes one block may plan and still have the target paused for the
-/// apply phase.
-///
-/// Pausing freezes the whole console, so it only pays off for a block small
-/// enough to finish while paused (a hook plus a cave).  A bulk write of many
-/// hundreds of bytes would keep the console frozen for far longer than the
-/// window it tries to protect.
-const PAUSE_WRITE_LIMIT: usize = 16;
-
 /// Page size used only to order the apply phase; addresses inside one page are
 /// never reordered.
 const APPLY_PAGE_SHIFT: u32 = 12;
@@ -248,6 +239,11 @@ pub struct RestoreReport {
     /// The cheat file could not be rewritten, so it still claims the cheats
     /// are on.
     pub save_error: Option<String>,
+    /// The target could not be frozen (or released) around the restore.  The
+    /// original bytes were still written back -- restoring is the safe
+    /// direction -- but the restore ran with the game live, so this is kept
+    /// visible instead of being swallowed.
+    pub freeze_error: Option<String>,
 }
 
 impl RestoreReport {
@@ -349,8 +345,6 @@ struct ApplyReport {
     /// Addresses the target accepted, in apply order.
     applied: Vec<u64>,
     error: Option<ApplyFailure>,
-    /// The target could not be paused; the writes were still applied.
-    pause_error: Option<String>,
     /// The pause was held but releasing it failed.
     resume_error: Option<String>,
 }
@@ -1240,6 +1234,11 @@ impl CheatManager {
     /// `failed` (with a count in `failed_addresses`) so the caller can retry
     /// instead of believing a half-finished restore.  A cheat-file write
     /// failure is reported in `save_error` without blocking the restore.
+    ///
+    /// Every restore is written with `allow_rx = true`, so the batch runs inside
+    /// a freeze whenever it has anything to write.  A refused freeze never
+    /// blocks the restore (putting originals back is the safe direction); it is
+    /// reported in `freeze_error` and `last_error` instead.
     pub fn restore_all_backups<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M) -> RestoreReport {
         let addresses: Vec<u64> = self.backups.keys().copied().collect();
         let cleared_cheats = self.enabled.len();
@@ -1249,21 +1248,38 @@ impl CheatManager {
             cleared_cheats,
             ..Default::default()
         };
-        for address in addresses {
-            let original = match self.backups.get(&address) {
-                Some(entry) => entry.original.clone(),
-                None => continue,
-            };
-            match io.write_mem(address, &original, true) {
-                Ok(()) => {
-                    self.backups.remove(&address);
-                    report.restored += 1;
-                }
-                Err(error) => {
-                    report.failed.push((address, error.clone()));
-                    self.last_error = Some(format!("restore 0x{address:X} failed: {error}"));
+        // The backup table records no page permissions, so every restore is
+        // written with `allow_rx = true`: a batch that may put code back runs
+        // inside one freeze.  A refused freeze must not stop a restore (putting
+        // the original bytes back is the safe direction), so the writes still
+        // happen and the failure is recorded.
+        let frozen = with_optional_freeze(io, !addresses.is_empty(), |io| {
+            let mut restored = 0usize;
+            let mut failed: Vec<(u64, String)> = Vec::new();
+            for address in addresses {
+                let original = match self.backups.get(&address) {
+                    Some(entry) => entry.original.clone(),
+                    None => continue,
+                };
+                match io.write_mem(address, &original, true) {
+                    Ok(()) => {
+                        self.backups.remove(&address);
+                        restored += 1;
+                    }
+                    Err(error) => failed.push((address, error)),
                 }
             }
+            (restored, failed)
+        });
+        let (restored, failed) = frozen.result;
+        report.restored = restored;
+        report.failed = failed;
+        for (address, error) in &report.failed {
+            self.last_error = Some(format!("restore 0x{address:X} failed: {error}"));
+        }
+        if let Some(error) = freeze_error_message(&frozen.pause_error, &frozen.resume_error) {
+            self.last_error = Some(error.clone());
+            report.freeze_error = Some(error);
         }
         report.failed_addresses = report.failed.len();
 
@@ -1302,8 +1318,9 @@ impl CheatManager {
     ///    writes instead of issuing them and overlays them for later reads.
     ///    A block that fails or overruns therefore leaves memory untouched.
     /// 2. *Apply*: only if the block succeeded, [`apply_plan`] preflights every
-    ///    address, optionally pauses the target, writes the plan in
-    ///    cave-before-hook order and verifies the result by reading it back.
+    ///    address, drops the stores whose bytes are already there, freezes the
+    ///    target before writing code, writes in cave-before-hook order and
+    ///    verifies the result by reading it back.
     ///
     /// The returned [`CodeRun`] carries the memory rollback bookkeeping and the
     /// exact list of addresses that reached the target.
@@ -1363,11 +1380,6 @@ impl CheatManager {
         let mut target_gone = false;
         if result.is_ok() {
             let report = apply_plan(io, &plan, deadline);
-            if let Some(error) = report.pause_error {
-                // Not fatal: the ordered writes still protect most of the
-                // window, so the block continues unpaused (the caller sees why).
-                self.last_error = Some(error);
-            }
             if let Some(error) = report.resume_error {
                 self.last_error = Some(error);
             }
@@ -1404,6 +1416,11 @@ impl CheatManager {
     /// lose the backup again.  When a write-back fails the backup is *kept*
     /// (so a later `panic_off` can still restore it) and the failure is
     /// returned, never swallowed.
+    ///
+    /// The write-back may put code back (the bytes it restores were patched as
+    /// code), so it is frozen whenever it really stores something.  A refused
+    /// freeze does not block the restore: the originals are written anyway and
+    /// the failure is returned with them.
     fn rollback_block<M: CheatMemoryIo + ?Sized>(
         &mut self,
         writes: Vec<(u64, PreWrite)>,
@@ -1414,34 +1431,45 @@ impl CheatManager {
             return Ok(());
         }
         let applied: BTreeSet<u64> = applied.iter().copied().collect();
+        let will_write = writes
+            .iter()
+            .any(|(address, _)| applied.contains(address));
         let mut failures: Vec<(u64, String)> = Vec::new();
-        for (address, pre) in writes.into_iter().rev() {
-            let restored = if applied.contains(&address) {
-                io.write_mem(address, &pre.previous, true)
-            } else {
-                Ok(())
-            };
-            match restored {
-                Ok(()) => {
-                    if pre.existed {
-                        if let Some(entry) = self.backups.get_mut(&address) {
-                            entry.owners = pre.owners;
-                            entry.written = pre.written;
-                            entry.state = pre.state;
+        let frozen = with_optional_freeze(io, will_write, |io| {
+            for (address, pre) in writes.into_iter().rev() {
+                let restored = if applied.contains(&address) {
+                    io.write_mem(address, &pre.previous, true)
+                } else {
+                    Ok(())
+                };
+                match restored {
+                    Ok(()) => {
+                        if pre.existed {
+                            if let Some(entry) = self.backups.get_mut(&address) {
+                                entry.owners = pre.owners;
+                                entry.written = pre.written;
+                                entry.state = pre.state;
+                            }
+                        } else {
+                            self.backups.remove(&address);
                         }
-                    } else {
-                        self.backups.remove(&address);
+                    }
+                    Err(error) => {
+                        // The target still holds our bytes: keep the restore data.
+                        failures.push((address, error));
                     }
                 }
-                Err(error) => {
-                    // The target still holds our bytes: keep the restore data.
-                    failures.push((address, error));
-                }
             }
-        }
+        });
+        let freeze_error = freeze_error_message(&frozen.pause_error, &frozen.resume_error);
         let journal_error = self.persist_journal().err();
         if failures.is_empty() && journal_error.is_none() {
-            return Ok(());
+            return match freeze_error {
+                None => Ok(()),
+                Some(error) => Err(format!(
+                    "rollback wrote the original bytes, but the target could not be frozen: {error}"
+                )),
+            };
         }
         let mut summary = failures
             .iter()
@@ -1453,6 +1481,12 @@ impl CheatManager {
                 summary.push_str(", ");
             }
             summary.push_str(&format!("journal: {error}"));
+        }
+        if let Some(error) = freeze_error {
+            if !summary.is_empty() {
+                summary.push_str(", ");
+            }
+            summary.push_str(&format!("freeze: {error}"));
         }
         Err(format!("rollback failed for {summary}"))
     }
@@ -1532,7 +1566,8 @@ impl CheatManager {
             .filter(|(_, entry)| entry.owners.contains(&key))
             .map(|(address, _)| *address)
             .collect();
-        let mut failures = Vec::new();
+        let mut failures: Vec<(u64, String)> = Vec::new();
+        let mut to_restore: Vec<u64> = Vec::new();
 
         for address in addresses {
             let exclusive = self
@@ -1549,33 +1584,56 @@ impl CheatManager {
                 }
                 continue;
             }
-
-            let entry = match self.backups.get(&address) {
-                Some(entry) => entry.clone(),
-                None => continue,
-            };
-            // Identity is bound to this manager instance; `set_target` clears
-            // the table before a different process can be addressed.
-            match io.write_mem(address, &entry.original, true) {
-                Ok(()) => {
-                    self.backups.remove(&address);
-                    if let Err(error) = self.persist_journal() {
-                        failures.push((address, error));
-                    }
-                }
-                Err(error) => failures.push((address, error)),
-            }
+            to_restore.push(address);
         }
 
+        // Restores are written with `allow_rx = true` (the backup table does
+        // not record page permissions), so the batch is frozen as soon as it
+        // stores anything.  A refused freeze does not stop the restore.
+        let frozen = with_optional_freeze(io, !to_restore.is_empty(), |io| {
+            for address in to_restore {
+                let entry = match self.backups.get(&address) {
+                    Some(entry) => entry.clone(),
+                    None => continue,
+                };
+                // Identity is bound to this manager instance; `set_target` clears
+                // the table before a different process can be addressed.
+                match io.write_mem(address, &entry.original, true) {
+                    Ok(()) => {
+                        self.backups.remove(&address);
+                        if let Err(error) = self.persist_journal() {
+                            failures.push((address, error));
+                        }
+                    }
+                    Err(error) => failures.push((address, error)),
+                }
+            }
+        });
+        let freeze_error = freeze_error_message(&frozen.pause_error, &frozen.resume_error);
+
         if failures.is_empty() {
+            if let Some(error) = freeze_error {
+                // The originals are back, so this is not a restore failure --
+                // but the game was live while they were written, and that must
+                // stay visible.
+                self.last_error = Some(format!(
+                    "restore wrote the original bytes without a complete freeze: {error}"
+                ));
+            }
             self.settle_dirty();
             Ok(())
         } else {
-            let summary = failures
+            let mut summary = failures
                 .iter()
                 .map(|(address, error)| format!("0x{address:X}: {error}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            if let Some(error) = freeze_error {
+                if !summary.is_empty() {
+                    summary.push_str(", ");
+                }
+                summary.push_str(&format!("freeze: {error}"));
+            }
             let message = format!("restore failed for {summary}");
             self.last_error = Some(message.clone());
             Err(message)
@@ -1683,8 +1741,9 @@ impl CheatManager {
 /// The guarantee is a *heuristic*, not a proof: nothing in the cheat format
 /// marks which store is the hook, and a cave that lives below the hook page, or
 /// a game thread that is already executing inside the target page, can still
-/// observe a partial patch.  It only reduces the window; the conditional pause
-/// in [`apply_plan`] closes it for small blocks.
+/// observe a partial patch.  The freeze in [`apply_plan`] closes that window:
+/// a plan that writes code runs with the target stopped, however many stores
+/// it contains.
 ///
 /// Writes inside the same 4 KB page keep their original order: they cannot be
 /// merged into one store, so reordering them would only make overlapping
@@ -1752,18 +1811,87 @@ impl<M: CheatMemoryIo + ?Sized> Drop for ResumeGuard<'_, M> {
     }
 }
 
+/// Outcome of [`with_optional_freeze`].
+struct FrozenRun<R> {
+    result: R,
+    /// The freeze was requested but the target refused it; `result` still ran.
+    pause_error: Option<String>,
+    /// The freeze was held but releasing it failed.
+    resume_error: Option<String>,
+}
+
+/// Run `body` with the target frozen when `wanted` is set.
+///
+/// The pause is released on every path (success, an early return inside
+/// `body`, a panic — see [`ResumeGuard`]).  A *refused* freeze never blocks the
+/// caller: a restore writes the safe direction, so the originals still go out
+/// and the failure is handed back for the caller to record.
+fn with_optional_freeze<M: CheatMemoryIo + ?Sized, R>(
+    io: &mut M,
+    wanted: bool,
+    body: impl FnOnce(&mut M) -> R,
+) -> FrozenRun<R> {
+    let mut pause_error = None;
+    let paused = if wanted {
+        match io.pause_process() {
+            Ok(()) => true,
+            Err(error) => {
+                pause_error = Some(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let mut guard = ResumeGuard { io, armed: paused };
+    let result = body(&mut *guard.io);
+    let mut resume_error = None;
+    if paused {
+        if let Err(error) = guard.resume_now() {
+            resume_error = Some(error);
+        }
+    }
+    FrozenRun {
+        result,
+        pause_error,
+        resume_error,
+    }
+}
+
+/// One readable message for a freeze that could not be taken or released.
+fn freeze_error_message(
+    pause_error: &Option<String>,
+    resume_error: &Option<String>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(error) = pause_error {
+        parts.push(format!("could not freeze the target: {error}"));
+    }
+    if let Some(error) = resume_error {
+        parts.push(format!("could not release the freeze: {error}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 /// Publish a block's planned writes.
 ///
 /// 1. *Preflight*: read every planned address first.  A target that rejects one
 ///    of them would reject the later store too, so nothing is written when any
-///    read fails -- not one byte.
-/// 2. *Pause* (conditional): freeze the process when the block is small and
-///    touches executable (`allow_rx`) pages, because those are the bytes the
-///    game may jump to.  A failed pause is not fatal: the ordered stores below
-///    still apply.
+///    read fails -- not one byte.  The same read answers "does this address
+///    already hold the planned bytes?"; those stores are dropped, so a loop
+///    that keeps re-applying an unchanged patch neither writes nor freezes.
+/// 2. *Freeze*: if anything left to write is an executable (`allow_rx`) store,
+///    freeze the process -- regardless of how many stores the plan holds.  A
+///    half-written `bl` is executed by the game and crashes it, so writing code
+///    without the freeze is not allowed: a refused freeze aborts the apply with
+///    no byte written.  Plans that only write data never freeze.
 /// 3. *Write* in cave-before-hook order (see [`apply_order`]).
-/// 4. *Verify*: read every address back.  A mismatch is a silent bit flip and
-///    is reported so the caller can roll the block back.
+/// 4. *Verify*: read every written address back while still frozen.  A mismatch
+///    is a silent bit flip and is reported so the caller can roll the block back.
 fn apply_plan<M: CheatMemoryIo + ?Sized>(
     io: &mut M,
     plan: &[PlannedWrite],
@@ -1776,38 +1904,60 @@ fn apply_plan<M: CheatMemoryIo + ?Sized>(
     let order = apply_order(plan);
 
     // Preflight: a target that cannot be read right now cannot be written.
+    // Addresses whose bytes already match need no store at all.
+    let mut pending: Vec<usize> = Vec::with_capacity(order.len());
     for index in &order {
         let write = &plan[*index];
         let size = u32::try_from(write.data.len()).unwrap_or(u32::MAX);
-        if let Err(error) = io.read_mem(write.address, size) {
-            report.error = Some(ApplyFailure {
-                message: format!(
-                    "preflight read failed at 0x{:X}: {error}; no byte was written",
-                    write.address
-                ),
-                target_gone: false,
-            });
-            return report;
+        match io.read_mem(write.address, size) {
+            Ok(bytes) if bytes.as_slice() == write.data.as_slice() => {}
+            Ok(_) => pending.push(*index),
+            Err(error) => {
+                report.error = Some(ApplyFailure {
+                    message: format!(
+                        "preflight read failed at 0x{:X}: {error}; no byte was written",
+                        write.address
+                    ),
+                    target_gone: false,
+                });
+                return report;
+            }
         }
     }
+    if pending.is_empty() {
+        // Everything already holds the planned bytes: no store needs to land,
+        // so there is nothing to protect and the target stays responsive.
+        return report;
+    }
 
-    let pause_wanted = plan.iter().any(|write| write.allow_rx) && plan.len() <= PAUSE_WRITE_LIMIT;
+    let pause_wanted = pending.iter().any(|index| plan[*index].allow_rx);
     let mut paused = false;
     if pause_wanted {
         match io.pause_process() {
             Ok(()) => paused = true,
             Err(error) => {
-                // Not fatal: ordered stores still reduce the window.
-                report.pause_error = Some(format!(
-                    "pause before applying writes failed: {error}; applying without pausing"
-                ));
+                let target_gone = io.failure_kind(&error) == FailureKind::TargetGone;
+                let address = pending
+                    .iter()
+                    .find(|index| plan[**index].allow_rx)
+                    .map(|index| plan[*index].address)
+                    .unwrap_or(plan[pending[0]].address);
+                // Writing code while the game runs is exactly the crash this
+                // freeze exists for: refuse instead of "probably fine".
+                report.error = Some(ApplyFailure {
+                    message: format!(
+                        "cannot freeze the target, refusing to patch code at 0x{address:X}: {error}; no byte was written"
+                    ),
+                    target_gone,
+                });
+                return report;
             }
         }
     }
 
     {
         let mut guard = ResumeGuard { io, armed: paused };
-        for index in &order {
+        for index in &pending {
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
                     report.error = Some(ApplyFailure {
@@ -1846,7 +1996,7 @@ fn apply_plan<M: CheatMemoryIo + ?Sized>(
         if report.error.is_none() {
             let mut mismatches: Vec<String> = Vec::new();
             let mut target_gone = false;
-            for index in &order {
+            for index in &pending {
                 let write = &plan[*index];
                 let size = u32::try_from(write.data.len()).unwrap_or(u32::MAX);
                 match guard.io.read_mem(write.address, size) {
@@ -2252,6 +2402,10 @@ mod tests {
         fail_read_after: usize,
         reads: usize,
         pause_fails: bool,
+        /// 1-based pause call from which `pause_process` starts failing
+        /// (0 = never).  Lets a test freeze successfully for the apply and then
+        /// fail the freeze of the rollback.
+        pause_fails_from: usize,
         pause_calls: usize,
         resume_calls: usize,
     }
@@ -2272,6 +2426,7 @@ mod tests {
                 fail_read_after: 0,
                 reads: 0,
                 pause_fails: false,
+                pause_fails_from: 0,
                 pause_calls: 0,
                 resume_calls: 0,
             }
@@ -2350,7 +2505,9 @@ mod tests {
 
         fn pause_process(&mut self) -> Result<(), String> {
             self.pause_calls += 1;
-            if self.pause_fails {
+            if self.pause_fails
+                || (self.pause_fails_from != 0 && self.pause_calls >= self.pause_fails_from)
+            {
                 return Err("pause rejected by the target".to_string());
             }
             self.paused = true;
@@ -2446,7 +2603,9 @@ mod tests {
         assert_eq!(writes_after_enable, 1);
 
         manager.tick(&mut io, 0);
-        assert_eq!(io.write_count(), writes_after_enable + 1);
+        // The loop stores the same value again, but the address already holds
+        // it: no store is issued (and therefore no freeze is wasted).
+        assert_eq!(io.write_count(), writes_after_enable);
         assert_eq!(manager.backup_count(), 1);
     }
 
@@ -3262,7 +3421,7 @@ B4000000 00000000
     }
 
     #[test]
-    fn pause_is_taken_for_small_rx_blocks_and_released_on_error() {
+    fn pause_is_taken_for_rx_blocks_and_released_on_error() {
         let text = "\
 [Two]
 04400000 00001234 00000063
@@ -3280,7 +3439,8 @@ B4000000 00000000
         assert_eq!(io.resume_calls, 1);
         assert!(!io.paused);
 
-        // The same block failing mid-apply must release the pause as well.
+        // The same block failing mid-apply must release the pause as well; the
+        // rollback that writes the first store back takes its own freeze.
         let dir = TempDir::new("pause-error");
         dir.write(&format!("{BUILD}.txt"), &text);
         let mut io = TestIo::with_u32(ADDRESS, 5);
@@ -3290,16 +3450,23 @@ B4000000 00000000
                 .unwrap();
         let key = manager.find_key("Two").unwrap();
         manager.enable(key, &mut io).unwrap_err();
-        assert_eq!(io.pause_calls, 1, "the pause was taken before the stores");
-        assert_eq!(io.resume_calls, 1, "an error path must still resume");
+        assert_eq!(
+            io.pause_calls, 2,
+            "one freeze for the apply, one for the rollback"
+        );
+        assert_eq!(io.resume_calls, 2, "an error path must still resume");
         assert!(!io.paused, "the console must never be left frozen");
+        assert_eq!(io.value_u32(ADDRESS), 5, "the rollback put the byte back");
     }
 
+    /// Regression for the old 16-store `PAUSE_WRITE_LIMIT`: the longest (and
+    /// therefore most dangerous) patches were exactly the ones that skipped the
+    /// freeze.
     #[test]
-    fn pause_is_skipped_for_blocks_over_the_write_limit() {
-        let dir = TempDir::new("pause-limit");
+    fn long_rx_block_is_still_frozen() {
+        let dir = TempDir::new("pause-long");
         let mut text = String::from("[Many]\n");
-        for index in 0..=PAUSE_WRITE_LIMIT as u64 {
+        for index in 0..21u64 {
             text.push_str(&format!("04400000 {:08X} 00000001\n", 0x100 + index * 4));
         }
         dir.write(&format!("{BUILD}.txt"), &text);
@@ -3310,17 +3477,18 @@ B4000000 00000000
         let key = manager.find_key("Many").unwrap();
         manager.enable(key, &mut io).unwrap();
 
-        assert_eq!(io.write_count(), PAUSE_WRITE_LIMIT + 1);
+        assert_eq!(io.write_count(), 21);
         assert_eq!(
-            io.pause_calls, 0,
-            "a bulk write must not freeze the console for its whole duration"
+            io.pause_calls, 1,
+            "a 21-store code patch must be frozen, not skipped by a size limit"
         );
+        assert_eq!(io.resume_calls, 1);
         assert!(!io.paused);
     }
 
     #[test]
-    fn failed_pause_still_applies_and_is_reported() {
-        let dir = TempDir::new("pause-fails");
+    fn refused_pause_aborts_rx_block_without_writing() {
+        let dir = TempDir::new("pause-refused");
         dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
         let mut io = TestIo::with_u32(ADDRESS, 5);
         io.pause_fails = true;
@@ -3328,17 +3496,265 @@ B4000000 00000000
             CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
                 .unwrap();
         let key = manager.find_key("Value").unwrap();
-        manager.enable(key, &mut io).unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
 
-        assert_eq!(io.value_u32(ADDRESS), 0x63);
-        assert_eq!(io.pause_calls, 1);
+        assert!(
+            error.contains("cannot freeze the target, refusing to patch code at 0x1234"),
+            "{error}"
+        );
+        assert!(error.contains("no byte was written"), "{error}");
+        assert_eq!(
+            io.write_count(),
+            0,
+            "a refused freeze must not let a half patch through: {:?}",
+            io.writes
+        );
+        assert_eq!(io.value_u32(ADDRESS), 5);
         assert_eq!(
             io.resume_calls, 0,
             "nothing was paused, so nothing to resume"
         );
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+        assert!(!manager.journal_path().exists());
+    }
+
+    fn planned(address: u64, data: &[u8], allow_rx: bool) -> PlannedWrite {
+        PlannedWrite {
+            address,
+            data: data.to_vec(),
+            allow_rx,
+        }
+    }
+
+    /// The apply failure as text, for assertions.
+    fn apply_error(report: &ApplyReport) -> String {
+        match &report.error {
+            Some(failure) => failure.message.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// A plan that only writes data must not stop the console: there is no code
+    /// for the game to execute half-written.
+    #[test]
+    fn a_data_only_plan_never_freezes() {
+        let mut io = TestIo::default();
+        let plan = vec![
+            planned(0x1000, &[0x11, 0x22, 0x33, 0x44], false),
+            planned(0x1004, &[0x55], false),
+        ];
+        let report = apply_plan(&mut io, &plan, None);
+
+        assert!(report.error.is_none(), "{}", apply_error(&report));
+        assert_eq!(io.written_addresses(), vec![0x1000, 0x1004]);
+        assert_eq!(io.pause_calls, 0, "data writes do not need a freeze");
+        assert_eq!(io.resume_calls, 0);
+        assert!(!io.paused);
+    }
+
+    /// Re-applying a patch that is already there is free: no store, no freeze.
+    #[test]
+    fn an_already_applied_patch_writes_nothing_and_never_freezes() {
+        let dir = TempDir::new("already-applied");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 0x63);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        assert_eq!(io.write_count(), 0, "{:?}", io.writes);
+        assert_eq!(io.pause_calls, 0, "an unchanged patch must not freeze");
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        // The original bytes are still recorded, so a later OFF is honest.
+        assert_eq!(manager.backup_count(), 1);
+        assert!(manager.is_enabled(key));
+    }
+
+    /// Once a loop patch is in place, its next ticks are skipped entirely
+    /// instead of freezing the console every poll.
+    #[test]
+    fn repeated_loop_ticks_do_not_freeze_again() {
+        let dir = TempDir::new("loop-freeze-once");
+        let text = "\
+[Value]
+@loop
+04400000 00001234 00000063
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.pause_calls, 1, "the first store needs the freeze");
+        let writes = io.write_count();
+        let pauses = io.pause_calls;
+
+        manager.tick(&mut io, 0);
+        manager.tick(&mut io, 0);
+        assert_eq!(io.write_count(), writes, "the value is already there");
+        assert_eq!(io.pause_calls, pauses, "no work, no freeze");
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+    }
+
+    /// Only the stores whose bytes differ are issued, all under one freeze.
+    #[test]
+    fn only_the_differing_stores_are_written_under_one_freeze() {
+        let mut io = TestIo::default();
+        for (offset, byte) in [0x11u8, 0x22, 0x33, 0x44].iter().enumerate() {
+            io.memory.insert(0x1000 + offset as u64, *byte);
+        }
+        let plan = vec![
+            planned(0x1000, &[0x11, 0x22, 0x33, 0x44], true),
+            planned(0x1004, &[0x55, 0x66, 0x77, 0x88], true),
+        ];
+        let report = apply_plan(&mut io, &plan, None);
+
+        assert!(report.error.is_none(), "{}", apply_error(&report));
+        assert_eq!(io.written_addresses(), vec![0x1004], "{:?}", io.writes);
+        assert_eq!(report.applied, vec![0x1004]);
+        assert_eq!(io.pause_calls, 1, "the whole batch shares one freeze");
+        assert_eq!(io.resume_calls, 1);
+        assert!(!io.paused);
+    }
+
+    /// A rollback writes the original bytes back.  When the rollback cannot
+    /// freeze, it must still restore (safe direction) and report the failure.
+    #[test]
+    fn rollback_without_a_freeze_still_restores_the_bytes() {
+        let dir = TempDir::new("rollback-unfrozen");
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        io.fail_write_at = Some(ADDRESS + 4);
+        // Call 1 is the apply freeze (succeeds); call 2 is the rollback freeze.
+        io.pause_fails_from = 2;
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+
+        assert!(error.contains("could not be frozen"), "{error}");
+        assert_eq!(io.pause_calls, 2, "the rollback tried to freeze as well");
+        assert_eq!(io.resume_calls, 1, "only the apply freeze was held");
+        assert_eq!(
+            io.value_u32(ADDRESS),
+            5,
+            "the originals were written back without the freeze"
+        );
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!io.paused);
+    }
+
+    /// A verification failure is an error path, but it must not leave the
+    /// console frozen.
+    #[test]
+    fn resume_is_called_when_verification_fails() {
+        let dir = TempDir::new("verify-resume");
+        let text = "\
+[Two]
+04400000 00001234 00000063
+04400000 00001238 00000064
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        io.ignore_write_at = Some(ADDRESS + 4);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Two").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+
+        assert!(error.contains("read-back verification failed"), "{error}");
+        assert_eq!(io.resume_calls, io.pause_calls, "every freeze is released");
+        assert!(!io.paused, "the console must never be left frozen");
+    }
+
+    /// Panic-off writes originals with `allow_rx = true`, so the whole batch is
+    /// frozen.
+    #[test]
+    fn panic_off_freezes_while_it_restores() {
+        let dir = TempDir::new("panic-freeze");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        let pauses = io.pause_calls;
+
+        let report = manager.restore_all_backups(&mut io);
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(report.restored, 1);
+        assert!(report.freeze_error.is_none(), "{report:?}");
+        assert_eq!(io.pause_calls, pauses + 1, "the restore is frozen");
+        assert_eq!(io.resume_calls, io.pause_calls);
+        assert!(!io.paused);
+        assert_eq!(io.value_u32(ADDRESS), 5);
+    }
+
+    /// A refused freeze must not stop panic-off: putting the originals back is
+    /// the safe direction, so the bytes are written and the failure recorded.
+    #[test]
+    fn panic_off_restores_even_when_the_freeze_is_refused() {
+        let dir = TempDir::new("panic-unfrozen");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        io.pause_fails_from = io.pause_calls + 1;
+
+        let report = manager.restore_all_backups(&mut io);
+        assert_eq!(report.restored, 1);
+        assert_eq!(io.value_u32(ADDRESS), 5, "the restore still happened");
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(report.is_complete(), "the bytes are back: {report:?}");
         assert!(
-            manager.last_error().unwrap().contains("pause"),
-            "the failed pause must stay visible: {:?}",
+            report.freeze_error.is_some(),
+            "the refused freeze must be visible: {report:?}"
+        );
+        assert!(manager.last_error().unwrap().contains("freeze"));
+    }
+
+    /// Disabling a cheat restores through `restore_owned`, which must also
+    /// freeze and must also restore when the freeze is refused.
+    #[test]
+    fn disable_restores_even_when_the_freeze_is_refused() {
+        let dir = TempDir::new("disable-unfrozen");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        let pauses = io.pause_calls;
+        io.pause_fails_from = pauses + 1;
+
+        manager.disable(key, &mut io).unwrap();
+        assert_eq!(io.pause_calls, pauses + 1, "the restore tried to freeze");
+        assert_eq!(io.value_u32(ADDRESS), 5, "the original is back");
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.is_enabled(key));
+        assert!(
+            manager.last_error().unwrap().contains("freeze"),
+            "{:?}",
             manager.last_error()
         );
     }

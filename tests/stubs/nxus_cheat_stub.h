@@ -56,6 +56,26 @@ void cheatTestSetDebugAttached(bool attached);
 void cheatTestSetServerExited(bool exited);
 void cheatTestSetHeldMask(u64 mask);
 
+/* Mark [base, base + size) as RX: readable and executable but NOT writable, the
+ * way the console maps .text.  The cheat service has to recognise such a range as
+ * a code patch (it then requires a dmnt Pause) while ordinary writable ranges are
+ * plain data writes. */
+void cheatTestSetRxRange(u64 base, u32 size);
+
+/* dmnt Pause/Resume (65004/65005).  cheatTestSetPauseFails() makes the next and
+ * every later Pause fail, so the "no freeze -> no code write" path can be driven. */
+u32  cheatTestPauses(void);
+u32  cheatTestResumes(void);
+void cheatTestSetPauseFails(bool fails);
+
+/* Writes issued through the debug session (nxusDebugWriteMemory) while attached. */
+u32  cheatTestDebugWrites(void);
+
+/* Ordered trace of the interesting calls: 'P' pause, 'R' resume, 'W' dmnt write,
+ * 'w' debug-session write.  Used to assert pause -> write -> resume ordering. */
+const char *cheatTestCallLog(void);
+void        cheatTestCallLogClear(void);
+
 /* Target memory, seeded directly (not counted as a writer call). */
 u8  *cheatTestMemory(void);
 void cheatTestPoke(u64 address, const void *data, u32 size);
@@ -76,4 +96,8 @@ const NxusCheatFault *cheatTestLastFault(void);
 void cheatTestClearEvents(void);
 
 const char *cheatTestLastLog(void);
+/* True when any log line written since the last cheatTestLogClear() contains
+ * `needle` (the last-line accessor alone is not enough when one call emits several
+ * lines, e.g. a refusal followed by the generic "sending CheatFault" line). */
+bool        cheatTestLogContains(const char *needle);
 void        cheatTestLogClear(void);

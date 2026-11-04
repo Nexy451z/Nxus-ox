@@ -848,3 +848,7 @@ NXUS_STATIC_ASSERT(sizeof(NxusCheatFault) == 16, "NxusCheatFault must be 16 byte
 
 #define NXUS_CHEAT_FAULT_TARGET_GONE 100u /* the title was closed or restarted */
 #define NXUS_CHEAT_FAULT_JOURNAL_FULL 101u
+/* The engine wanted to patch code but could not freeze the target (a debugger owns
+   it, or dmnt refused).  Writing code without the freeze is how a half-written `bl`
+   gets executed, so the block is refused instead. */
+#define NXUS_CHEAT_FAULT_CANNOT_FREEZE 102u

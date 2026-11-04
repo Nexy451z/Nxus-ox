@@ -38,24 +38,31 @@
  * cap is fine as long as the reservation stays inside the documented budget, and
  * the build stops if it does not.
  *
- * Measured on the shipped caps: program 17592 B, journal 12296 B, stack 8192 B,
- * total 38080 B.  Note that the interpreter's own caps, not this file, set that
- * number: 512 instructions x 24 B is 12 KiB on its own, and a 24-byte journal entry
- * x 512 is another 12 KiB, so the program+journal pair is ~30 KiB before the stack.
+ * Measured on the shipped caps: program 17592 B, real journal 12296 B, plan-pass
+ * journal 12296 B, stack 8192 B, total 50376 B.  Note that the interpreter's own
+ * caps, not this file, set that number: 512 instructions x 24 B is 12 KiB on its
+ * own, and a 24-byte journal entry x 512 is another 12 KiB, so the program + two
+ * journals are ~42 KiB before the stack.  The plan pass needs the second journal
+ * because the interpreter journals before calling write(); see CheatIoState.
  * The asserts below pin the real footprint instead of a figure the types cannot
- * meet, and they are upper bounds so a future core cap that grows either structure
+ * meet, and they are upper bounds so a future core cap that grows any structure
  * fails the build here rather than silently taking more of the sysmodule's memory. */
 static NxusCheatProgram g_Program;
 static NxusCheatJournal g_Journal;
+/* Journal of the read-only plan pass (see CheatIoState / cheatSrvWorkerStep).  It
+ * only exists so the interpreter's journal-full rule can run without polluting the
+ * real journal with addresses that were never written; its contents are discarded
+ * after every probe. */
+static NxusCheatJournal g_ProbeJournal;
 static alignas(0x1000) u8 g_WorkerStack[0x2000];
 
-#define CHEATSRV_STATIC_MAX_BYTES (40u * 1024u)
+#define CHEATSRV_STATIC_MAX_BYTES (52u * 1024u)
 NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) <= 20u * 1024u,
                    "NxusCheatProgram must stay inside the cheat service budget");
 NXUS_STATIC_ASSERT(sizeof(NxusCheatJournal) <= 16u * 1024u,
                    "NxusCheatJournal must stay inside the cheat service budget");
-NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) + sizeof(g_WorkerStack)
-                       <= CHEATSRV_STATIC_MAX_BYTES,
+NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
+                       sizeof(g_WorkerStack) <= CHEATSRV_STATIC_MAX_BYTES,
                    "cheat service static footprint exceeded");
 
 /* Worker thread.  One creator (Init) and one joiner (Exit), both on the boot /
@@ -84,6 +91,9 @@ static bool g_ProgramLoaded;                                  /* under g_CheatLo
 static u32  g_ConsecutiveFailures[NXUS_CHEATVM_MAX_BLOCKS];    /* under g_CheatLock */
 static u32  g_FaultCount;                                     /* under g_CheatLock */
 static u32  g_MissedTicks;                                    /* worker thread only */
+/* Debug-attach transition logs (worker thread only, reset by Init). */
+static bool g_DebugSuspended;
+static bool g_DebugRxNotified;
 
 /* The target a program was uploaded for.  Every tick compares this with the live
  * session identity / dmnt incarnation; a difference stops everything. */
@@ -134,24 +144,49 @@ static u64 cheatNowMs(void) {
  *   else     -> the range must be readable AND writable
  *               (nxusSessionCheckRange(..., true), the plain-write policy)
  *
- * Both query the LIVE target (dmnt, or the debug session - but the worker is
- * suspended while a debug session owns the process, so dmnt is the one in use), so
- * a freshly reloaded .text is judged as it is now rather than against a scan-time
- * snapshot.
+ * Both query the LIVE target (dmnt normally, the debug handle while a debug session
+ * owns the process), so a freshly reloaded .text is judged as it is now rather than
+ * against a scan-time snapshot.
  *
- * One validated range is cached for the duration of a single tick: a loop cheat
- * writes the same address 60 times a second, and re-asking dmnt for the mapping
- * on every store would double the IPC count of the hot path.  The cache is cleared
- * at the start of every tick (and before a journal restore), so a remapped region
- * can never be written through a stale verdict for longer than one tick.
+ * ---- RX (code) detection ------------------------------------------------
+ *
+ * "A store the code-patch policy accepts, on a mapping that is NOT writable" is a
+ * code patch: .text is R-X on the console while .data is RW.  The verdict is cached
+ * with the validated range (one query per mapping per tick), so a loop cheat that
+ * stores to the same page 60 times a second does not multiply the IPC count.
+ *
+ * ---- planning pass ------------------------------------------------------
+ *
+ * Writing a `bl` (or any code patch) while the title runs is how a half-written
+ * instruction gets executed.  A runnable block is therefore run TWICE:
+ *
+ *   1. a read-only PLAN pass with `probe = true`: every store is validated, the
+ *      current bytes are read and compared, and the block records whether it would
+ *      write anything and whether any of those writes land in RX,
+ *   2. only when at least one write is actually needed is the block run again for
+ *      real - inside Pause/Resume when it touches RX.
+ *
+ * This is what keeps a 16 ms loop free of freezes: after the first tick the target
+ * already holds the requested value, the plan pass sees "nothing to write", and
+ * neither a write nor a Pause is issued.
+ *
+ * The plan pass must not touch the real journal - it writes nothing, so journalling
+ * would claim ownership of bytes that were never patched.  It gets its own static
+ * journal instead (see g_ProbeJournal below).
  */
 typedef struct {
     bool range_ok;
     u64  range_base;
     u64  range_size;
+    bool range_code;       /* cached range is read-only/executable: code patch */
     u32  ranges_checked;
-    u32  writes_ok;
+    u32  writes_ok;        /* accepted writes (a skipped no-op counts as restored) */
     u32  writes_failed;
+    u32  writes_skipped;   /* the target already held the requested bytes */
+    u32  writes_needed;    /* probe: differing writes the apply pass has to issue */
+    bool probe;            /* read-only plan pass */
+    bool plan_needs_write; /* probe: at least one write differs from memory */
+    bool plan_needs_freeze;/* probe: at least one differing write targets RX */
 } CheatIoState;
 
 static bool cheatIoRangeAllowed(CheatIoState *state, u64 address, u32 size, bool allow_rx) {
@@ -169,6 +204,9 @@ static bool cheatIoRangeAllowed(CheatIoState *state, u64 address, u32 size, bool
         state->range_ok = true;
         state->range_base = address;
         state->range_size = size;
+        /* Same criterion as the write validation above, refined by the plain
+         * writable check: RX code pages are not writable, data pages are. */
+        state->range_code = allow_rx && !nxusSessionCheckRange(address, size, true);
     }
     return ok;
 }
@@ -181,18 +219,46 @@ static int cheatSrvIoRead(void *user, u64 address, void *out, u32 size) {
     return nxusSessionReadMemory(address, out, size);
 }
 
+/* Writer for the legitimate paths: dmnt owns the process normally, the debug
+ * session owns it while a debugger is attached (RX blocks never reach this then -
+ * they are refused before the write, see cheatSrvWorkerStep). */
+static Result cheatSrvWriteTarget(u64 address, const void *data, u32 size) {
+    if (nxusDebugIsAttached()) return nxusDebugWriteMemory(address, data, size);
+    return nxusDmntWrite(address, data, size);
+}
+
 static int cheatSrvIoWrite(void *user, u64 address, const void *data, u32 size, bool allow_rx) {
     CheatIoState *state = (CheatIoState *)user;
+    u8 current[8];
 
-    if (state == NULL || data == NULL || size == 0) return -1;
+    if (state == NULL || data == NULL || size == 0 || size > sizeof(current)) return -1;
     if (!cheatIoRangeAllowed(state, address, size, allow_rx)) {
         state->writes_failed++;
         return -1;
     }
-    /* The worker is suspended while a debug session owns the process (see
-     * cheatSrvWorkerStep), so dmnt is the writer here - the same call the server's
-     * Write handler makes when no debug session is attached. */
-    if (R_FAILED(nxusDmntWrite(address, data, size))) {
+
+    /* Requirement: never write bytes the target already holds.  For an RX block
+     * this is what makes the second and later ticks read-only: the plan pass
+     * reports "nothing to do" and no Pause is issued at all.  A skipped restore
+     * write still counts as restored, so PanicOff accounting stays exact. */
+    if (nxusSessionReadMemory(address, current, size) == 0 &&
+        memcmp(current, data, size) == 0) {
+        state->writes_skipped++;
+        state->writes_ok++;
+        return 0;
+    }
+
+    if (state->probe) {
+        /* Plan only: pretend the write succeeded so the rest of the block runs
+         * exactly as it would for real, but touch nothing. */
+        state->writes_needed++;
+        state->plan_needs_write = true;
+        if (state->range_code) state->plan_needs_freeze = true;
+        state->writes_ok++;
+        return 0;
+    }
+
+    if (R_FAILED(cheatSrvWriteTarget(address, data, size))) {
         state->writes_failed++;
         return -1;
     }
@@ -200,8 +266,9 @@ static int cheatSrvIoWrite(void *user, u64 address, const void *data, u32 size, 
     return 0;
 }
 
-static void cheatIoInit(CheatIoState *state, NxusCheatIo *io) {
+static void cheatIoInit(CheatIoState *state, NxusCheatIo *io, bool probe) {
     memset(state, 0, sizeof(*state));
+    state->probe = probe;
     io->user = state;
     io->read = cheatSrvIoRead;
     io->write = cheatSrvIoWrite;
@@ -266,26 +333,91 @@ static void cheatDisableBlockLocked(u32 index) {
     if (index < NXUS_CHEATVM_MAX_BLOCKS) g_ConsecutiveFailures[index] = 0;
 }
 
+/* ---- freezing (dmnt Pause/Resume) --------------------------------------- */
+
+/*
+ * Pause the target through dmnt (65004 PauseCheatProcess) before a code write.
+ * Returns true only when the process is genuinely stopped; the caller must then
+ * call cheatSrvUnfreeze() on EVERY path (success, VM error, early return).
+ *
+ * While nxus_debug owns the process dmnt is detached and 65004 cannot work.  The
+ * caller refuses the RX block instead of writing unfrozen code (see
+ * cheatSrvWorkerStep); this helper reports "no freeze" rather than attempting a
+ * dmnt call that would be answered by a closed service.
+ */
+static bool cheatSrvFreeze(const char *why) {
+    const u64 start_ns = cheatNowNs();
+    Result rc;
+
+    if (nxusDebugIsAttached()) {
+        NXUS_LOG_DEBUG("cheat: %s: a debug session owns the process - no dmnt freeze",
+                       (why != NULL) ? why : "freeze");
+        return false;
+    }
+    rc = nxusDmntPause();
+    if (R_FAILED(rc)) {
+        NXUS_LOG("cheat: %s: PauseCheatProcess failed (rc=0x%08X) - refusing the code write",
+                 (why != NULL) ? why : "freeze", (unsigned)rc);
+        return false;
+    }
+    /* No status field can carry this (NxusCheatStatus is a fixed 48-byte wire
+     * structure), so the freeze duration is logged instead. */
+    NXUS_LOG_DEBUG("cheat: %s: target frozen after %llu us",
+                   (why != NULL) ? why : "freeze",
+                   (unsigned long long)((cheatNowNs() - start_ns) / 1000ull));
+    return true;
+}
+
+/* Always paired with cheatSrvFreeze() == true.  A failed Resume is logged but not
+ * retried here: the caller is already at its single exit point and a retry would
+ * itself have to guess whether the process is running. */
+static void cheatSrvUnfreeze(const char *why) {
+    Result rc = nxusDmntResume();
+    if (R_FAILED(rc)) {
+        NXUS_LOG_ERROR("cheat: %s: ResumeCheatProcess failed (rc=0x%08X) - the target may "
+                       "still be stopped", (why != NULL) ? why : "freeze", (unsigned)rc);
+    }
+}
+
 /* Restore the journalled originals through the adapter and report what happened.
  * The counters live in the adapter, so a partial failure is reported exactly
- * instead of being inferred from the interpreter's all-or-nothing return value. */
+ * instead of being inferred from the interpreter's all-or-nothing return value.
+ *
+ * `freeze` wraps the restore in Pause/Resume: writing the originals back is also a
+ * code write, and a half-restored instruction is just as executable as a
+ * half-written patch.  The restore runs even when the freeze failed (restoring is
+ * the safe direction); `freeze_failed` records that it did so unfrozen. */
 typedef struct {
-    u32 restored;
-    u32 failed;
+    u32  restored;
+    u32  failed;
+    bool freeze_failed;   /* freeze was attempted for this restore and failed */
 } CheatRestoreCount;
 
-static CheatRestoreCount cheatRestoreJournalLocked(void) {
+static CheatRestoreCount cheatRestoreJournalLocked(bool freeze) {
     CheatRestoreCount count;
     CheatIoState state;
     NxusCheatIo io;
+    bool paused = false;
 
     memset(&count, 0, sizeof(count));
-    cheatIoInit(&state, &io);
+    if (freeze && g_Journal.count != 0) {
+        paused = cheatSrvFreeze("journal restore");
+        count.freeze_failed = !paused && !nxusDebugIsAttached();
+    }
+    cheatIoInit(&state, &io, false);
     if (nxusCheatJournalRestore(&g_Journal, &io, true) < 0) {
         NXUS_LOG_DEBUG("cheat: journal restore reported a failed address");
     }
     count.restored = state.writes_ok;
     count.failed = state.writes_failed;
+    if (count.freeze_failed) {
+        NXUS_LOG("cheat: journal restore: could not freeze the target - %u/%u address(es) "
+                 "written back without the freeze",
+                 (unsigned)count.restored, (unsigned)(count.restored + count.failed));
+    }
+    /* Single exit point: the target is resumed on success, on a partial restore
+     * and on a refused range, because the freeze must never outlive one restore. */
+    if (paused) cheatSrvUnfreeze("journal restore");
     return count;
 }
 
@@ -355,33 +487,124 @@ static bool cheatWorkerShouldRun(void) {
     return !nxusServerHasExited();
 }
 
+/* ---- per-block execution ------------------------------------------------
+ *
+ * nxusCheatTick() runs every block in one go, which cannot express a
+ * per-block Pause/Resume.  The worker therefore drives one block at a time with
+ * the interpreter's public nxusCheatRunBlock() and mirrors the tick bookkeeping
+ * (patch blocks once per enable, exactly one execs/tick_count step per tick).
+ *
+ * A block is executed in two passes:
+ *   probe  - read-only; reports whether anything would be written and whether
+ *            any of it targets code,
+ *   apply  - only when the probe found a differing write; the real journal and
+ *            the real writer, inside Pause/Resume when the target is code.
+ */
+
+/* Read-only plan pass.  Does not touch the real journal and writes nothing.
+ * `state`/`io` are owned by the caller so the apply pass below can reuse the
+ * validated-range cache (one live mapping query per range per tick, not two). */
+static int cheatSrvProbeBlockLocked(u32 index, u64 keys, CheatIoState *state,
+                                    NxusCheatIo *io, bool *needs_write,
+                                    bool *needs_freeze) {
+    int rc;
+
+    nxusCheatJournalReset(&g_ProbeJournal);
+    cheatIoInit(state, io, true);
+    rc = nxusCheatRunBlock(&g_Program, index, io, keys, &g_ProbeJournal);
+    if (needs_write != NULL) *needs_write = state->plan_needs_write;
+    if (needs_freeze != NULL) *needs_freeze = state->plan_needs_freeze;
+    return rc;
+}
+
+/* Real pass: writes through the real journal, skipping bytes the target already
+ * holds (the adapter does that read/compare itself).  Reuses the plan pass's
+ * range cache; only the mode changes. */
+static int cheatSrvApplyBlockLocked(u32 index, u64 keys, CheatIoState *state,
+                                    NxusCheatIo *io) {
+    state->probe = false;
+    return nxusCheatRunBlock(&g_Program, index, io, keys, &g_Journal);
+}
+
+static void cheatBlockSucceededLocked(u32 index) {
+    NxusCheatBlockState *state = &g_Program.state[index];
+
+    state->execs++;
+    state->last_error = 0;
+    state->error_pc = 0;
+    if (g_Program.blocks[index].mode == 0) state->ran_once = true;
+    g_ConsecutiveFailures[index] = 0;
+}
+
+/* Same failure policy the tick path had: a transient failure is retried,
+ * NXUS_CHEATSRV_FAIL_LIMIT consecutive ones disable the block, and a full journal
+ * disables it immediately (waiting would only repeat the refusal).
+ *
+ * nxusCheatRunBlock() does not expose the failing instruction index (only the
+ * internal cheatRunBlock() of core does), so error_pc is reported as 0 rather
+ * than guessed. */
+static void cheatBlockFailedLocked(u32 index, int rc, NxusCheatFault *fault,
+                                   bool *have_fault) {
+    NxusCheatBlockState *state = &g_Program.state[index];
+
+    state->execs++;
+    state->last_error = (u32)rc;
+    state->error_pc = 0;
+
+    if (rc == NXUS_CHEATVM_ERR_WRITE && g_Journal.count >= g_Journal.capacity) {
+        if (fault != NULL && have_fault != NULL && !*have_fault) {
+            memset(fault, 0, sizeof(*fault));
+            fault->reason = NXUS_CHEAT_FAULT_JOURNAL_FULL;
+            fault->block = index;
+            fault->pc = 0;
+            *have_fault = true;
+        }
+        cheatDisableBlockLocked(index);
+        NXUS_LOG("cheat: block %u: journal full - block disabled", (unsigned)index);
+        return;
+    }
+
+    if (g_ConsecutiveFailures[index] < 0xFFu) g_ConsecutiveFailures[index]++;
+    if (g_ConsecutiveFailures[index] < NXUS_CHEATSRV_FAIL_LIMIT) return;
+
+    if (fault != NULL && have_fault != NULL && !*have_fault) {
+        memset(fault, 0, sizeof(*fault));
+        fault->reason = (u32)(-(s32)rc);   /* the documented positive code */
+        fault->block = index;
+        fault->pc = 0;
+        *have_fault = true;
+    }
+    cheatDisableBlockLocked(index);
+    NXUS_LOG("cheat: block %u failed %u tick(s) in a row (err=%d) - block disabled",
+             (unsigned)index, (unsigned)NXUS_CHEATSRV_FAIL_LIMIT, rc);
+}
+
 /* One tick: verify the target, run every enabled block through the interpreter,
  * disarm blocks that keep failing.  Exposed to the host test through the file
  * include (it is static on purpose: only the worker may call it in production). */
 static void cheatSrvWorkerStep(void) {
-    CheatIoState io;
-    NxusCheatIo io_iface;
     CheatTarget now;
     NxusCheatFault fault;
     bool have_fault = false;
+    bool debug_attached;
     u32 blocks;
-    u32 before[NXUS_CHEATVM_MAX_BLOCKS];
     u32 i;
-    static bool debug_suspended;
 
-    /* While a debug session owns the process dmnt is closed, and this project
-     * deliberately suspends the cheat VM for that window (nxus_debug.h: "cheat VM
-     * support is suspended while debug mode is active").  Log the two transitions
-     * once each so a user is not left wondering why the codes stopped. */
-    if (nxusDebugIsAttached()) {
-        if (!debug_suspended) {
-            debug_suspended = true;
-            NXUS_LOG("cheat: debug session holds the process - the cheat worker is suspended");
+    /* While a debug session owns the process dmnt is closed, so 65004 cannot
+     * freeze anything.  Data-only blocks may keep running (they use the debug
+     * handle), but a block that patches code is REFUSED: writing half an
+     * instruction while the title runs is exactly the crash this guards. */
+    debug_attached = nxusDebugIsAttached();
+    if (debug_attached) {
+        if (!g_DebugSuspended) {
+            g_DebugSuspended = true;
+            g_DebugRxNotified = false;
+            NXUS_LOG("cheat: debug session holds the process - RX blocks are suspended "
+                     "(data-only blocks keep running)");
         }
-        return;
-    }
-    if (debug_suspended) {
-        debug_suspended = false;
+    } else if (g_DebugSuspended) {
+        g_DebugSuspended = false;
+        g_DebugRxNotified = false;
         NXUS_LOG("cheat: debug session released - the cheat worker resumes");
     }
 
@@ -406,7 +629,11 @@ static void cheatSrvWorkerStep(void) {
          * would patch an unrelated address. */
         const CheatTarget uploaded = g_Owner;
         const u32 stopped = cheatDisableAllLocked();
-        const CheatRestoreCount restored = cheatRestoreJournalLocked();
+        /* No freeze here: the identity just changed, so a Pause would stop a
+         * process these journalled addresses no longer belong to.  The restore is
+         * still attempted (writing through the live mapping check refuses any
+         * address that moved). */
+        const CheatRestoreCount restored = cheatRestoreJournalLocked(false);
 
         nxusCheatJournalReset(&g_Journal);
         memset(&g_Owner, 0, sizeof(g_Owner));   /* no further ticks until a re-upload */
@@ -434,59 +661,94 @@ static void cheatSrvWorkerStep(void) {
 
     blocks = g_Program.header.block_count;
     if (blocks > NXUS_CHEATVM_MAX_BLOCKS) blocks = NXUS_CHEATVM_MAX_BLOCKS;
-    for (i = 0; i < blocks; i++) before[i] = g_Program.state[i].execs;
 
-    cheatIoInit(&io, &io_iface);
     /* The HID mask is sampled EVERY tick (the worker owns that read; a user presses
-     * the combo long after the upload), and the interpreter decides which blocks
-     * run: enabled loop blocks every tick, an enabled patch block once. */
-    (void)nxusCheatTick(&g_Program, &io_iface, nxusHidHeldMask(), &g_Journal);
+     * the combo long after the upload).  Each runnable block - an enabled loop
+     * block every tick, an enabled patch block once - runs through the plan pass
+     * first, and only a block that really has something to write is applied. */
+    {
+        const u64 keys = nxusHidHeldMask();
 
-    for (i = 0; i < blocks; i++) {
-        const NxusCheatBlockState *state = &g_Program.state[i];
-        u32 reason;
+        for (i = 0; i < blocks; i++) {
+            NxusCheatBlockState *state = &g_Program.state[i];
+            CheatIoState io_state;
+            NxusCheatIo io;
+            bool needs_write = false;
+            bool needs_freeze = false;
+            bool paused = false;
+            int rc;
 
-        /* execs moved => the interpreter ran this block in this tick; a block that
-         * is disabled or already ran its patch keeps its old error fields. */
-        if (state->execs == before[i]) continue;
-        if (state->last_error == 0) {
-            g_ConsecutiveFailures[i] = 0;   /* recovered */
-            continue;
-        }
+            if (!state->enabled) continue;
+            if (g_Program.blocks[i].mode == 0 && state->ran_once) continue;
 
-        reason = (u32)(-(s32)state->last_error);   /* the documented positive code */
-        if (state->last_error == (u32)NXUS_CHEATVM_ERR_WRITE &&
-            g_Journal.count >= g_Journal.capacity) {
-            /* Out of journal slots: nothing can be patched any more and waiting
-             * three ticks would only repeat the same refusal. */
-            if (!have_fault) {
-                memset(&fault, 0, sizeof(fault));
-                fault.reason = NXUS_CHEAT_FAULT_JOURNAL_FULL;
-                fault.block = i;
-                fault.pc = state->error_pc;
-                fault.restored = 0;
-                have_fault = true;
+            rc = cheatSrvProbeBlockLocked(i, keys, &io_state, &io, &needs_write,
+                                          &needs_freeze);
+            if (rc != NXUS_CHEATVM_OK) {
+                /* The plan pass already validates ranges and journals, so this is
+                 * the same failure the real pass would report - and it happened
+                 * without a single write. */
+                cheatBlockFailedLocked(i, rc, &fault, &have_fault);
+                continue;
             }
-            cheatDisableBlockLocked(i);
-            NXUS_LOG("cheat: block %u: journal full - block disabled", (unsigned)i);
-            continue;
-        }
+            if (!needs_write) {
+                /* Everything the block would write is already there: no write and,
+                 * crucially, no Pause.  This is the steady state of a 16 ms loop. */
+                cheatBlockSucceededLocked(i);
+                continue;
+            }
 
-        if (g_ConsecutiveFailures[i] < 0xFFu) g_ConsecutiveFailures[i]++;
-        if (g_ConsecutiveFailures[i] < NXUS_CHEATSRV_FAIL_LIMIT) continue;
+            if (needs_freeze && debug_attached) {
+                /* dmnt is detached: no 65004, so no safe code write.  Skip the
+                 * block (it stays enabled and resumes after the debug detach) and
+                 * tell the PC once per attach instead of hammering the link. */
+                if (!g_DebugRxNotified) {
+                    g_DebugRxNotified = true;
+                    if (!have_fault) {
+                        memset(&fault, 0, sizeof(fault));
+                        fault.reason = NXUS_CHEAT_FAULT_CANNOT_FREEZE;
+                        fault.block = i;
+                        fault.pc = 0;
+                        fault.restored = 0;
+                        have_fault = true;
+                    }
+                    NXUS_LOG("cheat: block %u patches code but a debug session owns the "
+                             "process - RX block not executed (no dmnt freeze)", (unsigned)i);
+                }
+                continue;
+            }
 
-        if (!have_fault) {
-            memset(&fault, 0, sizeof(fault));
-            fault.reason = reason;
-            fault.block = i;
-            fault.pc = state->error_pc;
-            fault.restored = 0;
-            have_fault = true;
+            if (needs_freeze) {
+                paused = cheatSrvFreeze("cheat RX block");
+                if (!paused) {
+                    /* The exact accident this guards: write a code patch only while
+                     * the title is stopped.  No freeze -> no write at all. */
+                    if (!have_fault) {
+                        memset(&fault, 0, sizeof(fault));
+                        fault.reason = NXUS_CHEAT_FAULT_CANNOT_FREEZE;
+                        fault.block = i;
+                        fault.pc = 0;
+                        fault.restored = 0;
+                        have_fault = true;
+                    }
+                    cheatDisableBlockLocked(i);
+                    NXUS_LOG("cheat: block %u patches code but the target could not be "
+                             "frozen - block disabled without writing", (unsigned)i);
+                    continue;
+                }
+            }
+
+            rc = cheatSrvApplyBlockLocked(i, keys, &io_state, &io);
+            /* Single exit point: resume on success, on a VM error and on a failed
+             * write alike.  The freeze never outlives this block. */
+            if (paused) cheatSrvUnfreeze("cheat RX block");
+
+            if (rc == NXUS_CHEATVM_OK) {
+                cheatBlockSucceededLocked(i);
+            } else {
+                cheatBlockFailedLocked(i, rc, &fault, &have_fault);
+            }
         }
-        cheatDisableBlockLocked(i);
-        NXUS_LOG("cheat: block %u failed %u tick(s) in a row (err=%d pc=%u) - block disabled",
-                 (unsigned)i, (unsigned)NXUS_CHEATSRV_FAIL_LIMIT, (int)state->last_error,
-                 (unsigned)state->error_pc);
+        g_Program.tick_count++;
     }
 
     if (have_fault) g_FaultCount++;
@@ -555,11 +817,14 @@ void nxusCheatSrvInit(void) {
      * (Init runs on the boot path, before the listener serves cheat commands). */
     nxusCheatReset(&g_Program);
     nxusCheatJournalReset(&g_Journal);
+    nxusCheatJournalReset(&g_ProbeJournal);
     memset(&g_Owner, 0, sizeof(g_Owner));
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));
     g_ProgramLoaded = false;
     g_FaultCount = 0;
     g_MissedTicks = 0;
+    g_DebugSuspended = false;
+    g_DebugRxNotified = false;
     atomic_store_explicit(&g_WorkerStop, false, memory_order_release);
     atomic_store_explicit(&g_WorkerDone, true, memory_order_release);
     atomic_store_explicit(&g_Shutdown, false, memory_order_release);
@@ -636,7 +901,7 @@ void nxusCheatSrvExit(void) {
     if (g_ProgramLoaded && g_Journal.count != 0) {
         CheatTarget now;
         if (cheatTargetSample(&now) && cheatTargetSame(&g_Owner, &now)) {
-            const CheatRestoreCount restored = cheatRestoreJournalLocked();
+            const CheatRestoreCount restored = cheatRestoreJournalLocked(true);
             NXUS_LOG("cheat: exit restored %u address(es) (%u failed)",
                      (unsigned)restored.restored, (unsigned)restored.failed);
         } else {
@@ -715,7 +980,7 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
      * describes what the OLD one patched.  Undo it (the addresses belong to the
      * target we just verified) and start from an empty journal. */
     if (g_Journal.count != 0) {
-        const CheatRestoreCount restored = cheatRestoreJournalLocked();
+        const CheatRestoreCount restored = cheatRestoreJournalLocked(true);
         NXUS_LOG("cheat: previous program: %u address(es) restored (%u failed)",
                  (unsigned)restored.restored, (unsigned)restored.failed);
     }
@@ -831,17 +1096,29 @@ void nxusCheatSrvPanicOff(NxusCheatRestore *out) {
 
     cheatLock();
     stopped = cheatDisableAllLocked();
-    restored = cheatRestoreJournalLocked();
+    /* PanicOff is the "no PC in the loop" recovery: it writes code originals back,
+     * so it runs inside Pause/Resume.  A failed freeze does NOT cancel the restore
+     * (restoring is the safe direction), but it is reported as a failure so a
+     * client can tell the repair happened unfrozen. */
+    restored = cheatRestoreJournalLocked(true);
     result.blocks_stopped = stopped;
     result.restored = restored.restored;
-    result.failed = restored.failed;
-    if (restored.failed == 0) nxusCheatJournalReset(&g_Journal);
+    result.failed = restored.failed + (restored.freeze_failed ? 1u : 0u);
+    /* Keep the journal when an address failed OR the restore ran unfrozen, so a
+     * later (freezable) PanicOff can retry the whole write-back. */
+    if (restored.failed == 0 && !restored.freeze_failed) nxusCheatJournalReset(&g_Journal);
     cheatPublishStatus();
     cheatUnlock();
 
-    NXUS_LOG("cheat: panic off - %u block(s) stopped, %u/%u address(es) restored",
-             (unsigned)stopped, (unsigned)restored.restored,
-             (unsigned)(restored.restored + restored.failed));
+    if (restored.freeze_failed) {
+        NXUS_LOG("cheat: panic off - %u block(s) stopped, %u address(es) restored WITHOUT a "
+                 "freeze (reported as failed)", (unsigned)stopped,
+                 (unsigned)restored.restored);
+    } else {
+        NXUS_LOG("cheat: panic off - %u block(s) stopped, %u/%u address(es) restored",
+                 (unsigned)stopped, (unsigned)restored.restored,
+                 (unsigned)(restored.restored + restored.failed));
+    }
     if (out != NULL) *out = result;
 }
 

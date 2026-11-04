@@ -37,15 +37,24 @@ static bool g_RangeAllowed = true;
 static bool g_DebugAttached = false;
 static bool g_ServerExited = false;
 static u64  g_HeldMask = 0;
+static u64  g_RxBase = 0;
+static u32  g_RxSize = 0;
+static bool g_PauseFails = false;
 
 static u8 g_Memory[CHEAT_TEST_SIZE];
 
 static u32 g_Writes;
 static u32 g_WritesOk;
+static u32 g_DebugWrites;
 static u32 g_Reads;
 static u32 g_PlainChecks;
 static u32 g_PatchChecks;
 static u32 g_HeldMaskReads;
+static u32 g_Pauses;
+static u32 g_Resumes;
+
+static char g_CallLog[256];
+static u32  g_CallLogLen;
 
 static u32 g_EventCount;
 static u16 g_LastEventType;
@@ -55,11 +64,45 @@ static NxusCheatFault g_LastFault;
 static char g_LastLog[1024];
 static char g_LastDebugLog[1024];
 
+/* Rolling window of recent NXUS_LOG lines (the last-line accessor loses everything
+ * but the final line of a multi-line diagnostic). */
+#define CHEAT_TEST_LOG_RING 8
+static char g_LogRing[CHEAT_TEST_LOG_RING][1024];
+static u32  g_LogRingCount;
+static u32  g_LogRingNext;
+
+static void cheatLogRingClear(void) {
+    g_LogRingCount = 0;
+    g_LogRingNext = 0;
+    memset(g_LogRing, 0, sizeof(g_LogRing));
+}
+
+static void cheatLogRingAdd(const char *text) {
+    snprintf(g_LogRing[g_LogRingNext], sizeof(g_LogRing[0]), "%s", text);
+    g_LogRingNext = (g_LogRingNext + 1u) % CHEAT_TEST_LOG_RING;
+    if (g_LogRingCount < CHEAT_TEST_LOG_RING) g_LogRingCount++;
+}
+
 static bool cheatMemoryRange(u64 address, u32 size) {
     if (address < CHEAT_TEST_BASE) return false;
     const u64 offset = address - CHEAT_TEST_BASE;
     if (offset > (u64)CHEAT_TEST_SIZE) return false;
     return (u64)size <= (u64)CHEAT_TEST_SIZE - offset;
+}
+
+/* True when [address, address + size) lies inside the RX window. */
+static bool cheatMemoryRx(u64 address, u32 size) {
+    if (g_RxSize == 0) return false;
+    if (address < g_RxBase) return false;
+    const u64 offset = address - g_RxBase;
+    return offset <= g_RxSize && (u64)size <= (u64)g_RxSize - offset;
+}
+
+static void cheatCallLogAdd(char c) {
+    if (g_CallLogLen + 1u < sizeof(g_CallLog)) {
+        g_CallLog[g_CallLogLen++] = c;
+        g_CallLog[g_CallLogLen] = '\0';
+    }
 }
 
 void cheatTestReset(void) {
@@ -73,13 +116,21 @@ void cheatTestReset(void) {
     g_DebugAttached = false;
     g_ServerExited = false;
     g_HeldMask = 0;
+    g_RxBase = 0;
+    g_RxSize = 0;
+    g_PauseFails = false;
 
     g_Writes = 0;
     g_WritesOk = 0;
+    g_DebugWrites = 0;
     g_Reads = 0;
     g_PlainChecks = 0;
     g_PatchChecks = 0;
     g_HeldMaskReads = 0;
+    g_Pauses = 0;
+    g_Resumes = 0;
+    g_CallLog[0] = '\0';
+    g_CallLogLen = 0;
 
     g_EventCount = 0;
     g_LastEventType = 0;
@@ -89,6 +140,7 @@ void cheatTestReset(void) {
     memset(g_Memory, 0, sizeof(g_Memory));
     g_LastLog[0] = '\0';
     g_LastDebugLog[0] = '\0';
+    cheatLogRingClear();
 }
 
 void cheatTestSetIdentity(u64 pid, u64 program_id) {
@@ -103,6 +155,17 @@ void cheatTestSetRangeAllowed(bool allowed) { g_RangeAllowed = allowed; }
 void cheatTestSetDebugAttached(bool attached) { g_DebugAttached = attached; }
 void cheatTestSetServerExited(bool exited) { g_ServerExited = exited; }
 void cheatTestSetHeldMask(u64 mask) { g_HeldMask = mask; }
+void cheatTestSetRxRange(u64 base, u32 size) { g_RxBase = base; g_RxSize = size; }
+u32  cheatTestPauses(void) { return g_Pauses; }
+u32  cheatTestResumes(void) { return g_Resumes; }
+void cheatTestSetPauseFails(bool fails) { g_PauseFails = fails; }
+u32  cheatTestDebugWrites(void) { return g_DebugWrites; }
+
+const char *cheatTestCallLog(void) { return g_CallLog; }
+void cheatTestCallLogClear(void) {
+    g_CallLog[0] = '\0';
+    g_CallLogLen = 0;
+}
 
 u8 *cheatTestMemory(void) { return g_Memory; }
 
@@ -137,9 +200,20 @@ void cheatTestClearEvents(void) {
 }
 
 const char *cheatTestLastLog(void) { return g_LastLog; }
+
+bool cheatTestLogContains(const char *needle) {
+    u32 i;
+    if (needle == NULL) return false;
+    for (i = 0; i < g_LogRingCount; i++) {
+        if (strstr(g_LogRing[i], needle) != NULL) return true;
+    }
+    return false;
+}
+
 void cheatTestLogClear(void) {
     g_LastLog[0] = '\0';
     g_LastDebugLog[0] = '\0';
+    cheatLogRingClear();
 }
 
 /* ---- nxus_session_* ----------------------------------------------------- */
@@ -168,6 +242,8 @@ bool nxusSessionCheckRange(u64 address, u64 size, bool require_writable) {
     g_PlainChecks++;
     if (!g_RangeAllowed) return false;
     if (require_writable && !g_Writable) return false;
+    /* A range marked RX is a code page: readable but not writable. */
+    if (require_writable && cheatMemoryRx(address, (u32)size)) return false;
     return size != 0 && cheatMemoryRange(address, (u32)size);
 }
 
@@ -175,7 +251,7 @@ bool nxusSessionCheckCodePatchRange(u64 address, u64 size) {
     g_PatchChecks++;
     if (!g_RangeAllowed) return false;
     /* The real check accepts read + (write OR execute); the stub's fake target is
-     * readable, so "allowed" is what the test decides. */
+     * readable, so "allowed" is what the test decides - including the RX window. */
     return size != 0 && cheatMemoryRange(address, (u32)size);
 }
 
@@ -183,6 +259,7 @@ bool nxusSessionCheckCodePatchRange(u64 address, u64 size) {
 
 Result nxusDmntWrite(u64 address, const void *buffer, size_t size) {
     g_Writes++;
+    cheatCallLogAdd('W');
     if (!g_Writable || buffer == NULL || size == 0) return (Result)1;
     if (address < CHEAT_TEST_BASE || size > CHEAT_TEST_SIZE ||
         address - CHEAT_TEST_BASE > CHEAT_TEST_SIZE - size) {
@@ -195,6 +272,28 @@ Result nxusDmntWrite(u64 address, const void *buffer, size_t size) {
 
 Result nxusDmntRead(u64 address, void *buffer, size_t size) {
     return nxusSessionReadMemory(address, buffer, (u32)size) == 0 ? 0 : (Result)1;
+}
+
+Result nxusDmntPause(void) {
+    g_Pauses++;
+    cheatCallLogAdd('P');
+    return g_PauseFails ? (Result)1 : 0;
+}
+
+Result nxusDmntResume(void) {
+    g_Resumes++;
+    cheatCallLogAdd('R');
+    return 0;
+}
+
+Result nxusDebugWriteMemory(u64 address, const void *buffer, u32 size) {
+    g_DebugWrites++;
+    cheatCallLogAdd('w');
+    if (buffer == NULL || size == 0) return (Result)1;
+    if (!cheatMemoryRange(address, size)) return (Result)1;
+    memcpy(g_Memory + (address - CHEAT_TEST_BASE), buffer, size);
+    g_WritesOk++;
+    return 0;
 }
 
 u32 nxusDmntTargetIncarnation(void) { return g_Incarnation; }
@@ -230,6 +329,7 @@ void nxusLogWrite(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_LastLog, sizeof(g_LastLog), fmt, ap);
     va_end(ap);
+    cheatLogRingAdd(g_LastLog);
 }
 
 void nxusLogWriteDebug(const char *fmt, ...) {
@@ -244,4 +344,5 @@ void nxusLogWriteError(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_LastLog, sizeof(g_LastLog), fmt, ap);
     va_end(ap);
+    cheatLogRingAdd(g_LastLog);
 }

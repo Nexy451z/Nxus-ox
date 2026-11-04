@@ -324,11 +324,17 @@ static void testPatchOnceAndLoop(void) {
           "installing a new program restored the previous program's patch");
 
     const u32 loop_base = cheatTestWrites();
+    /* The upload restored the previous program's journal (inside a freeze), so
+     * count pauses from here: the data loop itself must add none. */
+    const u32 pauses_base = cheatTestPauses();
     cheatSrvWorkerStep();
+    CHECK(cheatTestWrites() == loop_base + 1, "the first tick applied the loop value");
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == loop_base + 2, "the loop block wrote on both ticks");
+    CHECK(cheatTestWrites() == loop_base + 1,
+          "the second tick found the value already applied and wrote nothing");
     CHECK(cheatTestPeekU32(loop_addr) == 0x0BADF00Du, "the loop write landed");
     CHECK(statusNow().journal_count == 1, "one address is journalled for the loop block");
+    CHECK(cheatTestPauses() == pauses_base, "a data-only loop block never pauses the target");
 
     CHECK(setEnabled(0, false), "loop block disabled");
     const u32 after_disable = cheatTestWrites();
@@ -388,6 +394,12 @@ static void testConsecutiveFailures(void) {
     cheatTestSetWritable(true);
     cheatSrvWorkerStep();
     CHECK(statusNow().last_error == 0, "a successful tick clears the reported error");
+    /* Move the target value so the next ticks really try to write: an already
+     * applied value is skipped (and must not count as a failure). */
+    {
+        const u32 moved = 0x77770000u;
+        cheatTestPoke(addr, &moved, sizeof(moved));
+    }
     cheatTestSetWritable(false);
     cheatSrvWorkerStep();
     cheatSrvWorkerStep();
@@ -636,10 +648,12 @@ static void testIoAdapterPolicy(void) {
     }
     CHECK(uploadWire(&w2), "loop program installed");
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == 4, "four iterations wrote the address (%u writes)",
+    /* The plan pass sees the first iteration is needed and the next three would
+     * write the same bytes; the apply pass writes once and skips the rest. */
+    CHECK(cheatTestWrites() == 1, "only the first differing write is issued (%u writes)",
           (unsigned)cheatTestWrites());
     CHECK(cheatTestPatchRangeChecks() == 1,
-          "the validated range was reused inside the tick (%u live queries)",
+          "the validated range was reused across BOTH passes (%u live queries)",
           (unsigned)cheatTestPatchRangeChecks());
 }
 
@@ -673,12 +687,187 @@ static void testHeldMask(void) {
     CHECK(cheatTestHeldMaskReads() >= held_reads + 2, "the mask is read on every tick");
     CHECK(cheatTestWrites() == writes, "the store is skipped while the combo is released");
 
+    /* The value written while the combo was held is still there, so the store is
+     * skipped; only a target that lost the value causes another write. */
     cheatTestSetHeldMask(0x0000000000000010ull);
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == writes + 1, "the store runs again when the combo returns");
+    CHECK(cheatTestWrites() == writes, "an already-correct value is not rewritten");
+    {
+        const u32 stale = 0u;
+        cheatTestPoke(addr, &stale, sizeof(stale));
+    }
+    cheatSrvWorkerStep();
+    CHECK(cheatTestWrites() == writes + 1,
+          "the store runs again when the combo returns and the value differs");
 }
 
-/* ---- 10. lifecycle ------------------------------------------------------ */
+/* ---- 10. RX freeze ------------------------------------------------------ */
+
+static void testFreeze(void) {
+    printf("[test] freeze: RX blocks run inside dmnt Pause/Resume, never half-written\n");
+
+    const u64 code_addr = CHEAT_TEST_BASE + 0xD00;
+    const u64 data_addr = CHEAT_TEST_BASE + 0xD80;
+
+    /* 1. An RX block is pause -> write -> resume. */
+    fresh();
+    cheatTestSetRxRange(code_addr, 8);
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, code_addr, 0xFEEDFACEu);
+        CHECK(uploadWire(&w), "RX loop program installed");
+    }
+    cheatTestCallLogClear();
+    cheatTestClearEvents();
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(code_addr) == 0xFEEDFACEu, "the RX value was written");
+    CHECK(cheatTestPauses() == 1 && cheatTestResumes() == 1,
+          "exactly one Pause/Resume pair (%u/%u)",
+          (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+    CHECK(strcmp(cheatTestCallLog(), "PWR") == 0,
+          "the call order is Pause -> Write -> Resume (\"%s\")", cheatTestCallLog());
+    CHECK(cheatTestEventCount() == 0, "a frozen RX block reports no fault");
+
+    /* 2. The next tick finds the value already applied: no write, no pause. */
+    cheatTestCallLogClear();
+    cheatSrvWorkerStep();
+    CHECK(cheatTestWrites() == 1, "the steady-state tick wrote nothing (%u writes)",
+          (unsigned)cheatTestWrites());
+    CHECK(cheatTestPauses() == 1 && cheatTestResumes() == 1,
+          "and did not freeze the target again (%u/%u)",
+          (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+    CHECK(cheatTestCallLog()[0] == '\0', "the steady-state tick made no Pause/Write/Resume call");
+
+    /* 3. A data-only block never pauses. */
+    fresh();
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, data_addr, 0x12345678u);
+        CHECK(uploadWire(&w), "data loop program installed");
+    }
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(data_addr) == 0x12345678u, "the data value was written");
+    CHECK(cheatTestPauses() == 0 && cheatTestResumes() == 0,
+          "a data-only block does not pause (%u/%u)",
+          (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+
+    /* 4. Pause failure: zero writes, block disabled, CANNOT_FREEZE fault. */
+    fresh();
+    cheatTestSetRxRange(code_addr, 8);
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, code_addr, 0xDEADBEEFu);
+        CHECK(uploadWire(&w), "RX program installed for the pause-failure check");
+    }
+    cheatTestSetPauseFails(true);
+    cheatTestClearEvents();
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(code_addr) == 0u, "a failed Pause means no code was written");
+    CHECK(cheatTestWrites() == 0, "not a single write was issued (%u)",
+          (unsigned)cheatTestWrites());
+    CHECK(cheatTestPauses() == 1 && cheatTestResumes() == 0,
+          "a failed Pause is not followed by a Resume (%u/%u)",
+          (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+    CHECK(statusNow().enabled_count == 0, "the unfreezable RX block was disabled");
+    CHECK(cheatTestEventCount() == 1,
+          "the refused block reports exactly one event (%u)", (unsigned)cheatTestEventCount());
+    CHECK(cheatTestLastFault()->reason == NXUS_CHEAT_FAULT_CANNOT_FREEZE,
+          "the fault reason is CANNOT_FREEZE (%u)", (unsigned)cheatTestLastFault()->reason);
+    CHECK(cheatTestLogContains("frozen"),
+          "the refusal is logged: \"%s\"", cheatTestLastLog());
+
+    /* 5. A VM/write error inside the window still resumes. */
+    fresh();
+    cheatTestSetRxRange(code_addr, 8);
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, code_addr, 0xCAFEBABEu);
+        CHECK(uploadWire(&w), "RX program installed for the error-resume check");
+    }
+    cheatTestSetWritable(false);          /* the write itself fails */
+    cheatTestCallLogClear();
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPauses() == 1 && cheatTestResumes() == 1,
+          "Resume runs even when the write fails (%u/%u)",
+          (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+    CHECK(cheatTestWrites() == 1, "the failing write was attempted once (%u)",
+          (unsigned)cheatTestWrites());
+    CHECK(statusNow().last_error == (u32)NXUS_CHEATVM_ERR_WRITE,
+          "the interpreter error is recorded (%u)", (unsigned)statusNow().last_error);
+    CHECK(strcmp(cheatTestCallLog(), "PWR") == 0,
+          "the window still closes with a Resume (\"%s\")", cheatTestCallLog());
+
+    /* 6. PanicOff freezes the restore: pause -> write originals -> resume. */
+    fresh();
+    cheatTestSetRxRange(code_addr, 8);
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, code_addr, 0xA5A50001u);
+        CHECK(uploadWire(&w), "RX patch applied before PanicOff");
+    }
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(code_addr) == 0xA5A50001u, "the RX patch is in place");
+    cheatTestCallLogClear();
+    {
+        const u32 pauses_before = cheatTestPauses();
+        const u32 resumes_before = cheatTestResumes();
+        NxusCheatRestore rs;
+        nxusCheatSrvPanicOff(&rs);
+        CHECK(rs.restored == 1 && rs.failed == 0,
+              "PanicOff restored the address (%u restored, %u failed)",
+              (unsigned)rs.restored, (unsigned)rs.failed);
+        CHECK(cheatTestPeekU32(code_addr) == 0u, "the original code byte is back");
+        CHECK(strcmp(cheatTestCallLog(), "PWR") == 0,
+              "PanicOff order is Pause -> Restore -> Resume (\"%s\")", cheatTestCallLog());
+        CHECK(cheatTestPauses() == pauses_before + 1 &&
+              cheatTestResumes() == resumes_before + 1,
+              "PanicOff paused and resumed once (%u/%u)",
+              (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+        CHECK(statusNow().journal_count == 0, "a clean restore drops the journal");
+    }
+    /* The second PanicOff has nothing to restore, so it must not pause. */
+    {
+        const u32 pauses_before = cheatTestPauses();
+        const u32 resumes_before = cheatTestResumes();
+        NxusCheatRestore rs;
+        cheatTestCallLogClear();
+        nxusCheatSrvPanicOff(&rs);
+        CHECK(rs.restored == 0 && rs.failed == 0 && rs.blocks_stopped == 0,
+              "a second PanicOff is a no-op");
+        CHECK(cheatTestPauses() == pauses_before && cheatTestResumes() == resumes_before,
+              "an empty PanicOff does not touch Pause/Resume");
+    }
+
+    /* 7. PanicOff with a failing Pause still restores, and says it ran unfrozen. */
+    fresh();
+    cheatTestSetRxRange(code_addr, 8);
+    {
+        Wire w;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, code_addr, 0xA5A50002u);
+        CHECK(uploadWire(&w), "RX patch applied for the failing-freeze restore");
+    }
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(code_addr) == 0xA5A50002u, "the RX patch is in place again");
+    cheatTestSetPauseFails(true);
+    cheatTestLogClear();
+    {
+        NxusCheatRestore rs;
+        nxusCheatSrvPanicOff(&rs);
+        CHECK(rs.restored == 1, "the restore still ran without the freeze (%u restored)",
+              (unsigned)rs.restored);
+        CHECK(rs.failed >= 1, "and is reported as failed (%u failed)", (unsigned)rs.failed);
+        CHECK(cheatTestPeekU32(code_addr) == 0u, "the original byte was written back anyway");
+        CHECK(cheatTestPauses() == 2 && cheatTestResumes() == 1,
+              "the failed freeze was not paired with a Resume (%u/%u)",
+              (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
+        CHECK(strstr(cheatTestLastLog(), "freeze") != NULL,
+              "the unfrozen restore is logged: \"%s\"", cheatTestLastLog());
+        CHECK(statusNow().journal_count == 1,
+              "the journal is kept for a later, freezable retry");
+    }
+}
+
+/* ---- 11. lifecycle ------------------------------------------------------ */
 
 static void testLifecycle(void) {
     printf("[test] lifecycle: server gate, init/exit idempotence, statics\n");
@@ -715,14 +904,18 @@ static void testLifecycle(void) {
     CHECK(cheatWorkerShouldRun(), "a second init changes nothing");
 
     /* The static budget the header documents (the asserts in the shipped .c make
-       the build fail if a core cap pushes it out). */
-    const u32 footprint = (u32)(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) +
+       the build fail if a core cap pushes it out).  The plan pass needs its own
+       journal: 12 KiB more, still far inside the sysmodule's 8 MiB. */
+    const u32 footprint = (u32)(sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
                                 sizeof(g_WorkerStack));
-    CHECK(footprint <= 40u * 1024u, "cheat service statics fit the declared budget (%u B)",
+    CHECK(footprint <= 52u * 1024u, "cheat service statics fit the declared budget (%u B)",
           (unsigned)footprint);
     CHECK(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) == 29888u,
           "program + journal are 29888 B (program %u, journal %u)",
           (unsigned)sizeof(NxusCheatProgram), (unsigned)sizeof(NxusCheatJournal));
+    CHECK(sizeof(g_ProbeJournal) == sizeof(NxusCheatJournal),
+          "the plan journal is one more journal-sized block (%u B)",
+          (unsigned)sizeof(g_ProbeJournal));
 
     /* The identity sample may fail (a writer held the seqlock); that must skip the
        tick, never run unverified. */
@@ -737,25 +930,51 @@ static void testLifecycle(void) {
     cheatSrvWorkerStep();
     CHECK(cheatTestWrites() == writes + 1, "a verifiable identity runs the tick");
 
-    /* Debug mode suspends the cheat engine (dmnt is closed then) and says so once
-       per transition. */
+    /* Debug mode: dmnt is closed, so RX blocks cannot be frozen and are skipped,
+       while data-only blocks keep running through the debug handle. */
     fresh();
-    Wire w2;
-    makeProgram(&w2, CHEAT_TEST_TITLE_A, 1, 1, CHEAT_TEST_BASE + 0xB00, 0x0A0A0A0Au);
-    CHECK(uploadWire(&w2), "program installed for the debug-suspension check");
+    const u64 data_addr = CHEAT_TEST_BASE + 0xB00;
+    const u64 code_addr = CHEAT_TEST_BASE + 0xB04;
+    cheatTestSetRxRange(code_addr, 4);
+    {
+        Wire w2;
+        wireStart(&w2, CHEAT_TEST_TITLE_A);
+        const u32 data_block = wireBlock(&w2, 1, 1);
+        wireInsn(&w2, data_block, insnStore(data_addr, 4, 0x0A0A0A0Au));
+        const u32 code_block = wireBlock(&w2, 1, 1);
+        wireInsn(&w2, code_block, insnStore(code_addr, 4, 0x0B0B0B0Bu));
+        CHECK(uploadWire(&w2), "data + RX program installed for the debug check");
+    }
     cheatTestSetDebugAttached(true);
     cheatTestLogClear();
-    const u32 debug_writes = cheatTestWrites();
+    cheatTestClearEvents();
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == debug_writes, "no block runs while a debug session is attached");
-    CHECK(strstr(cheatTestLastLog(), "suspended") != NULL,
+    CHECK(cheatTestPeekU32(data_addr) == 0x0A0A0A0Au,
+          "a data-only block keeps running while a debug session is attached");
+    CHECK(cheatTestDebugWrites() == 1, "the data write used the debug handle (%u)",
+          (unsigned)cheatTestDebugWrites());
+    CHECK(cheatTestPeekU32(code_addr) == 0u, "the RX block was not executed while attached");
+    CHECK(cheatTestPauses() == 0, "no dmnt Pause was attempted without dmnt");
+    CHECK(cheatTestEventCount() == 1 &&
+          cheatTestLastFault()->reason == NXUS_CHEAT_FAULT_CANNOT_FREEZE,
+          "the skipped RX block reports CANNOT_FREEZE (%u)",
+          (unsigned)cheatTestLastFault()->reason);
+    CHECK(cheatTestLogContains("suspended"),
           "the suspension is logged once: \"%s\"", cheatTestLastLog());
+    /* Repeated ticks do not spam the link with the same fault. */
+    cheatSrvWorkerStep();
+    CHECK(cheatTestEventCount() == 1, "the debug RX fault is sent once per attach");
+
     cheatTestSetDebugAttached(false);
     cheatTestLogClear();
     cheatSrvWorkerStep();
     CHECK(strstr(cheatTestLastLog(), "resumes") != NULL,
           "the resumption is logged once: \"%s\"", cheatTestLastLog());
-    CHECK(cheatTestWrites() == debug_writes + 1, "the cheat runs again after the debug detach");
+    CHECK(cheatTestPeekU32(code_addr) == 0x0B0B0B0Bu,
+          "the RX block runs again after the debug detach");
+    CHECK(cheatTestPauses() == 1, "the RX block used a real dmnt Pause (%u)",
+          (unsigned)cheatTestPauses());
+    CHECK(cheatTestResumes() == 1, "and the matching Resume (%u)", (unsigned)cheatTestResumes());
 }
 
 int main(void) {
@@ -769,6 +988,7 @@ int main(void) {
     testClear();
     testIoAdapterPolicy();
     testHeldMask();
+    testFreeze();
     testLifecycle();
 
     nxusCheatSrvExit();

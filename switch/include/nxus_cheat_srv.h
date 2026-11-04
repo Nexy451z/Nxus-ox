@@ -16,23 +16,60 @@
  *     so a title restart can never leave a patch behind in the next process,
  *   - it undoes everything it wrote on PanicOff (with no PC in the loop), and
  *     disables a block that failed NXUS_CHEATSRV_FAIL_LIMIT ticks in a row instead
- *     of hammering a dead address for ever.
+ *     of hammering a dead address for ever,
+ *   - it writes CODE (RX) only while the target is frozen: a block that patches
+ *     code is wrapped in dmnt Pause (65004) / Resume (65005).  A half-written
+ *     `bl` can be executed by a running thread, which is a guaranteed crash, so
+ *     not freezing means not writing at all (see "Freezing" below).
+ *
+ * Freezing (RX writes)
+ * --------------------
+ * The interpreter cannot tell a .data store from a .text patch, so it passes
+ * allow_rx == true for every store and this service decides:
+ *
+ *     nxusSessionCheckCodePatchRange()  read + (write OR execute)  accepted
+ *     nxusSessionCheckRange(..., true)  read + write               plain data
+ *
+ * A range accepted by the code-patch policy but NOT writable is RX (.text is R-X
+ * on the console).  A block is executed in two passes:
+ *
+ *   1. plan   - read-only; validates ranges, reads the current bytes and reports
+ *               whether anything would actually change and whether any of it is RX,
+ *   2. apply  - only when the plan found a differing write; the real journal and
+ *               the real writer, inside Pause/Resume when the plan found RX.
+ *
+ * Consequences:
+ *   - a loop block that applies the same patch every 16 ms writes (and freezes)
+ *     only when the target value really differs, so the steady state costs reads
+ *     only (this is what keeps the per-tick freeze off the hot path),
+ *   - a failed Pause writes NOTHING: the block is disabled and
+ *     NXUS_CHEAT_FAULT_CANNOT_FREEZE is published,
+ *   - with a debug session attached dmnt is detached and 65004 cannot work, so RX
+ *     blocks are skipped (reported once per attach) while data-only blocks keep
+ *     running through the debug handle,
+ *   - PanicOff and the journal write-backs of upload/exit are wrapped the same
+ *     way; if the freeze fails the restore still runs (restoring is the safe
+ *     direction) and the failure is reported and logged.
  *
  * Memory
  * ------
  * The sysmodule's inner heap is 8 MiB and already holds the scan chunk, the hit
- * list and up to two snapshot slots, so nothing here is allocated: the program and
- * the journal are .bss and the worker stack is a static array.  The interpreter
- * caps (core/nxus_cheatvm.h) size them:
+ * list and up to two snapshot slots, so nothing here is allocated: the program,
+ * the journal, the plan-pass journal and the worker stack are .bss / a static
+ * array.  The interpreter caps (core/nxus_cheatvm.h) size them:
  *
  *     sizeof(NxusCheatProgram)  17592 B   (512 instructions x 24 B + 128 blocks)
  *     sizeof(NxusCheatJournal)  12296 B   (512 entries x 24 B)
+ *     plan-pass journal         12296 B   (same layout; never published)
  *     worker stack               8192 B
  *     ------------------------------------
- *     static total              38080 B   (~37 KiB, no heap at all)
+ *     static total              50376 B   (~49 KiB, no heap at all)
  *
- * The exact numbers are asserted in nxus_cheat_srv.c, so lowering/raising a core
- * cap cannot silently grow (or shrink) what the sysmodule reserves.
+ * The plan pass needs its own journal because the interpreter journals before it
+ * calls write(); reusing the real journal would record ownership of bytes that
+ * were never patched.  The exact numbers are asserted in nxus_cheat_srv.c, so
+ * lowering/raising a core cap cannot silently grow (or shrink) what the sysmodule
+ * reserves.
  *
  * Threading
  * ---------
@@ -43,16 +80,19 @@
  * rule - leaks the Thread instead of closing/freeing state a worker might still
  * read.
  *
- * The program, its block states, the journal and the per-block failure counters are
- * protected by one mutex (g_CheatLock).  Status does NOT take that mutex: it reads
- * a seqlock-published snapshot, so a status poll can never be delayed by a tick
- * that is inside a dmnt call.  That snapshot is republished after every mutation
- * (upload / enable / panic-off / clear / tick).
+ * The program, its block states, the journal, the plan-pass journal and the
+ * per-block failure counters are protected by one mutex (g_CheatLock).  Status does
+ * NOT take that mutex: it reads a seqlock-published snapshot, so a status poll can
+ * never be delayed by a tick that is inside a dmnt call.  That snapshot is
+ * republished after every mutation (upload / enable / panic-off / clear / tick).
+ * The freeze itself is strictly per tick / per restore: Pause and Resume are both
+ * issued inside the same critical section, so a title is never left stopped across
+ * ticks (and a slow client cannot inherit a freeze).
  *
  * Lock order: g_CheatLock is the innermost lock of this module.  It is held across
- * dmnt reads/writes and across the event send, and no other Nxus lock is taken
- * while it is held by a caller that also holds a different Nxus lock first (the
- * dispatcher calls into this file without holding one).
+ * dmnt reads/writes, Pause/Resume and the event send, and no other Nxus lock is
+ * taken while it is held by a caller that also holds a different Nxus lock first
+ * (the dispatcher calls into this file without holding one).
  */
 #pragma once
 
@@ -153,8 +193,16 @@ void nxusCheatSrvStatus(NxusCheatStatus *out);
  * addresses were restored, how many could not be (the target is gone, or the range
  * is no longer writable) and how many blocks were still enabled.
  *
+ * The restore is wrapped in Pause/Resume because it rewrites code too.  A failed
+ * Pause does NOT cancel it (restoring is the safe direction), but it is counted in
+ * `failed` (+1, the journal has no separate field for it and the wire structure is
+ * fixed) and logged; the journal is then kept so a later, freezable PanicOff can
+ * retry.  With a debug session attached dmnt is detached and a freeze is not
+ * attempted; the restore goes through the debug handle instead.
+ *
  * The journal is kept when a write-back failed, so a later PanicOff (or the exit
- * path) can retry it; it is cleared once every address was restored.
+ * path) can retry it; it is cleared once every address was restored (and the
+ * restore ran frozen).
  */
 void nxusCheatSrvPanicOff(NxusCheatRestore *out);
 
