@@ -26,11 +26,16 @@
 //! # }
 //! ```
 
+pub mod ir;
 pub mod manager;
 pub mod model;
 pub mod parser;
 pub mod vm;
 
+pub use ir::{
+    build_program, BlockDesc, ProgramHeader, WireInsn, BLOCK_BYTES, HEADER_BYTES, INSN_BYTES,
+    MAGIC, MAX_BLOCKS, MAX_INSNS, MAX_JOURNAL, MAX_PROGRAM_BYTES, STEP_LIMIT, VERSION,
+};
 pub use manager::{
     cheats_dir_for, cheats_directory, exe_dir, normalize_build_id, resolve_backup_path_in,
     resolve_cheat_path, resolve_cheat_path_in, resolve_existing_cheat_path_in, BackupEntry,

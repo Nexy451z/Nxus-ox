@@ -59,6 +59,13 @@ TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
     run_test test_snapshot_owner test_snapshot_owner.c \
     ../core/nxus_snapshot.c ./stubs/nxus_session_stub.c
 
+# The console-side cheat interpreter is plain C (no libnx), so the SHIPPED
+# core/nxus_cheatvm.c is linked directly against a mock NxusCheatIo (memory
+# array + write log + failure injection).  That exercises install validation,
+# the original-byte journal and every opcode family on the host, which is where
+# a width truncation or a loop counter bug would otherwise reach a title.
+run_test test_cheatvm test_cheatvm.c ../core/nxus_cheatvm.c
+
 echo
 if [ $fail -eq 0 ]; then echo "ALL HOST TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail
