@@ -176,6 +176,23 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                 {
                     app.send(Cmd::FetchConsoleLog, "fetching console log");
                 }
+                if ui
+                    .small_button("copy")
+                    .on_hover_text("copy the whole log to the clipboard")
+                    .clicked()
+                {
+                    let mut text = String::new();
+                    for line in &app.console_log {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                    for line in &app.st.log {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                    ui.ctx().copy_text(text);
+                    app.st.log("copied the log to the clipboard".to_string());
+                }
                 ui.label(RichText::new(format!("{} line(s)", app.st.log.len())).color(DIM));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for hit in app.st.break_hits.iter().take(1) {
@@ -192,7 +209,10 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                     for line in &app.console_log {
                         let color = if line.contains("dropped") || line.contains("retr") { YELLOW }
                                     else { DIM };
-                        ui.label(RichText::new(line).monospace().size(11.0).color(color));
+                        ui.add(
+                            egui::Label::new(RichText::new(line).monospace().size(11.0).color(color))
+                                .selectable(true),
+                        );
                     }
                 });
                 ui.separator();
@@ -203,7 +223,10 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                                 else if line.contains("STOPPED") { RED }
                                 else if line.contains("watch hit") || line.contains("hotkey") { YELLOW }
                                 else { DIM };
-                    ui.label(RichText::new(line).monospace().size(12.0).color(color));
+                    ui.add(
+                        egui::Label::new(RichText::new(line).monospace().size(12.0).color(color))
+                            .selectable(true),
+                    );
                 }
             });
         });
@@ -1698,12 +1721,34 @@ fn disasm_tab(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn info_tab(app: &mut App, ui: &mut egui::Ui) {
-    ui.label(RichText::new("Target").strong());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Target").strong());
+        if ui
+            .small_button("copy")
+            .on_hover_text("copy the target information to the clipboard")
+            .clicked()
+        {
+            let mut text = String::new();
+            if let Some(status) = &app.st.status {
+                text.push_str(&format!("title id : {:016X}\n", status.program_id));
+                text.push_str(&format!("process  : {}\n", status.process_id));
+                text.push_str(&format!("main     : {:08X} + {:X}\n", status.main_base, status.main_size));
+                text.push_str(&format!("scan     : {} / {} hits / {} permille\n",
+                                       status.scan_state, status.hit_count, status.progress_permille));
+                text.push_str(&format!("uptime   : {} ms\n", status.uptime_ms));
+            }
+            if let Some(meta) = &app.st.metadata {
+                text.push_str(&format!("build id : {}\n", meta.build_id_hex()));
+            }
+            ui.ctx().copy_text(text);
+            app.st.log("copied the target information".to_string());
+        }
+    });
     if let Some(status) = app.st.status.clone() {
         egui::Grid::new("info-grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
-            ui.label("title id"); ui.monospace(format!("{:016X}", status.program_id)); ui.end_row();
-            ui.label("process"); ui.monospace(format!("{}", status.process_id)); ui.end_row();
-            ui.label("main"); ui.monospace(format!("{:08X} + {:X}", status.main_base, status.main_size)); ui.end_row();
+            ui.label("title id"); ui.add(egui::Label::new(RichText::new(format!("{:016X}", status.program_id)).monospace()).selectable(true)); ui.end_row();
+            ui.label("process"); ui.add(egui::Label::new(RichText::new(format!("{}", status.process_id)).monospace()).selectable(true)); ui.end_row();
+            ui.label("main"); ui.add(egui::Label::new(RichText::new(format!("{:08X} + {:X}", status.main_base, status.main_size)).monospace()).selectable(true)); ui.end_row();
             ui.label("scan"); ui.monospace(format!("{} / {} hits / {} permille",
                         status.scan_state, status.hit_count, status.progress_permille)); ui.end_row();
             ui.label("uptime"); ui.monospace(format!("{} ms", status.uptime_ms)); ui.end_row();

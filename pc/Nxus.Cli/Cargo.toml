@@ -1,6 +1,6 @@
 [package]
 name = "nxus"
-version = "0.1.7-alpha"
+version = "0.1.8-alpha"
 edition = "2021"
 description = "Nxus - Nintendo Switch memory analysis (PC side)"
 default-run = "nxus"
@@ -19,7 +19,7 @@ test = false
 bench = false
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "clipboard"] }
 egui_extras = "0.37"
 serde = { version = "1", features = ["derive"] }
 rfd = "0.15"
