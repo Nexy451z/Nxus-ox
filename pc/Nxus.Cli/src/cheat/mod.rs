@@ -33,8 +33,9 @@ pub mod parser;
 pub mod vm;
 
 pub use ir::{
-    build_program, BlockDesc, ProgramHeader, WireInsn, BLOCK_BYTES, HEADER_BYTES, INSN_BYTES,
-    MAGIC, MAX_BLOCKS, MAX_INSNS, MAX_JOURNAL, MAX_PROGRAM_BYTES, STEP_LIMIT, VERSION,
+    build_program, build_program_resolved, BlockDesc, ProgramHeader, WireInsn, BLOCK_BYTES,
+    HEADER_BYTES, INSN_BYTES, MAGIC, MAX_BLOCKS, MAX_INSNS, MAX_JOURNAL, MAX_PROGRAM_BYTES,
+    STEP_LIMIT, VERSION,
 };
 pub use manager::{
     cheats_dir_for, cheats_directory, exe_dir, normalize_build_id, resolve_backup_path_in,

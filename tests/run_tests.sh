@@ -66,6 +66,16 @@ TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
 # a width truncation or a loop counter bug would otherwise reach a title.
 run_test test_cheatvm test_cheatvm.c ../core/nxus_cheatvm.c
 
+# The cheat SERVICE above the interpreter (switch/source/nxus_cheat_srv.c) is a
+# Switch unit: stubs/nxus_cheat_stub.c supplies the session/dmnt/HID/server/net
+# entry points it uses (settable target identity + incarnation, a 1 MiB fake
+# target, write/range failure injection, a recorded event sink) and the test
+# includes the SHIPPED .c, so its static 16 ms worker step, the 3-tick auto
+# disable, the PanicOff restore accounting and the upload target stamp are all
+# exercised on the host.  core/nxus_cheatvm.c is linked as usual.
+TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
+    run_test test_cheat_srv test_cheat_srv.c ./stubs/nxus_cheat_stub.c ../core/nxus_cheatvm.c
+
 echo
 if [ $fail -eq 0 ]; then echo "ALL HOST TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail

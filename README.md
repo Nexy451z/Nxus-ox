@@ -342,7 +342,7 @@ Nxus-ox/
               + cheat/ Atmosphere cheat parser/VM/manager, bin/NCL.rs standalone loader)
     nxus/     Python reference client & synthetic MockSwitch server for automated E2E testing
     tests/    Cross-language protocol parity & end-to-end test suite (133 tests)
-  tests/      Host C unit test suite (2,094 checks across 10 test binaries)
+  tests/      Host C unit test suite (2,249 checks across 11 test binaries)
   tools/      Build scripts, NPDM single-bit debug capability patcher, and PFS0/NSP verifier
 ```
 
@@ -365,7 +365,7 @@ bash tools/build_pc.sh
 
 ### Automated Test Suites (No Hardware Required)
 ```bash
-# 1. Host C Core Tests (2,094 checks / 10 binaries: scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 167, session_view 335, snapshot_owner 208, cheatvm 118)
+# 1. Host C Core Tests (2,249 checks / 11 binaries: scan 797, ptrscan 45, snapshot 75, budget 63, scantypes 275, hotkey 11, server_logic 167, session_view 335, snapshot_owner 208, cheatvm 118, cheat_srv 155)
 cd tests && bash run_tests.sh
 
 # 2. Rust Unit Tests (212 tests: expression evaluator, AArch64/ARM32/Thumb disassembler, dense pcscan, Jnoexs NDMP & EdiZon-SE EDZN/eFZN, Atmosphere cheat parser/VM/manager)

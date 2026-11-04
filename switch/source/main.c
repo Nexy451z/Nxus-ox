@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "nxus_cheat_srv.h"
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
 #include "nxus_hid.h"
@@ -261,7 +262,11 @@ void __appInit(void) {
  *                which can attach Nxus's own debug session and touch the session
  *                state, so nothing may start a pause while the rest is torn down.
  *                nxusHidExit() joins the thread, and it is itself idempotent.
- *   2. SERVER  - nxusServerExit(): cancel + join + close the pointer-scan worker,
+ *   2. CHEAT   - nxusCheatSrvExit(): stop + join the 16 ms cheat worker and write
+ *                the journalled originals back.  Before the server: that call
+ *                releases the session and raises the gate the worker checks, and
+ *                this one still wants dmnt.
+ *   3. SERVER  - nxusServerExit(): cancel + join + close the pointer-scan worker,
  *                cancel a running scan, then release the session (nxusSessionExit
  *                joins the scan worker and frees the views).  Both workers read the
  *                target through the debug handle and the session, so they must be
@@ -276,26 +281,29 @@ void __appInit(void) {
  *                doing anything, so a client that is still polling, draining or
  *                reconnecting cannot start a scan/pointer scan/debug session, nor
  *                re-create what this step just freed.
- *   3. DEBUG   - nxusDebugExit(): join the event thread, close the debug handle,
+ *   4. DEBUG   - nxusDebugExit(): join the event thread, close the debug handle,
  *                hand the process back to dmnt (ForceOpen).  Only now, with no
  *                reader left, can the handle be closed at all.  Kept before the
  *                network: a client that is still connected must not be able to
  *                attach/detach or read through the handle while it is closed - and
- *                the gate raised in step 2 is already refusing exactly those
+ *                the gate raised in step 3 is already refusing exactly those
  *                commands.
- *   4. NET     - nxusNetExit(): shut the socket down and join the connection thread.
+ *   5. NET     - nxusNetExit(): shut the socket down and join the connection thread.
  *                Before the log, because that thread and every handler log.
- *   5. DMNT    - nxusDmntExit(): close dmnt:cht.  Must follow nxusDebugExit() (a
+ *   6. DMNT    - nxusDmntExit(): close dmnt:cht.  Must follow nxusDebugExit() (a
  *                detach re-opens dmnt) and nxusNetExit() (no command can ask for it
  *                any more).
- *   6. LOG     - nxusLogExit() LAST.  Every step above logs its outcome, and the log
+ *   7. LOG     - nxusLogExit() LAST.  Every step above logs its outcome, and the log
  *                ring is what `nxus log` serves, so closing it earlier would drop the
  *                shutdown trail (the order this file used before could not be read
  *                back on a console that rebooted).
  */
 void __appExit(void) {
     nxusHidExit();        /* 1. hotkey producer (its callback drives Pause/Resume) */
-    /* 2. ptrscan worker + scan worker + session.  False means a drain timed out
+    /* 2. cheat worker: join it and undo its patches while the target is still
+       reachable (dmnt is open and no gate has been raised yet). */
+    nxusCheatSrvExit();
+    /* 3. ptrscan worker + scan worker + session.  False means a drain timed out
        and the server deliberately leaked the session because a worker/handler is
        still reading through the debug handle and dmnt.  Closing any of them here
        would free those resources underneath that reader (UAF), so leave them to
@@ -309,10 +317,10 @@ void __appExit(void) {
         fsExit();
         return;
     }
-    nxusDebugExit();      /* 3. event thread + debug handle + dmnt hand-back     */
-    nxusNetExit();        /* 4. listener + client socket + connection thread     */
-    nxusDmntExit();       /* 5. dmnt:cht (re-opened by the detach above)         */
-    nxusLogExit();        /* 6. log last: everything above wrote to it           */
+    nxusDebugExit();      /* 4. event thread + debug handle + dmnt hand-back     */
+    nxusNetExit();        /* 5. listener + client socket + connection thread     */
+    nxusDmntExit();       /* 6. dmnt:cht (re-opened by the detach above)         */
+    nxusLogExit();        /* 7. log last: everything above wrote to it           */
     fsdevUnmountAll();
     fsExit();
 }
@@ -412,13 +420,17 @@ int main(int argc, char *argv[]) {
                  (unsigned)rc);
     }
     nxusServerInit();
+    /* The cheat engine comes up behind the dispatcher: its worker reports faults
+       through nxusNetSendEvent() and reads the target through dmnt, both of which
+       exist by now.  Idempotent, so the boot chain can be re-entered safely. */
+    nxusCheatSrvInit();
 
     /* One explicit success marker for the init chain, written before the network
        wait: a boot2 sysmodule can sit in the retry loop below for a long time
        (Wi-Fi not associated yet), and without this line the log looked identical
        to a boot that died halfway.  "ready" is logged separately once the
        listener is actually up. */
-    NXUS_LOG("boot ok: init chain complete (dmnt/session/debug/snapshot/server) build %s",
+    NXUS_LOG("boot ok: init chain complete (dmnt/session/debug/snapshot/cheat/server) build %s",
              NXUS_BUILD_ID);
 
     /* A boot2 sysmodule usually starts before Wi-Fi is associated, so a single

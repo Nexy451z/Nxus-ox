@@ -146,6 +146,16 @@ typedef enum {
        sends it, and a server that does not implement it answers
        NXUS_ERR_UNSUPPORTED with NXUS_REASON_UNKNOWN_COMMAND. */
     NxusCmd_SnapshotRelease  = 0x0072,
+
+    /* On-console cheat engine (core/nxus_cheatvm.*).  The PC parses the cheat file and
+       uploads a LINKED program (branch targets are instruction indices); the console
+       interprets it from its own 16 ms worker, so key-conditional and loop cheats run
+       at frame rate instead of at the PC's polling rate. */
+    NxusCmd_CheatUpload      = 0x0080,  /* NxusCheatProgramHeader + blocks + insns */
+    NxusCmd_CheatEnable      = 0x0081,  /* NxusCheatEnable */
+    NxusCmd_CheatStatus      = 0x0082,  /* -> NxusCheatStatus */
+    NxusCmd_CheatPanicOff    = 0x0083,  /* stop all, restore originals -> NxusCheatRestore */
+    NxusCmd_CheatClear       = 0x0084,  /* drop the program (no writes) */
 } NxusCmd;
 
 /* ---- asynchronous events (Switch -> PC) ---- */
@@ -163,6 +173,9 @@ typedef enum {
        been gone for a while: payload is NxusFrozenReleased.  A reconnecting
        client uses it to drop its stale "frozen" markers. */
     NxusEvent_FrozenReleased = 0x8009,
+    /* The on-console cheat worker stopped a program by itself (target changed, a write
+       failed, journal full).  Payload: NxusCheatFault. */
+    NxusEvent_CheatFault     = 0x800A,
 } NxusEvent;
 
 /* ---- status flags ---- */
@@ -778,3 +791,60 @@ static inline void nxusHeaderInit(NxusPacketHeader *h, u16 type, u16 flags, u32 
     h->length = length;
     h->seq    = seq;
 }
+
+/* ------------------------------------------------------------------------- */
+/* On-console cheat engine (core/nxus_cheatvm.h owns the program layout)      */
+/* ------------------------------------------------------------------------- */
+
+/* NxusCmd_CheatEnable payload. */
+typedef struct NXUS_PACKED {
+    u32 index;   /* block index inside the uploaded program */
+    u32 enabled; /* 0 = off, 1 = on (patch blocks run once on enable) */
+} NxusCheatEnable;
+NXUS_STATIC_ASSERT(sizeof(NxusCheatEnable) == 8, "NxusCheatEnable must be 8 bytes");
+
+/* NxusCmd_CheatStatus reply. */
+typedef struct NXUS_PACKED {
+    u32 program_valid;  /* 0 when nothing is uploaded */
+    u32 block_count;
+    u32 enabled_count;
+    u32 insn_count;
+    u32 tick_count;     /* 16 ms ticks executed since the upload */
+    u32 journal_count;  /* addresses currently holding patched bytes */
+    u32 last_error;     /* NXUS_CHEATVM_ERR_* of the last block failure, 0 = none */
+    u32 last_error_pc;  /* instruction index of that failure */
+    u32 fault_count;    /* times the worker stopped the program by itself */
+    u32 running;        /* 1 while the worker loop is alive */
+    u64 keys_held;      /* live HID mask the engine is using */
+} NxusCheatStatus;
+NXUS_STATIC_ASSERT(sizeof(NxusCheatStatus) == 48, "NxusCheatStatus must be 48 bytes");
+
+/* NxusCmd_CheatPanicOff reply. */
+typedef struct NXUS_PACKED {
+    u32 restored;    /* addresses written back */
+    u32 failed;      /* addresses whose write-back failed (target gone) */
+    u32 blocks_stopped;
+    u32 reserved;
+} NxusCheatRestore;
+NXUS_STATIC_ASSERT(sizeof(NxusCheatRestore) == 16, "NxusCheatRestore must be 16 bytes");
+
+/* NxusCmd_CheatUpload reply. */
+typedef struct NXUS_PACKED {
+    u32 accepted_blocks;
+    u32 accepted_insns;
+    u32 rejected_reason; /* 0, or the negative NXUS_CHEATVM_ERR_* as a positive code */
+    u32 reserved;
+} NxusCheatUploadReply;
+NXUS_STATIC_ASSERT(sizeof(NxusCheatUploadReply) == 16, "NxusCheatUploadReply must be 16 bytes");
+
+/* NxusEvent_CheatFault payload: the worker stopped everything by itself. */
+typedef struct NXUS_PACKED {
+    u32 reason;     /* NXUS_CHEATVM_ERR_* or NXUS_CHEAT_FAULT_* */
+    u32 block;      /* block index, 0xFFFFFFFF when not block specific */
+    u32 pc;         /* instruction index inside that block */
+    u32 restored;   /* addresses that were written back before stopping */
+} NxusCheatFault;
+NXUS_STATIC_ASSERT(sizeof(NxusCheatFault) == 16, "NxusCheatFault must be 16 bytes");
+
+#define NXUS_CHEAT_FAULT_TARGET_GONE 100u /* the title was closed or restarted */
+#define NXUS_CHEAT_FAULT_JOURNAL_FULL 101u

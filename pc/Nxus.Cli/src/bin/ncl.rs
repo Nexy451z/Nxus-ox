@@ -47,18 +47,26 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, RichText};
 
+use cheat::manager::CheatExecution;
 use cheat::{
     normalize_build_id, save_text_atomic, CheatDocument, CheatKey, CheatManager, CheatMemoryIo,
     FailureKind,
     MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
 };
-use client::NxusClient;
+use client::{is_unsupported_command, CheatFault, CheatRestore, CheatStatus, NxusClient};
 use protocol::{Metadata, Status};
 
 const APP_NAME: &str = "NCL";
 const DEFAULT_PORT: u16 = 7332;
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_LINES: usize = 500;
+
+/// コンソールのチートワーカーの状態を聞き直す間隔。
+///
+/// 本体のワーカーは 16 ms で回るが、カウンタは 2 秒でも十分動きが分かる。
+/// 毎 tick（250 ms）で問い合わせると、コンソールの単一接続スレッドと Wi-Fi を
+/// 無駄に使う。
+const CONSOLE_STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A job that has not answered after this long is already a bug (a hung
 /// console call, a stuck tick).  The UI says so and offers the abort.
@@ -134,6 +142,46 @@ struct TargetView {
     backups: usize,
     issues: usize,
     last_error: Option<String>,
+    /// いまチートを実行している場所（切替の表示に使う）。
+    execution: CheatExecution,
+}
+
+/// コンソールのチートワーカー（`NxusCheatStatus`）を 1 行にまとめたもの。
+///
+/// `cheat_status` は 2 秒に 1 回しか取らないので、UI はこのスナップショットを
+/// 描くだけにする（描画のたびにネットワークへ行かない）。
+#[derive(Clone, Debug, Default)]
+struct ConsoleRow {
+    program_valid: bool,
+    block_count: u32,
+    enabled_count: u32,
+    insn_count: u32,
+    tick_count: u32,
+    journal_count: u32,
+    last_error: Option<String>,
+    fault_count: u32,
+    running: bool,
+    keys_held: u64,
+    /// 直近の `NxusEvent_CheatFault` の説明。
+    fault: Option<String>,
+}
+
+impl ConsoleRow {
+    fn from_status(status: &CheatStatus) -> ConsoleRow {
+        ConsoleRow {
+            program_valid: status.program_valid != 0,
+            block_count: status.block_count,
+            enabled_count: status.enabled_count,
+            insn_count: status.insn_count,
+            tick_count: status.tick_count,
+            journal_count: status.journal_count,
+            last_error: status.last_error_text(),
+            fault_count: status.fault_count,
+            running: status.running != 0,
+            keys_held: status.keys_held,
+            fault: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +189,8 @@ struct LiveView {
     target: TargetView,
     rows: Vec<CheatRow>,
     backup_rows: Vec<BackupRow>,
+    /// コンソール実行のときだけ入る（pc 実行では `None`）。
+    console: Option<ConsoleRow>,
 }
 
 impl LiveView {
@@ -150,6 +200,14 @@ impl LiveView {
 
     fn has_loops(&self) -> bool {
         self.rows.iter().any(|row| row.live && row.mode == "Loop")
+    }
+
+    /// コンソールで実行しているか。
+    ///
+    /// pc 実行では Loop ブロックがあるときだけ tick が要るが、コンソール実行
+    /// ではループが無くても状態取得と fault の監視のために tick を回す。
+    fn runs_on_console(&self) -> bool {
+        self.target.execution.is_console()
     }
 }
 
@@ -211,12 +269,26 @@ fn make_view(manager: &CheatManager) -> LiveView {
         backups: snapshot.backups,
         issues: snapshot.issues,
         last_error: snapshot.last_error.clone(),
+        execution: manager.execution(),
     };
     LiveView {
         target,
         rows,
         backup_rows,
+        console: None,
     }
+}
+
+/// セッション全体（マネージャ + コンソールの状態）のスナップショット。
+///
+/// [`make_view`] はマネージャだけを見る。ネットワーク越しに取った
+/// `NxusCheatStatus` と、直近の fault の説明はここで重ねる。
+fn make_session_view(session: &Session) -> LiveView {
+    let mut view = make_view(&session.manager);
+    if session.manager.is_console_mode() {
+        view.console = session.console_row();
+    }
+    view
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +315,8 @@ enum Busy {
     Ticking,
     Restoring,
     Reloading,
+    /// 実行場所（console / PC）の切替。
+    ModeSwitch,
 }
 
 impl Busy {
@@ -256,6 +330,7 @@ impl Busy {
             Busy::Ticking => "ticking",
             Busy::Restoring => "restoring",
             Busy::Reloading => "reloading",
+            Busy::ModeSwitch => "switching where cheats run",
         }
     }
 
@@ -383,6 +458,8 @@ enum Job {
     Disconnect,
     Refresh,
     Toggle { key: CheatKey, on: bool },
+    /// チートを実行する場所を切り替える（`console` / `pc`）。
+    SetMode(CheatExecution),
     Tick,
     PanicOff,
     ReloadFile,
@@ -401,6 +478,7 @@ impl Job {
             Job::Refresh => Busy::Refreshing,
             Job::Toggle { on: true, .. } => Busy::Enabling,
             Job::Toggle { on: false, .. } => Busy::Disabling,
+            Job::SetMode(_) => Busy::ModeSwitch,
             Job::Tick => Busy::Ticking,
             Job::PanicOff => Busy::Restoring,
             Job::ReloadFile => Busy::Reloading,
@@ -442,6 +520,220 @@ struct Session {
     /// back yet.  Journal entries loaded from an earlier run do not set it, so
     /// connecting or disconnecting never silently undoes another tool's work.
     dirty: bool,
+    /// コンソールのチートワーカーの直近の状態（2 秒間隔で取り直す）。
+    console: Option<ConsoleRow>,
+    /// 直近の `NxusEvent_CheatFault` の説明。
+    ///
+    /// 状態とは別に持つ: fault の直後は `cheat_status` が取れないことがあり、
+    /// そのときも理由を出したい。
+    console_fault: Option<String>,
+    /// `cheat_status` を最後に取った時刻（2 秒間隔に絞る）。
+    last_console_status: Instant,
+}
+
+impl Session {
+    /// 表示用のコンソール行（状態がまだ無くても fault があれば作る）。
+    fn console_row(&self) -> Option<ConsoleRow> {
+        match (&self.console, &self.console_fault) {
+            (None, None) => None,
+            (status, fault) => {
+                let mut row = status.clone().unwrap_or_default();
+                row.fault = fault.clone();
+                Some(row)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// コンソール実行モード
+// ---------------------------------------------------------------------------
+
+/// コンソールで 1 ブロックを ON/OFF した結果。
+enum ConsoleToggle {
+    /// 成功（利用者に見せる 1 行）。
+    Done(String),
+    /// 失敗（対象の状態は変えていない）。
+    Failed(String),
+    /// 接続先がこのコマンドを知らない。pc 経路へフォールバックする。
+    Unsupported(String),
+}
+
+/// コンソールで 1 ブロックを ON/OFF する。
+///
+/// ON は「プログラム全体のアップロード（同一内容なら省略）→
+/// `cheat_enable(index, true)`」の順。ブロック単体を送るコマンドは無いので、
+/// どのブロックを ON にするときもプログラム全体が要る。
+fn console_toggle(session: &mut Session, key: CheatKey, on: bool) -> ConsoleToggle {
+    let Some(index) = session.manager.block_index(key) else {
+        return ConsoleToggle::Failed(format!("cheat {key} is not part of the program"));
+    };
+    if on {
+        let program = match session.manager.build_console_program() {
+            Ok(program) => program,
+            Err(error) => {
+                // リンクできないブロックを部分的に送ると、利用者が書いていない
+                // コードが走る。断って、何が駄目かをそのまま見せる。
+                return ConsoleToggle::Failed(format!("cannot link the cheat program: {error}"));
+            }
+        };
+        if session.manager.need_console_upload(&program) {
+            match session.client.cheat_upload(&program) {
+                Ok(reply) => {
+                    if let Some(reason) = reply.rejected_text() {
+                        return ConsoleToggle::Failed(format!(
+                            "the console refused the cheat program: {reason}"
+                        ));
+                    }
+                    session.manager.note_console_upload(&program);
+                }
+                Err(error) => {
+                    return if is_unsupported_command(&error) {
+                        ConsoleToggle::Unsupported(error.to_string())
+                    } else {
+                        ConsoleToggle::Failed(format!("cheat upload: {error}"))
+                    };
+                }
+            }
+        }
+    }
+    match session.client.cheat_enable(index, on) {
+        Ok(()) => {
+            let name = session
+                .manager
+                .block(key)
+                .map(|block| block.name.clone())
+                .unwrap_or_else(|| key.to_string());
+            match session.manager.note_console_toggle(key, on) {
+                Ok(()) => ConsoleToggle::Done(format!(
+                    "{} '{name}' on the console",
+                    if on { "enabled" } else { "disabled" }
+                )),
+                Err(error) => ConsoleToggle::Failed(error),
+            }
+        }
+        Err(error) => {
+            if is_unsupported_command(&error) {
+                ConsoleToggle::Unsupported(error.to_string())
+            } else {
+                ConsoleToggle::Failed(format!("cheat_enable({index}) failed: {error}"))
+            }
+        }
+    }
+}
+
+/// 2 秒に 1 回だけ `cheat_status` を取り直す。
+///
+/// 戻り値はログに出す 1 行で、これは未対応だったときのフォールバック通知だけ。
+/// 通信エラーは状態行の `last_error` に出す（2 秒ごとにログを溢れさせない）。
+fn refresh_console_status(session: &mut Session) -> Option<String> {
+    if !session.manager.is_console_mode() {
+        return None;
+    }
+    if session.last_console_status.elapsed() < CONSOLE_STATUS_INTERVAL {
+        return None;
+    }
+    session.last_console_status = Instant::now();
+    match session.client.cheat_status() {
+        Ok(status) => {
+            if status.program_valid == 0 {
+                // コンソール側のプログラムが消えた（再起動・CheatClear）。
+                // 控えを捨てないと、次の ON が「載っている」前提で有効化だけを
+                // 送って BAD_STATE になる。
+                session.manager.forget_console_upload();
+            }
+            let mut row = ConsoleRow::from_status(&status);
+            row.fault = session.console_fault.clone();
+            session.console = Some(row);
+            None
+        }
+        Err(error) => {
+            let notice = if is_unsupported_command(&error) {
+                session.manager.fallback_to_pc(&error.to_string())
+            } else {
+                None
+            };
+            if let Some(row) = session.console.as_mut() {
+                row.last_error = Some(error.to_string());
+            }
+            notice
+        }
+    }
+}
+
+/// `NxusEvent_CheatFault` を受けたときの後始末。
+///
+/// 実行はコンソール側のワーカーが持っているので、PC が書き戻すものは無い。
+/// 表示（全ブロック OFF）と理由だけを合わせ、利用者に 1 行で伝える。
+fn apply_cheat_fault(manager: &mut CheatManager, fault: &CheatFault) -> String {
+    let off = manager.mark_all_off();
+    format!(
+        "the console stopped every cheat ({off} block(s) turned off): {}",
+        fault.reason_text()
+    )
+}
+
+/// コンソールの非同期イベントを空にするまで読み、fault だけ処理する。
+///
+/// `poll_event` は受信キューの唯一の読み手なので、ここで吸い出さないと
+/// キューが溜まる。関心のあるイベント（CheatFault）以外は捨てる。
+fn drain_cheat_faults(session: &mut Session) -> Vec<String> {
+    let mut messages = Vec::new();
+    // 0 秒待ちなので、キューが空になった時点で必ず戻る。
+    while let Some(event) = session.client.poll_event(Duration::ZERO) {
+        if let Some(fault) = event.cheat_fault() {
+            let message = apply_cheat_fault(&mut session.manager, &fault);
+            session.console_fault = Some(fault.reason_text());
+            if let Some(row) = session.console.as_mut() {
+                row.fault = session.console_fault.clone();
+            }
+            messages.push(message);
+        }
+    }
+    messages
+}
+
+/// panic-off の戻り値を 1 行にする。
+///
+/// コンソールは「書き戻せた数」と「失敗した数」を返す。失敗を隠すと
+/// 「全部戻した」と誤解されるので、必ず両方出す。
+fn panic_off_console_text(restore: &CheatRestore) -> String {
+    let mut text = format!(
+        "the console restored {} address(es) and stopped {} block(s)",
+        restore.restored, restore.blocks_stopped
+    );
+    if restore.failed > 0 {
+        text.push_str(&format!(
+            "; {} address(es) could not be restored (the title is gone)",
+            restore.failed
+        ));
+    }
+    text
+}
+
+/// 接続時にコンソールの対応を 1 度だけ確かめる。
+///
+/// 既定はコンソール実行。新コマンドを持たないコンソールなら、最初の ON で
+/// 初めて失敗するより、接続した時点で pc へ落ちて 1 行ログを出す方が分かり
+/// やすい。未対応以外の失敗は tick ごとの再試行に任せる。
+fn probe_console(session: &mut Session) {
+    if !session.manager.is_console_mode() {
+        return;
+    }
+    match session.client.cheat_status() {
+        Ok(status) => {
+            session.console = Some(ConsoleRow::from_status(&status));
+            session.last_console_status = Instant::now();
+        }
+        Err(error) => {
+            if is_unsupported_command(&error) {
+                // 通知文面は manager 側に残る（`console_fallback`）。ワーカーが
+                // `Ev::Log` で 1 回だけ流す。
+                session.manager.fallback_to_pc(&error.to_string());
+                session.console = None;
+            }
+        }
+    }
 }
 
 struct ClientCheatIo<'a> {
@@ -580,21 +872,45 @@ fn open_session(host: &str, port: u16) -> Result<(Session, String), String> {
     let path = cheat::resolve_cheat_path(&identity.build_id)?;
     let manager = CheatManager::open_with_path(identity, regions, path)?;
     let text = manager.document().raw_text.clone();
-    Ok((
-        Session {
-            client,
-            manager,
-            dirty: false,
-        },
-        text,
-    ))
+    let mut session = Session {
+        client,
+        manager,
+        dirty: false,
+        console: None,
+        console_fault: None,
+        last_console_status: Instant::now(),
+    };
+    // 実行場所の既定はコンソール。対応していないコンソールはここで pc へ
+    // 落ちるので、最初のチート ON で初めて失敗する、ということが起きない。
+    probe_console(&mut session);
+    Ok((session, text))
 }
 
 /// Restore the patches this session enabled.  The session is only dropped when
 /// every original byte is back; otherwise the UI keeps it so the user can retry.
 fn retire(session: &mut Session) -> Result<String, String> {
+    // コンソール実行では PC 側のジャーナルに何も無いので、`dirty` だけを見て
+    // いると ON のまま切断してしまう。コンソールに載っているブロックは
+    // タイトルが終わるまで書き換え続けるので、必ず先に止める。
+    let mut console_note = None;
+    if session.manager.is_console_mode() && !session.manager.enabled_keys().is_empty() {
+        match session.client.cheat_panic_off() {
+            Ok(restore) => {
+                let _ = session.manager.mark_all_off();
+                console_note = Some(panic_off_console_text(&restore));
+            }
+            Err(error) if is_unsupported_command(&error) => {
+                // 旧コンソールはここへ来ない（接続時の probe で pc へ落ちる）。
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot stop the console cheats before disconnecting: {error}"
+                ));
+            }
+        }
+    }
     if !session.dirty {
-        return Ok("disconnected".to_string());
+        return Ok(console_note.unwrap_or_else(|| "disconnected".to_string()));
     }
     match check_target(session) {
         Ok(true) => {}
@@ -603,7 +919,10 @@ fn retire(session: &mut Session) -> Result<String, String> {
             // originals to whatever now owns those addresses would corrupt the
             // new title.
             session.dirty = false;
-            return Ok("the title restarted; old patches died with it".to_string());
+            return Ok(match console_note {
+                Some(note) => format!("{note}; the title restarted"),
+                None => "the title restarted; old patches died with it".to_string(),
+            });
         }
         Err(error) => {
             return Err(format!(
@@ -631,10 +950,14 @@ fn retire(session: &mut Session) -> Result<String, String> {
         ));
     }
     session.dirty = false;
-    Ok(format!(
+    let message = format!(
         "restored {} address(es) before disconnecting",
         report.restored
-    ))
+    );
+    Ok(match console_note {
+        Some(note) => format!("{note}; {message}"),
+        None => message,
+    })
 }
 
 fn run_worker(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
@@ -699,9 +1022,18 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 }
                 match open_session(&host, port) {
                     Ok((new_session, text)) => {
-                        let view = make_view(&new_session.manager);
+                        let view = make_session_view(&new_session);
+                        // 旧コンソールで pc 実行へ落ちたなら、黙って済ませず
+                        // 1 行だけ知らせる（manager 側で 1 回に絞ってある）。
+                        let fallback = new_session
+                            .manager
+                            .console_fallback()
+                            .map(std::string::ToString::to_string);
                         session = Some(new_session);
                         let _ = tx.send(Ev::Opened(view, text));
+                        if let Some(notice) = fallback {
+                            let _ = tx.send(Ev::Log(notice));
+                        }
                     }
                     Err(error) => {
                         // The old session (if any) is already gone; the UI must not
@@ -734,7 +1066,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 };
                 match check_target(&current) {
                     Ok(true) => {
-                        let view = make_view(&current.manager);
+                        let view = make_session_view(&current);
                         session = Some(current);
                         let _ = tx.send(Ev::Updated(view, "refreshed".to_string()));
                     }
@@ -784,6 +1116,37 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                     .block(key)
                     .map(|block| block.name.clone())
                     .unwrap_or_else(|| key.to_string());
+                // コンソール実行: PC は「どのブロックか」を送るだけで、実際の
+                // 書き込みは本体のワーカーが行う（従来の PC 実行パスはそのまま
+                // 下に残してある）。
+                if current.manager.is_console_mode() {
+                    match console_toggle(&mut current, key, on) {
+                        ConsoleToggle::Done(message) => {
+                            current.dirty = current.manager.dirty();
+                            let view = make_session_view(&current);
+                            session = Some(current);
+                            let _ = tx.send(Ev::Updated(view, message));
+                            continue;
+                        }
+                        ConsoleToggle::Failed(error) => {
+                            current.dirty = current.manager.dirty();
+                            let view = make_session_view(&current);
+                            session = Some(current);
+                            let _ =
+                                tx.send(Ev::Updated(view, format!("could not toggle '{name}'")));
+                            let _ = tx.send(Ev::Error(format!("{name}: {error}")));
+                            continue;
+                        }
+                        ConsoleToggle::Unsupported(reason) => {
+                            // 接続時の probe をすり抜けた（新しいファームで
+                            // 一部だけ未実装など）。ここで pc へ落として、
+                            // 同じ操作をそのまま PC 経路で実行する。
+                            if let Some(notice) = current.manager.fallback_to_pc(&reason) {
+                                let _ = tx.send(Ev::Log(notice));
+                            }
+                        }
+                    }
+                }
                 let mut io = ClientCheatIo {
                     client: &current.client,
                 };
@@ -792,7 +1155,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                         // The manager owns the truth about leftover patches: a toggle that returned
                         // Ok after a failed restore used to look clean and was then never restored.
                         current.dirty = current.manager.dirty();
-                        let view = make_view(&current.manager);
+                        let view = make_session_view(&current);
                         session = Some(current);
                         let message = if on {
                             format!("enabled '{name}'")
@@ -803,7 +1166,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                     }
                     Err(error) => {
                         current.dirty = current.manager.dirty();
-                        let view = make_view(&current.manager);
+                        let view = make_session_view(&current);
                         session = Some(current);
                         let _ = tx.send(Ev::Updated(view, format!("could not toggle '{name}'")));
                         let _ = tx.send(Ev::Error(format!("{name}: {error}")));
@@ -840,12 +1203,27 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                         continue;
                     }
                 }
+                if current.manager.is_console_mode() {
+                    // コンソール実行中は PC からは何も書かない。ループは本体の
+                    // 16 ms ワーカーが回しているので、ここでやるのは fault の
+                    // 監視と 2 秒ごとの状態取得だけ。
+                    for message in drain_cheat_faults(&mut current) {
+                        let _ = tx.send(Ev::Log(message));
+                    }
+                    if let Some(notice) = refresh_console_status(&mut current) {
+                        let _ = tx.send(Ev::Log(notice));
+                    }
+                    let view = make_session_view(&current);
+                    session = Some(current);
+                    let _ = tx.send(Ev::Ticked(view));
+                    continue;
+                }
                 let keys = status.map(|status| status.keys_held).unwrap_or(0);
                 let mut io = ClientCheatIo {
                     client: &current.client,
                 };
                 let report = current.manager.tick(&mut io, keys);
-                let view = make_view(&current.manager);
+                let view = make_session_view(&current);
                 session = Some(current);
                 let _ = tx.send(Ev::Ticked(view));
                 if let Some((_, error)) = report.errors.first() {
@@ -876,6 +1254,42 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                         continue;
                     }
                 }
+                // コンソール実行では、まず本体のワーカーに全部止めさせて原本を
+                // 書き戻させる（復元表はコンソールが持っている）。そのあとで
+                // 従来のジャーナル復元も走らせる: PC 経路で書いた分が残って
+                // いれば、それも戻す必要がある。
+                let mut console_note = None;
+                if current.manager.is_console_mode() {
+                    match current.client.cheat_panic_off() {
+                        Ok(restore) => {
+                            let _ = current.manager.mark_all_off();
+                            console_note = Some(panic_off_console_text(&restore));
+                            if !restore.is_complete() {
+                                let _ = tx.send(Ev::Error(format!(
+                                    "the console could not restore {} address(es) - the title is \
+                                     probably gone",
+                                    restore.failed
+                                )));
+                            }
+                        }
+                        Err(error) if is_unsupported_command(&error) => {
+                            if let Some(notice) = current.manager.fallback_to_pc(&error.to_string())
+                            {
+                                let _ = tx.send(Ev::Log(notice));
+                            }
+                        }
+                        Err(error) => {
+                            let view = make_session_view(&current);
+                            session = Some(current);
+                            let _ = tx.send(Ev::Updated(
+                                view,
+                                "could not stop the console cheats".to_string(),
+                            ));
+                            let _ = tx.send(Ev::Error(format!("cheat panic-off: {error}")));
+                            continue;
+                        }
+                    }
+                }
                 let mut io = ClientCheatIo {
                     client: &current.client,
                 };
@@ -883,12 +1297,16 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 if report.is_complete() {
                     current.dirty = false;
                 }
-                let view = make_view(&current.manager);
+                let view = make_session_view(&current);
                 session = Some(current);
-                let message = format!(
+                let pc_message = format!(
                     "restored {} address(es), cleared {} enabled cheat(s)",
                     report.restored, report.cleared_cheats
                 );
+                let message = match console_note {
+                    Some(note) => format!("{note}; PC journal: {pc_message}"),
+                    None => pc_message,
+                };
                 let complete = report.is_complete();
                 let failed = report.failed.len();
                 let _ = tx.send(Ev::Restored(view, message, complete));
@@ -897,6 +1315,37 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                         "{failed} address(es) could not be restored - keep the console and retry"
                     )));
                 }
+            }
+            Job::SetMode(execution) => {
+                let Some(current) = session.as_mut() else {
+                    let _ = tx.send(Ev::Error("not connected".to_string()));
+                    continue;
+                };
+                if current.manager.execution() == execution {
+                    continue;
+                }
+                if !current.manager.enabled_keys().is_empty() {
+                    // 同じアドレスを 2 つの VM が書くと、片方のジャーナルが必ず
+                    // 嘘になる。切替は「全部 OFF」のときだけ許す。
+                    let view = make_session_view(current);
+                    let _ = tx.send(Ev::Updated(
+                        view,
+                        "turn every cheat off before switching where they run".to_string(),
+                    ));
+                    continue;
+                }
+                current.manager.set_execution(execution);
+                current.console = None;
+                current.console_fault = None;
+                // 切替直後に状態を取りに行く（2 秒待たない）。
+                current.last_console_status = Instant::now()
+                    .checked_sub(CONSOLE_STATUS_INTERVAL)
+                    .unwrap_or_else(Instant::now);
+                let view = make_session_view(current);
+                let _ = tx.send(Ev::Updated(
+                    view,
+                    format!("cheats now run on the {}", execution.label()),
+                ));
             }
             Job::ReloadFile => {
                 let Some(current) = session.as_mut() else {
@@ -911,7 +1360,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 }
                 match current.manager.reload() {
                     Ok(()) => {
-                        let view = make_view(&current.manager);
+                        let view = make_session_view(current);
                         let text = current.manager.document().raw_text.clone();
                         let _ = tx.send(Ev::Opened(view, text));
                     }
@@ -1094,6 +1543,12 @@ struct NclApp {
     host: String,
     port: String,
     auto_tick: bool,
+    /// チートを実行する場所の選択（実体は worker 側のマネージャが持つ）。
+    ///
+    /// UI 側にも控えるのは、`Job::SetMode` が断られたとき（ON のブロックが
+    /// 残っている間）に表示を戻すため。worker から view が届いたら、そちらの
+    /// `execution` に合わせる（フォールバックもこれで画面に反映される）。
+    execution: CheatExecution,
 
     worker: Worker,
     /// The job in flight, or `None`.  Never a `String` any more: see [`Busy`].
@@ -1159,6 +1614,7 @@ impl NclApp {
             host: prefs.host,
             port: prefs.port,
             auto_tick: prefs.auto_tick,
+            execution: CheatExecution::Console,
             worker: Worker::spawn(),
             busy: None,
             watchdog_warned: false,
@@ -1462,6 +1918,7 @@ impl NclApp {
                 self.log(self.message.clone());
                 self.editor.path = view.target.path.clone();
                 self.editor.build_id = view.target.build_id.clone();
+                self.execution = view.target.execution;
                 if self.editor.dirty() {
                     self.log(
                         "editor has unsaved changes; kept them (use \"Use target file\" to replace)",
@@ -1477,11 +1934,13 @@ impl NclApp {
             Ev::Updated(view, message) => {
                 self.message = message.clone();
                 self.log(message);
+                self.execution = view.target.execution;
                 self.live = Some(view);
             }
             Ev::Restored(view, message, complete) => {
                 self.message = message.clone();
                 self.log(message);
+                self.execution = view.target.execution;
                 self.live = Some(view);
                 if complete {
                     if self.quit_after_restore {
@@ -1497,6 +1956,7 @@ impl NclApp {
                 }
             }
             Ev::Ticked(view) => {
+                self.execution = view.target.execution;
                 self.live = Some(view);
             }
             Ev::Done(kind) => {
@@ -1547,7 +2007,9 @@ impl NclApp {
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        if !self.auto_tick || !live.has_loops() || self.busy.is_some() {
+        // コンソール実行ではループが無くても tick を回す: fault（本体が自分で
+        // 全部止めた）の監視と、2 秒ごとの状態取得がこの tick に乗っている。
+        if !self.auto_tick || !(live.has_loops() || live.runs_on_console()) || self.busy.is_some() {
             return;
         }
         if self.last_tick.elapsed() < TICK_INTERVAL {
@@ -1953,6 +2415,62 @@ impl NclApp {
                 // Refused (and the state left untouched) while a tick is in
                 // flight; see `NclApp::submit`.
                 self.submit(Job::Tick);
+            }
+        });
+        // 実行場所の切替。既定はコンソール（本体の 16 ms ワーカーで回る）。
+        // `PC` は従来の read/write 経路で、新コマンドを持たないコンソール向け。
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("run on").strong());
+            let mut wanted = self.execution;
+            ui.selectable_value(&mut wanted, CheatExecution::Console, "console")
+                .on_hover_text(
+                    "upload the linked program and let the console's 16 ms worker run it \
+                     (key conditions at frame rate, cheats keep running after a disconnect)",
+                );
+            ui.selectable_value(&mut wanted, CheatExecution::Pc, "PC")
+                .on_hover_text(
+                    "run the cheats from this PC (the classic read/write path); nothing is \
+                     uploaded, so the PC must stay connected",
+                );
+            if wanted != self.execution {
+                // 表示はすぐ切り替える。ON のブロックが残っている間の切替は
+                // worker が断り、その view でここが元に戻る。
+                self.execution = wanted;
+                self.submit(Job::SetMode(wanted));
+            }
+            if let Some(console) = &live.console {
+                ui.separator();
+                ui.label(
+                    RichText::new(if console.program_valid {
+                        "program loaded"
+                    } else {
+                        "no program"
+                    })
+                    .color(if console.program_valid { GREEN } else { DIM }),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} block(s) / {} on / {} insn",
+                        console.block_count, console.enabled_count, console.insn_count
+                    ))
+                    .color(DIM),
+                );
+                ui.monospace(format!("tick {}", console.tick_count));
+                ui.monospace(format!("journal {}", console.journal_count));
+                ui.monospace(format!("faults {}", console.fault_count));
+                ui.label(if console.running {
+                    RichText::new("running").color(GREEN)
+                } else {
+                    RichText::new("stopped").color(DIM)
+                });
+                if let Some(error) = &console.last_error {
+                    ui.label(RichText::new(error).color(YELLOW));
+                }
+                if let Some(fault) = &console.fault {
+                    // コンソールが自分で止めた理由。全ブロックは既に OFF 表示に
+                    // なっている（`mark_all_off`）。
+                    ui.label(RichText::new(fault).color(RED));
+                }
             }
         });
         if let Some(error) = &live.target.last_error {
@@ -2653,7 +3171,15 @@ impl eframe::App for NclApp {
 
         if self.busy.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(120));
-        } else if self.live.as_ref().map(LiveView::has_loops).unwrap_or(false) && self.auto_tick {
+        } else if self.auto_tick
+            && self
+                .live
+                .as_ref()
+                .map(|view| view.has_loops() || view.runs_on_console())
+                .unwrap_or(false)
+        {
+            // コンソール実行ではループが無くても tick を回す（状態取得と
+            // fault の監視）。フレーム時計を止めると、それも止まる。
             ui.ctx().request_repaint_after(TICK_INTERVAL);
         }
     }

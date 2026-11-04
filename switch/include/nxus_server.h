@@ -71,3 +71,11 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 /* Called periodically from the main loop: watchdog + deferred work.  A no-op after
    nxusServerExit() (everything it would maintain has been released). */
 void nxusServerTick(void);
+
+/* True from the moment nxusServerExit() raised the terminal gate (until the next
+   nxusServerInit()).  Exposed for the workers this file does not own: a thread that
+   outlives the dispatcher (the cheat VM worker in nxus_cheat_srv.c) polls it so it
+   can never start another tick against the session/dmnt the exit path is releasing.
+   Not a substitute for joining such a worker - main.c still stops it BEFORE
+   nxusServerExit() - it is the belt to that brace. */
+bool nxusServerHasExited(void);

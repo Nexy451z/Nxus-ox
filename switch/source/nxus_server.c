@@ -1,4 +1,5 @@
 #include "nxus_server.h"
+#include "nxus_cheat_srv.h"
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
 #include "nxus_hid.h"
@@ -1893,6 +1894,13 @@ static void serverExitGateReset(void) {
     /* No exit of this lifetime has run yet: a query before the first Exit must not
        report the previous round's outcome. */
     atomic_store_explicit(&g_ServerExitQuiesced, false, memory_order_release);
+}
+
+/* Read-only view of the gate for the workers this file does not own (see the
+   header).  Acquire, matching the gate checks above: a worker that sees true also
+   sees everything the exit path published before raising it. */
+bool nxusServerHasExited(void) {
+    return atomic_load_explicit(&g_ServerExited, memory_order_acquire);
 }
 
 /* How long nxusServerExit() is willing to wait for the worker Thread slot, and the
@@ -4189,6 +4197,99 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
 
         case NxusCmd_HitClear:
             nxusDebugClearHits();
+            reply(fd, type, seq, NULL, 0);
+            break;
+
+        /* ---- on-console cheat engine (0x0080..0x0084) ----------------------
+           The PC parses the cheat file and uploads a LINKED program; the 16 ms
+           worker in nxus_cheat_srv.c interprets it from the console, so key
+           conditionals and loops run at frame rate instead of at the PC's polling
+           rate.  These handlers only validate what the wire says (payload shape /
+           length) and leave every engine decision to the service, which owns the
+           program, the journal and the target stamp.
+
+           Every case is inside the terminal gate like the rest of the switch (a
+           packet that arrives after nxusServerExit() is refused above, before
+           dispatchCommand() runs) and none of them touches the session's scan /
+           snapshot state, so no extra BUSY gate is needed: the engine has its own
+           static program + journal (about 30 KB, no heap) and its own worker. */
+
+        case NxusCmd_CheatUpload: {
+            /* Length first, in two steps, because both are client errors and both
+               have a precise reason: a payload shorter than the program header, and
+               a header whose total_bytes / block_count / insn_count disagree with
+               the bytes that actually arrived.  The service then validates the
+               program itself (magic/version/branch targets) and the target it was
+               built for. */
+            if (length < sizeof(NxusCheatProgramHeader)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
+            NxusCheatProgramHeader ch;
+            memcpy(&ch, payload, sizeof(ch));
+            /* In u64: block_count/insn_count come straight off the wire, so a u32
+               product could wrap and accept a truncated program. */
+            const u64 expected = (u64)sizeof(NxusCheatProgramHeader) +
+                                 (u64)ch.block_count * (u64)sizeof(NxusCheatBlockDesc) +
+                                 (u64)ch.insn_count * (u64)sizeof(NxusCheatInsn);
+            if ((u64)ch.total_bytes != (u64)length || expected != (u64)length) {
+                NXUS_LOG("cheat: upload refused - header total_bytes=%u blocks=%u insns=%u "
+                         "do not describe a %u-byte payload",
+                         (unsigned)ch.total_bytes, (unsigned)ch.block_count,
+                         (unsigned)ch.insn_count, (unsigned)length);
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
+            NxusCheatUploadReply up;
+            if (!nxusCheatSrvUpload(payload, length, &up)) {
+                /* A rejected program, or one uploaded for another title than the
+                   target the session is on: the payload was well formed, so the
+                   argument (the program's target) is what is refused. */
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
+                break;
+            }
+            reply(fd, type, seq, &up, sizeof(up));
+            break;
+        }
+
+        case NxusCmd_CheatEnable: {
+            if (length < sizeof(NxusCheatEnable)) {
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_LENGTH);
+                break;
+            }
+            NxusCheatEnable ce;
+            memcpy(&ce, payload, sizeof(ce));
+            if (!nxusCheatSrvSetEnabled(&ce)) {
+                /* No program, an index outside it, or a target that changed since
+                   the upload: all refused without touching the engine. */
+                replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
+                                 NXUS_REASON_BAD_ARG);
+                break;
+            }
+            reply(fd, type, seq, NULL, 0);
+            break;
+        }
+
+        case NxusCmd_CheatStatus: {
+            NxusCheatStatus cs;
+            nxusCheatSrvStatus(&cs);
+            reply(fd, type, seq, &cs, sizeof(cs));
+            break;
+        }
+
+        case NxusCmd_CheatPanicOff: {
+            NxusCheatRestore rs;
+            nxusCheatSrvPanicOff(&rs);
+            reply(fd, type, seq, &rs, sizeof(rs));
+            break;
+        }
+
+        case NxusCmd_CheatClear:
+            nxusCheatSrvClear();
             reply(fd, type, seq, NULL, 0);
             break;
 

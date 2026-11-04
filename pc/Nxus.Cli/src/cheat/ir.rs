@@ -1,69 +1,88 @@
 //! Linked cheat programs for the on-console interpreter.
 //!
-//! The PC already parses an Atmosphere `<BUILDID>.txt` into a
-//! [`CheatDocument`]; this module turns that document into the **wire program**
-//! described by `core/nxus_cheatvm.h`, so the console needs no assembler and no
-//! linker: every branch target is already resolved to an **instruction index**
-//! in the flat instruction array.
+//! `core/nxus_cheatvm.h` is the contract.  The PC parses an Atmosphere
+//! `<BUILDID>.txt` into a [`CheatDocument`]; this module turns that document
+//! into the **wire program** the console executes (`nxusCheatInstall`), with
+//! every branch target already resolved to an instruction index, so the console
+//! never needs an assembler or a linker.
 //!
-//! The wire layout is a header, one block descriptor per cheat, and then the
-//! instructions of every block, back to back.  All integers are little endian
-//! and all structures are packed (no padding):
+//! ## Layout (little endian, packed - no padding)
 //!
 //! ```text
-//! NxusCheatProgramHeader (32 bytes)
+//! NxusCheatProgramHeader (40 bytes, one per program)
 //!   u32 magic, u32 version, u64 build_id, u64 program_id,
-//!   u16 block_count, u16 insn_count, u16 total_bytes, u16 reserved
-//! NxusCheatBlockDesc (24 bytes) x block_count
+//!   u32 block_count, u32 insn_count, u32 total_bytes, u32 reserved
+//! NxusCheatBlockDesc (24 bytes, block_count of them)
 //!   u32 index, u32 mode, u32 first, u32 count, u32 enabled, u32 reserved
-//! NxusCheatInsn (24 bytes) x insn_count
+//! NxusCheatInsn (24 bytes, insn_count of them)
 //!   u16 op, u8 width, u8 region, u8 cmp, u8 reg_a, u8 reg_b, u8 flags,
 //!   u32 target, u32 address, u64 value
 //! ```
 //!
-//! `core/nxus_cheatvm.h` declares the four header counters as `u32`, which sums
-//! to 40 bytes and contradicts the `sizeof(...) == 32` assertion right below
-//! them.  This module follows the asserted size (32 bytes; also the size the
-//! console budget was computed from), so those four counters are 16-bit.  Every
-//! legal value fits: at most 128 blocks, 512 instructions and 48 KiB.
+//! The blocks and then the instructions follow the header back to back;
+//! `total_bytes` covers all three.
+//!
+//! ## Address contract
+//!
+//! The header says the PC resolves `region + offset` to the **final absolute
+//! address** before uploading and that the console adds no base.
+//! [`build_program`] keeps the region-relative address (plus the region) as
+//! parsed, which is what the PC-side VM consumes; [`build_program_resolved`]
+//! applies [`MemoryRegions`] first and is what an upload has to use.  `address`
+//! is 32 bits wide, so an absolute address above `0xFFFF_FFFF` cannot be linked
+//! and is an error.
 //!
 //! ## Instruction mapping
 //!
-//! `target` is a program-wide instruction index; it is `0` for instructions
-//! that never branch.  `address` holds the low 32 bits of a relative address
-//! (always `0` when unused) and `value` holds an immediate, a key mask or a
-//! register mask.
+//! `target` is a program-wide instruction index and is `0` for instructions
+//! that never branch.  `address` holds the (resolved or relative) address;
+//! `value` holds an immediate, a key mask or a register mask.
 //!
 //! | `Instruction` (model.rs) | `op` | fields |
 //! |---|---|---|
-//! | `StoreStatic` | 1 | `width`, `region`, `address`, `value`, `reg_b` = offset register |
-//! | `BeginConditional` | 2 | `width`, `region`, `cmp`, `address`, `value`, `reg_b`, [`FLAG_OFFSET_REGISTER`] |
+//! | `StoreStatic` | 1 | `width`, `region`, `address`, `value`, `reg_b` = offset register, [`FLAG_OFFSET_REGISTER`] |
+//! | `BeginConditional` | 2 | `width`, `region`, `cmp`, `address`, `value`, `reg_b`, [`FLAG_OFFSET_REGISTER`], `target` |
 //! | `EndConditional { is_else: true }` | 3 | `target` = first instruction after the matching end |
 //! | `EndConditional { is_else: false }` | 4 | falls through, `target` = 0 |
 //! | `LoopStart` | 5 | `reg_a` = counter, `value` = count, `target` = first body instruction |
 //! | `LoopEnd` | 6 | `reg_a` = counter, `target` = the matching `LoopStart` |
 //! | `LoadRegisterImmediate` | 7 | `reg_a`, `value` |
-//! | `LoadRegisterMemory` modes 0..3 | 8, 11, 12, 13 | `width`, `reg_a` = destination, `reg_b` = base register, `region`, `address` |
-//! | `StoreStaticToRegister` | 9 | `width`, `reg_a`, `reg_b`, `value`, [`FLAG_INCREMENT`] / [`FLAG_OFFSET_REGISTER`] |
+//! | `LoadRegisterMemory` mode 0 | 8 | `width`, `region`, `address`, `reg_a` = destination, `reg_b` = unused offset register |
+//! | `LoadRegisterMemory` mode 1 | 11 | `width`, `reg_a` = destination (and base), `address` = offset |
+//! | `LoadRegisterMemory` mode 2 | 8 | `width`, `region` = absolute, `reg_a` = destination, `reg_b` = base register, [`FLAG_OFFSET_REGISTER`], `address` = offset |
+//! | `LoadRegisterMemory` mode 3 | 8 | `width`, `region`, `reg_a` = destination, `reg_b` = base register, [`FLAG_OFFSET_REGISTER`], `address` = offset |
+//! | `StoreStaticToRegister` | 9 | `width`, `reg_a`, `value`, `reg_b` = offset register, [`FLAG_OFFSET_REGISTER`] / [`FLAG_INCREMENT`] |
 //! | `LegacyArithmetic` | 10 | `width`, `reg_a`, `cmp` = arithmetic, `value` |
 //! | `RegisterArithmetic` (immediate, in place) | 10 | `width`, `reg_a`, `cmp` = arithmetic, `value` |
 //! | `RegisterArithmetic` (register, in place) | 14 | `width`, `reg_a`, `cmp` = arithmetic, `reg_b` = operand |
-//! | `StoreRegisterToMemory` | 15 | `width`, `reg_a` = address register, `reg_b` = source register, `flags` = mode, [`FLAG_INCREMENT`], offset register; `region`/`address` for the offset forms |
-//! | `RegisterConditional` | 16 | `width`, `cmp`, `reg_a` = value register, `flags` = operand form, `reg_b`/`region`/`address`/`value` per form |
-//! | `SaveRestoreRegisterMask` (save/restore) | 17, 18 | `value` = mask |
-//! | `StaticRegister` | 19 | `reg_a`, `value` = static index, [`FLAG_STATIC_WRITE`] when writing |
+//! | `StoreRegisterToMemory` (no offset, no increment) | 15 | `width`, `reg_a` = address register, `reg_b` = source register |
+//! | `RegisterConditional` (immediate) | 16 | `width`, `cmp`, `reg_a` = value register, `value` = immediate, `target` |
+//! | `RegisterConditional` (register) | 16 | `width`, `cmp`, `reg_a`, `reg_b` = operand register, [`FLAG_REGISTER_OPERAND`], `target` |
+//! | `SaveRestoreRegisterMask` (save / restore) | 17, 18 | `value` = mask |
 //! | `PauseProcess` / `ResumeProcess` | 20, 21 | — |
 //! | `KeypressConditional` | 22 | `value` = key mask, `target` = false branch |
 //!
-//! Anything the wire format cannot express is an **error**, never a silent
-//! drop: `Unsupported` opcodes, single-register save/restore, out-of-range
-//! arithmetic, 3-operand register arithmetic (the wire opcodes are in place),
-//! and relative addresses wider than 32 bits.
+//! ## What cannot be linked (an error, never a silent drop)
 //!
-//! A conditional whose false/else branch leaves the block at its very end would
-//! point one past the last instruction.  Such a block gets a trailing
-//! [`OP_NOP`] so every target names an instruction the console can validate;
-//! the interpreter stops at the end of the block either way.
+//! * `Unsupported` opcodes and blocks whose ON code has parse issues.
+//! * `SaveRestoreRegister` (`0xC1`) and the "clear" mask operations: the wire
+//!   only has mask save/restore.
+//! * `StaticRegister` (`0xC3`): the wire opcode is reserved and executes as a
+//!   `Nop`, so linking it would silently drop the transfer.
+//! * `StoreRegisterToMemory` with an offset or an increment: wire `StoreReg` is
+//!   only `[rA] = rB`.
+//! * `RegisterConditional` with a memory operand: wire `RegConditional`
+//!   compares a register with an immediate or another register.
+//! * Register arithmetic whose destination differs from its first source, and
+//!   arithmetic other than `+ - * << >>`: the wire opcodes are in place and the
+//!   arithmetic enum stops at the right shift.
+//! * Addresses that do not fit 32 bits, and any program over
+//!   [`MAX_PROGRAM_BYTES`] / [`MAX_INSNS`] / [`MAX_BLOCKS`].
+//!
+//! A conditional whose false (or else) branch leaves the block at its very end
+//! would point one past the last instruction, which `nxusCheatInstall` rejects
+//! (`-4`).  Such a block gets a trailing [`OP_NOP`] so every target names an
+//! instruction inside the block; the interpreter stops at the end either way.
 //!
 //! The OFF half of a block is deliberately not part of the program: the console
 //! journals the original bytes and restores them when a block is disabled.
@@ -74,6 +93,7 @@ use super::model::{
     ArithmeticOp, ArithmeticOperand, CheatCode, CheatDocument, CheatExecMode, CheatKey, Comparison,
     ConditionalOperand, Instruction, MemoryRegion, SaveRestoreOp, StoreOffset,
 };
+use super::vm::MemoryRegions;
 
 // ---------------------------------------------------------------------------
 // Limits and format constants (mirror of `core/nxus_cheatvm.h`)
@@ -85,7 +105,7 @@ pub const MAGIC: u32 = 0x4E43_564D;
 pub const VERSION: u32 = 1;
 
 /// Bytes of `NxusCheatProgramHeader`.
-pub const HEADER_BYTES: usize = 32;
+pub const HEADER_BYTES: usize = 40;
 /// Bytes of `NxusCheatBlockDesc`.
 pub const BLOCK_BYTES: usize = 24;
 /// Bytes of `NxusCheatInsn`.
@@ -135,46 +155,33 @@ pub const OP_PAUSE: u16 = 20;
 pub const OP_RESUME: u16 = 21;
 pub const OP_KEYPRESS_CONDITIONAL: u16 = 22;
 
-/// `flags` bit for `OP_STORE_STATIC_TO_REG`/`OP_STORE_REG`: the address
-/// register is advanced by `width` after the access (Atmosphere 0x6/0xA bit 12).
-pub const FLAG_INCREMENT: u8 = 1 << 0;
-/// `flags` bit for `OP_BEGIN_CONDITIONAL`/`OP_STORE_STATIC_TO_REG`: `reg_b` is
-/// added to the region-relative address.
-pub const FLAG_OFFSET_REGISTER: u8 = 1 << 1;
-/// `flags` bit for `OP_STATIC_REGS`: the transfer goes general -> static
-/// (the Atmosphere 0xC3 convention of a static index at or above `0x80`).
-pub const FLAG_STATIC_WRITE: u8 = 1 << 0;
-
-/// `OP_REG_CONDITIONAL` operand form: `[region + address]`.
-pub const COND_MEMORY_RELATIVE: u8 = 0;
-/// `OP_REG_CONDITIONAL` operand form: `[region + rB]`.
-pub const COND_MEMORY_OFFSET: u8 = 1;
-/// `OP_REG_CONDITIONAL` operand form: `[rB + address]`.
-pub const COND_REGISTER_RELATIVE: u8 = 2;
-/// `OP_REG_CONDITIONAL` operand form: `[rB + rValue]` (the offset register is
-/// kept in `value`).
-pub const COND_REGISTER_OFFSET: u8 = 3;
-/// `OP_REG_CONDITIONAL` operand form: compare against the immediate `value`.
-pub const COND_IMMEDIATE: u8 = 4;
-/// `OP_REG_CONDITIONAL` operand form: compare against `rB`.
-pub const COND_REGISTER: u8 = 5;
+/// `flags` bit for `OP_STORE_STATIC`/`OP_BEGIN_CONDITIONAL`/`OP_LOAD_REG_MEM`:
+/// `reg_b` is added to the region-relative address.  Also bit 0 of
+/// `OP_STORE_STATIC_TO_REG` (the `nxus_cheatvm.c` convention).
+pub const FLAG_OFFSET_REGISTER: u8 = 1 << 0;
+/// `flags` bit for `OP_STORE_STATIC_TO_REG`: advance the address register by
+/// `width` after the store (Atmosphere 0x6 `I` bit).
+pub const FLAG_INCREMENT: u8 = 1 << 1;
+/// `flags` bit for `OP_REG_CONDITIONAL`: compare with `reg_b` instead of the
+/// immediate `value`.
+pub const FLAG_REGISTER_OPERAND: u8 = 1 << 0;
 
 // ---------------------------------------------------------------------------
 // Wire structures
 // ---------------------------------------------------------------------------
 
-/// `NxusCheatProgramHeader` - 32 bytes, packed.
+/// `NxusCheatProgramHeader` - 40 bytes, packed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProgramHeader {
     pub magic: u32,
     pub version: u32,
     pub build_id: u64,
     pub program_id: u64,
-    pub block_count: u16,
-    pub insn_count: u16,
+    pub block_count: u32,
+    pub insn_count: u32,
     /// Header + blocks + instructions.
-    pub total_bytes: u16,
-    pub reserved: u16,
+    pub total_bytes: u32,
+    pub reserved: u32,
 }
 
 impl ProgramHeader {
@@ -184,10 +191,10 @@ impl ProgramHeader {
         out[4..8].copy_from_slice(&self.version.to_le_bytes());
         out[8..16].copy_from_slice(&self.build_id.to_le_bytes());
         out[16..24].copy_from_slice(&self.program_id.to_le_bytes());
-        out[24..26].copy_from_slice(&self.block_count.to_le_bytes());
-        out[26..28].copy_from_slice(&self.insn_count.to_le_bytes());
-        out[28..30].copy_from_slice(&self.total_bytes.to_le_bytes());
-        out[30..32].copy_from_slice(&self.reserved.to_le_bytes());
+        out[24..28].copy_from_slice(&self.block_count.to_le_bytes());
+        out[28..32].copy_from_slice(&self.insn_count.to_le_bytes());
+        out[32..36].copy_from_slice(&self.total_bytes.to_le_bytes());
+        out[36..40].copy_from_slice(&self.reserved.to_le_bytes());
         out
     }
 
@@ -203,10 +210,10 @@ impl ProgramHeader {
             version: read_u32(bytes, 4),
             build_id: read_u64(bytes, 8),
             program_id: read_u64(bytes, 16),
-            block_count: read_u16(bytes, 24),
-            insn_count: read_u16(bytes, 26),
-            total_bytes: read_u16(bytes, 28),
-            reserved: read_u16(bytes, 30),
+            block_count: read_u32(bytes, 24),
+            insn_count: read_u32(bytes, 28),
+            total_bytes: read_u32(bytes, 32),
+            reserved: read_u32(bytes, 36),
         })
     }
 }
@@ -274,7 +281,7 @@ pub struct WireInsn {
     pub flags: u8,
     /// Linked branch target (a program-wide instruction index), `0` when none.
     pub target: u32,
-    /// Low 32 bits of the relative address, or an immediate.
+    /// Address (32 bits), or an immediate.
     pub address: u32,
     /// Immediate, key mask or register mask.
     pub value: u64,
@@ -318,10 +325,6 @@ impl WireInsn {
     }
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-}
-
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     let mut word = [0u8; 4];
     word.copy_from_slice(&bytes[offset..offset + 4]);
@@ -338,12 +341,16 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 // Building a program
 // ---------------------------------------------------------------------------
 
-/// Link `document` into one console program.
+/// Link `document` into one console program, keeping region-relative addresses.
 ///
-/// Every block of the document becomes one [`BlockDesc`] (in document order),
+/// Every block of the document becomes one [`BlockDesc`] (in document order)
 /// carrying the ON instructions of that block.  `enabled` is the set of cheat
 /// keys the caller wants enabled at upload time; it lands in
 /// `BlockDesc::enabled`.
+///
+/// The addresses stay relative to `region`.  The console's interpreter adds no
+/// region base (see the header's address contract), so an upload normally wants
+/// [`build_program_resolved`] instead.
 ///
 /// A block whose ON code has parse issues is refused: shipping a partial block
 /// would execute something the user never wrote.
@@ -352,6 +359,32 @@ pub fn build_program(
     build_id: u64,
     program_id: u64,
     enabled: &BTreeSet<CheatKey>,
+) -> Result<Vec<u8>, String> {
+    build(document, build_id, program_id, enabled, None)
+}
+
+/// Link `document` into one console program with every address resolved.
+///
+/// `regions` are the target's main/heap/alias/aslr bases (the same values the
+/// PC-side VM uses).  Each region-relative address becomes the final absolute
+/// address the console executes against, exactly as the header's address
+/// contract requires.  [`MemoryRegion::Absolute`] addresses are left alone.
+pub fn build_program_resolved(
+    document: &CheatDocument,
+    build_id: u64,
+    program_id: u64,
+    enabled: &BTreeSet<CheatKey>,
+    regions: &MemoryRegions,
+) -> Result<Vec<u8>, String> {
+    build(document, build_id, program_id, enabled, Some(regions))
+}
+
+fn build(
+    document: &CheatDocument,
+    build_id: u64,
+    program_id: u64,
+    enabled: &BTreeSet<CheatKey>,
+    regions: Option<&MemoryRegions>,
 ) -> Result<Vec<u8>, String> {
     if document.blocks.len() > MAX_BLOCKS {
         return Err(format!(
@@ -368,7 +401,7 @@ pub fn build_program(
             return Err(format!("cheat '{}' cannot be linked: {issue}", block.name));
         }
         let first = insns.len();
-        let mut linked = link_block(&block.on, first, &block.name)?;
+        let mut linked = link_block(&block.on, first, &block.name, regions)?;
         let count = linked.len();
         insns.append(&mut linked);
         if insns.len() > MAX_INSNS {
@@ -402,13 +435,9 @@ pub fn build_program(
         version: VERSION,
         build_id,
         program_id,
-        block_count: u16::try_from(blocks.len())
-            .map_err(|_| "cheat program has too many blocks for the wire header".to_string())?,
-        insn_count: u16::try_from(insns.len()).map_err(|_| {
-            "cheat program has too many instructions for the wire header".to_string()
-        })?,
-        total_bytes: u16::try_from(total_bytes)
-            .map_err(|_| "cheat program is too large for the wire header".to_string())?,
+        block_count: blocks.len() as u32,
+        insn_count: insns.len() as u32,
+        total_bytes: total_bytes as u32,
         reserved: 0,
     };
 
@@ -428,7 +457,12 @@ pub fn build_program(
 ///
 /// `base` is the program-wide index of the block's first instruction, so the
 /// targets written here are already global.
-fn link_block(code: &CheatCode, base: usize, name: &str) -> Result<Vec<WireInsn>, String> {
+fn link_block(
+    code: &CheatCode,
+    base: usize,
+    name: &str,
+    regions: Option<&MemoryRegions>,
+) -> Result<Vec<WireInsn>, String> {
     let count = code.instructions.len();
     let mut local_targets: Vec<Option<usize>> = vec![None; count];
     // (begin index, matching else index)
@@ -501,8 +535,8 @@ fn link_block(code: &CheatCode, base: usize, name: &str) -> Result<Vec<WireInsn>
     }
 
     // A conditional that runs to the end of the block branches one past the
-    // last instruction.  Give that target a real Nop so the console's install
-    // check never sees a target outside the instruction array.
+    // last instruction.  `nxusCheatInstall` rejects such a target, so give it a
+    // real Nop and let the interpreter stop after it.
     let mut length = count;
     if local_targets.iter().any(|target| *target == Some(count)) {
         length += 1;
@@ -516,6 +550,7 @@ fn link_block(code: &CheatCode, base: usize, name: &str) -> Result<Vec<WireInsn>
             base,
             local_targets[index],
             name,
+            regions,
         )?);
     }
     if length > count {
@@ -534,16 +569,17 @@ fn convert(
     base: usize,
     local_target: Option<usize>,
     block: &str,
+    regions: Option<&MemoryRegions>,
 ) -> Result<WireInsn, String> {
     let at = |pc: usize| format!("cheat '{block}' instruction {pc}");
-    let resolved = |local: usize| -> Result<u32, String> {
-        u32::try_from(base + local)
-            .map_err(|_| format!("{}: branch target overflows the instruction index", at(pc)))
-    };
     let branch_target = |local_target: Option<usize>| -> Result<u32, String> {
         let local =
             local_target.ok_or_else(|| format!("{}: branch target was not linked", at(pc)))?;
-        resolved(local)
+        u32::try_from(base + local)
+            .map_err(|_| format!("{}: branch target overflows the instruction index", at(pc)))
+    };
+    let address = |rel_address: u64, region: MemoryRegion| {
+        wire_address(rel_address, region, regions, &at(pc))
     };
 
     let mut insn = WireInsn::default();
@@ -555,11 +591,14 @@ fn convert(
             rel_address,
             value,
         } => {
+            // Atmosphere 0x0 - and the PC VM - always add the offset register,
+            // so the flag is always set (for the usual r0 this is a zero add).
             insn.op = OP_STORE_STATIC;
             insn.width = *width;
             insn.region = region.bits() as u8;
             insn.reg_b = *offset_register;
-            insn.address = address32(*rel_address, &at(pc))?;
+            insn.flags |= FLAG_OFFSET_REGISTER;
+            insn.address = address(*rel_address, *region)?;
             insn.value = *value;
         }
         Instruction::BeginConditional {
@@ -579,7 +618,7 @@ fn convert(
             if *include_offset_register {
                 insn.flags |= FLAG_OFFSET_REGISTER;
             }
-            insn.address = address32(*rel_address, &at(pc))?;
+            insn.address = address(*rel_address, *region)?;
             insn.value = *value;
             insn.target = branch_target(local_target)?;
         }
@@ -617,22 +656,37 @@ fn convert(
         } => {
             insn.width = *width;
             insn.reg_a = *register;
-            insn.address = address32(*rel_address, &at(pc))?;
             match load_from_register {
+                // `[region + address]`; Atmosphere mode 0 ignores the offset
+                // register, so it is kept for the record but not added.
                 0 => {
                     insn.op = OP_LOAD_REG_MEM;
                     insn.region = region.bits() as u8;
                     insn.reg_b = *offset_register;
+                    insn.address = address(*rel_address, *region)?;
                 }
-                1 => insn.op = OP_LOAD_REG_MEM_REG,
+                // `[rA + address]`.
+                1 => {
+                    insn.op = OP_LOAD_REG_MEM_REG;
+                    insn.address = raw_address(*rel_address, &at(pc))?;
+                }
+                // `[rS + address]`: the wire `[region + address + rB]` form is
+                // the exact shape (`region = absolute` adds no base), while
+                // op 12's `[rA + rB]` would also add the destination register.
                 2 => {
-                    insn.op = OP_LOAD_REG_MEM_REG_REG;
+                    insn.op = OP_LOAD_REG_MEM;
+                    insn.region = MemoryRegion::Absolute.bits() as u8;
                     insn.reg_b = *offset_register;
+                    insn.flags |= FLAG_OFFSET_REGISTER;
+                    insn.address = address(*rel_address, MemoryRegion::Absolute)?;
                 }
+                // `[region + rS + address]`, same decomposition.
                 3 => {
-                    insn.op = OP_LOAD_REG_MEM_REG_REGION;
+                    insn.op = OP_LOAD_REG_MEM;
                     insn.region = region.bits() as u8;
                     insn.reg_b = *offset_register;
+                    insn.flags |= FLAG_OFFSET_REGISTER;
+                    insn.address = address(*rel_address, *region)?;
                 }
                 other => {
                     return Err(format!(
@@ -654,11 +708,11 @@ fn convert(
             insn.width = *width;
             insn.reg_a = *register;
             insn.reg_b = *offset_register;
-            if *increment {
-                insn.flags |= FLAG_INCREMENT;
-            }
             if *add_offset_register {
                 insn.flags |= FLAG_OFFSET_REGISTER;
+            }
+            if *increment {
+                insn.flags |= FLAG_INCREMENT;
             }
             insn.value = *value;
         }
@@ -721,42 +775,28 @@ fn convert(
             increment,
             offset,
         } => {
+            // Wire `StoreReg` is only `[rA] = rB`; neither an offset nor an
+            // increment has a field, so refuse rather than write the wrong
+            // address or leave the register unadvanced.
+            if *increment {
+                return Err(format!(
+                    "{}: StoreRegisterToMemory with an increment cannot be linked (the wire \
+                     StoreReg has no increment form)",
+                    at(pc)
+                ));
+            }
+            if !matches!(offset, StoreOffset::None) {
+                return Err(format!(
+                    "{}: StoreRegisterToMemory offset form {} cannot be linked (the wire StoreReg \
+                     only writes [rA])",
+                    at(pc),
+                    offset.code()
+                ));
+            }
             insn.op = OP_STORE_REG;
             insn.width = *width;
             insn.reg_a = *address_register;
             insn.reg_b = *source_register;
-            if *increment {
-                insn.flags |= FLAG_INCREMENT;
-            }
-            // bits 1..=3: offset form (`StoreOffset::code`)
-            insn.flags |= (offset.code() as u8) << 1;
-            match offset {
-                StoreOffset::None => {}
-                StoreOffset::Register(offset_register) => {
-                    // bits 4..=7: the offset register
-                    insn.flags |= offset_register << 4;
-                }
-                StoreOffset::Immediate(rel_address) => {
-                    insn.address = address32(*rel_address, &at(pc))?;
-                }
-                StoreOffset::MemoryRegister(region) => {
-                    insn.region = region.bits() as u8;
-                }
-                StoreOffset::MemoryImmediate {
-                    region,
-                    rel_address,
-                } => {
-                    insn.region = region.bits() as u8;
-                    insn.address = address32(*rel_address, &at(pc))?;
-                }
-                StoreOffset::MemoryImmediateRegister {
-                    region,
-                    rel_address,
-                } => {
-                    insn.region = region.bits() as u8;
-                    insn.address = address32(*rel_address, &at(pc))?;
-                }
-            }
         }
         Instruction::RegisterConditional {
             width,
@@ -769,47 +809,21 @@ fn convert(
             insn.cmp = comparison_code(*comparison);
             insn.reg_a = *value_register;
             match operand {
-                ConditionalOperand::MemoryRelative {
-                    region,
-                    rel_address,
-                } => {
-                    insn.flags = COND_MEMORY_RELATIVE;
-                    insn.region = region.bits() as u8;
-                    insn.address = address32(*rel_address, &at(pc))?;
-                }
-                ConditionalOperand::MemoryOffset {
-                    region,
-                    offset_register,
-                } => {
-                    insn.flags = COND_MEMORY_OFFSET;
-                    insn.region = region.bits() as u8;
-                    insn.reg_b = *offset_register;
-                }
-                ConditionalOperand::RegisterRelative {
-                    address_register,
-                    rel_address,
-                } => {
-                    insn.flags = COND_REGISTER_RELATIVE;
-                    insn.reg_b = *address_register;
-                    insn.address = address32(*rel_address, &at(pc))?;
-                }
-                ConditionalOperand::RegisterOffset {
-                    address_register,
-                    offset_register,
-                } => {
-                    insn.flags = COND_REGISTER_OFFSET;
-                    insn.reg_b = *address_register;
-                    // `value` is otherwise unused here, so it carries the
-                    // second register rather than widening `flags`.
-                    insn.value = u64::from(*offset_register);
-                }
+                // The wire instruction compares a register with an immediate
+                // or another register; a memory operand has no field.
                 ConditionalOperand::Immediate(value) => {
-                    insn.flags = COND_IMMEDIATE;
                     insn.value = *value;
                 }
                 ConditionalOperand::Register(register) => {
-                    insn.flags = COND_REGISTER;
+                    insn.flags |= FLAG_REGISTER_OPERAND;
                     insn.reg_b = *register;
+                }
+                other => {
+                    return Err(format!(
+                        "{}: register conditional against {other:?} cannot be linked (the wire \
+                         RegConditional compares an immediate or a register)",
+                        at(pc)
+                    ))
                 }
             }
             insn.target = branch_target(local_target)?;
@@ -836,16 +850,13 @@ fn convert(
                 ))
             }
         },
-        Instruction::StaticRegister {
-            static_index,
-            register,
-        } => {
-            insn.op = OP_STATIC_REGS;
-            insn.reg_a = *register;
-            insn.value = u64::from(*static_index);
-            if *static_index >= 0x80 {
-                insn.flags |= FLAG_STATIC_WRITE;
-            }
+        Instruction::StaticRegister { .. } => {
+            // NxusCheatOp_StaticRegs is reserved and the interpreter treats it
+            // as a Nop; linking would silently drop the transfer.
+            return Err(format!(
+                "{}: static-register opcode is reserved on the console and cannot be linked",
+                at(pc)
+            ));
         }
         Instruction::PauseProcess => insn.op = OP_PAUSE,
         Instruction::ResumeProcess => insn.op = OP_RESUME,
@@ -856,17 +867,34 @@ fn convert(
     Ok(insn)
 }
 
-/// The wire format carries 32 bits of relative address.
-fn address32(rel_address: u64, at: &str) -> Result<u32, String> {
-    u32::try_from(rel_address).map_err(|_| {
+/// The wire address: 32 bits, with the region base applied when a resolver is
+/// given (the header's address contract).
+fn wire_address(
+    rel_address: u64,
+    region: MemoryRegion,
+    regions: Option<&MemoryRegions>,
+    at: &str,
+) -> Result<u32, String> {
+    let absolute = match regions {
+        Some(regions) => regions.resolve(region, rel_address),
+        None => rel_address,
+    };
+    u32::try_from(absolute).map_err(|_| {
         format!(
-            "{at}: address 0x{rel_address:X} does not fit the 32-bit wire address \
-             (relative addresses above 0xFFFFFFFF cannot be linked)"
+            "{at}: address 0x{absolute:X} does not fit the 32-bit wire address \
+             (absolute addresses above 0xFFFFFFFF cannot be linked)"
         )
     })
 }
 
-/// `NxusCheatCmp` numbering (0..=5, `Comparison::bits` uses 1..=6).
+/// A plain 32-bit offset that is added to a register at run time and never
+/// carries a region base.
+fn raw_address(rel_address: u64, at: &str) -> Result<u32, String> {
+    u32::try_from(rel_address)
+        .map_err(|_| format!("{at}: offset 0x{rel_address:X} does not fit the 32-bit wire address"))
+}
+
+/// `NxusCheatCmp` numbering (0..=5; `Comparison::bits` uses 1..=6).
 fn comparison_code(comparison: Comparison) -> u8 {
     match comparison {
         Comparison::Greater => 0,
@@ -937,14 +965,51 @@ mod tests {
         (header, blocks, insns)
     }
 
+    /// The checks `nxusCheatInstall` makes, applied to a decoded program.
+    fn assert_installable(header: &ProgramHeader, blocks: &[BlockDesc], insns: &[WireInsn]) {
+        assert_eq!(
+            header.total_bytes as usize,
+            HEADER_BYTES + BLOCK_BYTES * blocks.len() + INSN_BYTES * insns.len()
+        );
+        let total = header.insn_count as usize;
+        assert_eq!(total, insns.len());
+        for block in blocks {
+            assert!(block.mode <= MODE_LOOP);
+            let first = block.first as usize;
+            let count = block.count as usize;
+            assert!(count <= total && first <= total - count);
+            for insn in &insns[first..first + count] {
+                assert!(insn.op <= OP_KEYPRESS_CONDITIONAL);
+                assert!(matches!(insn.width, 0 | 1 | 2 | 4 | 8));
+                assert!(insn.region <= MemoryRegion::Absolute.bits() as u8);
+                if matches!(
+                    insn.op,
+                    OP_BEGIN_CONDITIONAL
+                        | OP_ELSE
+                        | OP_LOOP_END
+                        | OP_REG_CONDITIONAL
+                        | OP_KEYPRESS_CONDITIONAL
+                ) {
+                    // nxusCheatInstall rejects a target outside the block.
+                    assert!(
+                        (insn.target as usize) >= first && (insn.target as usize) < first + count,
+                        "target outside its block: {insn:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn header_fields_and_wire_sizes_are_pinned() {
-        assert_eq!(HEADER_BYTES, 32);
+        assert_eq!(HEADER_BYTES, 40);
         assert_eq!(BLOCK_BYTES, 24);
         assert_eq!(INSN_BYTES, 24);
         assert_eq!(MAX_PROGRAM_BYTES, 48 * 1024);
         assert_eq!(MAX_INSNS, 512);
         assert_eq!(MAX_BLOCKS, 128);
+        assert_eq!(MAGIC, 0x4E43_564D);
+        assert_eq!(VERSION, 1);
 
         let document = build_document(&[("Money", &["04000000 42CA1DC4 0098967F"])]);
         let bytes = build_program(
@@ -960,9 +1025,7 @@ mod tests {
 
         let header = ProgramHeader::from_bytes(&bytes[..HEADER_BYTES]).unwrap();
         assert_eq!(header.magic, MAGIC);
-        assert_eq!(header.magic, 0x4E43_564D);
         assert_eq!(header.version, VERSION);
-        assert_eq!(header.version, 1);
         assert_eq!(header.build_id, 0x1122_3344_5566_7788);
         assert_eq!(header.program_id, 0x99AA_BBCC_DDEE_FF00);
         assert_eq!(header.block_count, 1);
@@ -990,10 +1053,12 @@ mod tests {
         assert_eq!(insn.cmp, 0);
         assert_eq!(insn.reg_a, 0);
         assert_eq!(insn.reg_b, 0);
-        assert_eq!(insn.flags, 0);
+        // Atmosphere 0x0 always adds the offset register; r0 adds nothing.
+        assert_eq!(insn.flags, FLAG_OFFSET_REGISTER);
         assert_eq!(insn.target, 0);
         assert_eq!(insn.address, 0x42CA_1DC4);
         assert_eq!(insn.value, 0x0098_967F);
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
@@ -1009,7 +1074,8 @@ mod tests {
             ],
         )]);
         let (header, blocks, insns) = decode(&program(&document));
-        // Five instructions plus the exit Nop that gives the else a real target.
+        // Five instructions plus the exit Nop that gives the branch a target
+        // inside the block.
         assert_eq!(header.insn_count, 6);
         assert_eq!(blocks[0].count, 6);
 
@@ -1028,6 +1094,7 @@ mod tests {
         assert_eq!(insns[4].op, OP_END_CONDITIONAL);
         assert_eq!(insns[4].target, 0);
         assert_eq!(insns[5].op, OP_NOP);
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
@@ -1048,6 +1115,7 @@ mod tests {
         assert_eq!(insns[2].op, OP_LOOP_END);
         assert_eq!(insns[2].reg_a, 0);
         assert_eq!(insns[2].target, 0); // the matching loop start
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
@@ -1061,7 +1129,7 @@ mod tests {
                 "04000000 00000024 000000BB",
             ],
         )]);
-        let (_, blocks, insns) = decode(&program(&document));
+        let (header, blocks, insns) = decode(&program(&document));
         // A keypad trigger makes the block a loop block.
         assert_eq!(blocks[0].mode, MODE_LOOP);
         assert_eq!(insns[0].op, OP_KEYPRESS_CONDITIONAL);
@@ -1069,6 +1137,7 @@ mod tests {
         assert_eq!(insns[0].target, 3);
         assert_eq!(insns[2].op, OP_END_CONDITIONAL);
         assert_eq!(insns[3].op, OP_STORE_STATIC);
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
@@ -1081,7 +1150,7 @@ mod tests {
                 "64011100 00000000 0000002A",
             ],
         )]);
-        let (_, _, insns) = decode(&program(&document));
+        let (header, blocks, insns) = decode(&program(&document));
 
         assert_eq!(insns[0].op, OP_LOAD_REG_IMM);
         assert_eq!(insns[0].reg_a, 1);
@@ -1098,12 +1167,33 @@ mod tests {
         assert_eq!(insns[2].width, 4);
         assert_eq!(insns[2].reg_a, 1);
         assert_eq!(insns[2].reg_b, 0);
+        // The C interpreter reads bit 0 as "add rB" and bit 1 as "increment".
         assert_eq!(
             insns[2].flags,
-            FLAG_INCREMENT | FLAG_OFFSET_REGISTER,
-            "the increment and offset-register bits must survive"
+            FLAG_OFFSET_REGISTER | FLAG_INCREMENT,
+            "the offset-register and increment bits must survive"
         );
         assert_eq!(insns[2].value, 0x2A);
+        assert_installable(&header, &blocks, &insns);
+    }
+
+    #[test]
+    fn store_static_to_register_flag_bits_are_distinct() {
+        // 64010000 = width 4, r1, no offset register, no increment.
+        let plain = build_document(&[("Plain", &["64010000 00000000 00000001"])]);
+        let (_, _, insns) = decode(&program(&plain));
+        assert_eq!(insns[0].op, OP_STORE_STATIC_TO_REG);
+        assert_eq!(insns[0].flags, 0);
+
+        // 64010100 = offset register r0 added.
+        let offset = build_document(&[("Offset", &["64010100 00000000 00000001"])]);
+        let (_, _, insns) = decode(&program(&offset));
+        assert_eq!(insns[0].flags, FLAG_OFFSET_REGISTER);
+
+        // 64011000 = increment after the store.
+        let increment = build_document(&[("Increment", &["64011000 00000000 00000001"])]);
+        let (_, _, insns) = decode(&program(&increment));
+        assert_eq!(insns[0].flags, FLAG_INCREMENT);
     }
 
     #[test]
@@ -1135,12 +1225,13 @@ mod tests {
                 &["80000001", "04000000 00000020 000000AA", "20000000"],
             ),
         ]);
-        let (header, blocks, _) = decode(&program(&document));
+        let (header, blocks, insns) = decode(&program(&document));
         assert_eq!(blocks[0].mode, MODE_PATCH);
         assert_eq!(blocks[1].mode, MODE_LOOP);
         // The keypress block ends with the conditional, so it carries the Nop.
         assert_eq!(blocks[1].count, 4);
         assert_eq!(header.insn_count, 1 + 4);
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
@@ -1202,12 +1293,12 @@ mod tests {
         let error = build_program(&parsed, 0, 0, &BTreeSet::new()).unwrap_err();
         assert!(error.to_lowercase().contains("unsupported"), "{error}");
 
-        // The same must hold for a hand-built block without parse issues.
+        // The same holds for a hand-built block without parse issues.
         let mut document = CheatDocument::new("TEST");
         let mut block = CheatBlock::new(CheatKey(1), "Raw", CheatKind::Regular);
         block.on.instructions.push(Instruction::Unsupported {
             opcode: 0xB,
-            words: vec![0x0B00_0000],
+            words: vec![0xB000_0000],
         });
         document.blocks.push(block);
 
@@ -1238,7 +1329,8 @@ mod tests {
     }
 
     #[test]
-    fn single_register_save_restore_is_refused() {
+    fn unrepresentable_instructions_are_refused() {
+        // Single-register save/restore (0xC1).
         let mut document = CheatDocument::new("TEST");
         let mut block = CheatBlock::new(CheatKey(1), "C1", CheatKind::Regular);
         block
@@ -1250,9 +1342,19 @@ mod tests {
                 operation: SaveRestoreOp::Save,
             });
         document.blocks.push(block);
-
         let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
         assert!(error.contains("save/restore"), "{error}");
+
+        // The reserved static-register opcode (0xC3).
+        let mut document = CheatDocument::new("TEST");
+        let mut block = CheatBlock::new(CheatKey(1), "C3", CheatKind::Regular);
+        block.on.instructions.push(Instruction::StaticRegister {
+            static_index: 0x05,
+            register: 2,
+        });
+        document.blocks.push(block);
+        let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
+        assert!(error.contains("static-register"), "{error}");
     }
 
     #[test]
@@ -1273,39 +1375,39 @@ mod tests {
     }
 
     #[test]
-    fn store_register_offset_forms_are_kept_in_flags() {
+    fn store_register_without_offset_maps_to_store_reg() {
         let document = build_document(&[(
             "Store",
             &[
                 "40010000 00000000 0000002A",
                 "40020000 00000000 00007000",
                 "A4120000",
-                "A4120130",
-                "A4120200 00000010",
-                "A4120300",
             ],
         )]);
-        let (_, _, insns) = decode(&program(&document));
-
+        let (header, blocks, insns) = decode(&program(&document));
         assert_eq!(insns[2].op, OP_STORE_REG);
         assert_eq!(insns[2].width, 4);
         assert_eq!(insns[2].reg_a, 2); // address register
         assert_eq!(insns[2].reg_b, 1); // source register
         assert_eq!(insns[2].flags, 0);
-        assert_eq!(insns[2].address, 0);
-
-        // Offset register r3, form 1.
-        assert_eq!(insns[3].flags, (1 << 1) | (3 << 4));
-        // Immediate 0x10 captured in `address`, form 2.
-        assert_eq!(insns[4].flags, 2 << 1);
-        assert_eq!(insns[4].address, 0x10);
-        // `[region + rA]`, form 3.
-        assert_eq!(insns[5].flags, 3 << 1);
-        assert_eq!(insns[5].region, 0);
+        assert_installable(&header, &blocks, &insns);
     }
 
     #[test]
-    fn load_register_memory_modes_map_to_their_opcodes() {
+    fn store_register_offsets_and_increments_are_refused() {
+        // A4120130: offset register r3.
+        let offset = build_document(&[("Offset", &["A4120130"])]);
+        let error = build_program(&offset, 0, 0, &BTreeSet::new()).unwrap_err();
+        assert!(error.contains("offset"), "{error}");
+
+        // A4121000: increment after the store.
+        let increment = build_document(&[("Increment", &["A4121000"])]);
+        let error = build_program(&increment, 0, 0, &BTreeSet::new()).unwrap_err();
+        assert!(error.contains("increment"), "{error}");
+    }
+
+    #[test]
+    fn load_register_memory_modes_use_the_matching_wire_forms() {
         let document = build_document(&[(
             "Load",
             &[
@@ -1315,23 +1417,81 @@ mod tests {
                 "54033100 00000000",
             ],
         )]);
-        let (_, _, insns) = decode(&program(&document));
+        let (header, blocks, insns) = decode(&program(&document));
 
+        // Mode 0: [region + address], the offset register is not added.
         assert_eq!(insns[0].op, OP_LOAD_REG_MEM);
+        assert_eq!(insns[0].region, 0);
         assert_eq!(insns[0].reg_a, 1);
+        assert_eq!(insns[0].reg_b, 0);
+        assert_eq!(insns[0].flags, 0);
         assert_eq!(insns[0].address, 0x10);
 
+        // Mode 1: [rA + address].
         assert_eq!(insns[1].op, OP_LOAD_REG_MEM_REG);
         assert_eq!(insns[1].reg_a, 1);
+        assert_eq!(insns[1].address, 0);
 
-        assert_eq!(insns[2].op, OP_LOAD_REG_MEM_REG_REG);
+        // Mode 2: [rB + address] - expressed as the wire's offset-register form.
+        assert_eq!(insns[2].op, OP_LOAD_REG_MEM);
+        assert_eq!(insns[2].region, MemoryRegion::Absolute.bits() as u8);
         assert_eq!(insns[2].reg_a, 2);
         assert_eq!(insns[2].reg_b, 1);
+        assert_eq!(insns[2].flags, FLAG_OFFSET_REGISTER);
         assert_eq!(insns[2].address, 4);
 
-        assert_eq!(insns[3].op, OP_LOAD_REG_MEM_REG_REGION);
+        // Mode 3: [region + rB + address].
+        assert_eq!(insns[3].op, OP_LOAD_REG_MEM);
+        assert_eq!(insns[3].region, 0);
         assert_eq!(insns[3].reg_a, 3);
         assert_eq!(insns[3].reg_b, 1);
+        assert_eq!(insns[3].flags, FLAG_OFFSET_REGISTER);
+        assert_installable(&header, &blocks, &insns);
+    }
+
+    #[test]
+    fn register_conditional_immediate_and_register_forms() {
+        // C0451400 00000005: if r1 == 5 (immediate form)
+        let immediate = build_document(&[(
+            "Imm",
+            &[
+                "40010000 00000000 00000005",
+                "C0451400 00000005",
+                "20000000",
+            ],
+        )]);
+        let (header, blocks, insns) = decode(&program(&immediate));
+        assert_eq!(insns[1].op, OP_REG_CONDITIONAL);
+        assert_eq!(insns[1].cmp, 4); // Equal
+        assert_eq!(insns[1].reg_a, 1);
+        assert_eq!(insns[1].flags, 0);
+        assert_eq!(insns[1].value, 5);
+        assert_eq!(insns[1].target, 3); // the exit Nop after the end
+        assert_eq!(insns[3].op, OP_NOP);
+        assert_installable(&header, &blocks, &insns);
+
+        // C0451520: if r1 == r2 (register form)
+        let register = build_document(&[("Reg", &["C0451520", "20000000"])]);
+        let (_, _, insns) = decode(&program(&register));
+        assert_eq!(insns[0].op, OP_REG_CONDITIONAL);
+        assert_eq!(insns[0].flags, FLAG_REGISTER_OPERAND);
+        assert_eq!(insns[0].reg_b, 2);
+    }
+
+    #[test]
+    fn register_conditional_with_a_memory_operand_is_refused() {
+        // C0420000 00000010: compare r1 with [main + 0x10].
+        let document = build_document(&[("Mem", &["C0420000 00000010", "20000000"])]);
+        let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
+        assert!(error.contains("RegConditional"), "{error}");
+    }
+
+    #[test]
+    fn three_operand_register_arithmetic_is_refused() {
+        // 94021100: r2 = r1 + 0x0F (the wire opcode is in place).
+        let document = build_document(&[("Three", &["94021100 0000000F"])]);
+        let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
+        assert!(error.contains("in place"), "{error}");
     }
 
     #[test]
@@ -1346,5 +1506,45 @@ mod tests {
 
         let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
         assert!(error.contains("else"), "{error}");
+    }
+
+    #[test]
+    fn resolved_build_applies_region_bases_to_absolute_addresses() {
+        let document = build_document(&[(
+            "Regions",
+            &[
+                "04000000 00000010 0000002A", // main + 0x10
+                "04400000 00001000 0000002B", // absolute 0x1000
+                "14050000 00000020 00000001", // condition on main + 0x20
+                "04000000 00000030 000000AA",
+                "20000000",
+            ],
+        )]);
+        let regions = MemoryRegions::new(0x8000_0000, 0x1000, 0x2000, 0x3000);
+        let bytes =
+            build_program_resolved(&document, 1, 2, &all_blocks(&document), &regions).unwrap();
+        let (header, blocks, insns) = decode(&bytes);
+        assert_installable(&header, &blocks, &insns);
+
+        assert_eq!(insns[0].region, MemoryRegion::Main.bits() as u8);
+        assert_eq!(insns[0].address, 0x8000_0010, "main base is folded in");
+        assert_eq!(insns[1].region, MemoryRegion::Absolute.bits() as u8);
+        assert_eq!(
+            insns[1].address, 0x1000,
+            "absolute addresses stay as they are"
+        );
+        assert_eq!(insns[2].address, 0x8000_0020);
+    }
+
+    #[test]
+    fn resolved_build_leaves_register_relative_offsets_alone() {
+        // 540F1000: rA = [rA + 0] - a register offset, never a region base.
+        let document = build_document(&[("Reg", &["540F1000 00000024"])]);
+        let regions = MemoryRegions::new(0x8000_0000, 0x1000, 0x2000, 0x3000);
+        let bytes =
+            build_program_resolved(&document, 1, 2, &all_blocks(&document), &regions).unwrap();
+        let (_, _, insns) = decode(&bytes);
+        assert_eq!(insns[0].op, OP_LOAD_REG_MEM_REG);
+        assert_eq!(insns[0].address, 0x24);
     }
 }

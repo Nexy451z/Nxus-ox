@@ -402,6 +402,321 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// fail immediately instead of waiting again.
 pub const CHEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+// ---------------------------------------------------------------------------
+// コンソール側チート VM（`NxusCmd_Cheat*` / `NxusEvent_CheatFault`）
+// ---------------------------------------------------------------------------
+
+// コマンド id を `protocol::cmd` に足さないのは、あの表が
+// `core/nxus_protocol.h` との対応を固定するパリティ検査（`protocol.rs` の
+// `header_define` 系テストと Python 側の test_protocol_parity）に載っている
+// 「プロトコル定義そのもの」だから。ここに置くのは、この 5 つを使うのが
+// 下の薄いラッパだけであり、定義表を動かさずに済むため。
+/// `NxusCmd_CheatUpload`（`NxusCheatProgramHeader` + ブロック + 命令）。
+pub const CMD_CHEAT_UPLOAD: u16 = 0x0080;
+/// `NxusCmd_CheatEnable`（`NxusCheatEnable`）。
+pub const CMD_CHEAT_ENABLE: u16 = 0x0081;
+/// `NxusCmd_CheatStatus` -> `NxusCheatStatus`。
+pub const CMD_CHEAT_STATUS: u16 = 0x0082;
+/// `NxusCmd_CheatPanicOff` -> `NxusCheatRestore`。
+pub const CMD_CHEAT_PANIC_OFF: u16 = 0x0083;
+/// `NxusCmd_CheatClear`（書き戻さずにプログラムを捨てる）。
+pub const CMD_CHEAT_CLEAR: u16 = 0x0084;
+
+/// `NxusEvent_CheatFault`: コンソールのチートワーカーが自分から全ブロックを
+/// 止めた（対象消滅 / 復元表が満杯 / 書き込み失敗）。
+pub const EVENT_CHEAT_FAULT: u16 = 0x800A;
+
+/// CheatUpload の締切（10 秒）。
+///
+/// プログラムは最大 48 KiB あり、コンソールは受け取ったバイト列をリンク・
+/// 検証してから答える。他のチート命令と同じ 3 秒では、遅い Wi-Fi や大きめの
+/// チートファイルで正当な応答を取りこぼす。
+pub const CHEAT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// CheatEnable / CheatStatus / CheatPanicOff / CheatClear の締切（3 秒）。
+///
+/// どれも「押したらすぐ返る」対話操作で、長い締切はそのまま UI の固まりに
+/// なる。チート 1 命令と同じ [`CHEAT_REQUEST_TIMEOUT`] に合わせてある。
+pub const CHEAT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `NxusCheatStatus`（48 バイト）: `NxusCmd_CheatStatus` の応答。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheatStatus {
+    /// 0 のときは何もアップロードされていない。
+    pub program_valid: u32,
+    pub block_count: u32,
+    pub enabled_count: u32,
+    pub insn_count: u32,
+    /// アップロード以後に実行した 16 ms ティック数。
+    pub tick_count: u32,
+    /// いま書き換えたバイトを保持しているアドレス数。
+    pub journal_count: u32,
+    /// 最後に失敗したブロックの `NXUS_CHEATVM_ERR_*`（0 = 無し）。
+    pub last_error: u32,
+    pub last_error_pc: u32,
+    /// ワーカーが自分からプログラムを止めた回数。
+    pub fault_count: u32,
+    pub running: u32,
+    /// エンジンが使っている生の HID マスク。
+    pub keys_held: u64,
+}
+
+impl CheatStatus {
+    pub const SIZE: usize = 48;
+
+    /// 短い応答も 0 埋めで受ける（古いコンソールは末尾のフィールドを
+    /// 送ってこない。足りない分を 0 として読むのが、`NxusStatus` と同じ扱い）。
+    pub fn parse(body: &[u8]) -> CheatStatus {
+        let word = |offset: usize| -> u32 {
+            if body.len() >= offset + 4 {
+                rd_u32(body, offset)
+            } else {
+                0
+            }
+        };
+        CheatStatus {
+            program_valid: word(0),
+            block_count: word(4),
+            enabled_count: word(8),
+            insn_count: word(12),
+            tick_count: word(16),
+            journal_count: word(20),
+            last_error: word(24),
+            last_error_pc: word(28),
+            fault_count: word(32),
+            running: word(36),
+            keys_held: if body.len() >= 48 { rd_u64(body, 40) } else { 0 },
+        }
+    }
+
+    /// 最後の失敗を 1 行にする（0 なら `None`）。
+    pub fn last_error_text(&self) -> Option<String> {
+        if self.last_error == 0 {
+            return None;
+        }
+        let name = cheat_error_name(self.last_error)
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| format!("code {}", self.last_error));
+        Some(format!("{name} at instruction {}", self.last_error_pc))
+    }
+}
+
+/// `NxusCheatRestore`（16 バイト）: `NxusCmd_CheatPanicOff` の応答。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheatRestore {
+    /// 書き戻せたアドレス数。
+    pub restored: u32,
+    /// 書き戻せなかったアドレス数（対象が消えた）。
+    pub failed: u32,
+    pub blocks_stopped: u32,
+    pub reserved: u32,
+}
+
+impl CheatRestore {
+    pub const SIZE: usize = 16;
+
+    pub fn parse(body: &[u8]) -> CheatRestore {
+        let word = |offset: usize| -> u32 {
+            if body.len() >= offset + 4 {
+                rd_u32(body, offset)
+            } else {
+                0
+            }
+        };
+        CheatRestore {
+            restored: word(0),
+            failed: word(4),
+            blocks_stopped: word(8),
+            reserved: word(12),
+        }
+    }
+
+    /// 全部戻せたか。1 バイトでも戻せていないなら「完了」ではない。
+    pub fn is_complete(&self) -> bool {
+        self.failed == 0
+    }
+}
+
+/// `NxusCheatUploadReply`（16 バイト）: `NxusCmd_CheatUpload` の応答。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheatUploadReply {
+    pub accepted_blocks: u32,
+    pub accepted_insns: u32,
+    /// 0、または拒否理由（`NXUS_CHEATVM_ERR_*` を正の値で）。
+    pub rejected_reason: u32,
+    pub reserved: u32,
+}
+
+impl CheatUploadReply {
+    pub const SIZE: usize = 16;
+
+    pub fn parse(body: &[u8]) -> CheatUploadReply {
+        let word = |offset: usize| -> u32 {
+            if body.len() >= offset + 4 {
+                rd_u32(body, offset)
+            } else {
+                0
+            }
+        };
+        CheatUploadReply {
+            accepted_blocks: word(0),
+            accepted_insns: word(4),
+            rejected_reason: word(8),
+            reserved: word(12),
+        }
+    }
+
+    /// コンソールが拒否した理由（受理されたなら `None`）。
+    pub fn rejected_text(&self) -> Option<String> {
+        if self.rejected_reason == 0 {
+            return None;
+        }
+        let name = cheat_error_name(self.rejected_reason)
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| format!("code {}", self.rejected_reason));
+        Some(name)
+    }
+}
+
+/// `NxusCheatFault`（16 バイト）: `NxusEvent_CheatFault` のペイロード。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheatFault {
+    /// `NXUS_CHEATVM_ERR_*` または `NXUS_CHEAT_FAULT_*`。
+    pub reason: u32,
+    /// ブロック番号。特定のブロックでないときは 0xFFFFFFFF。
+    pub block: u32,
+    /// そのブロック内の命令番号。
+    pub pc: u32,
+    /// 止まるまでに書き戻せたアドレス数。
+    pub restored: u32,
+}
+
+impl CheatFault {
+    pub const SIZE: usize = 16;
+
+    /// `NXUS_CHEAT_FAULT_TARGET_GONE`: タイトルが終了 / 再起動した。
+    pub const TARGET_GONE: u32 = 100;
+    /// `NXUS_CHEAT_FAULT_JOURNAL_FULL`: 復元表（`NXUS_CHEATVM_MAX_JOURNAL`）が満杯。
+    pub const JOURNAL_FULL: u32 = 101;
+
+    pub fn parse(body: &[u8]) -> Option<CheatFault> {
+        if body.len() < CheatFault::SIZE {
+            return None;
+        }
+        Some(CheatFault {
+            reason: rd_u32(body, 0),
+            block: rd_u32(body, 4),
+            pc: rd_u32(body, 8),
+            restored: rd_u32(body, 12),
+        })
+    }
+
+    /// 利用者にそのまま出す理由。
+    ///
+    /// 「全ブロックが勝手に止まった」だけでは何をすればよいか分からないので、
+    /// 原因ごとに次の行動が分かる文にする。
+    pub fn reason_text(&self) -> String {
+        let block = if self.block == u32::MAX {
+            "all blocks".to_string()
+        } else {
+            format!("block {}", self.block)
+        };
+        let text = match self.reason {
+            CheatFault::TARGET_GONE => "the title was closed or restarted".to_string(),
+            CheatFault::JOURNAL_FULL => {
+                "the restore table is full: turn some cheats off and try again".to_string()
+            }
+            other => cheat_error_name(other)
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| format!("reason {other}")),
+        };
+        format!("{text} ({block}, {} address(es) restored)", self.restored)
+    }
+}
+
+/// `NXUS_CHEATVM_ERR_*` の名前。
+///
+/// 2 つの載り方がある: `NxusCheatStatus.last_error` は s32 の負値をそのまま
+/// u32 に載せ、`NxusCheatUploadReply.rejected_reason` は「正の値」で返す
+/// （`core/nxus_protocol.h` のコメント）。どちらの経路でも同じ名前を出せる
+/// ように両方を受ける。
+fn cheat_error_name(code: u32) -> Option<&'static str> {
+    let negative = code >= 0xFFFF_FF00; // s32 の -256..-1
+    let small = if negative {
+        0u32.wrapping_sub(code)
+    } else {
+        code
+    };
+    match small {
+        1 => Some("bad program"),
+        2 => Some("bad block"),
+        3 => Some("a branch target is outside the program"),
+        4 => Some("step limit reached"),
+        5 => Some("target read failed"),
+        6 => Some("target write failed"),
+        7 => Some("bad register"),
+        8 => Some("bad opcode"),
+        _ => None,
+    }
+}
+
+/// 受信イベントのうち、このビルドが構造化して扱うもの。
+///
+/// [`Event`] は生フレーム（kind + payload）のまま保持する。既知のイベントを
+/// ここで型付きに開くことで、GUI/CLI がペイロードのレイアウトを知らずに
+/// 済み、知らないイベントは [`IncomingEvent::Other`] として素通りする
+/// （新しいイベントを足しても既存の呼び出し側が壊れない）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncomingEvent {
+    /// `NxusEvent_CheatFault`: コンソールのチートワーカーが自分から全部止めた。
+    CheatFault {
+        reason: u32,
+        block: u32,
+        pc: u32,
+        restored: u32,
+    },
+    /// このビルドが解釈しないイベント（生データは [`Event`] 側にある）。
+    Other,
+}
+
+impl Event {
+    /// 生フレームを型付きイベントに開く。
+    pub fn decode(&self) -> IncomingEvent {
+        match self.cheat_fault() {
+            Some(fault) => IncomingEvent::CheatFault {
+                reason: fault.reason,
+                block: fault.block,
+                pc: fault.pc,
+                restored: fault.restored,
+            },
+            None => IncomingEvent::Other,
+        }
+    }
+
+    /// `NxusEvent_CheatFault` なら中身を返す（[`Self::decode`] の近道）。
+    pub fn cheat_fault(&self) -> Option<CheatFault> {
+        if self.kind != EVENT_CHEAT_FAULT {
+            return None;
+        }
+        CheatFault::parse(&self.payload)
+    }
+}
+
+/// コンソールがこのコマンドを知らない（旧ビルド）ことを示す応答か。
+///
+/// 新しいコマンドを送ると、実装していないコンソールは
+/// `NXUS_MAKE_RESULT(NXUS_ERR_NOT_IMPLEMENTED)`（0x8003C801）または
+/// `NXUS_ERR_UNSUPPORTED`（0x8003C802）を返し、たいてい
+/// `NXUS_REASON_UNKNOWN_COMMAND`（6）を添える。判定をここ 1 か所にまとめて
+/// おくことで、GUI と NCL のフォールバック条件がずれない。
+pub fn is_unsupported_command(error: &NxusError) -> bool {
+    match error.result {
+        Some(0x8003_C801) | Some(0x8003_C802) => true,
+        // Result だけ返す古いコンソールでも、理由コードが読めたなら分かる。
+        _ => error.message.contains("(reason=6)"),
+    }
+}
+
 /// How long the reader tolerates hearing nothing while no request is waiting.
 ///
 /// The keepalive below sends a `Heartbeat` every few seconds, so a *live* link
@@ -1730,6 +2045,62 @@ impl NxusClient {
         Ok(String::from_utf8_lossy(&body).to_string())
     }
 
+    // ---- on-console cheat engine ----
+
+    /// リンク済みプログラム全体をコンソールへ載せる（`NxusCmd_CheatUpload`）。
+    ///
+    /// コンソールはブロック単位のアップロードを受け付けない: 先に
+    /// [`crate::cheat::ir::build_program`] の出力（最大 48 KiB）を送り、その
+    /// あと [`cheat_enable`](Self::cheat_enable) でブロックを個別に ON にする。
+    /// だから「1 ブロック ON」でも毎回プログラム全体が要る。
+    pub fn cheat_upload(&self, program: &[u8]) -> Result<CheatUploadReply> {
+        if program.is_empty() {
+            return Err(NxusError {
+                message: "cannot upload an empty cheat program".into(),
+                result: None,
+            });
+        }
+        let (_, body) =
+            self.request_timeout(CMD_CHEAT_UPLOAD, program, CHEAT_UPLOAD_TIMEOUT)?;
+        Ok(CheatUploadReply::parse(&body))
+    }
+
+    /// 1 ブロックを ON/OFF する（`NxusCmd_CheatEnable`）。
+    ///
+    /// ON にした Patch ブロックはコンソールのワーカーがその場で 1 回実行し、
+    /// Loop ブロックは 16 ms ごとに回る。OFF にするとコンソールが自分で
+    /// ジャーナルから原本を書き戻す（この PC 側のバックアップは使わない）。
+    pub fn cheat_enable(&self, index: u32, enabled: bool) -> Result<()> {
+        let mut payload = Vec::with_capacity(8);
+        put_u32(&mut payload, index);
+        put_u32(&mut payload, u32::from(enabled));
+        self.request_timeout(CMD_CHEAT_ENABLE, &payload, CHEAT_COMMAND_TIMEOUT)
+            .map(|_| ())
+    }
+
+    /// コンソールのチートワーカーの状態（`NxusCmd_CheatStatus`）。
+    pub fn cheat_status(&self) -> Result<CheatStatus> {
+        let (_, body) = self.request_timeout(CMD_CHEAT_STATUS, &[], CHEAT_COMMAND_TIMEOUT)?;
+        Ok(CheatStatus::parse(&body))
+    }
+
+    /// 全ブロックを止めて原本を書き戻す（`NxusCmd_CheatPanicOff`）。
+    ///
+    /// PC 側のジャーナル復元と違い、書き戻しはコンソールが自分のジャーナルで
+    /// 行い、対象がもう居なければ `failed` に数えて返す。この PC はその数字を
+    /// 表示するだけ。
+    pub fn cheat_panic_off(&self) -> Result<CheatRestore> {
+        let (_, body) =
+            self.request_timeout(CMD_CHEAT_PANIC_OFF, &[], CHEAT_COMMAND_TIMEOUT)?;
+        Ok(CheatRestore::parse(&body))
+    }
+
+    /// プログラムを捨てる（書き戻さない。`NxusCmd_CheatClear`）。
+    pub fn cheat_clear(&self) -> Result<()> {
+        self.request_timeout(CMD_CHEAT_CLEAR, &[], CHEAT_COMMAND_TIMEOUT)
+            .map(|_| ())
+    }
+
     // ---- freeze ----
 
     /// Current frozen entries (`FROZEN_LIST`, i.e. `NxusCmd_FrozenList`).
@@ -2592,10 +2963,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        error_from_reply, error_reason_text, is_retry_later, pointer_width_for,
-        pointer_width_with_reason, read_exact, released_addresses, result_text,
-        select_stopped_thread, walk_all_hits, Hit, HitBatch, LinkTiming, Mapping, Metadata,
-        NxusClient, NxusError, PERM_R, RESULT_BUSY, WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32,
+        error_from_reply, error_reason_text, is_retry_later, is_unsupported_command,
+        pointer_width_for, pointer_width_with_reason, read_exact, released_addresses, result_text,
+        select_stopped_thread, walk_all_hits, CheatFault, CheatRestore, CheatStatus,
+        CheatUploadReply, Event, Hit, HitBatch, IncomingEvent, LinkTiming, Mapping, Metadata,
+        NxusClient, NxusError, CHEAT_COMMAND_TIMEOUT, CHEAT_REQUEST_TIMEOUT, CHEAT_UPLOAD_TIMEOUT,
+        CMD_CHEAT_CLEAR, CMD_CHEAT_ENABLE, CMD_CHEAT_PANIC_OFF, CMD_CHEAT_STATUS, CMD_CHEAT_UPLOAD,
+        EVENT_CHEAT_FAULT, PERM_R, RESULT_BUSY, WIDTH_REASON_DEFAULT, WIDTH_REASON_MAIN_BASE_32,
         WIDTH_REASON_MAIN_BASE_64, WIDTH_REASON_MAPPINGS_32, WIDTH_REASON_MAPPINGS_64,
         WIDTH_REASON_PROCESS_32, WIDTH_REASON_PROCESS_64,
     };
@@ -3647,5 +4021,197 @@ mod tests {
 
         drop(client);
         let _ = server.join();
+    }
+
+    // ---- コンソール側チート VM ------------------------------------------
+
+    /// チートの締切は「アップロードだけ 10 秒、それ以外は 3 秒」。
+    ///
+    /// アップロードは最大 48 KiB をリンクさせるので長く、ON/OFF と状態取得は
+    /// 対話操作なので短い。値をピンしておかないと、片方だけ直して
+    /// 「UI が数秒固まる」再発になる。
+    #[test]
+    fn cheat_deadlines_are_ten_seconds_for_upload_and_three_for_the_rest() {
+        assert_eq!(CHEAT_UPLOAD_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(CHEAT_COMMAND_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(CHEAT_COMMAND_TIMEOUT, CHEAT_REQUEST_TIMEOUT);
+        // コマンド id は core/nxus_protocol.h の NxusCmd_Cheat* と一致する。
+        assert_eq!(CMD_CHEAT_UPLOAD, 0x0080);
+        assert_eq!(CMD_CHEAT_ENABLE, 0x0081);
+        assert_eq!(CMD_CHEAT_STATUS, 0x0082);
+        assert_eq!(CMD_CHEAT_PANIC_OFF, 0x0083);
+        assert_eq!(CMD_CHEAT_CLEAR, 0x0084);
+        assert_eq!(EVENT_CHEAT_FAULT, 0x800A);
+        // ワイヤ構造体のサイズ（static_assert と同じ値）。
+        assert_eq!(CheatStatus::SIZE, 48);
+        assert_eq!(CheatRestore::SIZE, 16);
+        assert_eq!(CheatUploadReply::SIZE, 16);
+        assert_eq!(CheatFault::SIZE, 16);
+    }
+
+    /// アップロードは `build_program` の出力を 1 バイトも変えずに送り、
+    /// 応答を `NxusCheatUploadReply` として読む。
+    ///
+    /// 「PC が組み立てたプログラム」と「実際に線を流れたバイト」が同じことを
+    /// 固定しないと、リンカの変更が静かに壊れた状態で通ってしまう。
+    #[test]
+    fn cheat_upload_sends_the_linked_program_verbatim() {
+        use crate::cheat::{ir, CheatDocument};
+
+        let document = CheatDocument::parse(
+            "[Money]\n04000000 42CA1DC4 0098967F\n",
+            "9D4C86E6EF74504A",
+        );
+        let program = ir::build_program(
+            &document,
+            0x9D4C_86E6_EF74_504A,
+            0x0100_C380_0049_C000,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the program links");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut seen: Option<Vec<u8>> = None;
+            while let Some((kind, _flags, seq, body)) = read_frame_from(&mut socket) {
+                if kind == CMD_CHEAT_UPLOAD {
+                    seen = Some(body);
+                    let mut reply = Vec::new();
+                    put_u32(&mut reply, 1); // accepted_blocks
+                    put_u32(&mut reply, 1); // accepted_insns
+                    put_u32(&mut reply, 0); // rejected_reason
+                    put_u32(&mut reply, 0);
+                    if socket.write_all(&frame_bytes(kind, 0, seq, &reply)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // 他のコマンドは空の成功応答で足りる（このテストは使わない）。
+                if socket.write_all(&frame_bytes(kind, 0, seq, &[])).is_err() {
+                    break;
+                }
+            }
+            seen
+        });
+
+        let client = NxusClient::connect("127.0.0.1", port).expect("connect");
+        let reply = client.cheat_upload(&program).expect("upload");
+        assert_eq!(reply.accepted_blocks, 1);
+        assert_eq!(reply.accepted_insns, 1);
+        assert!(reply.rejected_text().is_none(), "{reply:?}");
+
+        drop(client);
+        let seen = server.join().expect("server thread");
+        assert_eq!(
+            seen.as_deref(),
+            Some(program.as_slice()),
+            "the wire payload must be exactly ir::build_program's output"
+        );
+    }
+
+    /// `NxusEvent_CheatFault` は理由つきで開き、`TARGET_GONE` /
+    /// `JOURNAL_FULL` は利用者が次の行動を選べる文になる。
+    #[test]
+    fn a_cheat_fault_event_decodes_into_its_reason() {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, CheatFault::TARGET_GONE);
+        put_u32(&mut payload, u32::MAX);
+        put_u32(&mut payload, 0);
+        put_u32(&mut payload, 7);
+        let event = Event {
+            kind: EVENT_CHEAT_FAULT,
+            payload: payload.clone(),
+        };
+
+        match event.decode() {
+            IncomingEvent::CheatFault {
+                reason,
+                block,
+                pc,
+                restored,
+            } => {
+                assert_eq!(reason, CheatFault::TARGET_GONE);
+                assert_eq!(block, u32::MAX);
+                assert_eq!(pc, 0);
+                assert_eq!(restored, 7);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+
+        let fault = event.cheat_fault().expect("a fault");
+        assert!(fault.reason_text().contains("closed or restarted"));
+        assert!(fault.reason_text().contains("7 address(es) restored"));
+
+        let full = CheatFault {
+            reason: CheatFault::JOURNAL_FULL,
+            block: 2,
+            pc: 0,
+            restored: 0,
+        };
+        assert!(full.reason_text().contains("restore table is full"));
+        assert!(full.reason_text().contains("block 2"));
+
+        // 命令の失敗は NXUS_CHEATVM_ERR_* の名前で出る。
+        let write = CheatFault {
+            reason: 0xFFFF_FFFA, // -6 = NXUS_CHEATVM_ERR_WRITE
+            block: 0,
+            pc: 3,
+            restored: 1,
+        };
+        assert!(write.reason_text().contains("target write failed"));
+
+        // 短すぎるペイロードや別種のイベントは素通りする。
+        assert!(CheatFault::parse(&[0u8; 4]).is_none());
+        assert_eq!(
+            Event {
+                kind: 0x8001,
+                payload: payload,
+            }
+            .decode(),
+            IncomingEvent::Other
+        );
+    }
+
+    /// 「このコマンドは知らない」を 1 か所で判定する。
+    ///
+    /// GUI と NCL の両方が、この判定で PC 実行へフォールバックする。
+    #[test]
+    fn an_unimplemented_command_is_recognised_from_result_or_reason() {
+        let unimplemented = NxusError {
+            message: "command 0x0082 failed - the console does not implement this command"
+                .to_string(),
+            result: Some(0x8003_C801),
+        };
+        assert!(is_unsupported_command(&unimplemented));
+
+        let unsupported = NxusError {
+            message: "command 0x0080 failed".to_string(),
+            result: Some(0x8003_C802),
+        };
+        assert!(is_unsupported_command(&unsupported));
+
+        // Result だけ返す古いコンソール: 理由コード 6 で判定する。
+        let reason_only = NxusError {
+            message: "command 0x0082 failed - unknown command (reason=6)".to_string(),
+            result: Some(RESULT_BUSY),
+        };
+        assert!(is_unsupported_command(&reason_only));
+
+        for other in [
+            NxusError {
+                message: "connection lost".to_string(),
+                result: None,
+            },
+            NxusError {
+                message: "command 0x0082 failed - busy (reason=4)".to_string(),
+                result: Some(RESULT_BUSY),
+            },
+        ] {
+            assert!(!is_unsupported_command(&other), "{other}");
+        }
     }
 }

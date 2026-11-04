@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::ir;
 use super::model::{CheatBlock, CheatDocument, CheatExecMode, CheatKey};
 use super::parser;
 use super::vm::{self, CheatMemoryIo, FailureKind, MemoryRegions, VmReport, VmState};
@@ -355,6 +356,47 @@ struct ApplyReport {
 }
 
 // ---------------------------------------------------------------------------
+// Execution place (console cheat VM / PC-side VM)
+// ---------------------------------------------------------------------------
+
+/// チートをどちらの機械で実行するか。
+///
+/// 既定は [`CheatExecution::Console`]。コンソールのチートワーカーは本体の
+/// 16 ms 周期で回るので、鍵条件付きのコードやループが PC のポーリング周期
+/// （250 ms）に縛られず、PC が切断したあとも動き続ける。PC 側の実行経路は
+/// そのまま残してある: 新コマンドを持たないコンソールと、PC で 1 命令ずつ
+/// 追いながら挙動を確かめたいときのため。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheatExecution {
+    /// `core/nxus_cheatvm.c` のインタプリタで実行する（アップロード + 有効化）。
+    Console,
+    /// `cheat::vm` で PC から read/write しながら実行する（従来の経路）。
+    Pc,
+}
+
+impl Default for CheatExecution {
+    fn default() -> Self {
+        // 新コマンドが使えるコンソールでは、常にこちらが正しい既定。
+        // 使えないコンソールは接続時に自動で pc へ落ちる（`fallback_to_pc`）。
+        CheatExecution::Console
+    }
+}
+
+impl CheatExecution {
+    pub fn is_console(self) -> bool {
+        matches!(self, CheatExecution::Console)
+    }
+
+    /// 画面とログに出す名前。
+    pub fn label(self) -> &'static str {
+        match self {
+            CheatExecution::Console => "console",
+            CheatExecution::Pc => "pc",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
 
@@ -375,6 +417,16 @@ pub struct CheatManager {
     dirty: bool,
     /// Wall-clock budget for one ON/OFF block; `None` means no limit.
     block_budget: Option<Duration>,
+    /// チートを実行する場所（既定はコンソール）。
+    execution: CheatExecution,
+    /// コンソールへアップロード済みのプログラムそのもの。
+    ///
+    /// 同じ内容を何度も送らないための控え。ハッシュではなく実体を持つのは、
+    /// 衝突で「送っていないのに送った」と誤認すると、コンソールにプログラムが
+    /// 無いまま `cheat_enable` を送って BAD_STATE になるから（最大 48 KiB）。
+    console_uploaded: Option<Vec<u8>>,
+    /// 旧コンソールで新コマンドが使えなかった理由。ログを 1 行に抑えるため保持。
+    console_fallback: Option<String>,
 }
 
 impl CheatManager {
@@ -412,6 +464,9 @@ impl CheatManager {
             last_error: None,
             dirty: false,
             block_budget: DEFAULT_BLOCK_BUDGET,
+            execution: CheatExecution::default(),
+            console_uploaded: None,
+            console_fallback: None,
         };
         if let Err(error) = manager.load_journal() {
             manager.last_error = Some(format!("backup journal ignored: {error}"));
@@ -448,6 +503,9 @@ impl CheatManager {
             last_error: None,
             dirty: false,
             block_budget: DEFAULT_BLOCK_BUDGET,
+            execution: CheatExecution::default(),
+            console_uploaded: None,
+            console_fallback: None,
         };
         if let Err(error) = manager.load_journal() {
             manager.last_error = Some(format!("backup journal ignored: {error}"));
@@ -552,6 +610,159 @@ impl CheatManager {
         self.block_budget = budget;
     }
 
+    // -- コンソール実行モード ------------------------------------------------
+
+    pub fn execution(&self) -> CheatExecution {
+        self.execution
+    }
+
+    pub fn is_console_mode(&self) -> bool {
+        self.execution.is_console()
+    }
+
+    /// 実行場所を切り替える。
+    ///
+    /// ON のブロックがある間の切替は呼び出し側（GUI/CLI）が断ること: 同じ
+    /// アドレスを 2 つの VM が書くと、片方のジャーナルが必ず嘘になる。
+    pub fn set_execution(&mut self, execution: CheatExecution) {
+        self.execution = execution;
+    }
+
+    /// 新コマンドが未対応だったコンソールで PC 実行へ落とす。
+    ///
+    /// 戻り値は「1 行だけログするための文面」で、2 回目以降は `None`。
+    /// tick ごとにフォールバックを検出してもログが溢れないようにするため、
+    /// 判定は状態側（`console_fallback`）で 1 回だけにする。
+    pub fn fallback_to_pc(&mut self, reason: &str) -> Option<String> {
+        self.execution = CheatExecution::Pc;
+        self.console_uploaded = None;
+        if self.console_fallback.is_some() {
+            return None;
+        }
+        let message = format!(
+            "the console does not implement the on-console cheat commands ({reason}); \
+             running the cheats on the PC instead"
+        );
+        self.console_fallback = Some(message.clone());
+        Some(message)
+    }
+
+    /// [`Self::fallback_to_pc`] が記録した理由。
+    pub fn console_fallback(&self) -> Option<&str> {
+        self.console_fallback.as_deref()
+    }
+
+    /// コンソール上のブロック番号（`NxusCheatEnable.index`）。
+    ///
+    /// [`ir::build_program`] はドキュメント順に `BlockDesc::index` を振るので、
+    /// 表示順の位置がそのままワイヤの index になる。
+    pub fn block_index(&self, key: CheatKey) -> Option<u32> {
+        self.document
+            .blocks
+            .iter()
+            .position(|block| block.key == key)
+            .map(|index| index as u32)
+    }
+
+    /// 現在のターゲット identity でプログラム全体を組み立てる。
+    ///
+    /// コンソールはブロック単体を受け付けないので、どのブロックを ON にする
+    /// ときもプログラム全体が要る。既に ON のブロックは `BlockDesc::enabled`
+    /// に載るため、再アップロードしてもそれらは ON のまま残る。
+    pub fn build_console_program(&self) -> Result<Vec<u8>, String> {
+        let build_id = u64::from_str_radix(&self.identity.build_id, 16).map_err(|error| {
+            format!(
+                "build id '{}' is not hexadecimal: {error}",
+                self.identity.build_id
+            )
+        })?;
+        // The console adds no region base (`core/nxus_cheatvm.h`, "Address
+        // contract"): the PC has to hand over final absolute addresses.  Using the
+        // relative builder here would silently write main/heap cheats to the wrong
+        // place.
+        ir::build_program_resolved(
+            &self.document,
+            build_id,
+            self.identity.program_id,
+            &self.enabled,
+            &self.regions,
+        )
+    }
+
+    /// この内容はまだコンソールに載っていないか（同一内容なら送り直さない）。
+    ///
+    /// ブロックを 1 つ ON にするたびに最大 48 KiB を送ると、コンソールの
+    /// 受信バッファとワーカーを無駄に揺さぶる。内容が同じなら何もしない。
+    pub fn need_console_upload(&self, program: &[u8]) -> bool {
+        self.console_uploaded.as_deref() != Some(program)
+    }
+
+    /// アップロードが成功したことを記録する。
+    pub fn note_console_upload(&mut self, program: &[u8]) {
+        self.console_uploaded = Some(program.to_vec());
+    }
+
+    /// 控えを捨てる。
+    ///
+    /// コンソールがプログラムを失った（`NxusCheatStatus.program_valid == 0`）
+    /// ときに呼ぶ。「載っている」と思い込んだまま `cheat_enable` を送ると、
+    /// プログラムの無いコンソールでは BAD_STATE になる。
+    pub fn forget_console_upload(&mut self) {
+        self.console_uploaded = None;
+    }
+
+    /// 直近にアップロードしたプログラム（表示とテスト用）。
+    pub fn console_program(&self) -> Option<&[u8]> {
+        self.console_uploaded.as_deref()
+    }
+
+    /// コンソールで実行した ON/OFF を PC 側の状態に反映する。
+    ///
+    /// メモリには何も書かない: 書き込みはコンソールのワーカーが自分の
+    /// ジャーナルで行う。だからバックアップも作らず `dirty` も立てない。
+    /// 切断時に PC が「原本」を書き戻すと、コンソールが管理している復元表と
+    /// 二重になり、かえってタイトルを壊す。
+    pub fn note_console_toggle(&mut self, key: CheatKey, on: bool) -> Result<(), String> {
+        if on {
+            self.enabled.insert(key);
+            self.errors.remove(&key);
+        } else {
+            self.enabled.remove(&key);
+        }
+        if let Some(block) = self.document.block_mut(key) {
+            block.enabled = on;
+        }
+        self.settle_dirty();
+        if let Err(error) = self.save_document() {
+            let message = format!(
+                "cheat {} in memory, but the cheat file could not be saved: {error}",
+                if on { "enabled" } else { "disabled" }
+            );
+            self.last_error = Some(message.clone());
+            return Err(message);
+        }
+        Ok(())
+    }
+
+    /// コンソールのワーカーが自分から全ブロックを止めたときの後始末。
+    ///
+    /// `NxusEvent_CheatFault` は「コンソール側で全部止まった」という通知
+    /// なので、PC の表示も全部 OFF に合わせる。合わせないと、実際には止まって
+    /// いるブロックを ON と表示し続け、利用者は次の ON で「もう入っている」
+    /// と誤解する。戻り値は OFF にしたブロック数。
+    pub fn mark_all_off(&mut self) -> usize {
+        let count = self.enabled.len();
+        self.enabled.clear();
+        for block in &mut self.document.blocks {
+            block.enabled = false;
+        }
+        if let Err(error) = self.save_document() {
+            self.last_error = Some(format!("cheat file save failed: {error}"));
+        }
+        self.settle_dirty();
+        count
+    }
+
     pub fn snapshot(&self) -> CheatSnapshot {
         let mut loops = 0;
         let mut patches = 0;
@@ -628,6 +839,11 @@ impl CheatManager {
         // different process and must never be written again.
         let _ = self.persist_journal();
         self.vm_state.reset_all();
+        // 別プロセスではコンソール側のプログラムも別物。送信済みの控えを
+        // 捨てないと、新しいタイトルに古いプログラムを「載っている」と
+        // 思い込んで有効化だけを送ってしまう。
+        self.console_uploaded = None;
+        self.console_fallback = None;
         self.identity = identity;
         self.regions = regions;
         self.path = resolve_in_cheats_dir(&self.cheats_dir, &self.identity.build_id)?;
@@ -3173,5 +3389,193 @@ B4000000 00000000
         assert_eq!(io.value_u32(ADDRESS), 5);
         assert_eq!(io.write_count(), 0);
         assert_eq!(manager.backup_count(), 1);
+    }
+
+    // -- コンソール実行モード ------------------------------------------------
+
+    fn two_cheats(dir: &TempDir) -> String {
+        let text = "\
+[First]
+04400000 00001234 00000063
+[Second]
+@loop
+30050000 00000003
+04400000 00001238 00000001
+31050000
+";
+        dir.write(&format!("{BUILD}.txt"), text);
+        text.to_string()
+    }
+
+    /// アップロードするバイト列は、そのまま `ir::build_program` の出力。
+    ///
+    /// PC が「コンソール用プログラム」を独自に組み立て始めると、リンカの
+    /// 変更が片方にしか効かなくなる。同じ関数を通っていることを固定する。
+    #[test]
+    fn the_console_program_is_the_ir_linker_output_for_this_target() {
+        let dir = TempDir::new("console-program");
+        two_cheats(&dir);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let first = manager.find_key("First").unwrap();
+        // ON にしたブロックは `BlockDesc::enabled` に載る（再アップロードで
+        // 既存の ON が落ちない）。
+        manager.note_console_toggle(first, true).unwrap();
+
+        let program = manager.build_console_program().unwrap();
+        let build_id = u64::from_str_radix(BUILD, 16).unwrap();
+        let expected = ir::build_program(
+            manager.document(),
+            build_id,
+            manager.identity().program_id,
+            manager.enabled_keys(),
+        )
+        .unwrap();
+        assert_eq!(program, expected, "must be the linker's own bytes");
+
+        let header = ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES]).unwrap();
+        assert_eq!(header.magic, ir::MAGIC);
+        assert_eq!(header.build_id, build_id);
+        assert_eq!(header.program_id, 0x0100_C380_0049_C000);
+        assert_eq!(header.block_count, 2);
+        assert_eq!(header.total_bytes as usize, program.len());
+
+        // index はドキュメント順（`NxusCheatEnable.index` がそのまま使える）。
+        assert_eq!(manager.block_index(first), Some(0));
+        assert_eq!(
+            manager.block_index(manager.find_key("Second").unwrap()),
+            Some(1)
+        );
+        let second_desc = ir::BlockDesc::from_bytes(
+            &program[ir::HEADER_BYTES + ir::BLOCK_BYTES..ir::HEADER_BYTES + 2 * ir::BLOCK_BYTES],
+        )
+        .unwrap();
+        assert_eq!(second_desc.index, 1);
+        assert_eq!(second_desc.enabled, 0);
+        let first_desc =
+            ir::BlockDesc::from_bytes(&program[ir::HEADER_BYTES..ir::HEADER_BYTES + ir::BLOCK_BYTES])
+                .unwrap();
+        assert_eq!(first_desc.enabled, 1);
+    }
+
+    /// 同じ内容は 2 度送らない。内容が変わった / コンソールがプログラムを
+    /// 失ったときだけ送り直す。
+    #[test]
+    fn the_same_console_program_is_not_uploaded_twice() {
+        let dir = TempDir::new("console-upload-cache");
+        two_cheats(&dir);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+
+        let program = manager.build_console_program().unwrap();
+        assert!(manager.need_console_upload(&program), "nothing sent yet");
+        assert!(manager.console_program().is_none());
+
+        manager.note_console_upload(&program);
+        assert!(
+            !manager.need_console_upload(&program),
+            "identical content must not be sent again"
+        );
+        assert_eq!(manager.console_program(), Some(program.as_slice()));
+
+        // 内容が変われば（ブロックを ON にすると enabled が変わる）送り直す。
+        let first = manager.find_key("First").unwrap();
+        manager.note_console_toggle(first, true).unwrap();
+        let changed = manager.build_console_program().unwrap();
+        assert_ne!(changed, program);
+        assert!(manager.need_console_upload(&changed));
+
+        // コンソールが program_valid == 0 を返したら控えを捨て、次の ON で
+        // 送り直す（「載っている」と思い込むと BAD_STATE になる）。
+        manager.note_console_upload(&changed);
+        manager.forget_console_upload();
+        assert!(manager.need_console_upload(&changed));
+        assert!(manager.console_program().is_none());
+    }
+
+    /// コンソール実行の ON/OFF は PC のメモリにもジャーナルにも触らない。
+    ///
+    /// 書き込みはコンソールのワーカーが自分の復元表で行うので、PC 側に
+    /// バックアップを作ると「切断時に二重に書き戻す」事故になる。
+    #[test]
+    fn a_console_toggle_writes_nothing_from_the_pc() {
+        let dir = TempDir::new("console-toggle");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+
+        manager.note_console_toggle(key, true).unwrap();
+        assert_eq!(io.write_count(), 0, "the console does the writing");
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty(), "the console owns the restore table");
+        assert!(manager.is_enabled(key));
+        assert!(manager.block(key).unwrap().enabled);
+
+        manager.note_console_toggle(key, false).unwrap();
+        assert_eq!(io.write_count(), 0);
+        assert!(!manager.is_enabled(key));
+        assert!(!manager.block(key).unwrap().enabled);
+
+        // PC 側のジャーナル復元を走らせても書くものが無い（原本はコンソールが
+        // 持っている）ので、コンソールの復元表を二重に触らない。
+        let report = manager.restore_all_backups(&mut io);
+        assert_eq!(report.restored, 0);
+        assert_eq!(io.write_count(), 0);
+    }
+
+    /// 既定はコンソール実行。未対応のコンソールでは 1 回だけ通知して pc へ。
+    #[test]
+    fn cheats_run_on_the_console_by_default_and_fall_back_once() {
+        let dir = TempDir::new("console-default");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+
+        assert_eq!(CheatExecution::default(), CheatExecution::Console);
+        assert_eq!(manager.execution(), CheatExecution::Console);
+        assert!(manager.is_console_mode());
+        assert_eq!(CheatExecution::Console.label(), "console");
+        assert_eq!(CheatExecution::Pc.label(), "pc");
+        assert!(!CheatExecution::Pc.is_console());
+
+        let notice = manager
+            .fallback_to_pc("command 0x0082 failed (result=0x8003C801)")
+            .expect("the first fallback is reported");
+        assert!(notice.contains("does not implement"), "{notice}");
+        assert_eq!(manager.execution(), CheatExecution::Pc);
+        assert!(!manager.is_console_mode());
+        assert!(manager.console_fallback().is_some());
+        // 2 回目以降はログを溢れさせない。
+        assert!(manager
+            .fallback_to_pc("command 0x0082 failed (result=0x8003C801)")
+            .is_none());
+    }
+
+    /// コンソールのワーカーが自分から止めたら、表示上も全部 OFF にする。
+    #[test]
+    fn a_console_fault_clears_every_enabled_block() {
+        let dir = TempDir::new("console-fault");
+        two_cheats(&dir);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let first = manager.find_key("First").unwrap();
+        let second = manager.find_key("Second").unwrap();
+        manager.note_console_toggle(first, true).unwrap();
+        manager.note_console_toggle(second, true).unwrap();
+        assert_eq!(manager.enabled_keys().len(), 2);
+
+        let off = manager.mark_all_off();
+        assert_eq!(off, 2);
+        assert!(manager.enabled_keys().is_empty());
+        assert!(manager.blocks().iter().all(|block| !block.enabled));
+        // 2 回目は何も OFF にしない（冪等）。
+        assert_eq!(manager.mark_all_off(), 0);
     }
 }

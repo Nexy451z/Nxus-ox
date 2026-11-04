@@ -113,6 +113,12 @@ WATCH_STYLE_LINK6 = 2
 NXUS_PTRSCAN_MAX_DEPTH = 8
 CHEAT_F_32BIT = 0x0001
 
+CHEAT_ENABLE = struct.Struct('<II')
+CHEAT_STATUS = struct.Struct('<IIIIIIIIIIQ')   # 10 x u32 + u64 = 48 bytes
+CHEAT_RESTORE = struct.Struct('<IIII')
+CHEAT_UPLOAD_REPLY = struct.Struct('<IIII')
+CHEAT_FAULT = struct.Struct('<IIII')
+
 STRUCTS = {
     'NxusPacketHeader': HEADER,
     'NxusStatus': STATUS,
@@ -149,6 +155,11 @@ STRUCTS = {
     'NxusDebugStatus': DEBUG_STATUS_FULL,
     'NxusDebugConfig': DEBUG_CONFIG,
     'NxusDebugStop': DEBUG_STOP,
+    'NxusCheatEnable': CHEAT_ENABLE,
+    'NxusCheatStatus': CHEAT_STATUS,
+    'NxusCheatRestore': CHEAT_RESTORE,
+    'NxusCheatUploadReply': CHEAT_UPLOAD_REPLY,
+    'NxusCheatFault': CHEAT_FAULT,
 }
 
 CMD = {
@@ -204,6 +215,11 @@ CMD = {
     'ProbeGet': 0x0071,
 
     'SnapshotRelease': 0x0072,
+    'CheatUpload': 0x0080,
+    'CheatEnable': 0x0081,
+    'CheatStatus': 0x0082,
+    'CheatPanicOff': 0x0083,
+    'CheatClear': 0x0084,
 }
 
 EVT = {
@@ -216,6 +232,7 @@ EVT = {
     'DebugEvent': 0x8007,
     'DebugStopped': 0x8008,
     'FrozenReleased': 0x8009,
+    'CheatFault': 0x800A,
 }
 
 # NxusEvent_FrozenReleased payload: { u32 count; u32 reserved; u64 addresses[n]; }
