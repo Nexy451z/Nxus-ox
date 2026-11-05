@@ -58,7 +58,7 @@
  * the journal, the plan-pass journal and the worker stack are .bss / a static
  * array.  The interpreter caps (core/nxus_cheatvm.h) size them:
  *
- *     sizeof(NxusCheatProgram)  17592 B   (512 instructions x 24 B + 128 blocks)
+ *     sizeof(NxusCheatProgram)  54440 B   (2048 instructions x 24 B + 128 blocks)
  *     sizeof(NxusCheatJournal)  12296 B   (512 entries x 24 B)
  *     plan-pass journal         12296 B   (same layout; never published)
  *     worker stack               8192 B

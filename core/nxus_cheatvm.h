@@ -37,9 +37,11 @@ extern "C" {
 /* ---- limits (heap budget: the sysmodule has 8 MiB in total) ---------------- */
 
 /** Largest program the console accepts, in bytes (header + blocks + instructions). */
-#define NXUS_CHEATVM_MAX_PROGRAM_BYTES (48u * 1024u)
-/** Instructions in one program.  At 24 bytes each this is 12 KiB. */
-#define NXUS_CHEATVM_MAX_INSNS 512u
+#define NXUS_CHEATVM_MAX_PROGRAM_BYTES (64u * 1024u)
+/** Instructions in one program.  At 24 bytes each this is 48 KiB.  A 537-instruction
+ *  cheat used to be rejected at 512; 2048 keeps four times the headroom while the
+ *  program still fits the sysmodule's static budget. */
+#define NXUS_CHEATVM_MAX_INSNS 2048u
 /** Blocks in one program. */
 #define NXUS_CHEATVM_MAX_BLOCKS 128u
 /** Patched addresses whose original bytes are kept for Panic Restore. */

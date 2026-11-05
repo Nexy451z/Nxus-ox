@@ -908,10 +908,12 @@ static void testLifecycle(void) {
        journal: 12 KiB more, still far inside the sysmodule's 8 MiB. */
     const u32 footprint = (u32)(sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
                                 sizeof(g_WorkerStack));
-    CHECK(footprint <= 52u * 1024u, "cheat service statics fit the declared budget (%u B)",
+    /* 2048 instructions (up from 512: a 537-instruction cheat was rejected) put the
+       program at ~53 KiB; the ceiling in the .c is 96 KiB. */
+    CHECK(footprint <= 96u * 1024u, "cheat service statics fit the declared budget (%u B)",
           (unsigned)footprint);
-    CHECK(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) == 29888u,
-          "program + journal are 29888 B (program %u, journal %u)",
+    CHECK(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) == 54456u + 12296u,
+          "program + journal are 66752 B (program %u, journal %u)",
           (unsigned)sizeof(NxusCheatProgram), (unsigned)sizeof(NxusCheatJournal));
     CHECK(sizeof(g_ProbeJournal) == sizeof(NxusCheatJournal),
           "the plan journal is one more journal-sized block (%u B)",

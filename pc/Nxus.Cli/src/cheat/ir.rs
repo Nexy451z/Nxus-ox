@@ -112,9 +112,9 @@ pub const BLOCK_BYTES: usize = 24;
 pub const INSN_BYTES: usize = 24;
 
 /// `NXUS_CHEATVM_MAX_PROGRAM_BYTES`: header + blocks + instructions.
-pub const MAX_PROGRAM_BYTES: usize = 48 * 1024;
+pub const MAX_PROGRAM_BYTES: usize = 64 * 1024;
 /// `NXUS_CHEATVM_MAX_INSNS`.
-pub const MAX_INSNS: usize = 512;
+pub const MAX_INSNS: usize = 2048;
 /// `NXUS_CHEATVM_MAX_BLOCKS`.
 pub const MAX_BLOCKS: usize = 128;
 /// `NXUS_CHEATVM_MAX_JOURNAL` (the console journals patched bytes itself).
@@ -1005,8 +1005,8 @@ mod tests {
         assert_eq!(HEADER_BYTES, 40);
         assert_eq!(BLOCK_BYTES, 24);
         assert_eq!(INSN_BYTES, 24);
-        assert_eq!(MAX_PROGRAM_BYTES, 48 * 1024);
-        assert_eq!(MAX_INSNS, 512);
+        assert_eq!(MAX_PROGRAM_BYTES, 64 * 1024);
+        assert_eq!(MAX_INSNS, 2048);
         assert_eq!(MAX_BLOCKS, 128);
         assert_eq!(MAGIC, 0x4E43_564D);
         assert_eq!(VERSION, 1);
@@ -1260,13 +1260,15 @@ mod tests {
 
     #[test]
     fn too_many_instructions_is_an_error() {
+        // The parser stops at the Atmosphere-compatible 0x400-opcode limit long before
+        // the console's 2048-instruction ceiling, so this exercises the first gate that
+        // fires.  The console-side ceiling is enforced by `nxusCheatInstall` as well.
         let lines: Vec<String> = vec!["04000000 00000000 00000001".to_string(); MAX_INSNS + 1];
         let mut document = CheatDocument::new("LIMIT");
         document.add_cheat("Too Many", &lines, None);
 
         let error = build_program(&document, 0, 0, &BTreeSet::new()).unwrap_err();
-        assert!(error.contains("512"), "{error}");
-        assert!(error.contains("instructions"), "{error}");
+        assert!(error.contains("opcode limit") || error.contains("instructions"), "{error}");
     }
 
     #[test]

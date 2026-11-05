@@ -56,8 +56,8 @@ static NxusCheatJournal g_Journal;
 static NxusCheatJournal g_ProbeJournal;
 static alignas(0x1000) u8 g_WorkerStack[0x2000];
 
-#define CHEATSRV_STATIC_MAX_BYTES (52u * 1024u)
-NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) <= 20u * 1024u,
+#define CHEATSRV_STATIC_MAX_BYTES (96u * 1024u)
+NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) <= 56u * 1024u,
                    "NxusCheatProgram must stay inside the cheat service budget");
 NXUS_STATIC_ASSERT(sizeof(NxusCheatJournal) <= 16u * 1024u,
                    "NxusCheatJournal must stay inside the cheat service budget");
