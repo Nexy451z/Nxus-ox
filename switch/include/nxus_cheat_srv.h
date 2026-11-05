@@ -5,10 +5,13 @@
  * block at a time and keeps the original bytes of everything it patches.  This
  * service is what makes it run on the console:
  *
- *   - it owns the one program + the one journal (both STATIC, see the memory note
- *     below) and serialises the connection thread against the worker,
+ *   - it owns the one resident program, the scratch program of a patch-only
+ *     upload, and the one journal (all STATIC, see the memory note below) and
+ *     serialises the connection thread against the worker,
  *   - it drives a 16 ms worker that runs the enabled blocks, exactly like
- *     Atmosphère's cheat manager does inside the title,
+ *     Atmosphère's cheat manager does inside the title.  A program that contains
+ *     at least one LOOP block becomes resident; a PATCH-ONLY program is executed
+ *     once during the upload and released immediately (see nxusCheatSrvUpload),
  *   - it refuses to run a program against a target it was not uploaded for: the
  *     upload stamps {pid, program_id, dmnt target incarnation} and every tick is
  *     compared against the live values.  A mismatch stops every block, writes the
@@ -54,22 +57,26 @@
  * Memory
  * ------
  * The sysmodule's inner heap is 8 MiB and already holds the scan chunk, the hit
- * list and up to two snapshot slots, so nothing here is allocated: the program,
- * the journal, the plan-pass journal and the worker stack are .bss / a static
- * array.  The interpreter caps (core/nxus_cheatvm.h) size them:
+ * list and up to two snapshot slots, so nothing here is allocated up front: the
+ * program structures, the journal, the plan-pass journal and the worker stack are
+ * .bss / static arrays.  The interpreter caps (core/nxus_cheatvm.h) size them:
  *
- *     sizeof(NxusCheatProgram)  54440 B   (2048 instructions x 24 B + 128 blocks)
+ *     sizeof(NxusCheatProgram)  ~5.4 KiB each (blocks + states; instructions live
+ *                               on the heap, sized to the uploaded program)
+ *     resident program          1 x NxusCheatProgram
+ *     patch-upload scratch      1 x NxusCheatProgram (released after the upload)
  *     sizeof(NxusCheatJournal)  12296 B   (512 entries x 24 B)
  *     plan-pass journal         12296 B   (same layout; never published)
  *     worker stack               8192 B
- *     ------------------------------------
- *     static total              50376 B   (~49 KiB, no heap at all)
  *
- * The plan pass needs its own journal because the interpreter journals before it
- * calls write(); reusing the real journal would record ownership of bytes that
- * were never patched.  The exact numbers are asserted in nxus_cheat_srv.c, so
- * lowering/raising a core cap cannot silently grow (or shrink) what the sysmodule
- * reserves.
+ * The instruction arrays themselves are allocated by nxusCheatInstall() and freed
+ * by nxusCheatProgramRelease(); a patch-only upload allocates the scratch buffer,
+ * runs the blocks once and releases it before returning, so repeated patch
+ * uploads do not accumulate memory.  The plan pass needs its own journal because
+ * the interpreter journals before it calls write(); reusing the real journal
+ * would record ownership of bytes that were never patched.  The exact numbers are
+ * asserted in nxus_cheat_srv.c, so lowering/raising a core cap cannot silently
+ * grow (or shrink) what the sysmodule reserves.
  *
  * Threading
  * ---------
@@ -120,20 +127,23 @@
 #define NXUS_CHEATSRV_EXIT_JOIN_MS 2000u
 
 /*
- * Boot the service: reset the program/journal/failure counters and start the 16 ms
- * worker.  Idempotent for one lifetime (a second call while initialised does
- * nothing).  Call it AFTER nxusServerInit() (the worker reports faults through
- * nxusNetSendEvent, and main.c's ordering owns that module) and BEFORE the
- * network is expected to serve cheat commands.
+ * Boot the service: release any leftover program storage, reset the
+ * program/journal/failure counters and start the 16 ms worker.  Idempotent for one
+ * lifetime (a second call while initialised does nothing).  Call it AFTER
+ * nxusServerInit() (the worker reports faults through nxusNetSendEvent, and main.c's
+ * ordering owns that module) and BEFORE the network is expected to serve cheat
+ * commands.
  */
 void nxusCheatSrvInit(void);
 
 /*
  * Terminal shutdown: ask the worker to stop, wait NXUS_CHEATSRV_EXIT_JOIN_MS for
- * it, join + close the Thread when it did, then release the program and the
- * journal.  While the target is still the one the program was uploaded for, the
- * journal is written back first - a module stop must not leave a title patched with
- * bytes whose originals this service is about to forget.
+ * it, join + close the Thread when it did, then release the program (including its
+ * heap instruction array) and the journal.  While the target is still the one the
+ * journal belongs to, it is written back first - a module stop must not leave a
+ * title patched with bytes whose originals this service is about to forget.  That
+ * restore covers the journal of a patch-only upload too (stamped with the target
+ * even though no program is resident).
  *
  * Call it BEFORE nxusServerExit() (that call releases the session and raises the
  * terminal gate, and this one still wants dmnt).  Safe to call when never
@@ -150,10 +160,24 @@ void nxusCheatSrvExit(void);
  *   - refuses a program whose header.program_id names another title than the one
  *     the session is on, and one uploaded with no target at all (the client cannot
  *     have resolved any address then),
- *   - runs the interpreter's validation (magic/version/sizes/branch targets) and
- *     leaves everything untouched when it fails,
- *   - writes back whatever the PREVIOUS program patched (through the journal) and
- *     starts from an empty journal,
+ *   - runs the interpreter's validation (magic/version/sizes/branch targets) into
+ *     a SCRATCH program, so a refused or out-of-memory upload never touches the
+ *     installed one (NXUS_CHEATVM_ERR_NO_MEMORY is reported through
+ *     rejected_reason like any other install error),
+ *   - dispatches on the block table:
+ *       * PATCH-ONLY (every block mode == 0): the program is executed once, right
+ *         here, block by block - the same plan/apply pass the worker uses, with
+ *         Pause/Resume around code writes.  What it writes stays in the journal
+ *         (so a PC-less PanicOff can undo it), then the scratch program is
+ *         RELEASED.  Nothing becomes resident: g_Program, its block states and
+ *         `program_valid` are untouched, so a resident loop program keeps running
+ *         and CheatStatus still describes it.  A patch block that fails is
+ *         reported as a failed upload (rejected_reason = the interpreter error);
+ *       * LOOP OR MIXED (at least one block mode == 1): the program becomes
+ *         resident.  Whatever the previous program patched is written back first
+ *         (inside the usual freeze), the old program's instruction array is
+ *         released, and only then does the new program take its place.  A failure
+ *         before that point leaves the old program installed and running.
  *   - stamps the runtime identity the worker will compare against every tick.
  *
  * *reply is always filled (accepted_blocks / accepted_insns on success,
@@ -181,6 +205,10 @@ bool nxusCheatSrvSetEnabled(const NxusCheatEnable *req);
  * `program_valid`, `block_count`, `enabled_count`, `insn_count`, `tick_count`,
  * `journal_count`, `last_error`, `last_error_pc` and `fault_count` come from the
  * seqlock-published snapshot, while `running` and `keys_held` are read live.
+ *
+ * `program_valid`, `block_count` and `insn_count` describe the RESIDENT program
+ * only: a patch-only upload runs synchronously and leaves no program behind, so it
+ * never changes those three fields (its writes do show up in `journal_count`).
  *
  * `last_error` carries the interpreter's own (negative) NXUS_CHEATVM_ERR_* value of
  * the most recent failing block, 0 when the last tick had no failure - unlike
@@ -210,6 +238,7 @@ void nxusCheatSrvPanicOff(NxusCheatRestore *out);
  * Drop the program and the journal WITHOUT writing anything to the target: the
  * NxusCmd_CheatClear contract ("drop the program (no writes)").  Patches that are
  * still applied stay applied and their originals are forgotten, so the log line
- * says so - a client that wants them undone sends CheatPanicOff first.
+ * says so - a client that wants them undone sends CheatPanicOff first.  The
+ * resident program's heap instruction array is released here.
  */
 void nxusCheatSrvClear(void);

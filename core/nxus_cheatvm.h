@@ -37,11 +37,14 @@ extern "C" {
 /* ---- limits (heap budget: the sysmodule has 8 MiB in total) ---------------- */
 
 /** Largest program the console accepts, in bytes (header + blocks + instructions). */
-#define NXUS_CHEATVM_MAX_PROGRAM_BYTES (64u * 1024u)
-/** Instructions in one program.  At 24 bytes each this is 48 KiB.  A 537-instruction
- *  cheat used to be rejected at 512; 2048 keeps four times the headroom while the
- *  program still fits the sysmodule's static budget. */
-#define NXUS_CHEATVM_MAX_INSNS 2048u
+#define NXUS_CHEATVM_MAX_PROGRAM_BYTES (512u * 1024u)
+/** Largest instruction count one program may carry.  This is a ceiling on the wire
+ *  format, not on resident memory: the instruction array is allocated on the heap
+ *  with exactly `insn_count` slots (see NxusCheatProgram.insns), so a one-instruction
+ *  patch costs 24 bytes while a 20 000-instruction loop file still fits.  The old
+ *  fixed array forced every program, including write-once patches, to reserve the
+ *  same 48 KiB. */
+#define NXUS_CHEATVM_MAX_INSNS 20000u
 /** Blocks in one program. */
 #define NXUS_CHEATVM_MAX_BLOCKS 128u
 /** Patched addresses whose original bytes are kept for Panic Restore. */
@@ -198,6 +201,24 @@ typedef struct NxusCheatJournal NxusCheatJournal;
 
 /* ---- program storage ----------------------------------------------------- */
 
+/**
+ * Allocator hook for the instruction array.
+ *
+ * nxusCheatInstall allocates `insn_count * sizeof(NxusCheatInsn)` bytes and
+ * nxusCheatProgramRelease frees them again.  The default is malloc/free; the hook
+ * exists so host tests can inject an allocation failure (and count calls) without
+ * touching the shipped behaviour.  A program remembers the free function that
+ * matches the allocator that produced its buffer, so restoring the default while a
+ * program is still installed cannot mismatch them.
+ *
+ * Passing NULL for either function restores the default.  Do not change the hooks
+ * concurrently with an install or release.
+ */
+typedef void *(*NxusCheatAllocFn)(size_t size, void *user);
+typedef void (*NxusCheatFreeFn)(void *ptr, void *user);
+
+void nxusCheatSetAllocator(NxusCheatAllocFn alloc, NxusCheatFreeFn release, void *user);
+
 typedef struct NxusCheatBlockState {
     bool enabled;
     bool ran_once;   /**< a patch block has been applied for the current enable */
@@ -206,10 +227,26 @@ typedef struct NxusCheatBlockState {
     u32 error_pc;
 } NxusCheatBlockState;
 
+/**
+ * Program storage.
+ *
+ * The instruction array lives on the heap, sized exactly to the installed
+ * program, so a write-once patch does not reserve room for a 20 000-instruction
+ * loop.  `blocks` and `state` are only 24 B + 16 B per entry, so they stay inline.
+ *
+ * Ownership: `nxusCheatInstall` (re)allocates `insns`; `nxusCheatReset` empties the
+ * program but DOES NOT free it; `nxusCheatProgramRelease` is the only function that
+ * frees it.  Every successful install must be paired with a release when the
+ * program is dropped, and a program must be initialised with nxusCheatProgramInit
+ * (or static zero-initialisation) before its first install/reset.
+ */
 typedef struct NxusCheatProgram {
     NxusCheatProgramHeader header;
     NxusCheatBlockDesc blocks[NXUS_CHEATVM_MAX_BLOCKS];
-    NxusCheatInsn insns[NXUS_CHEATVM_MAX_INSNS];
+    NxusCheatInsn *insns;        /**< heap array of `insn_capacity` instructions, or NULL */
+    u32 insn_capacity;           /**< instruction slots actually allocated at `insns` */
+    NxusCheatFreeFn insns_free;  /**< free() matching the allocator that produced `insns` */
+    void *insns_free_user;       /**< user pointer captured with `insns_free` */
     NxusCheatBlockState state[NXUS_CHEATVM_MAX_BLOCKS];
     u32 registers[16];
     u32 saved_registers[16];
@@ -218,16 +255,45 @@ typedef struct NxusCheatProgram {
     u32 tick_count;
 } NxusCheatProgram;
 
-/** Reset a program to "empty, nothing enabled". */
+/**
+ * Initialise fresh (uninitialised) program storage to the empty, releasable state.
+ *
+ * This zeroes the struct; it does not free anything, so calling it on a program
+ * that still owns an instruction buffer leaks that buffer - call
+ * nxusCheatProgramRelease first in that case.
+ */
+void nxusCheatProgramInit(NxusCheatProgram *program);
+
+/**
+ * Free the heap instruction array and return the program to the empty state.
+ *
+ * Idempotent and safe on a zero-initialised / already-released program (`insns`
+ * NULL is a no-op), so it may be called on every teardown path.  This is the only
+ * function that releases the instruction storage.
+ */
+void nxusCheatProgramRelease(NxusCheatProgram *program);
+
+/**
+ * Reset a program to "empty, nothing enabled".
+ *
+ * The heap instruction array (if any) is kept for reuse: this function deliberately
+ * does not free it.  Releasing it is nxusCheatProgramRelease's job.
+ */
 void nxusCheatReset(NxusCheatProgram *program);
 
 /**
  * Validate and install a wire program.
  *
  * Checks the magic/version/size, that every block's instruction range is inside the
- * program, and that every branch target points at a valid instruction.  Returns 0 on
- * success, a negative value otherwise (`-1` bad magic, `-2` bad size, `-3` bad block,
- * `-4` bad branch target, `-5` too many instructions).
+ * program, and that every branch target points at a valid instruction.  Once the
+ * checks pass it allocates `insn_count * sizeof(NxusCheatInsn)` bytes, copies the
+ * instructions there and swaps the new buffer in (the previous buffer, if any, is
+ * freed only after the allocation succeeded, so a re-install never leaks and a
+ * failed allocation leaves the installed program untouched).
+ *
+ * Returns 0 on success, a negative value otherwise (`-1` bad magic, `-2` bad size,
+ * `-3` bad block, `-4` bad branch target, `-5` too many instructions, `-9` no
+ * memory for the instruction array).
  */
 int nxusCheatInstall(NxusCheatProgram *program, const void *wire, size_t length);
 
@@ -261,6 +327,7 @@ int nxusCheatRunBlock(NxusCheatProgram *program, u32 index, const NxusCheatIo *i
 #define NXUS_CHEATVM_ERR_WRITE (-6)
 #define NXUS_CHEATVM_ERR_BAD_REGISTER (-7)
 #define NXUS_CHEATVM_ERR_BAD_OPCODE (-8)
+#define NXUS_CHEATVM_ERR_NO_MEMORY (-9)
 
 /* ---- journal (original bytes, for Panic Restore without a PC) ------------ */
 

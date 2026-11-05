@@ -49,9 +49,8 @@ use egui::{Color32, RichText};
 
 use cheat::manager::CheatExecution;
 use cheat::{
-    normalize_build_id, save_text_atomic, CheatDocument, CheatKey, CheatManager, CheatMemoryIo,
-    FailureKind,
-    MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
+    normalize_build_id, save_text_atomic, CheatDocument, CheatExecMode, CheatKey, CheatManager,
+    CheatMemoryIo, FailureKind, MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
 };
 use client::{is_unsupported_command, CheatFault, CheatRestore, CheatStatus, NxusClient};
 use protocol::{Metadata, Status};
@@ -561,54 +560,75 @@ enum ConsoleToggle {
 
 /// コンソールで 1 ブロックを ON/OFF する。
 ///
-/// ON は「プログラム全体のアップロード（同一内容なら省略）→
-/// `cheat_enable(index, true)`」の順。ブロック単体を送るコマンドは無いので、
-/// どのブロックを ON にするときもプログラム全体が要る。
+/// コンソールは **loop を含むプログラムだけを常駐**させ（16 ms ごとに実行）、
+/// **patch だけのプログラムはアップロード直後に 1 回実行して解放する**。
+/// だから ON の経路はブロックの種別で分かれる:
+///
+/// * **loop**: 常駐プログラム（loop ブロックだけ）をアップロード（同一内容なら
+///   省略）→ `cheat_enable(index, true)`。index は常駐プログラム内の位置。
+/// * **patch**: そのブロック単体のプログラムをアップロードするだけで、コンソール
+///   が 1 回実行して解放する。常駐しないので `cheat_enable` は送らない（index が
+///   存在しない）。コンソール側に復元表は残らないため、送信の**前に**原本を
+///   PC のジャーナルへ控え、OFF は PC 側の復元で戻す。
 fn console_toggle(session: &mut Session, key: CheatKey, on: bool) -> ConsoleToggle {
-    let Some(index) = session.manager.block_index(key) else {
+    let Some(mode) = session.manager.block(key).map(|block| block.mode) else {
         return ConsoleToggle::Failed(format!("cheat {key} is not part of the program"));
     };
-    if on {
-        let program = match session.manager.build_console_program() {
-            Ok(program) => program,
-            Err(error) => {
-                // リンクできないブロックを部分的に送ると、利用者が書いていない
-                // コードが走る。断って、何が駄目かをそのまま見せる。
-                return ConsoleToggle::Failed(format!("cannot link the cheat program: {error}"));
+    match (mode, on) {
+        (CheatExecMode::Loop, true) => console_enable_loop(session, key),
+        (CheatExecMode::Loop, false) => console_disable_loop(session, key),
+        (CheatExecMode::Patch, true) => console_apply_patch(session, key),
+        (CheatExecMode::Patch, false) => console_restore_patch(session, key),
+    }
+}
+
+fn console_block_name(session: &Session, key: CheatKey) -> String {
+    session
+        .manager
+        .block(key)
+        .map(|block| block.name.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// loop ブロックの ON: 常駐プログラム → `cheat_enable(index, true)`。
+fn console_enable_loop(session: &mut Session, key: CheatKey) -> ConsoleToggle {
+    let Some(index) = session.manager.block_index(key) else {
+        return ConsoleToggle::Failed(format!(
+            "cheat {key} is not part of the resident (loop) program"
+        ));
+    };
+    let program = match session.manager.build_console_program() {
+        Ok(program) => program,
+        Err(error) => {
+            // リンクできないブロックを部分的に送ると、利用者が書いていない
+            // コードが走る。断って、何が駄目かをそのまま見せる。
+            return ConsoleToggle::Failed(format!("cannot link the cheat program: {error}"));
+        }
+    };
+    if session.manager.need_console_upload(&program) {
+        match session.client.cheat_upload(&program) {
+            Ok(reply) => {
+                if let Some(reason) = reply.rejected_text() {
+                    return ConsoleToggle::Failed(format!(
+                        "the console refused the cheat program: {reason}"
+                    ));
+                }
+                session.manager.note_console_upload(&program);
             }
-        };
-        if session.manager.need_console_upload(&program) {
-            match session.client.cheat_upload(&program) {
-                Ok(reply) => {
-                    if let Some(reason) = reply.rejected_text() {
-                        return ConsoleToggle::Failed(format!(
-                            "the console refused the cheat program: {reason}"
-                        ));
-                    }
-                    session.manager.note_console_upload(&program);
-                }
-                Err(error) => {
-                    return if is_unsupported_command(&error) {
-                        ConsoleToggle::Unsupported(error.to_string())
-                    } else {
-                        ConsoleToggle::Failed(format!("cheat upload: {error}"))
-                    };
-                }
+            Err(error) => {
+                return if is_unsupported_command(&error) {
+                    ConsoleToggle::Unsupported(error.to_string())
+                } else {
+                    ConsoleToggle::Failed(format!("cheat upload: {error}"))
+                };
             }
         }
     }
-    match session.client.cheat_enable(index, on) {
+    match session.client.cheat_enable(index, true) {
         Ok(()) => {
-            let name = session
-                .manager
-                .block(key)
-                .map(|block| block.name.clone())
-                .unwrap_or_else(|| key.to_string());
-            match session.manager.note_console_toggle(key, on) {
-                Ok(()) => ConsoleToggle::Done(format!(
-                    "{} '{name}' on the console",
-                    if on { "enabled" } else { "disabled" }
-                )),
+            let name = console_block_name(session, key);
+            match session.manager.note_console_toggle(key, true) {
+                Ok(()) => ConsoleToggle::Done(format!("enabled '{name}' on the console")),
                 Err(error) => ConsoleToggle::Failed(error),
             }
         }
@@ -619,6 +639,131 @@ fn console_toggle(session: &mut Session, key: CheatKey, on: bool) -> ConsoleTogg
                 ConsoleToggle::Failed(format!("cheat_enable({index}) failed: {error}"))
             }
         }
+    }
+}
+
+/// loop ブロックの OFF: `cheat_enable(index, false)`（原本はコンソールが戻す）。
+fn console_disable_loop(session: &mut Session, key: CheatKey) -> ConsoleToggle {
+    let Some(index) = session.manager.block_index(key) else {
+        return ConsoleToggle::Failed(format!(
+            "cheat {key} is not part of the resident (loop) program"
+        ));
+    };
+    match session.client.cheat_enable(index, false) {
+        Ok(()) => {
+            let name = console_block_name(session, key);
+            match session.manager.note_console_toggle(key, false) {
+                Ok(()) => ConsoleToggle::Done(format!("disabled '{name}' on the console")),
+                Err(error) => ConsoleToggle::Failed(error),
+            }
+        }
+        Err(error) => {
+            if is_unsupported_command(&error) {
+                ConsoleToggle::Unsupported(error.to_string())
+            } else {
+                ConsoleToggle::Failed(format!("cheat_enable({index}) failed: {error}"))
+            }
+        }
+    }
+}
+
+/// patch ブロックの ON: 原本を PC ジャーナルへ控えてから単体プログラムを送る。
+///
+/// 送信が成功した時点でコンソールは 1 回実行してプログラムを解放している。
+/// 控えを残すのは OFF のため（コンソール側に復元表は無い）。
+fn console_apply_patch(session: &mut Session, key: CheatKey) -> ConsoleToggle {
+    let program = match session.manager.build_patch_program(key) {
+        Ok(program) => program,
+        Err(error) => {
+            return ConsoleToggle::Failed(format!("cannot link the cheat program: {error}"));
+        }
+    };
+    let name = console_block_name(session, key);
+    if !session.manager.need_patch_upload(key, &program) {
+        // 同じ内容を送って実行済み。二重に実行しない（既存方針）。
+        return match session.manager.note_console_toggle(key, true) {
+            Ok(()) => ConsoleToggle::Done(format!(
+                "applied '{name}' on the console (ran once already)"
+            )),
+            Err(error) => ConsoleToggle::Failed(error),
+        };
+    }
+    // 原本はコンソールが書き換える前に読む。ここで失敗したら、送信して
+    // 復元できなくなるより前に止める。
+    {
+        let mut io = ClientCheatIo {
+            client: &session.client,
+        };
+        if let Err(error) = session.manager.prepare_console_patch(key, &mut io) {
+            return ConsoleToggle::Failed(format!("cannot record the original bytes: {error}"));
+        }
+    }
+    match session.client.cheat_upload(&program) {
+        Ok(reply) => {
+            if let Some(reason) = reply.rejected_text() {
+                let extra = discard_patch_journal(session);
+                return ConsoleToggle::Failed(with_extra(
+                    format!("the console refused the cheat program: {reason}"),
+                    extra,
+                ));
+            }
+            session.manager.note_patch_upload(key, &program);
+        }
+        Err(error) => {
+            let extra = discard_patch_journal(session);
+            return if is_unsupported_command(&error) {
+                ConsoleToggle::Unsupported(error.to_string())
+            } else {
+                ConsoleToggle::Failed(with_extra(format!("cheat upload: {error}"), extra))
+            };
+        }
+    }
+    match session.manager.finish_console_patch() {
+        // 常駐しないので表示は「適用した（1 回実行）」。
+        Ok(()) => ConsoleToggle::Done(format!(
+            "applied '{name}' on the console (ran once)"
+        )),
+        Err(error) => ConsoleToggle::Failed(error),
+    }
+}
+
+/// patch ブロックの OFF: コンソールは既に解放しているので PC ジャーナルで戻す。
+///
+/// `cheat_enable(index, false)` は送らない（常駐していないので index が無い）。
+fn console_restore_patch(session: &mut Session, key: CheatKey) -> ConsoleToggle {
+    let name = console_block_name(session, key);
+    let restored = {
+        let mut io = ClientCheatIo {
+            client: &session.client,
+        };
+        session.manager.disable(key, &mut io)
+    };
+    match restored {
+        Ok(()) => {
+            // 次に同じ patch を ON したら、もう一度送って実行させる。
+            session.manager.forget_patch_upload(key);
+            ConsoleToggle::Done(format!(
+                "disabled '{name}' (the console released it; the original bytes came back from \
+                 the PC journal)"
+            ))
+        }
+        Err(error) => ConsoleToggle::Failed(error),
+    }
+}
+
+/// 送信に失敗した patch のジャーナル記録を捨てる。戻り値は追加の失敗理由。
+fn discard_patch_journal(session: &mut Session) -> Option<String> {
+    let mut io = ClientCheatIo {
+        client: &session.client,
+    };
+    session.manager.abort_console_patch(&mut io).err()
+}
+
+/// 主たる失敗理由に、後始末の失敗を 1 行で足す。
+fn with_extra(message: String, extra: Option<String>) -> String {
+    match extra {
+        Some(extra) => format!("{message}; {extra}"),
+        None => message,
     }
 }
 
@@ -665,12 +810,23 @@ fn refresh_console_status(session: &mut Session) -> Option<String> {
 ///
 /// 実行はコンソール側のワーカーが持っているので、PC が書き戻すものは無い。
 /// 表示（全ブロック OFF）と理由だけを合わせ、利用者に 1 行で伝える。
+///
+/// ただし patch の原本はコンソールが持っていない（1 回実行して解放するため）。
+/// PC のジャーナルに残っている分は Panic Restore で戻すしかないので、その
+/// 責務が残っていることを黙って隠さない。
 fn apply_cheat_fault(manager: &mut CheatManager, fault: &CheatFault) -> String {
     let off = manager.mark_all_off();
-    format!(
+    let mut message = format!(
         "the console stopped every cheat ({off} block(s) turned off): {}",
         fault.reason_text()
-    )
+    );
+    if manager.dirty() {
+        message.push_str(&format!(
+            "; the PC journal still owes {} address(es) - Panic Restore writes them back",
+            manager.backup_count()
+        ));
+    }
+    message
 }
 
 /// コンソールの非同期イベントを空にするまで読み、fault だけ処理する。
@@ -2450,7 +2606,7 @@ impl NclApp {
                 );
                 ui.label(
                     RichText::new(format!(
-                        "{} block(s) / {} on / {} insn",
+                        "{} loop block(s) / {} on / {} insn",
                         console.block_count, console.enabled_count, console.insn_count
                     ))
                     .color(DIM),

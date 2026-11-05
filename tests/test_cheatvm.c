@@ -6,6 +6,7 @@
  * 送る契約なので、テストも最終アドレスを直接使う）。
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nxus_cheatvm.h"
@@ -224,7 +225,7 @@ static void test_install_validation(void) {
 
     printf("- install validation\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     build_minimal_program();
     CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "a well-formed program installs");
@@ -303,6 +304,7 @@ static void test_install_validation(void) {
           "RunBlock rejects an index outside the program");
     nxusCheatReset(&program);
     CHECK(nxusCheatTick(&program, &g_io, 0, &g_journal) == 0, "tick with an empty program runs nothing");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -314,7 +316,7 @@ static void test_store_static_widths_and_regions(void) {
 
     printf("- StoreStatic: widths, truncation, regions\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(1, 7);
     wire_block_set(0, 1, 0, 7, 1);
@@ -339,6 +341,7 @@ static void test_store_static_widths_and_regions(void) {
     CHECK(writes_at(0x0108, 4) == 1 && g_write_log_count == 7, "one write per instruction");
     CHECK(all_writes_allow_rx(), "every write carries allow_rx");
     CHECK(last_write_value(0x0110, 8) == 0x1122334455667788ull, "write log records the little-endian value");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -350,7 +353,7 @@ static void test_conditional_and_else(void) {
 
     printf("- conditionals: true / false / else\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     /* 0: if [0x2600] == 7 -> else へ (target=3)
        1: [0x2610] = 0xAA
@@ -393,6 +396,7 @@ static void test_conditional_and_else(void) {
     mem_put(0x2620, 1, 4);
     (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
     CHECK(writes_at(0x2630, 4) == 1, "condition true falls through EndConditional");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -404,7 +408,7 @@ static void test_loop(void) {
 
     printf("- loops\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     /* 0: r2 = 3
        1: [0x2300] = 0x77
@@ -431,6 +435,7 @@ static void test_loop(void) {
     CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "zero-iteration loop installs");
     (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
     CHECK(writes_at(0x2310, 4) == 0, "a zero-iteration loop skips its body");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -442,7 +447,7 @@ static void test_keypress_conditional(void) {
 
     printf("- keypress conditional (all bits AND)\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(1, 3);
     wire_block_set(0, 1, 0, 3, 1);
@@ -462,6 +467,7 @@ static void test_keypress_conditional(void) {
 
     (void)nxusCheatTick(&program, &g_io, 0x2, &g_journal);
     CHECK(writes_at(0x2700, 4) == 2, "another partial mask also blocks");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -473,7 +479,7 @@ static void test_register_operations(void) {
 
     printf("- register operations\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     /* 0:  r1 = 0x1000
        1:  r1 = r1 + 0x20 = 0x1020
@@ -581,6 +587,7 @@ static void test_register_operations(void) {
     (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
     CHECK(writes_at(0x2800, 4) == 0, "r1 != r2 skips the then-body");
     CHECK(writes_at(0x2804, 4) == 1, "r1 != r2 takes the jump target");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -592,7 +599,7 @@ static void test_patch_once_loop_every_tick(void) {
 
     printf("- patch once / loop every tick\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(2, 2);
     wire_block_set(0, 0, 0, 1, 1); /* patch */
@@ -616,6 +623,7 @@ static void test_patch_once_loop_every_tick(void) {
     CHECK(nxusCheatSetEnabled(&program, 0, true) == 0, "re-enable block 0");
     (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
     CHECK(writes_at(0x2000, 4) == 2, "re-enabling a patch block runs it again");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -627,7 +635,7 @@ static void test_step_limit(void) {
 
     printf("- step limit\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(1, 3);
     wire_block_set(0, 1, 0, 3, 1);
@@ -642,6 +650,7 @@ static void test_step_limit(void) {
     CHECK(program.state[0].last_error == (u32)NXUS_CHEATVM_ERR_STEP_LIMIT,
           "the step limit is recorded in last_error");
     CHECK(program.state[0].error_pc <= 2, "error_pc stays inside the block that overran");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -653,7 +662,7 @@ static void test_journal(void) {
 
     printf("- journal\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
     mem_put(0x2200, 0x11223344ull, 4);
 
     wire_begin(1, 1);
@@ -693,6 +702,7 @@ static void test_journal(void) {
           "that write is refused, not applied");
     CHECK(writes_at(0x1000 + (u64)NXUS_CHEATVM_MAX_JOURNAL * 4u, 4) == 0,
           "the refused address never reaches the IO");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -704,7 +714,7 @@ static void test_failure_isolation(void) {
 
     printf("- failures do not stop the following blocks\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(2, 2);
     wire_block_set(0, 1, 0, 1, 1);
@@ -748,6 +758,7 @@ static void test_failure_isolation(void) {
     CHECK(program.state[0].last_error == (u32)NXUS_CHEATVM_ERR_WRITE,
           "an unjournallable write is refused with ERR_WRITE");
     CHECK(g_write_log_count == 0, "nothing was written");
+    nxusCheatProgramRelease(&program);
 }
 
 /* ======================================================================== */
@@ -759,7 +770,7 @@ static void test_pause(void) {
 
     printf("- pause cuts the rest of the block\n");
     mock_reset();
-    nxusCheatReset(&program);
+    nxusCheatProgramInit(&program);
 
     wire_begin(1, 3);
     wire_block_set(0, 1, 0, 3, 1);
@@ -775,6 +786,209 @@ static void test_pause(void) {
 
     (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
     CHECK(writes_at(0x2700, 4) == 2, "the next tick starts the block from the beginning");
+    nxusCheatProgramRelease(&program);
+}
+
+/* ======================================================================== */
+/* ヒープ命令配列: 必要分だけ確保し、解放できること                          */
+/* ======================================================================== */
+
+/* malloc 失敗を注入し、確保・解放の回数とサイズを数えるためのフック。 */
+static u32 g_alloc_calls;
+static u32 g_free_calls;
+static size_t g_last_alloc_size;
+static bool g_alloc_fail;
+
+static void *counting_alloc(size_t size, void *user) {
+    (void)user;
+    g_alloc_calls++;
+    g_last_alloc_size = size;
+    if (g_alloc_fail) return NULL;
+    return malloc(size);
+}
+
+static void counting_free(void *ptr, void *user) {
+    (void)user;
+    g_free_calls++;
+    free(ptr);
+}
+
+/* 1 ブロック 1 命令の StoreStatic（enabled 指定可）。 */
+static void build_single_store(u64 address, u64 value, u32 enabled) {
+    wire_begin(1, 1);
+    wire_block_set(0, 1, 0, 1, enabled);
+    wire_insn_set(0, NxusCheatOp_StoreStatic, 4, NxusCheatRegion_Absolute, 0, 0, 0, 0, 0,
+                  (u32)address, value);
+}
+
+static void test_program_heap_lifecycle(void) {
+    NxusCheatProgram program;
+
+    printf("- heap instruction array: init / install / reset / release\n");
+    mock_reset();
+    nxusCheatProgramInit(&program);
+
+    CHECK(program.insns == NULL, "init leaves insns NULL");
+    CHECK(program.insn_capacity == 0, "init leaves the capacity at zero");
+
+    wire_begin(1, 2);
+    wire_block_set(0, 1, 0, 2, 1);
+    wire_insn_set(0, NxusCheatOp_StoreStatic, 4, NxusCheatRegion_Absolute, 0, 0, 0, 0, 0, 0x4100, 0xAAull);
+    wire_insn_set(1, NxusCheatOp_Nop, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "program installs");
+    CHECK(program.insns != NULL, "install allocates the instruction array");
+    CHECK(program.insn_capacity == 2, "capacity is exactly the installed instruction count");
+    CHECK(sizeof(NxusCheatProgram) < 8u * 1024u,
+          "the program struct no longer embeds 2048 instructions");
+    CHECK(nxusCheatTick(&program, &g_io, 0, &g_journal) == 1, "the heap-backed program runs");
+    CHECK(mem_get(0x4100, 4) == 0xAAull, "the heap-backed program wrote its value");
+
+    /* reset は解放せず「空」にする。 */
+    nxusCheatReset(&program);
+    CHECK(program.insns != NULL, "reset keeps the allocated instruction array");
+    CHECK(program.insn_capacity == 2, "reset keeps the capacity");
+    CHECK(program.header.block_count == 0, "reset empties the program header");
+    CHECK(nxusCheatTick(&program, &g_io, 0, &g_journal) == 0, "a reset program runs nothing");
+
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "install after reset succeeds");
+    CHECK(program.insn_capacity == 2, "install after reset reuses the same instruction count");
+
+    nxusCheatProgramRelease(&program);
+    CHECK(program.insns == NULL, "release clears insns");
+    CHECK(program.insn_capacity == 0, "release clears the capacity");
+
+    nxusCheatProgramRelease(&program);
+    CHECK(program.insns == NULL, "a second release is safe (no double free)");
+    CHECK(program.header.block_count == 0, "a second release leaves the program empty");
+
+    /* release 後の再 install がリークせず動く。 */
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "install after release succeeds");
+    CHECK(program.insns != NULL, "install after release allocates again");
+    nxusCheatProgramRelease(&program);
+}
+
+static void test_program_allocator_hook(void) {
+    NxusCheatProgram program;
+
+    printf("- allocation hook: failure injection and leak-free reinstall\n");
+    mock_reset();
+    nxusCheatProgramInit(&program);
+    CHECK(NXUS_CHEATVM_ERR_NO_MEMORY == -9, "ERR_NO_MEMORY is -9");
+
+    g_alloc_calls = 0;
+    g_free_calls = 0;
+    g_last_alloc_size = 0;
+    g_alloc_fail = false;
+    nxusCheatSetAllocator(counting_alloc, counting_free, NULL);
+
+    /* A: 2 命令。 */
+    wire_begin(1, 2);
+    wire_block_set(0, 1, 0, 2, 1);
+    wire_insn_set(0, NxusCheatOp_StoreStatic, 4, NxusCheatRegion_Absolute, 0, 0, 0, 0, 0, 0x4200, 0x1111ull);
+    wire_insn_set(1, NxusCheatOp_Nop, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "install through the injected allocator");
+    CHECK(g_alloc_calls == 1, "one allocation per install");
+    CHECK(g_last_alloc_size == 2u * sizeof(NxusCheatInsn),
+          "the allocation is exactly insn_count * sizeof(NxusCheatInsn)");
+
+    /* 新規 program への確保失敗: 空のまま、壊れない。 */
+    {
+        NxusCheatProgram fresh;
+
+        nxusCheatProgramInit(&fresh);
+        build_single_store(0x4210, 0x2222, 0);
+        g_alloc_fail = true;
+        CHECK(nxusCheatInstall(&fresh, g_wire, wire_length()) == NXUS_CHEATVM_ERR_NO_MEMORY,
+              "malloc failure returns ERR_NO_MEMORY (-9)");
+        CHECK(fresh.insns == NULL, "a failed first install leaves no buffer behind");
+        CHECK(fresh.insn_capacity == 0, "a failed first install leaves the capacity at zero");
+        CHECK(fresh.header.block_count == 0, "a failed first install leaves the program empty");
+        g_alloc_fail = false;
+        nxusCheatProgramRelease(&fresh);
+    }
+
+    /* 既存 program への再確保失敗: 直前のプログラムがそのまま残る。 */
+    build_single_store(0x4220, 0x3333, 1);
+    g_alloc_fail = true;
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == NXUS_CHEATVM_ERR_NO_MEMORY,
+          "a failed reinstall returns ERR_NO_MEMORY");
+    CHECK(program.insn_capacity == 2, "a failed reinstall keeps the installed capacity");
+    CHECK(program.header.insn_count == 2, "a failed reinstall keeps the installed header");
+    CHECK(g_free_calls == 0, "the old buffer is not freed before the new allocation succeeds");
+    g_alloc_fail = false;
+    CHECK(nxusCheatTick(&program, &g_io, 0, &g_journal) == 1,
+          "the old program still runs after a failed reinstall");
+    CHECK(mem_get(0x4200, 4) == 0x1111ull, "the old program still writes its value");
+
+    /* 再 install 成功: 旧バッファは解放される（リークしない）。 */
+    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "reinstall succeeds");
+    CHECK(g_alloc_calls == 4, "every install attempt allocates once");
+    CHECK(g_free_calls == 1, "a successful reinstall frees the previous buffer");
+    CHECK(g_last_alloc_size == 1u * sizeof(NxusCheatInsn),
+          "the new buffer is sized to the new (patch-sized) program");
+    CHECK(program.insn_capacity == 1, "the new capacity is one instruction");
+    CHECK(nxusCheatTick(&program, &g_io, 0, &g_journal) == 1, "the reinstalled program runs");
+    CHECK(mem_get(0x4220, 4) == 0x3333ull, "the reinstalled program writes the new value");
+
+    /* フックを既定へ戻した後でも、確保時の free で解放される。 */
+    nxusCheatSetAllocator(NULL, NULL, NULL);
+    nxusCheatProgramRelease(&program);
+    CHECK(g_free_calls == 2, "release uses the allocator that produced the buffer");
+    CHECK(program.insns == NULL, "release after restoring the hook clears insns");
+    nxusCheatProgramRelease(&program);
+    CHECK(g_free_calls == 2, "double release frees nothing a second time");
+}
+
+static void test_large_program_capacity(void) {
+    NxusCheatProgram program;
+    u8 *wire;
+    size_t bytes;
+    const u32 insn_count = 3000u;
+
+    printf("- raised ceilings: a 3000-instruction program\n");
+    mock_reset();
+    nxusCheatProgramInit(&program);
+
+    CHECK(NXUS_CHEATVM_MAX_INSNS == 20000u, "NXUS_CHEATVM_MAX_INSNS is 20000");
+    CHECK(NXUS_CHEATVM_MAX_PROGRAM_BYTES == 512u * 1024u,
+          "NXUS_CHEATVM_MAX_PROGRAM_BYTES is 512 KiB");
+
+    bytes = sizeof(NxusCheatProgramHeader) + sizeof(NxusCheatBlockDesc) +
+            (size_t)insn_count * sizeof(NxusCheatInsn);
+    wire = (u8 *)malloc(bytes);
+    CHECK(wire != NULL, "large wire buffer allocated");
+    if (wire == NULL) {
+        nxusCheatProgramRelease(&program);
+        return;
+    }
+
+    memset(wire, 0, bytes); /* 全命令ゼロ = Nop */
+    {
+        NxusCheatProgramHeader *header = (NxusCheatProgramHeader *)wire;
+        NxusCheatBlockDesc *block = (NxusCheatBlockDesc *)(wire + sizeof *header);
+
+        header->magic = NXUS_CHEATVM_MAGIC;
+        header->version = NXUS_CHEATVM_VERSION;
+        header->block_count = 1;
+        header->insn_count = insn_count;
+        header->total_bytes = (u32)bytes;
+        block->index = 0;
+        block->mode = 1;
+        block->first = 0;
+        block->count = insn_count;
+        block->enabled = 1;
+    }
+
+    CHECK(nxusCheatInstall(&program, wire, bytes) == 0,
+          "a 3000-instruction program installs (the old ceiling was 2048)");
+    CHECK(program.insn_capacity == insn_count, "capacity tracks the 3000 instructions");
+    CHECK(nxusCheatRunBlock(&program, 0, &g_io, 0, &g_journal) == NXUS_CHEATVM_OK,
+          "the 3000-instruction block runs");
+
+    nxusCheatProgramRelease(&program);
+    CHECK(program.insns == NULL, "the large buffer is released");
+    free(wire);
 }
 
 /* ======================================================================== */
@@ -799,6 +1013,9 @@ int main(void) {
     test_journal();
     test_failure_isolation();
     test_pause();
+    test_program_heap_lifecycle();
+    test_program_allocator_hook();
+    test_large_program_capacity();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     if (g_failures == 0) printf("ALL CHEAT VM TESTS PASSED\n");

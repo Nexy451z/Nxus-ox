@@ -31,23 +31,30 @@
 #include <string.h>
 
 /* ---- static footprint ---------------------------------------------------
- * Nothing in this file allocates: the sysmodule's 8 MiB inner heap already holds
- * the scan chunk, the hit list and up to two snapshot slots.  The two big blocks
- * are the interpreter's program and its journal, both sized by core/nxus_cheatvm.h.
+ * The program structures are static (no stack copies): the sysmodule's 8 MiB
+ * inner heap already holds the scan chunk, the hit list and up to two snapshot
+ * slots, and NxusCheatProgram is ~5 KiB even though its instruction array is on
+ * the heap.  g_Program is the resident (loop) program; g_PatchProgram is the
+ * scratch program of a patch-only upload, which is installed, run once and
+ * released inside nxusCheatSrvUpload() while g_CheatLock is held (see there).
  * The asserts below are deliberately UPPER bounds plus one total: raising a core
  * cap is fine as long as the reservation stays inside the documented budget, and
  * the build stops if it does not.
  *
- * Measured on the shipped caps: program 17592 B, real journal 12296 B, plan-pass
- * journal 12296 B, stack 8192 B, total 50376 B.  Note that the interpreter's own
- * caps, not this file, set that number: 512 instructions x 24 B is 12 KiB on its
- * own, and a 24-byte journal entry x 512 is another 12 KiB, so the program + two
- * journals are ~42 KiB before the stack.  The plan pass needs the second journal
- * because the interpreter journals before calling write(); see CheatIoState.
- * The asserts below pin the real footprint instead of a figure the types cannot
- * meet, and they are upper bounds so a future core cap that grows any structure
- * fails the build here rather than silently taking more of the sysmodule's memory. */
+ * Measured on the shipped caps: two program structs ~11 KiB, real journal 12296 B,
+ * plan-pass journal 12296 B, stack 8192 B, total ~44 KiB.  The instruction arrays
+ * themselves are heap-allocated to fit the uploaded program (see
+ * core/nxus_cheatvm.h).  The plan pass needs its own journal because the
+ * interpreter journals before calling write(); see CheatIoState.  The asserts
+ * below pin the real footprint instead of a figure the types cannot meet, and
+ * they are upper bounds so a future core cap that grows any structure fails the
+ * build here rather than silently taking more of the sysmodule's memory. */
 static NxusCheatProgram g_Program;
+/* Scratch program for a PATCH-ONLY upload (every block mode == 0).  Uploads are
+ * serialised by g_CheatLock, so one scratch slot is enough; it is released before
+ * nxusCheatSrvUpload() returns and therefore never holds instructions between
+ * calls. */
+static NxusCheatProgram g_PatchProgram;
 static NxusCheatJournal g_Journal;
 /* Journal of the read-only plan pass (see CheatIoState / cheatSrvWorkerStep).  It
  * only exists so the interpreter's journal-full rule can run without polluting the
@@ -61,7 +68,7 @@ NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) <= 56u * 1024u,
                    "NxusCheatProgram must stay inside the cheat service budget");
 NXUS_STATIC_ASSERT(sizeof(NxusCheatJournal) <= 16u * 1024u,
                    "NxusCheatJournal must stay inside the cheat service budget");
-NXUS_STATIC_ASSERT(sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
+NXUS_STATIC_ASSERT(2u * sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
                        sizeof(g_WorkerStack) <= CHEATSRV_STATIC_MAX_BYTES,
                    "cheat service static footprint exceeded");
 
@@ -503,15 +510,17 @@ static bool cheatWorkerShouldRun(void) {
 
 /* Read-only plan pass.  Does not touch the real journal and writes nothing.
  * `state`/`io` are owned by the caller so the apply pass below can reuse the
- * validated-range cache (one live mapping query per range per tick, not two). */
-static int cheatSrvProbeBlockLocked(u32 index, u64 keys, CheatIoState *state,
-                                    NxusCheatIo *io, bool *needs_write,
-                                    bool *needs_freeze) {
+ * validated-range cache (one live mapping query per range per tick, not two).
+ * `program` is g_Program for the worker, or g_PatchProgram for a patch-only
+ * upload's one-shot run. */
+static int cheatSrvProbeBlockLocked(NxusCheatProgram *program, u32 index, u64 keys,
+                                    CheatIoState *state, NxusCheatIo *io,
+                                    bool *needs_write, bool *needs_freeze) {
     int rc;
 
     nxusCheatJournalReset(&g_ProbeJournal);
     cheatIoInit(state, io, true);
-    rc = nxusCheatRunBlock(&g_Program, index, io, keys, &g_ProbeJournal);
+    rc = nxusCheatRunBlock(program, index, io, keys, &g_ProbeJournal);
     if (needs_write != NULL) *needs_write = state->plan_needs_write;
     if (needs_freeze != NULL) *needs_freeze = state->plan_needs_freeze;
     return rc;
@@ -520,10 +529,10 @@ static int cheatSrvProbeBlockLocked(u32 index, u64 keys, CheatIoState *state,
 /* Real pass: writes through the real journal, skipping bytes the target already
  * holds (the adapter does that read/compare itself).  Reuses the plan pass's
  * range cache; only the mode changes. */
-static int cheatSrvApplyBlockLocked(u32 index, u64 keys, CheatIoState *state,
-                                    NxusCheatIo *io) {
+static int cheatSrvApplyBlockLocked(NxusCheatProgram *program, u32 index, u64 keys,
+                                    CheatIoState *state, NxusCheatIo *io) {
     state->probe = false;
-    return nxusCheatRunBlock(&g_Program, index, io, keys, &g_Journal);
+    return nxusCheatRunBlock(program, index, io, keys, &g_Journal);
 }
 
 static void cheatBlockSucceededLocked(u32 index) {
@@ -577,6 +586,81 @@ static void cheatBlockFailedLocked(u32 index, int rc, NxusCheatFault *fault,
     cheatDisableBlockLocked(index);
     NXUS_LOG("cheat: block %u failed %u tick(s) in a row (err=%d) - block disabled",
              (unsigned)index, (unsigned)NXUS_CHEATSRV_FAIL_LIMIT, rc);
+}
+
+/* One-shot execution of a PATCH-ONLY upload (every block mode == 0).
+ *
+ * Called from nxusCheatSrvUpload() with g_CheatLock held, right after the program
+ * was installed into g_PatchProgram, and before that program is released.  It
+ * reuses the worker's plan/apply machinery - the same validated-range cache, the
+ * same "never write bytes the target already holds" rule and the same
+ * Pause/Resume around RX stores - but runs each enabled block exactly once and
+ * writes through the real journal, so a PC-less PanicOff can undo those writes.
+ *
+ * There is no retry window here (a patch block used to get NXUS_CHEATSRV_FAIL_LIMIT
+ * ticks before it was disabled): the upload is synchronous, so a failure is
+ * reported to the client as the interpreter's error instead of being retried in
+ * the background.  Writes that already happened stay journalled even on the error
+ * path - they are real patches and must remain reversible.
+ *
+ * Returns NXUS_CHEATVM_OK, or the first interpreter error / a refusal
+ * (NXUS_CHEATVM_ERR_WRITE) when an RX block cannot be frozen. */
+static int cheatSrvRunPatchProgramLocked(NxusCheatProgram *program) {
+    const u64 keys = nxusHidHeldMask();
+    const bool debug_attached = nxusDebugIsAttached();
+    u32 blocks;
+    u32 i;
+
+    blocks = program->header.block_count;
+    if (blocks > NXUS_CHEATVM_MAX_BLOCKS) blocks = NXUS_CHEATVM_MAX_BLOCKS;
+
+    for (i = 0; i < blocks; i++) {
+        CheatIoState io_state;
+        NxusCheatIo io;
+        bool needs_write = false;
+        bool needs_freeze = false;
+        bool paused = false;
+        int rc;
+
+        /* The upload-time enable flag is honoured: a disabled patch block stays a
+         * no-op, exactly as it would if the program had become resident. */
+        if (!program->state[i].enabled) continue;
+
+        rc = cheatSrvProbeBlockLocked(program, i, keys, &io_state, &io, &needs_write,
+                                      &needs_freeze);
+        if (rc != NXUS_CHEATVM_OK) {
+            NXUS_LOG("cheat: patch upload: block %u failed in the plan pass (err=%d) - "
+                     "the program is not executed further", (unsigned)i, rc);
+            return rc;
+        }
+        if (!needs_write) continue;   /* the target already holds every value */
+
+        if (needs_freeze && debug_attached) {
+            /* dmnt is detached, so 65004 cannot stop the title: writing half an
+             * instruction now is the crash this service exists to prevent. */
+            NXUS_LOG("cheat: patch upload: block %u patches code but a debug session "
+                     "owns the process - refused (no dmnt freeze)", (unsigned)i);
+            return NXUS_CHEATVM_ERR_WRITE;
+        }
+        if (needs_freeze) {
+            paused = cheatSrvFreeze("patch upload");
+            if (!paused) {
+                NXUS_LOG("cheat: patch upload: block %u patches code but the target "
+                         "could not be frozen - refused without writing", (unsigned)i);
+                return NXUS_CHEATVM_ERR_WRITE;
+            }
+        }
+
+        rc = cheatSrvApplyBlockLocked(program, i, keys, &io_state, &io);
+        /* Single exit point: the freeze never outlives this block. */
+        if (paused) cheatSrvUnfreeze("patch upload");
+        if (rc != NXUS_CHEATVM_OK) {
+            NXUS_LOG("cheat: patch upload: block %u failed while writing (err=%d) - "
+                     "what was written stays journalled", (unsigned)i, rc);
+            return rc;
+        }
+    }
+    return NXUS_CHEATVM_OK;
 }
 
 /* One tick: verify the target, run every enabled block through the interpreter,
@@ -681,8 +765,8 @@ static void cheatSrvWorkerStep(void) {
             if (!state->enabled) continue;
             if (g_Program.blocks[i].mode == 0 && state->ran_once) continue;
 
-            rc = cheatSrvProbeBlockLocked(i, keys, &io_state, &io, &needs_write,
-                                          &needs_freeze);
+            rc = cheatSrvProbeBlockLocked(&g_Program, i, keys, &io_state, &io,
+                                          &needs_write, &needs_freeze);
             if (rc != NXUS_CHEATVM_OK) {
                 /* The plan pass already validates ranges and journals, so this is
                  * the same failure the real pass would report - and it happened
@@ -737,7 +821,7 @@ static void cheatSrvWorkerStep(void) {
                 }
             }
 
-            rc = cheatSrvApplyBlockLocked(i, keys, &io_state, &io);
+            rc = cheatSrvApplyBlockLocked(&g_Program, i, keys, &io_state, &io);
             /* Single exit point: resume on success, on a VM error and on a failed
              * write alike.  The freeze never outlives this block. */
             if (paused) cheatSrvUnfreeze("cheat RX block");
@@ -814,8 +898,11 @@ void nxusCheatSrvInit(void) {
     }
 
     /* No worker and no command exists yet, so this reset cannot race a reader
-     * (Init runs on the boot path, before the listener serves cheat commands). */
-    nxusCheatReset(&g_Program);
+     * (Init runs on the boot path, before the listener serves cheat commands).
+     * Release (not just reset) frees the instruction array in case a previous
+     * lifetime left one behind; both calls are no-ops on static-zero storage. */
+    nxusCheatProgramRelease(&g_Program);
+    nxusCheatProgramRelease(&g_PatchProgram);
     nxusCheatJournalReset(&g_Journal);
     nxusCheatJournalReset(&g_ProbeJournal);
     memset(&g_Owner, 0, sizeof(g_Owner));
@@ -896,9 +983,12 @@ void nxusCheatSrvExit(void) {
 
     cheatLock();
     /* Give a stopped title its bytes back before their originals are forgotten.
-     * Only for the target the program was uploaded for: writing journals that
-     * belong to a previous process into whatever runs now would corrupt it. */
-    if (g_ProgramLoaded && g_Journal.count != 0) {
+     * Gated on the journal's own target stamp (g_Owner), not on a resident
+     * program: a PATCH-ONLY upload keeps no program but does fill the journal, and
+     * those bytes must still be reversible on the way out.  Writing journals that
+     * belong to a previous process into whatever runs now would corrupt it, hence
+     * the identity comparison. */
+    if (g_Owner.valid && g_Journal.count != 0) {
         CheatTarget now;
         if (cheatTargetSample(&now) && cheatTargetSame(&g_Owner, &now)) {
             const CheatRestoreCount restored = cheatRestoreJournalLocked(true);
@@ -911,7 +1001,8 @@ void nxusCheatSrvExit(void) {
         }
     }
     (void)cheatDisableAllLocked();
-    nxusCheatReset(&g_Program);
+    nxusCheatProgramRelease(&g_Program);
+    nxusCheatProgramRelease(&g_PatchProgram);
     nxusCheatJournalReset(&g_Journal);
     memset(&g_Owner, 0, sizeof(g_Owner));
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));
@@ -965,26 +1056,106 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
     }
 
     cheatLock();
-    /* Validate + install first: nxusCheatInstall() checks everything before it
-     * writes a single byte, so a rejected upload leaves the running program AND its
-     * journal intact. */
-    rc = nxusCheatInstall(&g_Program, wire, length);
-    if (rc != NXUS_CHEATVM_OK) {
+
+    /* Re-check under the lock: Exit raises g_Shutdown before it takes the lock, so
+     * this closes the window between the check above and this section. */
+    if (atomic_load_explicit(&g_Shutdown, memory_order_acquire)) {
         cheatUnlock();
-        NXUS_LOG("cheat: upload rejected by the interpreter (rc=%d)", rc);
+        NXUS_LOG("cheat: upload refused - the service is shutting down");
+        reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
+        return false;
+    }
+
+    /* Validate and ALLOCATE into the scratch program first, never into g_Program:
+     *   - a patch-only upload must not displace the resident program, and
+     *   - a resident replacement must keep the old program when the new one is
+     *     refused or runs out of memory (nxusCheatInstall checks everything and
+     *     allocates before it touches its target struct).
+     * Release is idempotent, so reusing the scratch slot from a previous upload is
+     * safe even if that one failed. */
+    nxusCheatProgramRelease(&g_PatchProgram);
+    rc = nxusCheatInstall(&g_PatchProgram, wire, length);
+    if (rc != NXUS_CHEATVM_OK) {
+        nxusCheatProgramRelease(&g_PatchProgram);
+        cheatUnlock();
+        NXUS_LOG("cheat: upload rejected by the interpreter (rc=%d) - the installed "
+                 "program was left untouched", rc);
         reply->rejected_reason = (u32)(-rc);
         return false;
     }
 
-    /* The block table now describes the new program, but the journal still
-     * describes what the OLD one patched.  Undo it (the addresses belong to the
-     * target we just verified) and start from an empty journal. */
+    /* The upload mode is decided by the block table: one loop block makes the
+     * program resident, otherwise it is a one-shot patch program. */
+    {
+        bool has_loop = false;
+        u32 i;
+
+        for (i = 0; i < g_PatchProgram.header.block_count; i++) {
+            if (g_PatchProgram.blocks[i].mode != 0) {
+                has_loop = true;
+                break;
+            }
+        }
+
+        if (!has_loop) {
+            /* ---- patch-only: run every block exactly once, keep nothing ---------
+             * The program is executed through the same plan/apply pass the worker
+             * uses (freeze around RX stores, skip bytes already in memory) and the
+             * writes stay journalled in g_Journal, which is the console-side truth
+             * for PanicOff.  g_Program, g_ProgramLoaded and the upload target stamp
+             * are NOT touched, so the resident program (if any) keeps running. */
+            const int run_rc = cheatSrvRunPatchProgramLocked(&g_PatchProgram);
+            u32 journalled;
+
+            accepted_blocks = g_PatchProgram.header.block_count;
+            accepted_insns = g_PatchProgram.header.insn_count;
+            nxusCheatProgramRelease(&g_PatchProgram);
+
+            /* The journal now belongs to this target: Exit uses g_Owner to decide
+             * whether writing it back is safe.  A resident program keeps its own
+             * stamp - this upload was verified against the same target above. */
+            if (!g_ProgramLoaded) {
+                g_Owner = now;
+                g_Owner.valid = true;
+            }
+            journalled = g_Journal.count;
+            cheatPublishStatus();
+            cheatUnlock();
+
+            if (run_rc != NXUS_CHEATVM_OK) {
+                NXUS_LOG("cheat: patch program failed while running (err=%d) - %u block(s) "
+                         "were not applied, %u address(es) stay journalled for PanicOff",
+                         run_rc, (unsigned)accepted_blocks, (unsigned)journalled);
+                reply->rejected_reason = (u32)(-run_rc);
+                return false;
+            }
+
+            reply->accepted_blocks = accepted_blocks;
+            reply->accepted_insns = accepted_insns;
+            reply->rejected_reason = 0;
+            NXUS_LOG("cheat: patch program executed once and released (%u block(s), %u "
+                     "instruction(s), %u journalled address(es); no resident program)",
+                     (unsigned)accepted_blocks, (unsigned)accepted_insns,
+                     (unsigned)journalled);
+            return true;
+        }
+    }
+
+    /* ---- resident program (contains at least one loop block) -----------------
+     * The new program is already validated and allocated, so anything that could
+     * fail has failed above and the old program is still intact.  What remains is
+     * the swap: undo what the OLD program patched (with the freeze), release its
+     * instruction array and only then make the new program resident. */
     if (g_Journal.count != 0) {
         const CheatRestoreCount restored = cheatRestoreJournalLocked(true);
         NXUS_LOG("cheat: previous program: %u address(es) restored (%u failed)",
                  (unsigned)restored.restored, (unsigned)restored.failed);
     }
     nxusCheatJournalReset(&g_Journal);
+    nxusCheatProgramRelease(&g_Program);
+    g_Program = g_PatchProgram;
+    nxusCheatProgramInit(&g_PatchProgram);   /* the pointer moved; do not free it twice */
+
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));
     g_Owner = now;
     g_Owner.valid = true;
@@ -1128,7 +1299,10 @@ void nxusCheatSrvClear(void) {
     cheatLock();
     patched = g_Journal.count;
     (void)cheatDisableAllLocked();
-    nxusCheatReset(&g_Program);
+    /* Release, not just reset: Clear drops the program for good (no re-install on
+     * the same buffer), so its heap instruction array must go with it. */
+    nxusCheatProgramRelease(&g_Program);
+    nxusCheatProgramRelease(&g_PatchProgram);
     nxusCheatJournalReset(&g_Journal);
     memset(&g_Owner, 0, sizeof(g_Owner));
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));

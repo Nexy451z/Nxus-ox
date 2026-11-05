@@ -28,10 +28,11 @@
 
 #include "nxus_cheatvm.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* install が返す -1..-5 はヘッダのコメントでしか名前が付いていないので、
-   ここで対応する名前を定義する（ヘッダは変更禁止）。 */
+   ここで対応する名前を定義する。 */
 #define CHEAT_ERR_BAD_MAGIC (-1)  /* magic / version 不一致      */
 #define CHEAT_ERR_BAD_SIZE (-2)   /* total_bytes / 実長の不一致  */
 #define CHEAT_ERR_BAD_BLOCK (-3)  /* ブロック・命令の内容不正    */
@@ -130,6 +131,56 @@ static u64 cheatArith(u32 op, u64 left, u64 right) {
         case NxusCheatArith_Rsh: return left >> (right & 63u);
         default: return left;
     }
+}
+
+/* ======================================================================== */
+/* 命令配列のアロケータ                                                     */
+/* ======================================================================== */
+
+/*
+ * 命令配列だけをヒープに置く。patch 型チートは 1 命令でも、loop 型は
+ * 20000 命令でも、実際に必要な分だけ確保する（旧実装は全プログラムが
+ * 2048 命令分の固定配列を常駐させていた）。
+ *
+ * フックはホストテストの malloc 失敗注入のために公開している。実機では
+ * 既定の malloc/free のまま。プログラムは確保時の free 関数を覚えるので、
+ * フックを戻したあとに release しても食い違わない。
+ */
+static void *cheatDefaultAlloc(size_t size, void *user) {
+    (void)user;
+    return malloc(size);
+}
+
+static void cheatDefaultFree(void *ptr, void *user) {
+    (void)user;
+    free(ptr);
+}
+
+static NxusCheatAllocFn g_cheat_alloc = cheatDefaultAlloc;
+static NxusCheatFreeFn g_cheat_free = cheatDefaultFree;
+static void *g_cheat_alloc_user = NULL;
+
+void nxusCheatSetAllocator(NxusCheatAllocFn alloc, NxusCheatFreeFn release, void *user) {
+    g_cheat_alloc = (alloc != NULL) ? alloc : cheatDefaultAlloc;
+    g_cheat_free = (release != NULL) ? release : cheatDefaultFree;
+    g_cheat_alloc_user = user;
+}
+
+/**
+ * program が持つ命令配列を解放して NULL に戻す。確保時の free を使う。
+ *
+ * 何度呼んでも安全: insns が NULL なら何もしない（二重解放しない）。
+ */
+static void cheatProgramFreeInsns(NxusCheatProgram *program) {
+    if (program->insns != NULL) {
+        NxusCheatFreeFn release =
+            (program->insns_free != NULL) ? program->insns_free : cheatDefaultFree;
+        release(program->insns, program->insns_free_user);
+    }
+    program->insns = NULL;
+    program->insn_capacity = 0;
+    program->insns_free = NULL;
+    program->insns_free_user = NULL;
 }
 
 /* ======================================================================== */
@@ -283,10 +334,43 @@ int nxusCheatJournalRestore(NxusCheatJournal *journal, const NxusCheatIo *io, bo
 /* プログラムの設置                                                         */
 /* ======================================================================== */
 
-void nxusCheatReset(NxusCheatProgram *program) {
+void nxusCheatProgramInit(NxusCheatProgram *program) {
     if (program == NULL) return;
+    /* ゼロが「空・全部無効・未確保」を意味する。ここでは解放しない:
+       未初期化のポインタを free してしまうほうが危険であり、確保済みの
+       program に対して呼ぶのは呼び出し側の契約違反（ヘッダに明記）。 */
+    memset(program, 0, sizeof *program);
+}
+
+void nxusCheatProgramRelease(NxusCheatProgram *program) {
+    if (program == NULL) return;
+    cheatProgramFreeInsns(program);
+    memset(program, 0, sizeof *program);
+}
+
+void nxusCheatReset(NxusCheatProgram *program) {
+    NxusCheatInsn *insns;
+    u32 capacity;
+    NxusCheatFreeFn release;
+    void *release_user;
+
+    if (program == NULL) return;
+
+    /* 命令配列は解放せず「空」にする（release の責務）。ここで free すると
+       既存契約（reset 後の再 install で再利用できる）が変わり、呼び出し側が
+       二重解放する危険も生まれる。 */
+    insns = program->insns;
+    capacity = program->insn_capacity;
+    release = program->insns_free;
+    release_user = program->insns_free_user;
+
     /* NxusCheatProgram は全部ゼロが「空・全部無効」を意味する。 */
     memset(program, 0, sizeof *program);
+
+    program->insns = insns;
+    program->insn_capacity = capacity;
+    program->insns_free = release;
+    program->insns_free_user = release_user;
 }
 
 /**
@@ -337,9 +421,9 @@ int nxusCheatInstall(NxusCheatProgram *program, const void *wire, size_t length)
     if (expected > NXUS_CHEATVM_MAX_PROGRAM_BYTES) return CHEAT_ERR_BAD_SIZE;
 
     /* ---- ここから検証。program には一切書かない（失敗時に不変を保証する）----
-       全ブロック・全命令を wire 上で読みながら検査し、全部通ってからコピーする。
-       検証用の一時 NxusCheatProgram（約 17 KiB）をスタックに置かないのは、
-       実機のワーカースレッドのスタックを圧迫しないため。 */
+       全ブロック・全命令を wire 上で読みながら検査し、全部通ってから確保・
+       コピーする。検証のために NxusCheatProgram の一時コピーをスタックに
+       置かないのは、実機のワーカースレッドのスタックを圧迫しないため。 */
     insn_total = header.insn_count;
     for (block_index = 0; block_index < header.block_count; block_index++) {
         NxusCheatBlockDesc block;
@@ -377,17 +461,40 @@ int nxusCheatInstall(NxusCheatProgram *program, const void *wire, size_t length)
         }
     }
 
-    /* ---- 検証済み: ここから初めて program を書き換える ---------------- */
+    /* ---- 検証済み: 命令配列を必要分だけ確保する ----------------------
+       確保が失敗したら program には一切触れない（直前のプログラムがそのまま
+       残る）。旧バッファの解放は新しい確保が成功した後に行うので、失敗時に
+       program を壊さず、再 install でリークもしない。 */
+    {
+        NxusCheatInsn *new_insns = NULL;
+        u32 new_capacity = 0;
+
+        if (header.insn_count > 0) {
+            size_t bytes = (size_t)header.insn_count * sizeof(NxusCheatInsn);
+
+            new_insns = g_cheat_alloc(bytes, g_cheat_alloc_user);
+            if (new_insns == NULL) return NXUS_CHEATVM_ERR_NO_MEMORY;
+            new_capacity = header.insn_count;
+            memcpy(new_insns, base + insn_offset, bytes);
+        }
+
+        cheatProgramFreeInsns(program);
+        program->insns = new_insns;
+        program->insn_capacity = new_capacity;
+        program->insns_free = g_cheat_free;
+        program->insns_free_user = g_cheat_alloc_user;
+    }
+
+    /* ---- ここから program の残りを書き換える ------------------------- */
     program->header = header;
     memcpy(program->blocks, base + block_offset,
            (size_t)header.block_count * sizeof(NxusCheatBlockDesc));
     memset(program->blocks + header.block_count, 0,
            (NXUS_CHEATVM_MAX_BLOCKS - header.block_count) * sizeof(NxusCheatBlockDesc));
 
-    memcpy(program->insns, base + insn_offset,
-           (size_t)header.insn_count * sizeof(NxusCheatInsn));
-    memset(program->insns + header.insn_count, 0,
-           (NXUS_CHEATVM_MAX_INSNS - header.insn_count) * sizeof(NxusCheatInsn));
+    /* 命令は確保済みのバッファへコピー済み。固定配列だった頃の末尾ゼロ埋めは
+       不要（ヒープ配列は insn_count 分しか持たず、ブロック範囲はすべて
+       insn_count 内であることを上で検証済み）。 */
 
     memset(program->state, 0, sizeof program->state);
     for (block_index = 0; block_index < header.block_count; block_index++) {

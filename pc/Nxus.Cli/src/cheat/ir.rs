@@ -86,12 +86,24 @@
 //!
 //! The OFF half of a block is deliberately not part of the program: the console
 //! journals the original bytes and restores them when a block is disabled.
+//!
+//! ## Two programs, not one
+//!
+//! The console keeps a program **resident** only while it contains work that
+//! repeats: `Loop` blocks are re-run every 16 ms, so they stay installed, whereas
+//! a program made only of `Patch` blocks is executed once on upload and released
+//! immediately.  One mixed program would therefore keep the write-once half
+//! resident (and its enable/disable state with it), so the PC builds the two
+//! halves separately: [`build_program_filtered`] with
+//! `|mode| mode == CheatExecMode::Loop` for the resident program and
+//! [`build_program_for_block`] for one `Patch` block.  [`build_program`] and
+//! [`build_program_resolved`] still link every block, unchanged.
 
 use std::collections::BTreeSet;
 
 use super::model::{
-    ArithmeticOp, ArithmeticOperand, CheatCode, CheatDocument, CheatExecMode, CheatKey, Comparison,
-    ConditionalOperand, Instruction, MemoryRegion, SaveRestoreOp, StoreOffset,
+    ArithmeticOp, ArithmeticOperand, CheatBlock, CheatCode, CheatDocument, CheatExecMode, CheatKey,
+    Comparison, ConditionalOperand, Instruction, MemoryRegion, SaveRestoreOp, StoreOffset,
 };
 use super::vm::MemoryRegions;
 
@@ -112,9 +124,9 @@ pub const BLOCK_BYTES: usize = 24;
 pub const INSN_BYTES: usize = 24;
 
 /// `NXUS_CHEATVM_MAX_PROGRAM_BYTES`: header + blocks + instructions.
-pub const MAX_PROGRAM_BYTES: usize = 64 * 1024;
+pub const MAX_PROGRAM_BYTES: usize = 512 * 1024;
 /// `NXUS_CHEATVM_MAX_INSNS`.
-pub const MAX_INSNS: usize = 2048;
+pub const MAX_INSNS: usize = 20000;
 /// `NXUS_CHEATVM_MAX_BLOCKS`.
 pub const MAX_BLOCKS: usize = 128;
 /// `NXUS_CHEATVM_MAX_JOURNAL` (the console journals patched bytes itself).
@@ -360,7 +372,8 @@ pub fn build_program(
     program_id: u64,
     enabled: &BTreeSet<CheatKey>,
 ) -> Result<Vec<u8>, String> {
-    build(document, build_id, program_id, enabled, None)
+    let blocks: Vec<&CheatBlock> = document.blocks.iter().collect();
+    build_selected(&blocks, build_id, program_id, enabled, None)
 }
 
 /// Link `document` into one console program with every address resolved.
@@ -376,27 +389,86 @@ pub fn build_program_resolved(
     enabled: &BTreeSet<CheatKey>,
     regions: &MemoryRegions,
 ) -> Result<Vec<u8>, String> {
-    build(document, build_id, program_id, enabled, Some(regions))
+    let blocks: Vec<&CheatBlock> = document.blocks.iter().collect();
+    build_selected(&blocks, build_id, program_id, enabled, Some(regions))
 }
 
-fn build(
+/// Link **only the blocks whose mode `want` accepts** into one console program.
+///
+/// The console keeps a *resident* program for the blocks that repeat (`Loop`,
+/// re-run every 16 ms) and runs a `Patch` program once and throws it away, so a
+/// single program that carries both would keep the write-once half resident
+/// forever.  This is the filter that lets the caller build each half on its own:
+/// `|mode| mode == CheatExecMode::Loop` for the resident program,
+/// `|mode| mode == CheatExecMode::Patch` for a one-shot one.
+///
+/// The selected blocks are renumbered from `0` in document order, so
+/// `BlockDesc::index` is again the position the console's `cheat_enable` uses.
+/// Addresses are resolved exactly like [`build_program_resolved`].  A document
+/// with no matching block yields a valid header-only program (`block_count == 0`),
+/// which the console must never be asked to run.
+pub fn build_program_filtered(
     document: &CheatDocument,
+    build_id: u64,
+    program_id: u64,
+    enabled: &BTreeSet<CheatKey>,
+    regions: &MemoryRegions,
+    want: fn(CheatExecMode) -> bool,
+) -> Result<Vec<u8>, String> {
+    let blocks: Vec<&CheatBlock> = document
+        .blocks
+        .iter()
+        // Every block of the requested mode.  The per-block `enabled` flag still
+        // decides execution; patches are uploaded one at a time so their size is a
+        // single block, and the resident program only ever holds loop blocks.
+        .filter(|block| want(block.mode))
+        .collect();
+    build_selected(&blocks, build_id, program_id, enabled, Some(regions))
+}
+
+/// Link **exactly one block** into its own program.
+///
+/// This is what a `Patch` block is uploaded as: the console runs it once and
+/// releases the program, so it must carry nothing else (a resident loop block in
+/// the same payload would be thrown away with it).
+pub fn build_program_for_block(
+    document: &CheatDocument,
+    build_id: u64,
+    program_id: u64,
+    enabled: &BTreeSet<CheatKey>,
+    regions: &MemoryRegions,
+    key: CheatKey,
+) -> Result<Vec<u8>, String> {
+    let blocks: Vec<&CheatBlock> = document
+        .blocks
+        .iter()
+        .filter(|block| block.key == key)
+        .collect();
+    if blocks.is_empty() {
+        return Err(format!("cheat {key} is not part of the document"));
+    }
+    build_selected(&blocks, build_id, program_id, enabled, Some(regions))
+}
+
+/// Link `blocks` (a document-order subset) into one wire program.
+fn build_selected(
+    blocks: &[&CheatBlock],
     build_id: u64,
     program_id: u64,
     enabled: &BTreeSet<CheatKey>,
     regions: Option<&MemoryRegions>,
 ) -> Result<Vec<u8>, String> {
-    if document.blocks.len() > MAX_BLOCKS {
+    if blocks.len() > MAX_BLOCKS {
         return Err(format!(
             "cheat file has {} blocks; the console accepts at most {MAX_BLOCKS}",
-            document.blocks.len()
+            blocks.len()
         ));
     }
 
-    let mut blocks: Vec<BlockDesc> = Vec::with_capacity(document.blocks.len());
+    let mut descs: Vec<BlockDesc> = Vec::with_capacity(blocks.len());
     let mut insns: Vec<WireInsn> = Vec::new();
 
-    for (index, block) in document.blocks.iter().enumerate() {
+    for (index, block) in blocks.iter().enumerate() {
         if let Some(issue) = block.on.issues.first() {
             return Err(format!("cheat '{}' cannot be linked: {issue}", block.name));
         }
@@ -410,7 +482,7 @@ fn build(
                 insns.len()
             ));
         }
-        blocks.push(BlockDesc {
+        descs.push(BlockDesc {
             index: index as u32,
             mode: match block.mode {
                 CheatExecMode::Patch => MODE_PATCH,
@@ -423,7 +495,7 @@ fn build(
         });
     }
 
-    let total_bytes = HEADER_BYTES + BLOCK_BYTES * blocks.len() + INSN_BYTES * insns.len();
+    let total_bytes = HEADER_BYTES + BLOCK_BYTES * descs.len() + INSN_BYTES * insns.len();
     if total_bytes > MAX_PROGRAM_BYTES {
         return Err(format!(
             "cheat program is {total_bytes} bytes; the console accepts at most {MAX_PROGRAM_BYTES}"
@@ -435,7 +507,7 @@ fn build(
         version: VERSION,
         build_id,
         program_id,
-        block_count: blocks.len() as u32,
+        block_count: descs.len() as u32,
         insn_count: insns.len() as u32,
         total_bytes: total_bytes as u32,
         reserved: 0,
@@ -443,7 +515,7 @@ fn build(
 
     let mut out = Vec::with_capacity(total_bytes);
     out.extend_from_slice(&header.to_bytes());
-    for block in &blocks {
+    for block in &descs {
         out.extend_from_slice(&block.to_bytes());
     }
     for insn in &insns {
@@ -1005,8 +1077,8 @@ mod tests {
         assert_eq!(HEADER_BYTES, 40);
         assert_eq!(BLOCK_BYTES, 24);
         assert_eq!(INSN_BYTES, 24);
-        assert_eq!(MAX_PROGRAM_BYTES, 64 * 1024);
-        assert_eq!(MAX_INSNS, 2048);
+        assert_eq!(MAX_PROGRAM_BYTES, 512 * 1024);
+        assert_eq!(MAX_INSNS, 20000);
         assert_eq!(MAX_BLOCKS, 128);
         assert_eq!(MAGIC, 0x4E43_564D);
         assert_eq!(VERSION, 1);

@@ -413,14 +413,49 @@ pub struct CheatManager {
     block_budget: Option<Duration>,
     /// チートを実行する場所（既定はコンソール）。
     execution: CheatExecution,
-    /// コンソールへアップロード済みのプログラムそのもの。
+    /// コンソールへアップロード済みの**常駐プログラム**（loop ブロックだけ）。
     ///
     /// 同じ内容を何度も送らないための控え。ハッシュではなく実体を持つのは、
     /// 衝突で「送っていないのに送った」と誤認すると、コンソールにプログラムが
     /// 無いまま `cheat_enable` を送って BAD_STATE になるから（最大 48 KiB）。
     console_uploaded: Option<Vec<u8>>,
+    /// コンソールへ送って 1 回実行した patch プログラム（キーごと）。
+    ///
+    /// patch は実行後にコンソールが解放するので、これは「載っている」の控えでは
+    /// なく「送って実行済み」の控え。同じ patch を続けて ON しても二重実行しない
+    /// ために持ち、OFF（＝原本を PC が戻す）で消す。消さないと、次に同じ内容を
+    /// ON したときに送信を省いてしまい、何も起きない。
+    console_patches: BTreeMap<CheatKey, Vec<u8>>,
+    /// コンソール用 patch の原本を控えたが、まだ送っていない状態。
+    pending_patch: Option<PendingPatch>,
     /// 旧コンソールで新コマンドが使えなかった理由。ログを 1 行に抑えるため保持。
     console_fallback: Option<String>,
+}
+
+/// コンソールで 1 回実行する patch の「送信前」状態。
+///
+/// 原本はコンソールが書き換える前に読んでおかないと復元できないので、送信の
+/// 前に `PlanIo` で計画だけを走らせ、`ensure_backup` の副作用（原本 +
+/// `.backup`）だけを受け取る。送信が失敗したら [`CheatManager::abort_console_patch`]
+/// がこの記録をメモリに 1 バイトも書かずに捨てる。
+struct PendingPatch {
+    key: CheatKey,
+    /// このブロックが触ったアドレスの事前状態（`rollback_block` が使う）。
+    writes: Vec<(u64, PreWrite)>,
+}
+
+/// ワイヤプログラムの `block_count`（読めないバイト列は 0）。
+///
+/// 「常駐するブロックが 1 つも無い」プログラムをコンソールへ送ると、既に
+/// 載っている常駐プログラムを空で上書きしてしまう。空かどうかはヘッダだけで
+/// 判定できるので、リンカを呼ばずにここで見る。
+fn program_block_count(program: &[u8]) -> u32 {
+    if program.len() < ir::HEADER_BYTES {
+        return 0;
+    }
+    ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES])
+        .map(|header| header.block_count)
+        .unwrap_or(0)
 }
 
 impl CheatManager {
@@ -460,6 +495,8 @@ impl CheatManager {
             block_budget: DEFAULT_BLOCK_BUDGET,
             execution: CheatExecution::default(),
             console_uploaded: None,
+            console_patches: BTreeMap::new(),
+            pending_patch: None,
             console_fallback: None,
         };
         if let Err(error) = manager.load_journal() {
@@ -499,6 +536,8 @@ impl CheatManager {
             block_budget: DEFAULT_BLOCK_BUDGET,
             execution: CheatExecution::default(),
             console_uploaded: None,
+            console_patches: BTreeMap::new(),
+            pending_patch: None,
             console_fallback: None,
         };
         if let Err(error) = manager.load_journal() {
@@ -630,6 +669,9 @@ impl CheatManager {
     pub fn fallback_to_pc(&mut self, reason: &str) -> Option<String> {
         self.execution = CheatExecution::Pc;
         self.console_uploaded = None;
+        // 以降は PC が書く。コンソール側に残した控えは意味を持たない。
+        self.console_patches.clear();
+        self.pending_patch = None;
         if self.console_fallback.is_some() {
             return None;
         }
@@ -648,67 +690,253 @@ impl CheatManager {
 
     /// コンソール上のブロック番号（`NxusCheatEnable.index`）。
     ///
-    /// [`ir::build_program`] はドキュメント順に `BlockDesc::index` を振るので、
-    /// 表示順の位置がそのままワイヤの index になる。
+    /// 常駐プログラムに入るのは loop ブロックだけなので、index は
+    /// **loop ブロックの中での位置**になる。[`CheatExecMode::Patch`] は
+    /// 常駐しない（送信と同時に実行されて解放される）ため index を持たない。
     pub fn block_index(&self, key: CheatKey) -> Option<u32> {
+        if self.document.block(key)?.mode != CheatExecMode::Loop {
+            return None;
+        }
         self.document
             .blocks
             .iter()
+            .filter(|block| block.mode == CheatExecMode::Loop)
             .position(|block| block.key == key)
             .map(|index| index as u32)
     }
 
-    /// 現在のターゲット identity でプログラム全体を組み立てる。
+    /// 常駐プログラム（loop ブロックだけ）を組み立てる。
     ///
-    /// コンソールはブロック単体を受け付けないので、どのブロックを ON にする
-    /// ときもプログラム全体が要る。既に ON のブロックは `BlockDesc::enabled`
-    /// に載るため、再アップロードしてもそれらは ON のまま残る。
+    /// コンソールはブロック単体を受け付けないので、loop ブロックを ON にする
+    /// ときは常駐プログラムが要る。既に ON の loop ブロックは
+    /// `BlockDesc::enabled` に載るため、再アップロードしてもそれらは ON の
+    /// まま残る。
+    ///
+    /// patch ブロックは**入れない**: 混ぜると、1 回だけ実行して捨てるはずの
+    /// patch まで 16 ms ごとの常駐プログラムに載ってしまう（コンソールは
+    /// patch だけのプログラムをアップロード直後に 1 回実行して解放する）。
+    /// loop が 1 つも無いドキュメントでは block_count 0 のプログラムを返すので、
+    /// そのまま送ってはいけない（[`Self::need_console_upload`] が断る）。
     pub fn build_console_program(&self) -> Result<Vec<u8>, String> {
-        let build_id = u64::from_str_radix(&self.identity.build_id, 16).map_err(|error| {
-            format!(
-                "build id '{}' is not hexadecimal: {error}",
-                self.identity.build_id
-            )
-        })?;
+        let build_id = self.build_id_word()?;
         // The console adds no region base (`core/nxus_cheatvm.h`, "Address
         // contract"): the PC has to hand over final absolute addresses.  Using the
         // relative builder here would silently write main/heap cheats to the wrong
         // place.
-        ir::build_program_resolved(
+        ir::build_program_filtered(
             &self.document,
             build_id,
             self.identity.program_id,
             &self.enabled,
             &self.regions,
+            |mode| mode == CheatExecMode::Loop,
         )
     }
 
-    /// この内容はまだコンソールに載っていないか（同一内容なら送り直さない）。
+    /// 1 つの patch ブロックだけのプログラムを組み立てる。
+    ///
+    /// コンソールは patch だけのプログラムをアップロード直後に 1 回実行して
+    /// 解放するので、そのブロック以外を含めてはいけない。`BlockDesc::enabled`
+    /// は「これを実行せよ」の要求として 1 を立てる（まだ `enabled` には入って
+    /// いないため、明示的に足す）。
+    pub fn build_patch_program(&self, key: CheatKey) -> Result<Vec<u8>, String> {
+        let block = self
+            .document
+            .block(key)
+            .ok_or_else(|| format!("cheat {key} is not part of the document"))?;
+        if block.mode != CheatExecMode::Patch {
+            return Err(format!(
+                "cheat '{}' is a {} block; only patch blocks get a one-shot program",
+                block.name, block.mode
+            ));
+        }
+        let build_id = self.build_id_word()?;
+        let mut enabled = self.enabled.clone();
+        enabled.insert(key);
+        ir::build_program_for_block(
+            &self.document,
+            build_id,
+            self.identity.program_id,
+            &enabled,
+            &self.regions,
+            key,
+        )
+    }
+
+    fn build_id_word(&self) -> Result<u64, String> {
+        u64::from_str_radix(&self.identity.build_id, 16).map_err(|error| {
+            format!(
+                "build id '{}' is not hexadecimal: {error}",
+                self.identity.build_id
+            )
+        })
+    }
+
+    /// この常駐プログラムはまだコンソールに載っていないか。
     ///
     /// ブロックを 1 つ ON にするたびに最大 48 KiB を送ると、コンソールの
     /// 受信バッファとワーカーを無駄に揺さぶる。内容が同じなら何もしない。
+    ///
+    /// loop ブロックが 1 つも無い（`block_count == 0`）プログラムは、載せる
+    /// 意味が無いどころか、既に載っている常駐プログラムを空で上書きしてしまう
+    /// ので必ず `false`。
     pub fn need_console_upload(&self, program: &[u8]) -> bool {
+        if program_block_count(program) == 0 {
+            return false;
+        }
         self.console_uploaded.as_deref() != Some(program)
     }
 
-    /// アップロードが成功したことを記録する。
+    /// 常駐プログラムのアップロードが成功したことを記録する。
     pub fn note_console_upload(&mut self, program: &[u8]) {
         self.console_uploaded = Some(program.to_vec());
     }
 
-    /// 控えを捨てる。
+    /// この patch ブロックのプログラムはまだ送っていないか。
+    ///
+    /// コンソールは patch を実行すると解放するので、控えは「載っている」では
+    /// なく「送って実行済み」。OFF で [`Self::forget_patch_upload`] すること。
+    pub fn need_patch_upload(&self, key: CheatKey, program: &[u8]) -> bool {
+        self.console_patches.get(&key).map(Vec::as_slice) != Some(program)
+    }
+
+    /// patch プログラムの送信（＝コンソールでの 1 回実行）が成功したことを記録する。
+    pub fn note_patch_upload(&mut self, key: CheatKey, program: &[u8]) {
+        self.console_patches.insert(key, program.to_vec());
+    }
+
+    /// この patch を「送っていない」状態に戻す。
+    ///
+    /// OFF（PC ジャーナルで原本を戻した）で呼ぶ。残したままだと、次に同じ
+    /// patch を ON したとき送信を省いてしまい、コンソールは何も実行しない。
+    pub fn forget_patch_upload(&mut self, key: CheatKey) {
+        self.console_patches.remove(&key);
+    }
+
+    /// 常駐プログラムの控えを捨てる。
     ///
     /// コンソールがプログラムを失った（`NxusCheatStatus.program_valid == 0`）
     /// ときに呼ぶ。「載っている」と思い込んだまま `cheat_enable` を送ると、
     /// プログラムの無いコンソールでは BAD_STATE になる。
+    ///
+    /// patch の控えは消さない: patch は常駐しないので `program_valid == 0` が
+    /// 正常な状態であり、そこで消すと同じ patch を二重に実行してしまう。
     pub fn forget_console_upload(&mut self) {
         self.console_uploaded = None;
     }
 
-    /// 直近にアップロードしたプログラム（表示とテスト用）。
+    /// 直近にアップロードした常駐プログラム（表示とテスト用）。
     pub fn console_program(&self) -> Option<&[u8]> {
         self.console_uploaded.as_deref()
     }
+
+    /// 直近に送って実行した patch プログラム（表示とテスト用）。
+    pub fn console_patch_program(&self, key: CheatKey) -> Option<&[u8]> {
+        self.console_patches.get(&key).map(Vec::as_slice)
+    }
+
+    /// コンソールで 1 回実行する patch の原本を PC のジャーナルへ記録する。
+    ///
+    /// **メモリには 1 バイトも書かない。** 書き込みはコンソールがアップロード
+    /// 直後に 1 回だけ行い、そのあとプログラムを解放する。つまりコンソール側
+    /// には復元表が残らないので、OFF で原本を戻せるのはこの PC のジャーナル
+    /// だけ。だから送信の**前に**原本を読んで `.backup` に落としておく。
+    ///
+    /// 計画（`PlanIo`）だけを走らせるので、書き込み先のアドレス・幅・値は
+    /// PC 側の通常の ON と同じ経路で決まる。計画が失敗したら何も残さない。
+    /// 成功後に送信が失敗したら [`Self::abort_console_patch`] で捨てること。
+    pub fn prepare_console_patch<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        key: CheatKey,
+        io: &mut M,
+    ) -> Result<(), String> {
+        if self.pending_patch.is_some() {
+            return Err("another console patch is still pending".to_string());
+        }
+        let block = self
+            .document
+            .block(key)
+            .cloned()
+            .ok_or_else(|| format!("cheat {key} not found"))?;
+        if block.mode != CheatExecMode::Patch {
+            return Err(format!(
+                "cheat '{}' is a {} block; the console runs patches one-shot only",
+                block.name, block.mode
+            ));
+        }
+        if !block.is_enableable() {
+            let message = block
+                .on
+                .first_issue()
+                .map(|issue| issue.to_string())
+                .unwrap_or_else(|| "cheat has no executable ON code".to_string());
+            self.errors.insert(key, message.clone());
+            self.last_error = Some(message.clone());
+            return Err(message);
+        }
+
+        // From here the console may patch the target, so the manager owes a
+        // restore until the block settles.
+        self.dirty = true;
+        let budget = self.block_budget;
+        let run = self.run_code(key, &block.on, 0, true, io, budget, &mut |_, _| {}, false);
+        let CodeRun {
+            result,
+            writes,
+            target_gone,
+            ..
+        } = run;
+        match result {
+            Ok(_) => {
+                self.pending_patch = Some(PendingPatch { key, writes });
+                self.settle_dirty();
+                Ok(())
+            }
+            Err(error) => {
+                // The console was never asked to run anything, so nothing was
+                // written: drop the restore records on paper only.
+                let rollback = self.rollback_block(writes, &[], io);
+                self.settle_dirty();
+                let message = merge_rollback_error(error, rollback, target_gone);
+                self.errors.insert(key, message.clone());
+                self.last_error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// 送信に成功した patch を「ON」にする（メモリには何も書かない）。
+    ///
+    /// 原本は送信前に [`Self::prepare_console_patch`] がジャーナルへ控えて
+    /// いるので、ここでやるのは表示・ファイル・`dirty` の更新だけ。
+    pub fn finish_console_patch(&mut self) -> Result<(), String> {
+        let Some(pending) = self.pending_patch.take() else {
+            return Err("no console patch was prepared".to_string());
+        };
+        self.note_console_toggle(pending.key, true)
+    }
+
+    /// 送信に失敗した patch のジャーナル記録を、書き込み無しで捨てる。
+    ///
+    /// `rollback_block` に「適用済みアドレス」を空で渡すので、対象メモリには
+    /// 一切触らず、控えた原本と `.backup` の該当行だけが消える。
+    pub fn abort_console_patch<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        io: &mut M,
+    ) -> Result<(), String> {
+        let Some(pending) = self.pending_patch.take() else {
+            return Ok(());
+        };
+        let rollback = self.rollback_block(pending.writes, &[], io);
+        self.settle_dirty();
+        rollback
+    }
+
+    /// 未送信の patch 記録があるか（表示とテスト用）。
+    pub fn has_pending_console_patch(&self) -> bool {
+        self.pending_patch.is_some()
+    }
+
 
     /// コンソールで実行した ON/OFF を PC 側の状態に反映する。
     ///
@@ -716,6 +944,10 @@ impl CheatManager {
     /// ジャーナルで行う。だからバックアップも作らず `dirty` も立てない。
     /// 切断時に PC が「原本」を書き戻すと、コンソールが管理している復元表と
     /// 二重になり、かえってタイトルを壊す。
+    ///
+    /// 例外は patch: コンソールは patch を 1 回実行して解放するので復元表が
+    /// 残らない。その原本は**送信の前に** [`Self::prepare_console_patch`] が
+    /// PC のジャーナルへ控える（`dirty` はそこで立つ）。
     pub fn note_console_toggle(&mut self, key: CheatKey, on: bool) -> Result<(), String> {
         if on {
             self.enabled.insert(key);
@@ -750,6 +982,10 @@ impl CheatManager {
         for block in &mut self.document.blocks {
             block.enabled = false;
         }
+        // コンソールは全ブロックを止めた。patch の控えも一緒に捨てる: 次に ON
+        // したときは必ず送り直す（送らないと 1 回も実行されない）。
+        self.console_patches.clear();
+        self.pending_patch = None;
         if let Err(error) = self.save_document() {
             self.last_error = Some(format!("cheat file save failed: {error}"));
         }
@@ -785,6 +1021,10 @@ impl CheatManager {
         self.document = load_document(&self.path, &self.identity.build_id)?;
         self.enabled.clear();
         self.errors.clear();
+        // キー（＝ブロック）の並びが変わりうるので、キーごとの控えは全部捨てる。
+        self.console_uploaded = None;
+        self.console_patches.clear();
+        self.pending_patch = None;
         self.settle_dirty();
         Ok(())
     }
@@ -807,6 +1047,11 @@ impl CheatManager {
         self.document.generation = self.document.generation.wrapping_add(1);
         self.enabled.clear();
         self.errors.clear();
+        // 保存したテキストでブロックもキーも変わる。コンソール側の控えは
+        // すべて「もう存在しない内容」なので捨てる。
+        self.console_uploaded = None;
+        self.console_patches.clear();
+        self.pending_patch = None;
         Ok(())
     }
 
@@ -837,6 +1082,8 @@ impl CheatManager {
         // 捨てないと、新しいタイトルに古いプログラムを「載っている」と
         // 思い込んで有効化だけを送ってしまう。
         self.console_uploaded = None;
+        self.console_patches.clear();
+        self.pending_patch = None;
         self.console_fallback = None;
         self.identity = identity;
         self.regions = regions;
@@ -917,7 +1164,7 @@ impl CheatManager {
         // From here the target may be patched, so the manager is dirty until
         // the block settles (success keeps it, a full rollback clears it).
         self.dirty = true;
-        let run = self.run_code(key, &block.on, 0, true, io, budget, on_progress);
+        let run = self.run_code(key, &block.on, 0, true, io, budget, on_progress, true);
         let CodeRun {
             result,
             writes,
@@ -1030,7 +1277,7 @@ impl CheatManager {
             let Some(off) = block.as_ref().and_then(|block| block.off.as_ref()).cloned() else {
                 return Err("explicit OFF block disappeared".to_string());
             };
-            let run = self.run_code(key, &off, 0, false, io, budget, &mut |_, _| {});
+            let run = self.run_code(key, &off, 0, false, io, budget, &mut |_, _| {}, true);
             let CodeRun {
                 result,
                 target_gone,
@@ -1195,7 +1442,7 @@ impl CheatManager {
                 }
                 None => continue,
             };
-            let run = self.run_code(key, &code, keys_held, true, io, budget, &mut |_, _| {});
+            let run = self.run_code(key, &code, keys_held, true, io, budget, &mut |_, _| {}, true);
             let CodeRun {
                 result,
                 writes,
@@ -1322,6 +1569,11 @@ impl CheatManager {
     ///    target before writing code, writes in cave-before-hook order and
     ///    verifies the result by reading it back.
     ///
+    /// `publish == false` stops after the plan phase and publishes nothing.
+    /// That is how a console-side `Patch` prepares its restore record: the
+    /// console owns the write, the PC only needs the original bytes in its
+    /// journal (see [`Self::prepare_console_patch`]).
+    ///
     /// The returned [`CodeRun`] carries the memory rollback bookkeeping and the
     /// exact list of addresses that reached the target.
     #[allow(clippy::too_many_arguments)]
@@ -1334,6 +1586,7 @@ impl CheatManager {
         io: &mut M,
         budget: Option<Duration>,
         on_progress: &mut dyn FnMut(usize, usize),
+        publish: bool,
     ) -> CodeRun {
         if !code.is_executable() {
             return CodeRun {
@@ -1378,7 +1631,7 @@ impl CheatManager {
         let mut result = planned.map_err(|error| error.to_string());
         let mut applied = Vec::new();
         let mut target_gone = false;
-        if result.is_ok() {
+        if result.is_ok() && publish {
             let report = apply_plan(io, &plan, deadline);
             if let Some(error) = report.resume_error {
                 self.last_error = Some(error);
@@ -3823,60 +4076,238 @@ B4000000 00000000
         text.to_string()
     }
 
-    /// アップロードするバイト列は、そのまま `ir::build_program` の出力。
+    /// 常駐プログラムは **loop ブロックだけ**で、そのままリンカの出力。
     ///
     /// PC が「コンソール用プログラム」を独自に組み立て始めると、リンカの
     /// 変更が片方にしか効かなくなる。同じ関数を通っていることを固定する。
     #[test]
-    fn the_console_program_is_the_ir_linker_output_for_this_target() {
+    fn the_resident_program_carries_only_the_loop_blocks() {
         let dir = TempDir::new("console-program");
         two_cheats(&dir);
         let mut manager =
             CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
                 .unwrap();
         let first = manager.find_key("First").unwrap();
+        let second = manager.find_key("Second").unwrap();
         // ON にしたブロックは `BlockDesc::enabled` に載る（再アップロードで
         // 既存の ON が落ちない）。
-        manager.note_console_toggle(first, true).unwrap();
+        manager.note_console_toggle(second, true).unwrap();
 
         let program = manager.build_console_program().unwrap();
         let build_id = u64::from_str_radix(BUILD, 16).unwrap();
-        let expected = ir::build_program(
+        let expected = ir::build_program_filtered(
             manager.document(),
             build_id,
             manager.identity().program_id,
             manager.enabled_keys(),
+            &regions(),
+            |mode| mode == CheatExecMode::Loop,
         )
         .unwrap();
         assert_eq!(program, expected, "must be the linker's own bytes");
+        // loop が 1 つだけなら、単体プログラムとバイト単位で同じ。
+        assert_eq!(
+            program,
+            ir::build_program_for_block(
+                manager.document(),
+                build_id,
+                manager.identity().program_id,
+                manager.enabled_keys(),
+                &regions(),
+                second,
+            )
+            .unwrap(),
+            "the patch block must not be in the resident program"
+        );
 
         let header = ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES]).unwrap();
         assert_eq!(header.magic, ir::MAGIC);
         assert_eq!(header.build_id, build_id);
         assert_eq!(header.program_id, 0x0100_C380_0049_C000);
-        assert_eq!(header.block_count, 2);
+        assert_eq!(header.block_count, 1, "only the loop block is resident");
         assert_eq!(header.total_bytes as usize, program.len());
 
-        // index はドキュメント順（`NxusCheatEnable.index` がそのまま使える）。
-        assert_eq!(manager.block_index(first), Some(0));
-        assert_eq!(
-            manager.block_index(manager.find_key("Second").unwrap()),
-            Some(1)
-        );
-        let second_desc = ir::BlockDesc::from_bytes(
-            &program[ir::HEADER_BYTES + ir::BLOCK_BYTES..ir::HEADER_BYTES + 2 * ir::BLOCK_BYTES],
-        )
-        .unwrap();
-        assert_eq!(second_desc.index, 1);
-        assert_eq!(second_desc.enabled, 0);
-        let first_desc =
+        // index は loop ブロックの中での位置（`NxusCheatEnable.index`）。
+        assert_eq!(manager.block_index(second), Some(0));
+        assert_eq!(manager.block_index(first), None, "patches are never resident");
+        let desc =
             ir::BlockDesc::from_bytes(&program[ir::HEADER_BYTES..ir::HEADER_BYTES + ir::BLOCK_BYTES])
                 .unwrap();
-        assert_eq!(first_desc.enabled, 1);
+        assert_eq!(desc.index, 0);
+        assert_eq!(desc.mode, ir::MODE_LOOP);
+        assert_eq!(desc.enabled, 1, "the loop block is already ON");
+        assert_eq!(desc.count, 3);
     }
 
-    /// 同じ内容は 2 度送らない。内容が変わった / コンソールがプログラムを
-    /// 失ったときだけ送り直す。
+    /// patch だけの文書に常駐プログラムは無い（＝空のプログラムは送らない）。
+    #[test]
+    fn a_patch_only_document_has_no_resident_program() {
+        let dir = TempDir::new("console-patch-only");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+
+        let program = manager.build_console_program().unwrap();
+        let header = ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES]).unwrap();
+        assert_eq!(header.block_count, 0);
+        assert_eq!(header.insn_count, 0);
+        assert_eq!(program.len(), ir::HEADER_BYTES);
+        assert!(
+            !manager.need_console_upload(&program),
+            "an empty resident program must never be uploaded (it would wipe the old one)"
+        );
+        // 空のプログラムは「載っている」ことにもしない。
+        assert!(manager.console_program().is_none());
+    }
+
+    /// patch の単体プログラムには、そのブロックしか入っていない。
+    #[test]
+    fn the_patch_program_carries_only_the_requested_block() {
+        let dir = TempDir::new("console-patch-program");
+        dir.write(
+            &format!("{BUILD}.txt"),
+            "[First]\n04400000 00001234 00000063\n\
+             [Spin]\n@loop\n30050000 00000003\n04400000 00001238 00000001\n31050000\n\
+             [Second]\n04400000 0000123C 00000007\n",
+        );
+        let manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let first = manager.find_key("First").unwrap();
+        let second = manager.find_key("Second").unwrap();
+        let lp = manager.find_key("Spin").unwrap();
+
+        let program = manager.build_patch_program(second).unwrap();
+        let header = ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES]).unwrap();
+        assert_eq!(header.block_count, 1);
+        assert_eq!(header.insn_count, 1);
+        let desc =
+            ir::BlockDesc::from_bytes(&program[ir::HEADER_BYTES..ir::HEADER_BYTES + ir::BLOCK_BYTES])
+                .unwrap();
+        assert_eq!(desc.index, 0);
+        assert_eq!(desc.mode, ir::MODE_PATCH);
+        assert_eq!(desc.enabled, 1, "the one-shot program asks for its own run");
+        let insn = ir::WireInsn::from_bytes(
+            &program[ir::HEADER_BYTES + ir::BLOCK_BYTES..ir::HEADER_BYTES + ir::BLOCK_BYTES + ir::INSN_BYTES],
+        )
+        .unwrap();
+        assert_eq!(insn.address, 0x123C, "the other blocks' addresses are absent");
+        assert_eq!(insn.value, 7);
+
+        // 2 つの patch は互いに混ざらない。
+        let other = manager.build_patch_program(first).unwrap();
+        assert_ne!(program, other);
+        assert_eq!(
+            other,
+            ir::build_program_for_block(
+                manager.document(),
+                u64::from_str_radix(BUILD, 16).unwrap(),
+                manager.identity().program_id,
+                &BTreeSet::from([first]),
+                &regions(),
+                first,
+            )
+            .unwrap()
+        );
+
+        // loop ブロックを「1 回実行の patch」として送ることはできない。
+        let error = manager.build_patch_program(lp).unwrap_err();
+        assert!(error.contains("loop"), "{error}");
+        assert_eq!(manager.block_index(lp), Some(0));
+        assert_eq!(manager.block_index(first), None);
+    }
+
+    /// patch の原本は「送る前」に控える（コンソールは実行して解放するので、
+    /// 後から読むとパッチ後の値しか残っていない）。
+    #[test]
+    fn the_console_patch_records_the_original_bytes_without_writing_them() {
+        let dir = TempDir::new("console-patch-prepare");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let journal = manager.journal_path().to_path_buf();
+        let key = manager.find_key("Value").unwrap();
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+
+        manager.prepare_console_patch(key, &mut io).unwrap();
+        assert_eq!(io.write_count(), 0, "the console is the one that writes");
+        assert_eq!(io.value_u32(ADDRESS), 5, "memory is still untouched");
+        assert_eq!(manager.backup_count(), 1);
+        assert!(manager.dirty(), "the PC now owes a restore");
+        assert!(manager.has_pending_console_patch());
+        let text = fs::read_to_string(&journal).unwrap();
+        assert!(text.contains("orig=05000000"), "{text}");
+        assert!(text.contains("state=committed"), "{text}");
+
+        // 送信に成功したら「ON」にする（書き込みはまだ 0 のまま）。
+        manager.note_patch_upload(key, &[1, 2, 3]);
+        manager.finish_console_patch().unwrap();
+        assert!(!manager.has_pending_console_patch());
+        assert!(manager.is_enabled(key));
+        assert_eq!(io.write_count(), 0);
+    }
+
+    /// コンソールで 1 回実行した patch の OFF は PC のジャーナルで戻す。
+    #[test]
+    fn disabling_a_console_patch_restores_the_original_bytes() {
+        let dir = TempDir::new("console-patch-off");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+
+        manager.prepare_console_patch(key, &mut io).unwrap();
+        manager.finish_console_patch().unwrap();
+        assert!(manager.is_enabled(key));
+
+        // コンソールが 1 回実行した結果を模す（PC は書いていない）。
+        for (offset, byte) in 0x63u32.to_le_bytes().iter().enumerate() {
+            io.memory.insert(ADDRESS + offset as u64, *byte);
+        }
+        manager.disable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 5, "the original bytes are back");
+        assert_eq!(io.write_count(), 1, "the PC did the restoring");
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        assert!(!manager.is_enabled(key));
+        assert!(!manager.block(key).unwrap().enabled);
+    }
+
+    /// 送信に失敗した patch は、メモリを書かずにジャーナル記録だけ捨てる。
+    #[test]
+    fn a_failed_patch_upload_drops_the_record_again() {
+        let dir = TempDir::new("console-patch-abort");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let journal = manager.journal_path().to_path_buf();
+        let key = manager.find_key("Value").unwrap();
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+
+        manager.prepare_console_patch(key, &mut io).unwrap();
+        assert_eq!(manager.backup_count(), 1);
+        manager.abort_console_patch(&mut io).unwrap();
+        assert_eq!(io.write_count(), 0, "nothing was ever written");
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty(), "no restore is owed any more");
+        assert!(!manager.has_pending_console_patch());
+        assert!(!manager.is_enabled(key));
+        // 空になったジャーナルは削除される（残っていても記録が消えている）。
+        let text = fs::read_to_string(&journal).unwrap_or_default();
+        assert!(!text.contains("orig=05000000"), "{text}");
+
+        // 2 回目の abort は何もしない（冪等）。
+        manager.abort_console_patch(&mut io).unwrap();
+        assert_eq!(io.write_count(), 0);
+    }
+
+    /// 同じ常駐プログラムは 2 度送らない。内容が変わった / コンソールが
+    /// プログラムを失ったときだけ送り直す。
     #[test]
     fn the_same_console_program_is_not_uploaded_twice() {
         let dir = TempDir::new("console-upload-cache");
@@ -3896,12 +4327,17 @@ B4000000 00000000
         );
         assert_eq!(manager.console_program(), Some(program.as_slice()));
 
-        // 内容が変われば（ブロックを ON にすると enabled が変わる）送り直す。
-        let first = manager.find_key("First").unwrap();
-        manager.note_console_toggle(first, true).unwrap();
+        // 内容が変われば（loop ブロックを ON にすると enabled が変わる）送り直す。
+        let second = manager.find_key("Second").unwrap();
+        manager.note_console_toggle(second, true).unwrap();
         let changed = manager.build_console_program().unwrap();
         assert_ne!(changed, program);
         assert!(manager.need_console_upload(&changed));
+
+        // patch を ON にしても常駐プログラムは変わらない（送り直さない）。
+        let first = manager.find_key("First").unwrap();
+        manager.note_console_toggle(first, true).unwrap();
+        assert_eq!(manager.build_console_program().unwrap(), changed);
 
         // コンソールが program_valid == 0 を返したら控えを捨て、次の ON で
         // 送り直す（「載っている」と思い込むと BAD_STATE になる）。
@@ -3909,6 +4345,43 @@ B4000000 00000000
         manager.forget_console_upload();
         assert!(manager.need_console_upload(&changed));
         assert!(manager.console_program().is_none());
+    }
+
+    /// patch の控えはキーごと。OFF で消さないと、次の ON が何も実行しない。
+    #[test]
+    fn the_same_patch_program_is_not_sent_twice() {
+        let dir = TempDir::new("console-patch-cache");
+        dir.write(
+            &format!("{BUILD}.txt"),
+            "[First]\n04400000 00001234 00000063\n[Second]\n04400000 00001238 00000001\n",
+        );
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let first = manager.find_key("First").unwrap();
+        let second = manager.find_key("Second").unwrap();
+        let first_program = manager.build_patch_program(first).unwrap();
+        let second_program = manager.build_patch_program(second).unwrap();
+
+        assert!(manager.need_patch_upload(first, &first_program));
+        manager.note_patch_upload(first, &first_program);
+        assert!(!manager.need_patch_upload(first, &first_program));
+        assert_eq!(
+            manager.console_patch_program(first),
+            Some(first_program.as_slice())
+        );
+        // キーごとなので、別の patch はまだ送っていない。
+        assert!(manager.need_patch_upload(second, &second_program));
+
+        // OFF は「送っていない」に戻す（戻さないと次の ON で何も実行されない）。
+        manager.forget_patch_upload(first);
+        assert!(manager.need_patch_upload(first, &first_program));
+        assert!(manager.console_patch_program(first).is_none());
+
+        // コンソールが全ブロックを止めたら、patch の控えも捨てる。
+        manager.note_patch_upload(second, &second_program);
+        manager.mark_all_off();
+        assert!(manager.need_patch_upload(second, &second_program));
     }
 
     /// コンソール実行の ON/OFF は PC のメモリにもジャーナルにも触らない。

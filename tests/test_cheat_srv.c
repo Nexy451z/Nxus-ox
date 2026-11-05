@@ -8,6 +8,14 @@
  *   - upload validation: the interpreter's own rejections, a program built for
  *     another title, an upload with no target, and a refused upload that leaves the
  *     running program AND its journal untouched,
+ *   - the upload dispatch: a PATCH-ONLY program (every block mode == 0) is executed
+ *     once during the upload (plan/apply pass, journal included) and its scratch
+ *     program is released - it never becomes resident and never replaces a running
+ *     loop program; a program WITH a loop block becomes resident, and a re-upload
+ *     restores the old journal, releases the old instruction array and keeps the
+ *     old program on a failed install (NO_MEMORY / validation),
+ *   - the heap lifetime of the instruction array: patch uploads are balanced,
+ *     re-upload / Clear / Exit release the resident array (allocator counter),
  *   - the target stamp: a pid / title / dmnt-incarnation change stops every block,
  *     writes the journalled originals back, drops the journal and publishes exactly
  *     one NxusEvent_CheatFault(NXUS_CHEAT_FAULT_TARGET_GONE); no further tick runs
@@ -16,7 +24,8 @@
  *     it and reports the interpreter error, and one success re-arms the window,
  *   - the journal-full path (immediate disable, NXUS_CHEAT_FAULT_JOURNAL_FULL),
  *   - PanicOff: restored/failed/blocks_stopped, a partial failure that keeps the
- *     journal for a retry, and the second call being a no-op,
+ *     journal for a retry, the second call being a no-op, and the write-back of a
+ *     patch-only upload (no resident program, journal is still the truth),
  *   - CheatClear: the program goes away WITHOUT any write to the target,
  *   - the IO adapter: allow_rx selects the RX-patch range policy (not the plain
  *     writable one), a refused range means no write at all, and one validated
@@ -32,6 +41,7 @@
  * test - the same technique test_snapshot_owner.c uses for its static stamps.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nxus_cheat_srv.h"
@@ -51,6 +61,63 @@ static int g_failures = 0;
             puts("");                                                \
         }                                                            \
     } while (0)
+
+/* ---- instruction-array allocator spy ------------------------------------ *
+ * nxusCheatSetAllocator() (core/nxus_cheatvm.h) lets the test count installs and
+ * releases and remember the pointers that were freed, which is what makes
+ * "a patch-only upload does not leak" and "a re-upload frees the OLD array"
+ * observable instead of inferred.  Every program stores the free function that
+ * produced its buffer, so restoring the default allocator later cannot mismatch.
+ */
+static u32  g_Allocs;
+static u32  g_Frees;
+static void *g_Freed[32];
+static u32  g_FreedCount;
+
+static void *testAlloc(size_t size, void *user) {
+    (void)user;
+    g_Allocs++;
+    return malloc(size);
+}
+
+static void testFree(void *ptr, void *user) {
+    (void)user;
+    if (ptr != NULL) {
+        if (g_FreedCount < (u32)(sizeof(g_Freed) / sizeof(g_Freed[0]))) {
+            g_Freed[g_FreedCount] = ptr;
+        }
+        g_FreedCount++;
+        g_Frees++;
+        free(ptr);
+    }
+}
+
+static void *failAlloc(size_t size, void *user) {
+    (void)size;
+    (void)user;
+    g_Allocs++;
+    return NULL;
+}
+
+static void allocatorBegin(void) {
+    g_Allocs = 0;
+    g_Frees = 0;
+    g_FreedCount = 0;
+    memset(g_Freed, 0, sizeof(g_Freed));
+    nxusCheatSetAllocator(testAlloc, testFree, NULL);
+}
+
+static void allocatorEnd(void) {
+    nxusCheatSetAllocator(NULL, NULL, NULL);
+}
+
+static bool freedContains(const void *ptr) {
+    u32 i;
+    for (i = 0; i < g_FreedCount && i < (u32)(sizeof(g_Freed) / sizeof(g_Freed[0])); i++) {
+        if (g_Freed[i] == ptr) return true;
+    }
+    return false;
+}
 
 /* ---- wire-program builder ----------------------------------------------- */
 
@@ -196,7 +263,9 @@ static void testUploadValidation(void) {
     Wire w;
     NxusCheatUploadReply reply;
 
-    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, CHEAT_TEST_BASE + 0x100, 0x11223344u);
+    /* A loop block keeps the program resident, which is what the status checks
+     * below describe (a patch-only upload is executed and released instead). */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, CHEAT_TEST_BASE + 0x100, 0x11223344u);
     CHECK(uploadWireReply(&w, &reply), "a program for the current target is accepted");
     CHECK(reply.accepted_blocks == 1 && reply.accepted_insns == 1 && reply.rejected_reason == 0,
           "reply counts: blocks=%u insns=%u reason=%u", (unsigned)reply.accepted_blocks,
@@ -302,20 +371,41 @@ static void testPatchOnceAndLoop(void) {
     const u64 loop_addr = CHEAT_TEST_BASE + 0x304;
     Wire w;
 
-    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, patch_addr, 0xAAAA5555u);
-    CHECK(uploadWire(&w), "patch program installed");
+    /* One loop block anywhere keeps the whole program resident, so a patch block
+     * that travels WITH a loop stays on the worker path: it runs once on the first
+     * tick (mode 0 = once per enable) while the loop block runs every tick.  A
+     * patch-only program never gets here - it is executed during the upload and
+     * released (see testPatchOnlyUpload). */
+    wireStart(&w, CHEAT_TEST_TITLE_A);
+    const u32 patch_block = wireBlock(&w, 0, 1);
+    wireInsn(&w, patch_block, insnStore(patch_addr, 4, 0xAAAA5555u));
+    const u32 loop_block = wireBlock(&w, 1, 1);
+    wireInsn(&w, loop_block, insnStore(loop_addr, 4, 0x0BADF00Du));
+    CHECK(uploadWire(&w), "patch + loop program installed");
+    CHECK(statusNow().program_valid == 1 && statusNow().block_count == 2 &&
+          statusNow().insn_count == 2,
+          "a program with a loop block is resident (valid=%u blocks=%u insns=%u)",
+          (unsigned)statusNow().program_valid, (unsigned)statusNow().block_count,
+          (unsigned)statusNow().insn_count);
+    CHECK(cheatTestPeekU32(patch_addr) == 0u && cheatTestPeekU32(loop_addr) == 0u,
+          "the upload itself executed nothing");
+
     const u32 base_writes = cheatTestWrites();
 
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == base_writes + 1, "the patch block wrote once");
+    CHECK(cheatTestWrites() == base_writes + 2,
+          "the first tick applied the patch block and the loop block (%u writes)",
+          (unsigned)(cheatTestWrites() - base_writes));
     CHECK(cheatTestPeekU32(patch_addr) == 0xAAAA5555u, "the target holds the patched value");
-    CHECK(statusNow().journal_count == 1, "the original byte is journalled");
+    CHECK(cheatTestPeekU32(loop_addr) == 0x0BADF00Du, "the loop write landed");
+    CHECK(statusNow().journal_count == 2, "both originals are journalled");
     CHECK(statusNow().tick_count == 1, "one tick counted");
 
     cheatSrvWorkerStep();
-    CHECK(cheatTestWrites() == base_writes + 1,
-          "the patch block did not run a second time (mode 0 = once per enable)");
-    CHECK(statusNow().tick_count == 2, "the worker keeps ticking while nothing runs");
+    CHECK(cheatTestWrites() == base_writes + 2,
+          "the patch block did not run a second time (mode 0 = once per enable); the "
+          "loop found its value already applied");
+    CHECK(statusNow().tick_count == 2, "the worker keeps ticking while nothing writes");
 
     /* A loop block runs on every tick. */
     makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, loop_addr, 0x0BADF00Du);
@@ -420,8 +510,8 @@ static void testTargetGone(void) {
     cheatTestPoke(addr, &original, sizeof(original));
 
     Wire w;
-    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, addr, 0xDEADBEEFu);
-    CHECK(uploadWire(&w), "patch program installed");
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xDEADBEEFu);
+    CHECK(uploadWire(&w), "loop program installed");
     cheatSrvWorkerStep();
     CHECK(cheatTestPeekU32(addr) == 0xDEADBEEFu, "the patch is applied");
     CHECK(statusNow().journal_count == 1, "the original byte is journalled");
@@ -459,7 +549,7 @@ static void testTargetGone(void) {
 
     /* Re-uploading for the target that is actually running works. */
     Wire w2;
-    makeProgram(&w2, CHEAT_TEST_TITLE_A, 0, 1, addr, 0x12345678u);
+    makeProgram(&w2, CHEAT_TEST_TITLE_A, 1, 1, addr, 0x12345678u);
     CHECK(uploadWire(&w2), "a re-upload for the current target is accepted");
     cheatSrvWorkerStep();
     CHECK(cheatTestPeekU32(addr) == 0x12345678u, "the re-uploaded program runs");
@@ -469,7 +559,7 @@ static void testTargetGone(void) {
     fresh();
     cheatTestPoke(addr, &original, sizeof(original));
     Wire w3;
-    makeProgram(&w3, CHEAT_TEST_TITLE_A, 0, 1, addr, 0xA5A5A5A5u);
+    makeProgram(&w3, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xA5A5A5A5u);
     CHECK(uploadWire(&w3), "second program installed");
     cheatSrvWorkerStep();
     CHECK(cheatTestPeekU32(addr) == 0xA5A5A5A5u, "second program patched its address");
@@ -484,7 +574,7 @@ static void testTargetGone(void) {
     /* A title change with the pid reused (pid is the same, title moved). */
     fresh();
     Wire w4;
-    makeProgram(&w4, CHEAT_TEST_TITLE_A, 0, 0, addr, 1);
+    makeProgram(&w4, CHEAT_TEST_TITLE_A, 1, 0, addr, 1);
     CHECK(uploadWire(&w4), "third program installed");
     cheatTestSetIdentity(CHEAT_TEST_PID_A, CHEAT_TEST_TITLE_B);
     cheatTestClearEvents();
@@ -567,8 +657,8 @@ static void testClear(void) {
 
     const u64 addr = CHEAT_TEST_BASE + 0x700;
     Wire w;
-    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, addr, 0x77777777u);
-    CHECK(uploadWire(&w), "program installed");
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, addr, 0x77777777u);
+    CHECK(uploadWire(&w), "loop program installed");
     cheatSrvWorkerStep();
     const u32 writes = cheatTestWrites();
     CHECK(cheatTestPeekU32(addr) == 0x77777777u, "the patch is applied");
@@ -904,17 +994,23 @@ static void testLifecycle(void) {
     CHECK(cheatWorkerShouldRun(), "a second init changes nothing");
 
     /* The static budget the header documents (the asserts in the shipped .c make
-       the build fail if a core cap pushes it out).  The plan pass needs its own
-       journal: 12 KiB more, still far inside the sysmodule's 8 MiB. */
-    const u32 footprint = (u32)(sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
+       the build fail if a core cap pushes it out).  There are two program structs
+       now - the resident program and the patch-upload scratch - and the plan pass
+       needs its own journal: still far inside the sysmodule's 8 MiB. */
+    const u32 footprint = (u32)(2u * sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
                                 sizeof(g_WorkerStack));
-    /* 2048 instructions (up from 512: a 537-instruction cheat was rejected) put the
-       program at ~53 KiB; the ceiling in the .c is 96 KiB. */
+    /* The instruction arrays are heap-allocated (only what was uploaded), so each
+       program struct is ~5 KiB instead of carrying 2048 instructions inline. */
     CHECK(footprint <= 96u * 1024u, "cheat service statics fit the declared budget (%u B)",
           (unsigned)footprint);
-    CHECK(sizeof(NxusCheatProgram) + sizeof(NxusCheatJournal) == 54456u + 12296u,
-          "program + journal are 66752 B (program %u, journal %u)",
-          (unsigned)sizeof(NxusCheatProgram), (unsigned)sizeof(NxusCheatJournal));
+    /* The instruction array is heap-allocated now (only what was uploaded), so the
+       struct itself is ~5 KiB instead of ~53 KiB.  Range checks instead of an exact
+       size: the point is "the program no longer carries 2048 instructions inline". */
+    CHECK(sizeof(NxusCheatProgram) < 8u * 1024u,
+          "the program struct no longer embeds the instructions (%u B)",
+          (unsigned)sizeof(NxusCheatProgram));
+    CHECK(sizeof(NxusCheatJournal) == 12296u,
+          "the journal is 512 entries x 24 B (%u B)", (unsigned)sizeof(NxusCheatJournal));
     CHECK(sizeof(g_ProbeJournal) == sizeof(NxusCheatJournal),
           "the plan journal is one more journal-sized block (%u B)",
           (unsigned)sizeof(g_ProbeJournal));
@@ -979,6 +1075,253 @@ static void testLifecycle(void) {
     CHECK(cheatTestResumes() == 1, "and the matching Resume (%u)", (unsigned)cheatTestResumes());
 }
 
+/* ---- 12. patch-only upload (synchronous, non-resident) ------------------ */
+
+static void testPatchOnlyUpload(void) {
+    printf("[test] patch-only upload: runs at upload, journals, releases, stays non-resident\n");
+    fresh();
+
+    const u64 addr = CHEAT_TEST_BASE + 0xE00;
+    const u32 original = 0x13572468u;
+    cheatTestPoke(addr, &original, sizeof(original));
+
+    Wire w;
+    NxusCheatUploadReply reply;
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, addr, 0x24681357u);
+    const u32 writes = cheatTestWrites();
+    CHECK(uploadWireReply(&w, &reply), "a patch-only program is accepted");
+    CHECK(reply.accepted_blocks == 1 && reply.accepted_insns == 1 &&
+          reply.rejected_reason == 0,
+          "the reply counts the executed program (blocks=%u insns=%u reason=%u)",
+          (unsigned)reply.accepted_blocks, (unsigned)reply.accepted_insns,
+          (unsigned)reply.rejected_reason);
+    CHECK(cheatTestPeekU32(addr) == 0x24681357u,
+          "the patch was applied during the upload, not deferred to a tick");
+    CHECK(cheatTestWrites() == writes + 1, "exactly one write was issued (%u)",
+          (unsigned)(cheatTestWrites() - writes));
+
+    {
+        const NxusCheatStatus st = statusNow();
+        CHECK(st.program_valid == 0 && st.block_count == 0 && st.insn_count == 0,
+              "no program is resident after a patch-only upload (valid=%u blocks=%u insns=%u)",
+              (unsigned)st.program_valid, (unsigned)st.block_count, (unsigned)st.insn_count);
+        CHECK(st.journal_count == 1, "the write stays journalled for PanicOff (%u)",
+              (unsigned)st.journal_count);
+        CHECK(st.enabled_count == 0, "no resident block is enabled");
+    }
+
+    /* The worker has nothing to run: there is no resident program. */
+    cheatSrvWorkerStep();
+    CHECK(cheatTestWrites() == writes + 1, "a later tick does not repeat the patch");
+    CHECK(statusNow().tick_count == 0, "no resident program means no ticks are counted");
+    CHECK(g_Program.insns == NULL && g_PatchProgram.insns == NULL,
+          "neither the resident slot nor the scratch slot owns an instruction array");
+
+    /* A disabled patch block is a no-op: the upload-time enable flag is honoured. */
+    {
+        const u64 off_addr = CHEAT_TEST_BASE + 0xE04;
+        Wire off;
+        makeProgram(&off, CHEAT_TEST_TITLE_A, 0, 0, off_addr, 0x11112222u);
+        CHECK(uploadWire(&off), "a disabled patch-only program is accepted");
+        CHECK(cheatTestPeekU32(off_addr) == 0u, "a disabled patch block wrote nothing");
+    }
+
+    /* The patch-only write is reversible with no PC in the loop. */
+    {
+        NxusCheatRestore rs;
+        nxusCheatSrvPanicOff(&rs);
+        CHECK(rs.restored == 1 && rs.failed == 0,
+              "PanicOff restored the patch-only write (%u restored, %u failed)",
+              (unsigned)rs.restored, (unsigned)rs.failed);
+        CHECK(cheatTestPeekU32(addr) == original, "the original value is back");
+        CHECK(statusNow().journal_count == 0, "the journal is empty after the restore");
+    }
+
+    /* A patch-only upload must not displace - nor write back the patches of - a
+     * resident program: g_Program keeps running and status keeps describing it. */
+    fresh();
+    {
+        const u64 res_addr = CHEAT_TEST_BASE + 0xE40;
+        const u64 one_shot = CHEAT_TEST_BASE + 0xE44;
+        Wire res;
+        makeProgram(&res, CHEAT_TEST_TITLE_A, 1, 1, res_addr, 0x0A0B0C0Du);
+        CHECK(uploadWire(&res), "resident loop program installed");
+        const NxusCheatStatus before = statusNow();
+        CHECK(before.program_valid == 1 && before.block_count == 1,
+              "the loop program is resident");
+
+        Wire patch;
+        makeProgram(&patch, CHEAT_TEST_TITLE_A, 0, 1, one_shot, 0x51515151u);
+        CHECK(uploadWire(&patch), "a patch-only program is accepted next to the resident one");
+        CHECK(cheatTestPeekU32(one_shot) == 0x51515151u, "the one-shot patch ran");
+        {
+            const NxusCheatStatus after = statusNow();
+            CHECK(after.program_valid == 1 && after.block_count == 1 && after.insn_count == 1,
+                  "the resident program is still the installed one (valid=%u blocks=%u insns=%u)",
+                  (unsigned)after.program_valid, (unsigned)after.block_count,
+                  (unsigned)after.insn_count);
+            CHECK(after.tick_count == before.tick_count,
+                  "the patch upload did not advance the worker's tick count");
+        }
+        cheatSrvWorkerStep();
+        CHECK(cheatTestPeekU32(res_addr) == 0x0A0B0C0Du, "the resident loop still runs");
+        CHECK(cheatTestPeekU32(one_shot) == 0x51515151u, "and the one-shot patch stays applied");
+    }
+
+    /* A loop-only program is resident with every block counted by status. */
+    fresh();
+    {
+        Wire two;
+        wireStart(&two, CHEAT_TEST_TITLE_A);
+        wireInsn(&two, wireBlock(&two, 1, 1), insnStore(CHEAT_TEST_BASE + 0xE80, 4, 1));
+        wireInsn(&two, wireBlock(&two, 1, 1), insnStore(CHEAT_TEST_BASE + 0xE84, 4, 2));
+        CHECK(uploadWire(&two), "two-loop program installed");
+        CHECK(statusNow().program_valid == 1 && statusNow().block_count == 2,
+              "both loop blocks are resident (valid=%u blocks=%u)",
+              (unsigned)statusNow().program_valid, (unsigned)statusNow().block_count);
+        CHECK(statusNow().insn_count == 2, "and both instructions are counted (%u)",
+              (unsigned)statusNow().insn_count);
+    }
+}
+
+/* ---- 13. heap lifetime ------------------------------------------------- */
+
+static void testHeapLifetime(void) {
+    printf("[test] heap: patch uploads release, re-upload frees the old insns, clear/exit release\n");
+    fresh();
+    allocatorBegin();
+
+    const u64 base = CHEAT_TEST_BASE + 0xF00;
+    Wire w;
+
+    /* Two patch-only uploads: each allocates its instruction array, runs, and
+     * releases it before the upload returns, so the heap does not grow. */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, base, 0x01010101u);
+    CHECK(uploadWire(&w), "first patch-only upload accepted");
+    CHECK(cheatTestPeekU32(base) == 0x01010101u, "the first patch ran");
+    CHECK(g_Allocs - g_Frees == 0, "the first patch upload released its array (live=%u)",
+          (unsigned)(g_Allocs - g_Frees));
+
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, base + 4u, 0x02020202u);
+    CHECK(uploadWire(&w), "second patch-only upload accepted");
+    CHECK(cheatTestPeekU32(base + 4u) == 0x02020202u, "the second patch ran too");
+    CHECK(g_Allocs == 2 && g_Frees == 2,
+          "two patch uploads => two allocations, two releases (%u/%u)",
+          (unsigned)g_Allocs, (unsigned)g_Frees);
+    CHECK(g_Allocs - g_Frees == 0, "repeated patch uploads do not grow the heap (live=%u)",
+          (unsigned)(g_Allocs - g_Frees));
+
+    /* A loop upload becomes resident and keeps exactly one array. */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, base + 8u, 0x03030303u);
+    CHECK(uploadWire(&w), "loop program installed");
+    CHECK(g_Allocs - g_Frees == 1, "exactly one instruction array is resident (live=%u)",
+          (unsigned)(g_Allocs - g_Frees));
+    CHECK(g_Program.insns != NULL && g_Program.insn_capacity == 1,
+          "the resident program owns its one-instruction array");
+
+    /* Re-upload: the OLD array must be freed (before this change it leaked). */
+    {
+        const void *old_insns = (const void *)g_Program.insns;
+        makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, base + 12u, 0x04040404u);
+        CHECK(uploadWire(&w), "loop program re-uploaded");
+        CHECK(freedContains(old_insns),
+              "the previous instruction array was released (%u frees)",
+              (unsigned)g_Frees);
+        CHECK(g_Allocs - g_Frees == 1, "still exactly one array is resident (live=%u)",
+              (unsigned)(g_Allocs - g_Frees));
+    }
+
+    /* Clear releases the resident array. */
+    {
+        const void *resident = (const void *)g_Program.insns;
+        nxusCheatSrvClear();
+        CHECK(g_Program.insns == NULL, "clear dropped the instruction pointer");
+        CHECK(freedContains(resident), "clear released the resident instruction array");
+        CHECK(g_Allocs - g_Frees == 0, "nothing is left allocated after clear (live=%u)",
+              (unsigned)(g_Allocs - g_Frees));
+    }
+
+    /* Exit releases as well. */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, base + 16u, 0x05050505u);
+    CHECK(uploadWire(&w), "loop program installed for the exit check");
+    {
+        const void *before_exit = (const void *)g_Program.insns;
+        nxusCheatSrvExit();
+        CHECK(g_Program.insns == NULL, "exit dropped the instruction pointer");
+        CHECK(freedContains(before_exit), "exit released the resident instruction array");
+        CHECK(g_Allocs - g_Frees == 0, "nothing is left allocated after exit (live=%u)",
+              (unsigned)(g_Allocs - g_Frees));
+    }
+
+    allocatorEnd();
+    nxusCheatSrvInit();          /* the following tests start from an initialised service */
+}
+
+/* ---- 14. failed uploads ------------------------------------------------- */
+
+static void testUploadFailures(void) {
+    printf("[test] upload failures: NO_MEMORY / rejected program keep the resident one\n");
+    fresh();
+
+    const u64 addr = CHEAT_TEST_BASE + 0x1000;
+    Wire w;
+    NxusCheatUploadReply reply;
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xAAAA0001u);
+    CHECK(uploadWire(&w), "resident loop program installed");
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(addr) == 0xAAAA0001u, "the resident program runs");
+
+    const void *resident = (const void *)g_Program.insns;
+
+    /* Allocation failure (NXUS_CHEATVM_ERR_NO_MEMORY, wire code 9): the installed
+     * program and its instruction array must survive untouched. */
+    nxusCheatSetAllocator(failAlloc, testFree, NULL);
+    {
+        Wire big;
+        makeProgram(&big, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xBBBB0002u);
+        CHECK(!uploadWireReply(&big, &reply), "an upload that cannot allocate is refused");
+        CHECK(reply.rejected_reason == (u32)(-NXUS_CHEATVM_ERR_NO_MEMORY),
+              "the reason is NO_MEMORY (%u)", (unsigned)reply.rejected_reason);
+        CHECK(g_Program.insns == resident && statusNow().program_valid == 1,
+              "the installed program still owns its instruction array");
+        CHECK(statusNow().block_count == 1,
+              "status still describes the installed program (%u block(s))",
+              (unsigned)statusNow().block_count);
+    }
+
+    /* ...and it still executes (the probe/apply pass sees a differing value). */
+    {
+        const u32 moved = 0u;
+        cheatTestPoke(addr, &moved, sizeof(moved));
+        cheatSrvWorkerStep();
+        CHECK(cheatTestPeekU32(addr) == 0xAAAA0001u,
+              "the old program still runs after a failed replacement");
+    }
+
+    /* A patch-only upload that cannot allocate executes nothing at all. */
+    {
+        const u64 patch_addr = CHEAT_TEST_BASE + 0x1004;
+        Wire patch;
+        makeProgram(&patch, CHEAT_TEST_TITLE_A, 0, 1, patch_addr, 0xCCCC0003u);
+        CHECK(!uploadWireReply(&patch, &reply), "a patch-only upload that cannot allocate fails");
+        CHECK(cheatTestPeekU32(patch_addr) == 0u, "and executed nothing");
+        CHECK(g_Program.insns == resident, "the resident program was not touched");
+    }
+    allocatorEnd();
+
+    /* A program rejected by validation leaves the installed program untouched too
+     * (install validates before it allocates or writes). */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xDDDD0004u);
+    w.insns[0].op = 999u;        /* no such opcode */
+    CHECK(!uploadWireReply(&w, &reply), "an invalid program is refused");
+    CHECK(reply.rejected_reason == 3u,
+          "the reason is the interpreter's bad-block code (%u)", (unsigned)reply.rejected_reason);
+    CHECK(g_Program.insns == resident && statusNow().program_valid == 1,
+          "the installed program survived the refused replacement");
+    cheatSrvWorkerStep();
+    CHECK(cheatTestPeekU32(addr) == 0xAAAA0001u, "and it keeps running");
+}
+
 int main(void) {
     printf("== Nxus cheat service host tests ==\n");
     testUploadValidation();
@@ -992,6 +1335,9 @@ int main(void) {
     testHeldMask();
     testFreeze();
     testLifecycle();
+    testPatchOnlyUpload();
+    testHeapLifetime();
+    testUploadFailures();
 
     nxusCheatSrvExit();
     printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
