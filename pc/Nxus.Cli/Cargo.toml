@@ -1,6 +1,6 @@
 [package]
 name = "nxus"
-version = "0.1.10-alpha"
+version = "0.1.11-alpha"
 edition = "2021"
 description = "Nxus - Nintendo Switch memory analysis (PC side)"
 default-run = "nxus"

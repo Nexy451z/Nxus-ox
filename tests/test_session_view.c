@@ -1552,6 +1552,140 @@ static void testTargetIdentityNoTornRead(void) {
     nxusSessionExit();
 }
 
+/* ---- baseline store: contiguous write fast path / RAM threshold --------- */
+
+/* nxus_session.c keeps the store in file-static state, and this test compiles
+   the SHIPPED source, so the cursor, the seek counter and the backend globals
+   are directly observable.  That is what lets the test prove the write loop
+   appends without fseek (the old code seeked per block, which flushed stdio's
+   64 KB buffer on every block) and that a <= 4 MiB scope never opens a file. */
+
+static void baselineTestResetHealth(void) {
+    g_Session.baseline_write_failed = 0;
+    g_Session.baseline_write_logged = false;
+    g_Session.baseline_degraded = false;
+}
+
+/* A host stand-in for the SD stream: baselineStoreWrite() only looks at
+   g_BaseFile, so a tmpfile exercises the same stdio path.  The cursor is set
+   the way baselineStoreOpen() leaves it after fopen("wb+"). */
+static bool baselineTestOpenTmp(void) {
+    baselineStoreClose();
+    baselineTestResetHealth();
+    g_BaseFile = tmpfile();
+    if (g_BaseFile == NULL) return false;
+    g_BaseWritePosValid = true;
+    g_BaseWritePos = 0;
+    g_BaseWriteBytes = 0;
+    g_BaseWriteCalls = 0;
+    g_BaseSeekCalls = 0;
+    g_BaseReserveActive = false;      /* tmpfile is not the SD preallocation path */
+    g_BaseReserved = 0;
+    g_BaseReserveLimit = 0;
+    g_BaseWriteSeq = 0;
+    return true;
+}
+
+static void testBaselineContiguousWrites(void) {
+    printf("- baseline writes: contiguous blocks append without fseek\n");
+    enum { BLK = 4096, JUMP = 64 * 1024 };
+    static u8 a[BLK], b[BLK], back[BLK];
+
+    for (u32 i = 0; i < (u32)BLK; i++) {
+        a[i] = (u8)(i * 37u + 11u);
+        b[i] = (u8)(i ^ 0xA5u);
+    }
+
+    if (!baselineTestOpenTmp()) {
+        CHECK(0, "tmpfile() for the baseline store failed");
+        return;
+    }
+
+    CHECK(baselineStoreWrite(NULL, 0, a, BLK) == 0, "first block write");
+    CHECK(baselineStoreWrite(NULL, BLK, b, BLK) == 0, "contiguous block write");
+    CHECK(g_BaseSeekCalls == 0,
+          "two contiguous blocks must not fseek (seeks=%llu)",
+          (unsigned long long)g_BaseSeekCalls);
+
+    /* A real jump (the sparse-layout case) still seeks, exactly once. */
+    CHECK(baselineStoreWrite(NULL, JUMP, a, BLK) == 0, "jumped block write");
+    CHECK(g_BaseSeekCalls == 1,
+          "a non-contiguous offset seeks once (seeks=%llu)",
+          (unsigned long long)g_BaseSeekCalls);
+
+    CHECK(baselineStoreWrite(NULL, JUMP + BLK, b, BLK) == 0, "block after the jump");
+    CHECK(g_BaseSeekCalls == 1,
+          "the write after the jump is contiguous again (seeks=%llu)",
+          (unsigned long long)g_BaseSeekCalls);
+
+    /* Every stored byte reads back unchanged, at both the start of the stream
+       and after the hole the jump left. */
+    CHECK(baselineStoreRead(NULL, 0, back, BLK) == 0, "read block A back");
+    CHECK(memcmp(back, a, BLK) == 0, "block A round-trips byte for byte");
+    CHECK(baselineStoreRead(NULL, BLK, back, BLK) == 0, "read block B back");
+    CHECK(memcmp(back, b, BLK) == 0, "contiguous block B round-trips");
+    CHECK(baselineStoreRead(NULL, JUMP, back, BLK) == 0, "read the jumped block back");
+    CHECK(memcmp(back, a, BLK) == 0, "block after the jump round-trips");
+    CHECK(baselineStoreRead(NULL, JUMP + BLK, back, BLK) == 0, "read the second post-jump block");
+    CHECK(memcmp(back, b, BLK) == 0, "second post-jump block round-trips");
+
+    /* A read moves the stream position, so the next write cannot append
+       blindly even though its offset continues the previous write's end. */
+    const u64 seeks_before = g_BaseSeekCalls;
+    CHECK(baselineStoreWrite(NULL, JUMP + 2u * BLK, a, BLK) == 0, "write after a read");
+    CHECK(g_BaseSeekCalls == seeks_before + 1,
+          "a write after a read seeks again (seeks=%llu, expected %llu)",
+          (unsigned long long)g_BaseSeekCalls,
+          (unsigned long long)(seeks_before + 1));
+
+    CHECK(g_Session.baseline_write_failed == 0, "no store write failed (%u)",
+          (unsigned)g_Session.baseline_write_failed);
+    baselineStoreClose();
+    baselineTestResetHealth();
+}
+
+static void testBaselineRamThreshold(void) {
+    printf("- baseline store: <= 4 MiB stays in RAM (no SD file)\n");
+    CHECK(sizeof(g_BaseFileBuf) == 256u * 1024u,
+          "the SD stream buffer is 256 KB (%u bytes)", (unsigned)sizeof(g_BaseFileBuf));
+    CHECK(NXUS_BASELINE_RAM_MAX == 4u * 1024u * 1024u,
+          "the RAM ceiling is 4 MiB (%u bytes)", (unsigned)NXUS_BASELINE_RAM_MAX);
+
+    /* The store reads the scoped region list straight from the session. */
+    NxusScanRegion *saved_regions = g_Session.regions;
+    u32 saved_count = g_Session.region_count;
+    NxusScanRegion region;
+    memset(&region, 0, sizeof(region));
+    region.size = NXUS_BASELINE_RAM_MAX;      /* exactly the ceiling */
+    region.perm = NXUS_PERM_R | NXUS_PERM_W;
+
+    baselineStoreClose();
+    baselineTestResetHealth();
+    g_Session.regions = &region;
+    g_Session.region_count = 1;
+
+    CHECK(baselineStoreOpen(), "a 4 MiB scope opens a store");
+    CHECK(g_BaseFile == NULL, "a <= 4 MiB scope must not open the SD store");
+    CHECK(g_BaseRam != NULL, "a <= 4 MiB scope is backed by RAM");
+    CHECK(g_BaseRamSize == region.size,
+          "the RAM store covers the whole scope (%llu of %llu)",
+          (unsigned long long)g_BaseRamSize,
+          (unsigned long long)region.size);
+
+    static const u8 payload[8] = { 9, 8, 7, 6, 5, 4, 3, 2 };
+    u8 back[8];
+    CHECK(baselineStoreWrite(NULL, 0, payload, sizeof(payload)) == 0, "RAM store write");
+    CHECK(baselineStoreRead(NULL, 0, back, sizeof(back)) == 0, "RAM store read");
+    CHECK(memcmp(back, payload, sizeof(payload)) == 0, "RAM store round-trips");
+
+    CHECK(g_Session.baseline_write_failed == 0, "no RAM store write failed (%u)",
+          (unsigned)g_Session.baseline_write_failed);
+    baselineStoreClose();
+    baselineTestResetHealth();
+    g_Session.regions = saved_regions;
+    g_Session.region_count = saved_count;
+}
+
 /* ---- libnx / service stand-ins (only what nxus_session.c calls) --------- */
 
 void nxusLogWrite(const char *fmt, ...) {
@@ -1656,6 +1790,8 @@ int main(void) {
     testHitLimitBudget();
     testTargetIdentitySnapshot();
     testTargetIdentityNoTornRead();
+    testBaselineContiguousWrites();
+    testBaselineRamThreshold();
 
     /* Leave the module in the state the console leaves it in at shutdown. */
     nxusSessionExit();

@@ -9,6 +9,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/statvfs.h>
+#include <unistd.h>          /* ftruncate(): preallocate the baseline dump */
+
+/* The host test compiles this unit with -std=c11, and a strict-ISO <unistd.h>
+   hides the POSIX fileno()/ftruncate() prototypes that the reservation uses.
+   Both symbols exist in newlib and in the host libc; only the declarations are
+   gated behind feature macros. */
+#if defined(__STRICT_ANSI__)
+extern int fileno(FILE *stream);
+extern int ftruncate(int fd, off_t length);
+#endif
 
 /* Ceiling of the mapping table the hit-rescue path can index.  The snapshot itself
    is capped at 4096 mappings (snapshotMappings), so this only guards a future
@@ -609,6 +619,13 @@ static void mapSortIndex(u32 count) {
 
 static u64 nowMs(void) { return armTicksToNs(armGetSystemTick()) / 1000000ull; }
 
+/* MiB/s in tenths, integer-only: NXUS_LOG has no float formatting anywhere
+   else in the sysmodule, and this must not pull printf's float path in. */
+static u64 mibPerSecondX10(u64 bytes, u64 ms) {
+    if (ms == 0) return 0;
+    return (bytes * 10ull) / (ms * 1024ull * 1024ull);
+}
+
 /* ---- state publication ------------------------------------------------- */
 
 /*
@@ -1127,28 +1144,44 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
  * per-block fingerprint and streams the non-zero blocks to this store.  Two
  * backends share one interface so the engine does not care which is in use:
  *
- *   - SD card: "sdmc:/nxus/scan_base.bin", opened "wb+" with one static 64 KB
- *     stdio buffer (no per-block malloc, writes coalesce into the card's
- *     cluster size),
- *   - RAM: a single malloc of the scoped byte count, used when the card cannot
- *     be opened (no SD inserted, read-only card, ...), when the scoped range is
- *     small enough that writing a file would cost more than the memory
- *     (<= 512 KB), or when statvfs proves the card cannot hold the stream with
+ *   - SD card: "sdmc:/nxus/scan_base.bin", opened "wb+" with one static 256 KB
+ *     stdio buffer.  The engine writes its blocks in ascending store order, so
+ *     the write cursor is tracked and a continued block is appended with a bare
+ *     fwrite: a per-block fseek would flush the stdio buffer on every 16-64 KB
+ *     block and turn one burst into thousands of tiny card writes.  Only a
+ *     non-contiguous offset pays a seek.  The file is also grown ahead of the
+ *     cursor with ftruncate() (libnx's devoptab implements it; posix_fallocate
+ *     is not available) so the card allocates a whole 16 MiB run at a time.
+ *   - RAM: a single malloc of the scoped byte count, used when the scoped range
+ *     is small enough that writing a file would cost more than the memory
+ *     (<= 4 MiB), when the card cannot be opened (no SD inserted, read-only
+ *     card, ...), or when statvfs proves the card cannot hold the stream with
  *     1.5x headroom (a store that fills up mid-scan loses blocks silently).
+ *     Below the threshold the card is not touched at all; if the sysmodule
+ *     heap refuses the malloc, the SD store is tried instead.
  *
  * Offsets are absolute positions in the store; the engine hands each block the
- * offset it was assigned, so a plain fseek covers the sparse layout.
+ * offset it was assigned, so a jump in the sparse layout still seeks.
  *
  * Health: a failed write is counted in g_Session.baseline_write_failed, logged
  * once, folded into stats.write_failed and published through
  * nxusSessionBaselineWriteFailed() / nxusSessionBaselineDegraded(), so a short
  * candidate list caused by the store is distinguishable from an empty target.
  */
-#define NXUS_BASELINE_RAM_MAX   (512u * 1024u)
-#define NXUS_BASELINE_FILE_BUF  (64u * 1024u)
+#define NXUS_BASELINE_RAM_MAX   (4u * 1024u * 1024u)
+#define NXUS_BASELINE_FILE_BUF  (256u * 1024u)
 /* Refine buffers: at least one whole block, and never below 64 KB so a future
    smaller block size still gets a decent read size. */
 #define NXUS_BASELINE_BUF_MIN   (64u * 1024u)
+/* Preallocation step.  Large enough that the card's allocator sees one
+   contiguous extent per ftruncate, small enough that a scan cancelled early
+   does not strand gigabytes of unwritten dump on the card. */
+#define NXUS_BASELINE_RESERVE_STEP (16ull * 1024ull * 1024ull)
+/* Budget for one reservation.  A metadata-only SetFileSize (allocate the
+   cluster chain) finishes in milliseconds; a filesystem that ZERO-FILLS the
+   extension instead would spend longer than writing the data, so the guard
+   below turns preallocation off and lets fwrite extend the file. */
+#define NXUS_BASELINE_RESERVE_MS   100ull
 
 static FILE *g_BaseFile = NULL;
 static u8   *g_BaseRam = NULL;
@@ -1157,6 +1190,68 @@ static u64   g_BaseRamSize = 0;
    non-zero, storable block, so this is the block number the failure line names. */
 static u32   g_BaseWriteSeq = 0;
 static u8    g_BaseFileBuf[NXUS_BASELINE_FILE_BUF] __attribute__((aligned(0x10)));
+
+/* Stream position after the previous write.  valid == false after a seek-for-
+   read and a partial write, i.e. whenever the position is unknown and the next
+   write has to seek.  It starts true because a store that has just been opened
+   with "wb+" is at 0 (baselineStoreOpenSd() states that explicitly); the flag is
+   only consulted while g_BaseFile is non-NULL, and baselineStoreClose() clears
+   it.  Diagnostics (calls, bytes, seeks) are logged by the first pass so a slow
+   card can be told apart from a slow read path. */
+static bool  g_BaseWritePosValid = true;
+static u64   g_BaseWritePos = 0;
+static u64   g_BaseWriteBytes = 0;
+static u64   g_BaseWriteCalls = 0;
+static u64   g_BaseSeekCalls = 0;
+
+/* ftruncate() reservation: the file is guaranteed to hold at least g_BaseReserved
+   bytes, the stream may need up to g_BaseReserveLimit (u32 store offsets capped
+   at 4 GiB).  ReserveActive is cleared on the first refusal; a refused
+   reservation never fails a write, it only stops growing the file early. */
+static u64   g_BaseReserveLimit = 0;
+static u64   g_BaseReserved = 0;
+static bool  g_BaseReserveActive = false;
+
+/* All store seeks go through here: the counter is what the first-pass line
+   reports, and what proves the contiguous fast path does not seek. */
+static int baselineFileSeek(FILE *f, u64 offset) {
+    g_BaseSeekCalls++;
+    return fseek(f, (long)offset, SEEK_SET);
+}
+
+/* Reserve file space ahead of the write cursor.  libnx's devoptab has
+   ftruncate_r (fsFileSetSize) but no posix_fallocate, so ftruncate is the
+   portable call here: it extends the file in one 16 MiB run, letting the card
+   allocate a contiguous cluster chain instead of extending it per stdio
+   burst.  Failure is not a scan failure: the stream falls back to plain
+   fwrite-driven growth after logging the first refusal (a FAT32 card at the
+   4 GiB file limit is the expected case). */
+static void baselineReserveUpTo(u64 end) {
+    if (!g_BaseReserveActive || end <= g_BaseReserved) return;
+    u64 target = end + NXUS_BASELINE_RESERVE_STEP;
+    if (target < end || target > g_BaseReserveLimit) target = g_BaseReserveLimit;
+    if (target <= g_BaseReserved) return;
+    const u64 started_ms = nowMs();
+    errno = 0;
+    if (ftruncate(fileno(g_BaseFile), (off_t)target) == 0) {
+        g_BaseReserved = target;
+        /* Some filesystems materialise the extension instead of just growing
+           the cluster chain; that costs more than writing the bytes.  Turn the
+           reservation off rather than paying it on every chunk. */
+        if (nowMs() - started_ms > NXUS_BASELINE_RESERVE_MS) {
+            g_BaseReserveActive = false;
+            NXUS_LOG("baseline: preallocation is materialising data (%llu ms for the "
+                     "chunk) - disabled, writing through fwrite",
+                     (unsigned long long)(nowMs() - started_ms));
+        }
+        return;
+    }
+    g_BaseReserveActive = false;
+    NXUS_LOG("baseline: file preallocation stopped at %llu MiB (errno=%d) - "
+             "the stream will extend the file itself",
+             (unsigned long long)(g_BaseReserved / (1024ull * 1024ull)),
+             errno ? errno : EIO);
+}
 
 /* Record one failing store write.  The engine turns that block into
    NXUS_BBLOCK_UNREADABLE and bumps stats->dropped like any unreadable block, so
@@ -1173,23 +1268,58 @@ static void baselineWriteFailure(u32 block, int err) {
     }
 }
 
+/* Push the buffered tail to the card.  A first pass calls this before it
+   reports, so the tail (< 256 KB) is part of the measured elapsed time and a
+   card that only fails at the end is still counted in this pass. */
+static int baselineStoreFlush(void) {
+    if (g_BaseFile == NULL) return 0;
+    errno = 0;
+    if (fflush(g_BaseFile) != 0) {
+        baselineWriteFailure(g_BaseWriteSeq, errno ? errno : EIO);
+        g_BaseWritePosValid = false;
+        return -1;
+    }
+    return 0;
+}
+
 static int baselineStoreWrite(void *ctx, u64 offset, const void *buf, u32 len) {
     (void)ctx;
     if (len == 0) return 0;
     const u32 block = g_BaseWriteSeq++;
+    g_BaseWriteCalls++;
     errno = 0;
-    int failed;
+    int failed = 0;
     if (g_BaseFile != NULL) {
-        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) {
-            failed = 1;
-        } else {
-            failed = (fwrite(buf, 1, len, g_BaseFile) == len) ? 0 : 1;
+        /* The engine's store offsets only advance (zero blocks are skipped, not
+           stored), so the block that follows the last write starts exactly at
+           the buffered stream position.  fwrite alone then accumulates a full
+           256 KB burst on the card; fseek would flush the stdio buffer on every
+           block.  A jump (or the first write / a seek-for-read) still seeks. */
+        if (!g_BaseWritePosValid || g_BaseWritePos != offset) {
+            if (baselineFileSeek(g_BaseFile, offset) != 0) {
+                failed = 1;
+                g_BaseWritePosValid = false;
+            } else {
+                g_BaseWritePosValid = true;
+                g_BaseWritePos = offset;
+            }
+        }
+        if (!failed) {
+            baselineReserveUpTo(offset + len);   /* best effort, never fatal */
+            if (fwrite(buf, 1, len, g_BaseFile) == len) {
+                g_BaseWritePos += len;
+                g_BaseWriteBytes += len;
+            } else {
+                /* A short write leaves the stream position ambiguous. */
+                failed = 1;
+                g_BaseWritePosValid = false;
+            }
         }
     } else if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) {
         failed = 1;
     } else {
         memcpy(g_BaseRam + offset, buf, len);
-        failed = 0;
+        g_BaseWriteBytes += len;
     }
     if (failed) {
         baselineWriteFailure(block, errno ? errno : EIO);
@@ -1202,7 +1332,11 @@ static int baselineStoreRead(void *ctx, u64 offset, void *buf, u32 len) {
     (void)ctx;
     if (len == 0) return 0;
     if (g_BaseFile != NULL) {
-        if (fseek(g_BaseFile, (long)offset, SEEK_SET) != 0) return -1;
+        /* Reading moves the stream: the next write cannot append blindly.  The
+           fseek between a write and a read is also what flushes the pending
+           write buffer (C guarantees it for a read/write stream). */
+        g_BaseWritePosValid = false;
+        if (baselineFileSeek(g_BaseFile, offset) != 0) return -1;
         return fread(buf, 1, len, g_BaseFile) == len ? 0 : -1;
     }
     if (g_BaseRam == NULL || offset > g_BaseRamSize || (u64)len > g_BaseRamSize - offset) return -1;
@@ -1227,22 +1361,28 @@ static u64 baselineRegionBytes(void) {
 static void baselineStoreClose(void) {
     if (g_BaseFile != NULL) {
         /* A buffered stream can surface a card error only at flush time: the last
-           (< 64 KB) writes still sit in the stdio buffer when the stream closes,
+           (< 256 KB) writes still sit in the stdio buffer when the stream closes,
            so a card that filled up near the end of the scan would otherwise look
            like a clean run.  Only the FLUSH result is checked, never ferror():
            ferror() also reflects a failed READ from the refine pass, which is not
            a write failure and is reported as dropped_reads instead. */
-        errno = 0;
-        int flush_err = (fflush(g_BaseFile) != 0) ? (errno ? errno : EIO) : 0;
-        if (fclose(g_BaseFile) != 0 && flush_err == 0) {   /* also flushes */
-            flush_err = errno ? errno : EIO;
+        const int flush_failed = baselineStoreFlush() != 0;
+        if (fclose(g_BaseFile) != 0 && !flush_failed) {   /* also flushes */
+            baselineWriteFailure(g_BaseWriteSeq, errno ? errno : EIO);
         }
         g_BaseFile = NULL;
-        if (flush_err != 0) baselineWriteFailure(g_BaseWriteSeq, flush_err);
     }
     free(g_BaseRam);
     g_BaseRam = NULL;
     g_BaseRamSize = 0;
+    /* The stream is gone: the next open starts with an unknown cursor and no
+       reservation.  The diagnostic counters survive until the next open so the
+       first-pass line can still be read from them. */
+    g_BaseWritePosValid = false;
+    g_BaseWritePos = 0;
+    g_BaseReserveActive = false;
+    g_BaseReserved = 0;
+    g_BaseReserveLimit = 0;
 }
 
 /* Does the card hold the whole stream with room to spare?  `needed` is the upper
@@ -1268,11 +1408,62 @@ static bool baselineSdHasRoom(u64 needed) {
     if (required < needed) required = 0xFFFFFFFFFFFFFFFFull;   /* overflow clamp */
 
     if (avail < required) {
-        NXUS_LOG("baseline: only %llu MiB free of %llu MiB needed - using the RAM buffer",
+        NXUS_LOG("baseline: only %llu MiB free of %llu MiB needed - not using the SD stream",
                  (unsigned long long)(avail / (1024ull * 1024ull)),
                  (unsigned long long)(required / (1024ull * 1024ull)));
         return false;
     }
+    return true;
+}
+
+/* The whole scoped range is the worst case: only blocks that are not all-zero
+   are ever written, so this is an upper bound. */
+static bool baselineStoreOpenRam(u64 region_bytes) {
+    g_BaseRam = (u8 *)malloc((size_t)region_bytes);
+    if (g_BaseRam == NULL) return false;
+    g_BaseRamSize = region_bytes;
+    NXUS_LOG("baseline: RAM store open (%llu bytes)", (unsigned long long)region_bytes);
+    return true;
+}
+
+/* Stream to "sdmc:/nxus/scan_base.bin".  The dump can only grow to the last byte
+   the u32 store offset can name, so a range beyond 4 GiB does not need 1.5x of
+   its full size: the stream is capped there (blocks past it are dropped by the
+   engine).  A proven shortage returns false with baseline_degraded set, so the
+   caller can fall back to RAM instead of filling the card write by write. */
+static bool baselineStoreOpenSd(u64 region_bytes) {
+    u64 needed = region_bytes;
+    if (needed > 0xFFFFFFFFull) needed = 0xFFFFFFFFull;
+
+    if (!baselineSdHasRoom(needed)) {
+        g_Session.baseline_degraded = true;
+        return false;
+    }
+
+    FILE *f = fopen(NXUS_SESSION_BASELINE_PATH, "wb+");
+    if (f == NULL) {
+        NXUS_LOG("baseline: SD store unavailable (errno=%d)",
+                 errno ? errno : EIO);
+        return false;
+    }
+
+    /* A full buffered stream keeps the write path off the heap and turns the
+       engine's per-block writes into card-sized bursts. */
+    setvbuf(f, (char *)g_BaseFileBuf, _IOFBF, sizeof(g_BaseFileBuf));
+    g_BaseFile = f;
+    /* "wb+" just truncated/created the file, so the cursor really is at 0: the
+       very first write can append without a seek. */
+    g_BaseWritePosValid = true;
+    g_BaseWritePos = 0;
+    g_BaseReserveLimit = needed;
+    g_BaseReserved = 0;
+    g_BaseReserveActive = (needed > 0);
+    baselineReserveUpTo(1);   /* reserve the first chunk before any write */
+
+    NXUS_LOG("baseline: SD store open (%llu region bytes, %u KiB buffer%s)",
+             (unsigned long long)region_bytes,
+             (unsigned)(NXUS_BASELINE_FILE_BUF / 1024u),
+             g_BaseReserveActive ? ", space preallocated" : "");
     return true;
 }
 
@@ -1281,46 +1472,34 @@ static bool baselineStoreOpen(void) {
     baselineStoreClose();
     remove(NXUS_SESSION_BASELINE_PATH);
     g_BaseWriteSeq = 0;
+    g_BaseWriteBytes = 0;
+    g_BaseWriteCalls = 0;
+    g_BaseSeekCalls = 0;
 
     const u64 region_bytes = baselineRegionBytes();
     if (region_bytes == 0) return false;
 
-    if (region_bytes > NXUS_BASELINE_RAM_MAX) {
-        /* The dump can only grow to the last byte the u32 store offset can name,
-           so a range beyond 4 GiB does not need 1.5x of its full size: the stream
-           is capped there (blocks past it are dropped by the engine). */
-        u64 needed = region_bytes;
-        if (needed > 0xFFFFFFFFull) needed = 0xFFFFFFFFull;
-        if (!baselineSdHasRoom(needed)) {
-            /* Proven shortage: skip the SD stream entirely instead of filling the
-               card / failing write by write.  Mark it so the client can tell this
-               scan is running on the reduced (RAM or classic) baseline. */
-            g_Session.baseline_degraded = true;
-        } else {
-            FILE *f = fopen(NXUS_SESSION_BASELINE_PATH, "wb+");
-            if (f != NULL) {
-                /* A full buffered stream keeps the write path off the heap and turns
-                   the engine's per-block writes into card-sized bursts. */
-                setvbuf(f, (char *)g_BaseFileBuf, _IOFBF, sizeof(g_BaseFileBuf));
-                g_BaseFile = f;
-                NXUS_LOG("baseline: SD store open (%llu region bytes)", (unsigned long long)region_bytes);
-                return true;
-            }
-            NXUS_LOG("baseline: SD store unavailable, using RAM");
-        }
+    if (region_bytes <= NXUS_BASELINE_RAM_MAX) {
+        /* Small scope: a file would cost more than the memory.  The sysmodule
+           heap is shared with hits/snapshots and a 4 MiB allocation can fail,
+           so a refused malloc falls back to the SD stream instead of losing
+           the baseline (which would force the classic first pass). */
+        if (baselineStoreOpenRam(region_bytes)) return true;
+        NXUS_LOG("baseline: %llu-byte RAM store allocation failed - falling back to the SD store",
+                 (unsigned long long)region_bytes);
+        return baselineStoreOpenSd(region_bytes);
     }
 
-    /* The whole scoped range is the worst case: only blocks that are not all-zero
-       are ever written, so this is an upper bound. */
-    g_BaseRam = (u8 *)malloc((size_t)region_bytes);
-    if (g_BaseRam == NULL) {
-        NXUS_LOG("baseline: %llu-byte RAM store allocation failed",
-                 (unsigned long long)region_bytes);
-        return false;
-    }
-    g_BaseRamSize = region_bytes;
-    NXUS_LOG("baseline: RAM store open (%llu bytes)", (unsigned long long)region_bytes);
-    return true;
+    if (baselineStoreOpenSd(region_bytes)) return true;
+
+    /* SD refused (no card / no room): last resort is one malloc of the whole
+       scoped range, exactly as before. */
+    NXUS_LOG("baseline: falling back to the RAM store for %llu bytes",
+             (unsigned long long)region_bytes);
+    if (baselineStoreOpenRam(region_bytes)) return true;
+    NXUS_LOG("baseline: %llu-byte RAM store allocation failed",
+             (unsigned long long)region_bytes);
+    return false;
 }
 
 /* Forget the baseline completely: heap block metadata, open handle and the SD
@@ -1337,6 +1516,9 @@ static void baselineDiscard(void) {
     g_Session.baseline_write_logged = false;
     g_Session.baseline_degraded = false;
     g_BaseWriteSeq = 0;
+    g_BaseWriteBytes = 0;
+    g_BaseWriteCalls = 0;
+    g_BaseSeekCalls = 0;
 }
 
 /* ---- target memory access --------------------------------------------- */
@@ -2569,6 +2751,7 @@ static void scanThread(void *arg) {
             /* Unknown scan: fingerprint every block and stream the non-zero ones
                to the baseline store.  No hits are pushed here - the candidate
                count is what the status reports. */
+            const u64 baseline_started_ms = nowMs();
             rc = nxusScanFirstBaseline(&g_Session.baseline,
                                        g_Session.regions, g_Session.region_count,
                                        &g_Session.job_req,
@@ -2576,6 +2759,29 @@ static void scanThread(void *arg) {
                                        &g_BaselineIo, NULL,
                                        chunk, chunk_size, &stats,
                                        (int *)&g_Session.cancel);
+            /* The last (< 256 KB) of the dump are still in the stdio buffer: a
+               flush here makes a card that only fails at the end part of THIS
+               pass (and its health counters), and makes the elapsed time below
+               cover the whole write, not just the enqueued part. */
+            (void)baselineStoreFlush();
+            const u64 baseline_ms = nowMs() - baseline_started_ms;
+            const u64 read_x10 = mibPerSecondX10(stats.bytes_read, baseline_ms);
+            const u64 write_x10 = mibPerSecondX10(g_BaseWriteBytes, baseline_ms);
+            NXUS_LOG("baseline: first pass on %s: read=%llu B wrote=%llu B "
+                     "elapsed=%llu ms read=%llu.%llu MiB/s write=%llu.%llu MiB/s "
+                     "reads=%llu writes=%llu seeks=%llu%s",
+                     (g_BaseFile != NULL) ? "SD" : "RAM",
+                     (unsigned long long)stats.bytes_read,
+                     (unsigned long long)g_BaseWriteBytes,
+                     (unsigned long long)baseline_ms,
+                     (unsigned long long)(read_x10 / 10ull),
+                     (unsigned long long)(read_x10 % 10ull),
+                     (unsigned long long)(write_x10 / 10ull),
+                     (unsigned long long)(write_x10 % 10ull),
+                     (unsigned long long)stats.reads,
+                     (unsigned long long)g_BaseWriteCalls,
+                     (unsigned long long)g_BaseSeekCalls,
+                     g_Session.baseline_degraded ? " degraded=1" : "");
             candidates = g_Session.baseline.candidate_count;
             if (rc != NXUS_SCAN_OK) {
                 /* A partial baseline cannot be refined safely: blocks that were
