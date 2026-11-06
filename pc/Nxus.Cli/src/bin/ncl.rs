@@ -105,6 +105,10 @@ struct CheatRow {
     mode: String,
     live: bool,
     file_on: bool,
+    /// ON, but the file was edited after it was applied: the console still runs
+    /// (or the target still holds) the old code and nothing re-applies the new
+    /// code by itself.
+    stale: bool,
     restore_only: bool,
     trigger: bool,
     instructions: usize,
@@ -140,6 +144,8 @@ struct TargetView {
     patches: usize,
     backups: usize,
     issues: usize,
+    /// ON blocks whose code changed since they were applied.
+    stale: usize,
     last_error: Option<String>,
     /// いまチートを実行している場所（切替の表示に使う）。
     execution: CheatExecution,
@@ -222,6 +228,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
             mode: block.mode.as_str().to_string(),
             live: manager.is_enabled(block.key),
             file_on: block.enabled,
+            stale: manager.is_stale(block.key),
             restore_only: block.is_restore_only(),
             trigger: block.has_keypad_trigger(),
             instructions: block.on.instructions.len(),
@@ -267,6 +274,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
         patches: snapshot.patches,
         backups: snapshot.backups,
         issues: snapshot.issues,
+        stale: snapshot.stale,
         last_error: snapshot.last_error.clone(),
         execution: manager.execution(),
     };
@@ -1508,17 +1516,20 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                     let _ = tx.send(Ev::Error("not connected".to_string()));
                     continue;
                 };
-                if !current.manager.enabled_keys().is_empty() {
-                    let _ = tx.send(Ev::Error(
-                        "turn every cheat off before reloading the file".to_string(),
-                    ));
-                    continue;
-                }
-                match current.manager.reload() {
-                    Ok(()) => {
+                // Reloading is allowed while cheats are ON: the live blocks are
+                // reconciled with the file instead of being dropped.
+                let mut io = ClientCheatIo {
+                    client: &current.client,
+                };
+                match current.manager.reload(&mut io) {
+                    Ok(report) => {
+                        current.dirty = current.manager.dirty();
                         let view = make_session_view(current);
                         let text = current.manager.document().raw_text.clone();
                         let _ = tx.send(Ev::Opened(view, text));
+                        for line in report.log_lines() {
+                            let _ = tx.send(Ev::Log(line));
+                        }
                     }
                     Err(error) => {
                         let _ = tx.send(Ev::Error(format!("reload: {error}")));
@@ -2263,14 +2274,12 @@ impl NclApp {
         Ok(self.library.dir.join(format!("{build_id}.txt")))
     }
 
-    fn save_editor(&mut self, force: bool) {
-        if self.any_enabled() && !force {
-            self.message =
-                "turn every cheat off before saving (the manager would lose its backups)"
-                    .to_string();
-            self.log(self.message.clone());
-            return;
-        }
+    fn save_editor(&mut self) {
+        // Saving is always allowed, even while cheats are ON: the file is the
+        // user's document, not a mirror of the applied bytes.  What happens to
+        // the blocks that are ON is decided by the manager when the file is
+        // re-read (`Job::ReloadFile`): unchanged ones stay applied, edited ones
+        // become stale and deleted ones are restored.
         let path = match self.editor_path() {
             Ok(path) => path,
             Err(error) => {
@@ -2452,6 +2461,15 @@ impl NclApp {
                         ))
                         .color(DIM),
                     );
+                    if live.target.stale > 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} edited (re-toggle to apply)",
+                                live.target.stale
+                            ))
+                            .color(YELLOW),
+                        );
+                    }
                 }
             });
         });
@@ -2529,6 +2547,17 @@ impl NclApp {
             if ui.button("Use target file").clicked() {
                 self.use_target_file();
                 self.tab = Tab::Editor;
+            }
+            if ui
+                .add_enabled(self.can_queue(), egui::Button::new("Reload file"))
+                .on_hover_text(
+                    "re-read the file from disk: cheats that are ON keep the bytes they applied, \
+                     edited blocks are marked \"edited - re-toggle to apply\", and blocks that \
+                     were deleted from the file are restored and turned off",
+                )
+                .clicked()
+            {
+                self.submit(Job::ReloadFile);
             }
             if ui
                 .button("Reveal")
@@ -2741,6 +2770,19 @@ impl NclApp {
                             if let Some(error) = &row.error {
                                 ui.label(RichText::new("ERROR").strong().color(RED))
                                     .on_hover_text(error);
+                            } else if row.live && row.stale {
+                                // The console still runs (or the target still
+                                // holds) the old code; the edited code is not
+                                // applied until the block is toggled off and on.
+                                ui.label(
+                                    RichText::new("edited - re-toggle to apply")
+                                        .strong()
+                                        .color(YELLOW),
+                                )
+                                .on_hover_text(
+                                    "this block is ON with the bytes it applied before the edit; \
+                                     toggle it off and on to apply the new code",
+                                );
                             } else if row.live {
                                 ui.label(RichText::new("ON").strong().color(GREEN));
                             } else if row.restore_only {
@@ -2858,18 +2900,15 @@ impl NclApp {
                 self.refresh_parse();
             }
             if ui
-                .add_enabled(
-                    !self.any_enabled(),
-                    egui::Button::new(RichText::new("Save").strong()),
+                .add(egui::Button::new(RichText::new("Save").strong()))
+                .on_hover_text(
+                    "write atomically; Ctrl+S.  Saving works while cheats are ON - edited \
+                     blocks keep their old bytes and are not re-applied until you toggle them \
+                     off and on",
                 )
-                .on_hover_text(if self.any_enabled() {
-                    "turn every cheat off first"
-                } else {
-                    "write atomically; Ctrl+S"
-                })
                 .clicked()
             {
-                self.save_editor(false);
+                self.save_editor();
             }
             if ui.button("New").clicked() {
                 self.new_file();
@@ -2900,12 +2939,18 @@ impl NclApp {
             }
         });
         if self.any_enabled() {
+            let stale = self
+                .live
+                .as_ref()
+                .map(|live| live.target.stale)
+                .unwrap_or(0);
             ui.label(
-                RichText::new(
-                    "Cheats are enabled: saving/reloading is blocked until they are turned off, \
-                     so the manager cannot forget its original-byte backups.",
-                )
-                .color(YELLOW),
+                RichText::new(format!(
+                    "Cheats are ON: saving and reloading still work.  A block you edit keeps \
+                     the bytes it already wrote and is marked \"edited - re-toggle to apply\" \
+                     ({stale} now); a block you delete is restored and turned off.",
+                ))
+                .color(DIM),
             );
         }
         ui.separator();
@@ -3178,7 +3223,7 @@ impl NclApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
-            self.save_editor(false);
+            self.save_editor();
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.refresh_parse();

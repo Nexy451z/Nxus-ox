@@ -272,6 +272,74 @@ pub struct TickReport {
     pub errors: Vec<(CheatKey, String)>,
 }
 
+/// An ON block that the edited file no longer contains.
+///
+/// Editing is allowed while cheats are ON, so a save/reload can delete a block
+/// whose bytes are already patched into the target.  The manager resolves that
+/// immediately -- the original bytes are written back and the block is turned
+/// off -- and reports it here so the log can name the block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VanishedBlock {
+    pub key: CheatKey,
+    pub name: String,
+    /// The original bytes are back (or there was nothing left to restore).
+    pub restored: bool,
+    /// Why the restore failed.  The backup is kept in that case, so `dirty`
+    /// stays set and a later panic-off retries it.
+    pub error: Option<String>,
+}
+
+/// What one `reload` / raw save did to the blocks that are ON.
+///
+/// The text file is always editable, so the manager reconciles after every
+/// reparse instead of refusing the write:
+///
+/// * a block that still exists and is unchanged stays applied (`kept`),
+/// * a block that still exists but whose ON code changed stays applied **and**
+///   is marked stale -- it is never re-applied by itself (see
+///   [`CheatManager::is_stale`]); toggling it off and on applies the new code,
+/// * a block that disappeared from the file is restored and turned off
+///   (`vanished`).
+#[derive(Clone, Debug, Default)]
+pub struct ReloadReport {
+    /// ON blocks that survived the reparse unchanged.
+    pub kept: usize,
+    /// ON blocks whose ON code changed: kept applied, now stale.
+    pub stale: usize,
+    /// ON blocks that are gone from the file (restored and disabled).
+    pub vanished: Vec<VanishedBlock>,
+}
+
+impl ReloadReport {
+    /// One log line per thing the user has to know about.
+    pub fn log_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for block in &self.vanished {
+            if block.restored {
+                lines.push(format!(
+                    "block '{}' disappeared from the file; restored and disabled",
+                    block.name
+                ));
+            } else {
+                lines.push(format!(
+                    "block '{}' disappeared from the file; restore failed ({}); its backup is \
+                     kept - use Panic Restore All",
+                    block.name,
+                    block.error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+        }
+        if self.stale > 0 {
+            lines.push(format!(
+                "{} enabled block(s) were edited; they keep the old bytes until you toggle them \
+                 off and on",
+                self.stale
+            ));
+        }
+        lines
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CheatSnapshot {
     pub build_id: String,
@@ -281,6 +349,8 @@ pub struct CheatSnapshot {
     pub patches: usize,
     pub backups: usize,
     pub issues: usize,
+    /// ON blocks whose ON code changed after they were applied.
+    pub stale: usize,
     pub last_error: Option<String>,
     /// `true` while the target may still hold patched bytes that this manager
     /// is responsible for restoring (see [`CheatManager::dirty`]).
@@ -402,6 +472,15 @@ pub struct CheatManager {
     journal_path: PathBuf,
     document: CheatDocument,
     enabled: BTreeSet<CheatKey>,
+    /// ON blocks whose ON code changed after they were applied.
+    ///
+    /// The bytes in the target are the *old* ones; re-applying the new code by
+    /// itself could make new code run behind the user's back, so a stale block
+    /// keeps its applied bytes and its backups until it is toggled off and on.
+    stale: BTreeSet<CheatKey>,
+    /// Fingerprint of the ON code that was applied for each ON block.  Used to
+    /// tell "the file was edited" from "the file was reformatted".
+    applied_fingerprint: BTreeMap<CheatKey, u64>,
     errors: BTreeMap<CheatKey, String>,
     backups: BTreeMap<u64, BackupEntry>,
     vm_state: VmState,
@@ -458,6 +537,34 @@ fn program_block_count(program: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Fingerprint of what a block *runs*: its mode and the words of its ON code.
+///
+/// Comments, whitespace and line endings are deliberately excluded: rewriting
+/// a comment does not change a single byte in the target, so it must not nag
+/// the user with a "re-toggle to apply" marker.  A changed opcode, address or
+/// value does change the words and therefore the fingerprint.
+fn block_fingerprint(block: &CheatBlock) -> u64 {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    feed(&mut hash, block.mode.as_str().as_bytes());
+    feed(&mut hash, &block.on.instructions.len().to_le_bytes());
+    for instruction in &block.on.instructions {
+        for word in instruction.encode() {
+            feed(&mut hash, &word.to_le_bytes());
+        }
+        // Keep the instruction boundaries in the hash so a word that moves from
+        // one instruction to the next cannot cancel out.
+        feed(&mut hash, &[0xFF]);
+    }
+    hash
+}
+
 impl CheatManager {
     /// Open `<exe_dir>/cheats/<BuildID>.txt` for `identity`.
     pub fn open_for_target(
@@ -486,6 +593,8 @@ impl CheatManager {
             journal_path,
             document,
             enabled: BTreeSet::new(),
+            stale: BTreeSet::new(),
+            applied_fingerprint: BTreeMap::new(),
             errors: BTreeMap::new(),
             backups: BTreeMap::new(),
             vm_state: VmState::default(),
@@ -527,6 +636,8 @@ impl CheatManager {
             journal_path,
             document,
             enabled: BTreeSet::new(),
+            stale: BTreeSet::new(),
+            applied_fingerprint: BTreeMap::new(),
             errors: BTreeMap::new(),
             backups: BTreeMap::new(),
             vm_state: VmState::default(),
@@ -723,11 +834,15 @@ impl CheatManager {
         // contract"): the PC has to hand over final absolute addresses.  Using the
         // relative builder here would silently write main/heap cheats to the wrong
         // place.
+        //
+        // Stale blocks are left out on purpose: they are still applied with
+        // their *old* code, and a re-upload must not start the edited code.
+        let enabled = self.applied_enabled();
         ir::build_program_filtered(
             &self.document,
             build_id,
             self.identity.program_id,
-            &self.enabled,
+            &enabled,
             &self.regions,
             |mode| mode == CheatExecMode::Loop,
         )
@@ -952,8 +1067,16 @@ impl CheatManager {
         if on {
             self.enabled.insert(key);
             self.errors.remove(&key);
+            // コンソールが実際に走らせたのは「いまの内容」なので、ここから
+            // 保存/reload で内容が変わったかどうかを比べられる。
+            if let Some(block) = self.document.block(key) {
+                let fingerprint = block_fingerprint(block);
+                self.applied_fingerprint.insert(key, fingerprint);
+            }
+            self.stale.remove(&key);
         } else {
             self.enabled.remove(&key);
+            self.clear_applied(key);
         }
         if let Some(block) = self.document.block_mut(key) {
             block.enabled = on;
@@ -979,6 +1102,8 @@ impl CheatManager {
     pub fn mark_all_off(&mut self) -> usize {
         let count = self.enabled.len();
         self.enabled.clear();
+        self.stale.clear();
+        self.applied_fingerprint.clear();
         for block in &mut self.document.blocks {
             block.enabled = false;
         }
@@ -1011,22 +1136,61 @@ impl CheatManager {
             patches,
             backups: self.backups.len(),
             issues: self.document.issues_with_block().len(),
+            stale: self.stale.len(),
             last_error: self.last_error.clone(),
             dirty: self.dirty,
         }
     }
 
-    /// Reload the text file, dropping runtime enable state.
-    pub fn reload(&mut self) -> Result<(), String> {
-        self.document = load_document(&self.path, &self.identity.build_id)?;
-        self.enabled.clear();
-        self.errors.clear();
-        // キー（＝ブロック）の並びが変わりうるので、キーごとの控えは全部捨てる。
-        self.console_uploaded = None;
-        self.console_patches.clear();
-        self.pending_patch = None;
-        self.settle_dirty();
-        Ok(())
+    // -- 編集・保存は常に許可 ------------------------------------------------
+
+    /// `true` when this ON block was edited after it was applied.
+    ///
+    /// The target still holds the bytes of the *old* code.  A stale block is
+    /// never re-applied by itself: [`Self::tick`] skips it and the console
+    /// program does not mark it enabled, so editing a file can never make new
+    /// code run on its own.  Toggling it OFF and ON applies the new code and
+    /// clears the flag.
+    pub fn is_stale(&self, key: CheatKey) -> bool {
+        self.stale.contains(&key)
+    }
+
+    pub fn stale_keys(&self) -> &BTreeSet<CheatKey> {
+        &self.stale
+    }
+
+    pub fn stale_count(&self) -> usize {
+        self.stale.len()
+    }
+
+    /// Blocks that are ON **and** really applied (a stale block is excluded).
+    ///
+    /// This is the set the console program is built from: a re-upload must keep
+    /// the unchanged blocks running without ever starting the edited ones.
+    fn applied_enabled(&self) -> BTreeSet<CheatKey> {
+        self.enabled
+            .iter()
+            .copied()
+            .filter(|key| !self.stale.contains(key))
+            .collect()
+    }
+
+    /// Forget everything recorded for a block that is no longer applied.
+    fn clear_applied(&mut self, key: CheatKey) {
+        self.stale.remove(&key);
+        self.applied_fingerprint.remove(&key);
+    }
+
+    /// Reload the text file.  Allowed while cheats are ON.
+    ///
+    /// The live blocks are reconciled instead of dropped (see
+    /// [`ReloadReport`]): unchanged blocks stay applied, edited ones become
+    /// stale, and blocks that disappeared from the file are restored and turned
+    /// off.  Backups and the sidecar journal are kept either way, so a later
+    /// OFF / panic-off still restores the original bytes.
+    pub fn reload<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M) -> Result<ReloadReport, String> {
+        let document = load_document(&self.path, &self.identity.build_id)?;
+        Ok(self.adopt_document(document, io))
     }
 
     /// Save the structured document.  Runtime state is written into headers.
@@ -1037,22 +1201,139 @@ impl CheatManager {
         self.document.save_to(&self.path)
     }
 
-    /// Write arbitrary text (raw editor) atomically, then reparse it.
-    pub fn save_raw_text(&mut self, text: &str) -> Result<(), String> {
+    /// Write arbitrary text (raw editor) atomically, then reconcile it.
+    ///
+    /// The write is **always** attempted: an editor that refuses to save while
+    /// a cheat is ON loses the user's work, and a half-finished file (parse
+    /// errors and all) is exactly what a save button has to be able to store.
+    /// Parse errors only stop a block from being *enabled*; they never block a
+    /// save.  What the reparse does to the live blocks is described by
+    /// [`ReloadReport`].
+    pub fn save_raw_text<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        text: &str,
+        io: &mut M,
+    ) -> Result<ReloadReport, String> {
         super::model::save_text_atomic(&self.path, text)
             .map_err(|error| format!("{}: {error}", self.path.display()))?;
-        self.document = parser::parse_document(text, &self.identity.build_id);
-        self.document.path = Some(self.path.clone());
-        self.document.raw_text = text.to_string();
-        self.document.generation = self.document.generation.wrapping_add(1);
-        self.enabled.clear();
+        let mut document = parser::parse_document(text, &self.identity.build_id);
+        document.path = Some(self.path.clone());
+        document.generation = self.document.generation.wrapping_add(1);
+        Ok(self.adopt_document(document, io))
+    }
+
+    /// Install a freshly parsed document and reconcile the ON blocks with it.
+    ///
+    /// This is the one place that decides what an edit means for the bytes in
+    /// the target:
+    ///
+    /// * **kept** -- the block is still there with the same ON code; nothing
+    ///   is written and its backups stay exactly as they were,
+    /// * **stale** -- the block is still there but its ON code changed; the
+    ///   applied bytes are kept (never re-applied automatically) and the block
+    ///   is flagged so the UI can ask for a re-toggle,
+    /// * **vanished** -- the block is gone from the file; its original bytes
+    ///   are written back and it is turned off.
+    fn adopt_document<M: CheatMemoryIo + ?Sized>(
+        &mut self,
+        document: CheatDocument,
+        io: &mut M,
+    ) -> ReloadReport {
+        let mut report = ReloadReport::default();
+        // A console patch that was prepared but not finished already ran on the
+        // console and its originals are in the journal.  Settle it as ON in
+        // memory so the reconcile below sees the block instead of dropping the
+        // only record that owes a restore.
+        if let Some(pending) = self.pending_patch.take() {
+            self.enabled.insert(pending.key);
+        }
+
+        let previous_enabled: Vec<CheatKey> = self.enabled.iter().copied().collect();
+        let previous_applied = std::mem::take(&mut self.applied_fingerprint);
+        let previous_names: BTreeMap<CheatKey, String> = self
+            .document
+            .blocks
+            .iter()
+            .map(|block| (block.key, block.name.clone()))
+            .collect();
+
+        // Restore first: the backups are keyed by address and the old document
+        // is only used for the names, so the restore does not need the new one.
+        for key in previous_enabled.iter().copied() {
+            if document.block(key).is_some() {
+                continue;
+            }
+            let name = previous_names
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| key.to_string());
+            let outcome = self.restore_owned(key, io);
+            let error = outcome.err();
+            if let Some(error) = &error {
+                self.last_error = Some(format!(
+                    "block '{name}' disappeared from the file and its restore failed: {error}"
+                ));
+            }
+            self.enabled.remove(&key);
+            self.clear_applied(key);
+            self.errors.remove(&key);
+            report.vanished.push(VanishedBlock {
+                key,
+                name,
+                restored: error.is_none(),
+                error,
+            });
+        }
+
+        self.document = document;
         self.errors.clear();
-        // 保存したテキストでブロックもキーも変わる。コンソール側の控えは
-        // すべて「もう存在しない内容」なので捨てる。
+
+        // キーは変わらないが、ブロックの中身・並びは変わりうる。コンソール側の
+        // 控えは「いまの内容」ではないので捨てる（stale のブロックは
+        // `build_console_program` が enabled に載せないので、再送しても実行
+        // されない）。
         self.console_uploaded = None;
         self.console_patches.clear();
-        self.pending_patch = None;
-        Ok(())
+
+        let mut kept = BTreeSet::new();
+        let mut stale = BTreeSet::new();
+        let mut applied = BTreeMap::new();
+        for key in previous_enabled {
+            let Some(block) = self.document.block(key) else {
+                continue;
+            };
+            kept.insert(key);
+            let fingerprint = block_fingerprint(block);
+            match previous_applied.get(&key) {
+                Some(previous) if *previous == fingerprint => {
+                    applied.insert(key, fingerprint);
+                }
+                Some(previous) => {
+                    // The file says something else now.  Keep the bytes that are
+                    // already in the target and wait for a deliberate re-toggle.
+                    stale.insert(key);
+                    applied.insert(key, *previous);
+                }
+                // No record (a pending console patch, or a block enabled before
+                // this manager learned fingerprints): say nothing.
+                None => {}
+            }
+        }
+        // The manager is the truth about what is ON: a block can be applied even
+        // when the edited file marks it `@off`, and showing it OFF would hide a
+        // patch that still owes a restore.
+        for key in &kept {
+            if let Some(block) = self.document.block_mut(*key) {
+                block.enabled = true;
+            }
+        }
+        self.enabled = kept;
+        self.stale = stale;
+        self.applied_fingerprint = applied;
+        report.kept = self.enabled.len();
+        report.stale = self.stale.len();
+        self.settle_dirty();
+        report
     }
 
     /// Switch to another target.  Old backups are discarded, never written to
@@ -1072,6 +1353,8 @@ impl CheatManager {
 
         let dropped_backups = self.backups.len();
         self.enabled.clear();
+        self.stale.clear();
+        self.applied_fingerprint.clear();
         self.errors.clear();
         self.backups.clear();
         // Remove the old sidecar: those addresses belong to a dead or
@@ -1185,6 +1468,7 @@ impl CheatManager {
                 self.rollback_block(writes, &applied, io)
             };
             self.enabled.remove(&key);
+            self.clear_applied(key);
             self.errors.remove(&key);
             if let Some(block) = self.document.block_mut(key) {
                 block.enabled = false;
@@ -1201,6 +1485,14 @@ impl CheatManager {
         if let Some(block) = self.document.block_mut(key) {
             block.enabled = true;
         }
+        // Remember exactly what was applied: this is what a later save/reload
+        // compares against to decide whether the block is still current.
+        if let Some(block) = self.document.block(key) {
+            let fingerprint = block_fingerprint(block);
+            self.applied_fingerprint.insert(key, fingerprint);
+        }
+        // Applying the block on purpose is what clears a stale marker.
+        self.stale.remove(&key);
         self.settle_dirty();
         if let Err(error) = self.save_document() {
             let message = format!(
@@ -1262,6 +1554,7 @@ impl CheatManager {
                 }
             }
             self.errors.remove(&key);
+            self.clear_applied(key);
             self.settle_dirty();
             return Ok(());
         }
@@ -1287,6 +1580,7 @@ impl CheatManager {
                 Ok(_) => {
                     if let Err(error) = self.release_owner(key) {
                         self.enabled.remove(&key);
+                        self.clear_applied(key);
                         if let Some(block) = self.document.block_mut(key) {
                             block.enabled = false;
                         }
@@ -1312,6 +1606,7 @@ impl CheatManager {
                         // could only fail once per address.  The bytes died with
                         // the process; treat the cheat as off without writing.
                         self.enabled.remove(&key);
+                        self.clear_applied(key);
                         if let Some(block) = self.document.block_mut(key) {
                             block.enabled = false;
                         }
@@ -1323,6 +1618,7 @@ impl CheatManager {
                                 // The originals are back, so the cheat really is
                                 // off.
                                 self.enabled.remove(&key);
+                                self.clear_applied(key);
                                 if let Some(block) = self.document.block_mut(key) {
                                     block.enabled = false;
                                 }
@@ -1359,6 +1655,7 @@ impl CheatManager {
         }
 
         self.enabled.remove(&key);
+        self.clear_applied(key);
         self.errors.remove(&key);
         if let Some(block) = self.document.block_mut(key) {
             block.enabled = false;
@@ -1419,13 +1716,20 @@ impl CheatManager {
     /// tick starts from the state the target really has.  The loop stays
     /// enabled either way and its failure is reported in
     /// [`TickReport::errors`].
+    ///
+    /// A stale block is skipped: it is ON with its *old* bytes, and ticking it
+    /// would run the code that was just edited without the user asking for it.
     pub fn tick<M: CheatMemoryIo + ?Sized>(&mut self, io: &mut M, keys_held: u64) -> TickReport {
         let mut report = TickReport::default();
         let keys: Vec<CheatKey> = self
             .document
             .blocks
             .iter()
-            .filter(|block| self.enabled.contains(&block.key) && block.mode == CheatExecMode::Loop)
+            .filter(|block| {
+                self.enabled.contains(&block.key)
+                    && !self.stale.contains(&block.key)
+                    && block.mode == CheatExecMode::Loop
+            })
             .map(|block| block.key)
             .collect();
         let budget = self.block_budget;
@@ -1490,6 +1794,8 @@ impl CheatManager {
         let addresses: Vec<u64> = self.backups.keys().copied().collect();
         let cleared_cheats = self.enabled.len();
         self.enabled.clear();
+        self.stale.clear();
+        self.applied_fingerprint.clear();
 
         let mut report = RestoreReport {
             cleared_cheats,
@@ -3210,6 +3516,382 @@ mod tests {
         );
         reloaded.enable(reloaded_key, &mut io).unwrap();
         assert_eq!(io.value_u32(ADDRESS), 0x63);
+    }
+
+    // -- 編集・保存は ON のままでも許可される ------------------------------
+    //
+    // The user's complaint was concrete: "having any cheat ON makes it
+    // impossible to edit cheat.txt from NCL".  The file is the user's document,
+    // so writing it is never refused; what a reparse does to the bytes already
+    // in the target is what these tests pin down.
+
+    #[test]
+    fn save_raw_text_succeeds_while_a_cheat_is_on() {
+        let dir = TempDir::new("save-while-on");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        let writes = io.write_count();
+
+        let edited = "; edited while a cheat is ON\n[Value]\n04400000 00001234 00000063\n";
+        let report = manager.save_raw_text(edited, &mut io).unwrap();
+
+        // The save really happened, the block is still applied, and nothing was
+        // written to the target a second time.
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), edited);
+        assert!(manager.is_enabled(key));
+        assert_eq!(io.write_count(), writes);
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.stale, 0);
+        assert!(!manager.is_stale(key));
+        assert_eq!(manager.backup_count(), 1, "the backup must survive the save");
+    }
+
+    #[test]
+    fn reload_while_on_keeps_the_applied_bytes_and_the_backup() {
+        let dir = TempDir::new("reload-while-on");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        let journal = manager.journal_path().to_path_buf();
+        assert!(journal.exists());
+        let writes = io.write_count();
+
+        // Somebody rewrites the file behind the manager's back.
+        fs::write(manager.path(), patch_file("Value")).unwrap();
+        let report = manager.reload(&mut io).unwrap();
+
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.stale, 0);
+        assert!(manager.is_enabled(key));
+        assert_eq!(
+            io.write_count(),
+            writes,
+            "a reload must not write to the target"
+        );
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(manager.backup_count(), 1);
+        assert!(journal.exists(), "the restore record must be kept");
+
+        // Restoring still works exactly as before.
+        manager.disable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert_eq!(manager.backup_count(), 0);
+    }
+
+    #[test]
+    fn editing_an_enabled_block_marks_it_stale_until_it_is_toggled_again() {
+        let dir = TempDir::new("stale-retoggle");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+
+        let edited = "[Value]\n04400000 00001234 00000099\n";
+        let report = manager.save_raw_text(edited, &mut io).unwrap();
+        assert_eq!(report.stale, 1);
+        assert!(manager.is_stale(key));
+        assert_eq!(manager.stale_count(), 1);
+        assert_eq!(
+            io.value_u32(ADDRESS),
+            0x63,
+            "the new code must not be applied by itself"
+        );
+        assert!(report
+            .log_lines()
+            .iter()
+            .any(|line| line.contains("edited")));
+
+        // Toggling OFF restores the originals and drops the marker ...
+        manager.disable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert!(!manager.is_stale(key));
+        assert_eq!(manager.stale_count(), 0);
+
+        // ... and toggling ON applies the new code.
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x99);
+        assert!(!manager.is_stale(key));
+    }
+
+    #[test]
+    fn a_stale_loop_block_is_not_ticked() {
+        let dir = TempDir::new("stale-tick");
+        let mut io = TestIo::with_u32(ADDRESS, 9);
+        let text = "\
+[Value]
+@loop
+30050000 00000003
+04400000 00001234 00000063
+31050000
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+
+        manager
+            .save_raw_text(&text.replace("00000063", "00000099"), &mut io)
+            .unwrap();
+        assert!(manager.is_stale(key));
+
+        let writes = io.write_count();
+        let report = manager.tick(&mut io, 0);
+        assert_eq!(report.executed, 0, "a stale loop must not run");
+        assert_eq!(io.write_count(), writes);
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+    }
+
+    #[test]
+    fn a_block_removed_from_the_file_is_restored_and_disabled() {
+        let dir = TempDir::new("vanished");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+
+        let report = manager
+            .save_raw_text("[Other]\n04400000 00001234 00000007\n", &mut io)
+            .unwrap();
+
+        assert_eq!(report.vanished.len(), 1);
+        assert_eq!(report.vanished[0].name, "Value");
+        assert!(report.vanished[0].restored);
+        assert!(!manager.is_enabled(key));
+        assert_eq!(
+            io.value_u32(ADDRESS),
+            5,
+            "the original bytes must be back"
+        );
+        assert_eq!(manager.backup_count(), 0);
+        assert!(!manager.dirty());
+        let lines = report.log_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("block 'Value' disappeared from the file")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("restored and disabled")));
+    }
+
+    #[test]
+    fn deleting_one_block_keeps_the_other_applied_with_its_backup() {
+        let dir = TempDir::new("partial-delete");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let text = "\
+[First]
+04400000 00001234 00000063
+
+[Second]
+04400000 00001240 00000077
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let first = manager.find_key("First").unwrap();
+        let second = manager.find_key("Second").unwrap();
+        manager.enable(first, &mut io).unwrap();
+        manager.enable(second, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(io.value_u32(0x1240), 0x77);
+        assert_eq!(manager.backup_count(), 2);
+
+        let report = manager
+            .save_raw_text("[First]\n04400000 00001234 00000063\n", &mut io)
+            .unwrap();
+
+        assert_eq!(report.vanished.len(), 1);
+        assert_eq!(report.vanished[0].name, "Second");
+        assert!(manager.is_enabled(first));
+        assert!(!manager.is_enabled(second));
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+        assert_eq!(io.value_u32(0x1240), 0, "the removed block is restored");
+        assert_eq!(manager.backup_count(), 1, "the kept block keeps its backup");
+        assert!(manager.journal_path().exists());
+    }
+
+    #[test]
+    fn a_file_with_parse_errors_can_still_be_saved() {
+        let dir = TempDir::new("save-with-issues");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+
+        let broken = "[Broken]\nB4000000 00000000\n";
+        manager.save_raw_text(broken, &mut io).unwrap();
+        assert_eq!(fs::read_to_string(manager.path()).unwrap(), broken);
+        assert!(
+            !manager.document().issues_with_block().is_empty(),
+            "the parse issues must be reported"
+        );
+
+        // A half-finished block still cannot be enabled ...
+        let key = manager.find_key("Broken").unwrap();
+        let error = manager.enable(key, &mut io).unwrap_err();
+        assert!(error.contains("unsupported opcode"), "{error}");
+
+        // ... and that does not stop the next save either.
+        manager.save_raw_text(&patch_file("Value"), &mut io).unwrap();
+        assert_eq!(
+            fs::read_to_string(manager.path()).unwrap(),
+            patch_file("Value")
+        );
+    }
+
+    #[test]
+    fn a_comment_only_edit_does_not_mark_a_block_stale() {
+        let dir = TempDir::new("comment-edit");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+
+        let edited =
+            "; a new header comment\n[Value]\n; and a comment inside the body\n04400000 00001234 00000063\n";
+        let report = manager.save_raw_text(edited, &mut io).unwrap();
+
+        // Reformatting cannot change a byte in the target, so it must not nag.
+        assert_eq!(report.stale, 0);
+        assert!(!manager.is_stale(key));
+        assert!(manager.is_enabled(key));
+    }
+
+    #[test]
+    fn the_snapshot_reports_the_stale_count() {
+        let dir = TempDir::new("snapshot-stale");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(manager.snapshot().stale, 0);
+
+        manager
+            .save_raw_text("[Value]\n04400000 00001234 00000099\n", &mut io)
+            .unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.stale, 1);
+        assert_eq!(snapshot.enabled, 1);
+
+        manager.restore_all_backups(&mut io);
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.stale, 0);
+        assert_eq!(snapshot.enabled, 0);
+    }
+
+    #[test]
+    fn a_stale_block_is_left_out_of_the_console_program() {
+        let dir = TempDir::new("stale-console");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let text = "\
+[Spin]
+@loop
+30050000 00000003
+04400000 00001234 00000063
+31050000
+
+[Money]
+@loop
+30050000 00000002
+04400000 00001240 00000007
+31050000
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let spin = manager.find_key("Spin").unwrap();
+        let money = manager.find_key("Money").unwrap();
+        manager.enable(spin, &mut io).unwrap();
+        manager.enable(money, &mut io).unwrap();
+
+        manager
+            .save_raw_text(&text.replace("00000007", "00000008"), &mut io)
+            .unwrap();
+        assert!(!manager.is_stale(spin));
+        assert!(manager.is_stale(money));
+
+        // The re-uploaded resident program must keep the unchanged block running
+        // and must not start the edited one.
+        let program = manager.build_console_program().unwrap();
+        let header = ir::ProgramHeader::from_bytes(&program[..ir::HEADER_BYTES]).unwrap();
+        assert_eq!(header.block_count, 2, "both loop blocks stay in the program");
+        let desc = |index: usize| {
+            let start = ir::HEADER_BYTES + index * ir::BLOCK_BYTES;
+            ir::BlockDesc::from_bytes(&program[start..start + ir::BLOCK_BYTES]).unwrap()
+        };
+        assert_eq!(desc(0).enabled, 1, "the unchanged block keeps running");
+        assert_eq!(desc(1).enabled, 0, "the edited block must not run");
+        // The index used by `cheat_enable` is still the document position.
+        assert_eq!(manager.block_index(spin), Some(0));
+        assert_eq!(manager.block_index(money), Some(1));
+    }
+
+    #[test]
+    fn a_failed_restore_of_a_vanished_block_keeps_the_backup() {
+        let dir = TempDir::new("vanished-restore-failed");
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let key = manager.find_key("Value").unwrap();
+        manager.enable(key, &mut io).unwrap();
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+
+        // The target refuses the write-back, so the block cannot be undone.
+        io.fail_write_at = Some(ADDRESS);
+        let report = manager
+            .save_raw_text("[Other]\n04400000 00001234 00000007\n", &mut io)
+            .unwrap();
+
+        assert_eq!(report.vanished.len(), 1);
+        assert!(!report.vanished[0].restored);
+        assert!(report.vanished[0].error.is_some());
+        assert!(
+            report.log_lines()[0].contains("restore failed"),
+            "{:?}",
+            report.log_lines()
+        );
+        // The restore record is kept, so the bytes can still be put back.
+        assert_eq!(manager.backup_count(), 1);
+        assert!(manager.dirty(), "an unrestored backup keeps the manager dirty");
+
+        io.fail_write_at = None;
+        let restore = manager.restore_all_backups(&mut io);
+        assert!(restore.is_complete(), "{restore:?}");
+        assert_eq!(io.value_u32(ADDRESS), 5);
+        assert!(!manager.dirty());
     }
 
     #[test]

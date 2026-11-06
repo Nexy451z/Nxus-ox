@@ -23,7 +23,10 @@
  *       evaluated (the old early return skipped the latter);
  *   (d) result classification: a libnx MAKERESULT(345, n) has no bit 31, native
  *       errors do, and NXUS' own `0x8003C8xx` codes put 484 in the libnx
- *       DESCRIPTION field - the trap that made resultIsNxusError() always false.
+ *       DESCRIPTION field - the trap that made resultIsNxusError() always false;
+ *   (e) the TCP pending-connection policy: a live (heartbeating) client keeps its
+ *       session and a second connection gets BUSY, only a client silent for 8 s
+ *       is preempted, and the preempt/busy log wording is pinned.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,6 +36,10 @@
 
 #include "nxus_protocol.h"
 #include "nxus_ptrscan.h"
+/* The real transitive header is only included for the pending-connection policy
+   and its log wording (section (e)); the rest of the harness stays independent of
+   the libnx translation units, exactly like the sections above. */
+#include "../shared/nxus_net.h"
 
 static int g_checks;
 static int g_failures;
@@ -1200,6 +1207,156 @@ static void testStatusLayoutAndCodePatchPolicy(void) {
 }
 
 /* ====================================================================== */
+/* (e) pending-connection policy (shared/nxus_net.c)                      */
+/* ====================================================================== */
+
+/* Contract: while a client is registered, a pending accept is either a PREEMPT
+   (the registered client has been silent for NXUS_NET_PREEMPT_IDLE_NS) or a BUSY
+   refusal of the newcomer.  The decision below calls the SHIPPED helper from
+   shared/nxus_net.h and uses the SHIPPED log format strings, so the threshold,
+   the BUSY wire values and the grep-able wording are all the production ones;
+   only the socket bookkeeping (accept/close) is modelled. */
+#define TEST_NET_REGISTERED_FD 4
+#define TEST_NET_NEWCOMER_FD   5
+
+typedef struct {
+    bool live;
+    u64  last_rx_ns;
+    bool busy_refused;
+    bool preempted;
+    u32  busy_result;
+    u32  busy_reason;
+    int  log_count;
+    char log[192];
+} TestNetSession;
+
+static void testNetAccept(TestNetSession *s, u64 now_ns, const char *peer) {
+    s->log_count = 0;
+    s->log[0] = '\0';
+
+    if (!s->live) {
+        /* No registered client: the newcomer is simply served. */
+        s->live = true;
+        s->last_rx_ns = now_ns;
+        snprintf(s->log, sizeof(s->log), "client connected from %s (fd=%d)", peer,
+                 TEST_NET_NEWCOMER_FD);
+        s->log_count = 1;
+        return;
+    }
+
+    const u64 silent_ns = now_ns - s->last_rx_ns;
+    if (nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Preempt) {
+        /* The registration is stale: drop it and let the newcomer take over. */
+        s->preempted = true;
+        s->busy_refused = false;
+        s->last_rx_ns = now_ns;
+        snprintf(s->log, sizeof(s->log), NXUS_NET_LOG_PREEMPT_FMT,
+                 TEST_NET_REGISTERED_FD, (unsigned long long)(silent_ns / 1000000ull));
+        s->log_count = 1;
+        return;
+    }
+
+    s32 payload[2];
+    nxusNetFillBusyPayload(payload);
+    s->busy_refused = true;
+    s->preempted = false;
+    s->busy_result = (u32)payload[0];
+    s->busy_reason = (u32)payload[1];
+    snprintf(s->log, sizeof(s->log), NXUS_NET_LOG_BUSY_FMT, peer,
+             TEST_NET_NEWCOMER_FD, TEST_NET_REGISTERED_FD);
+    s->log_count = 1;
+}
+
+/* First connection: nobody is registered, so it is accepted.  The session then
+   starts with a clean log so each assertion looks at one outcome only. */
+static void testNetInit(TestNetSession *s) {
+    memset(s, 0, sizeof(*s));
+    testNetAccept(s, 0, "192.168.1.10:40000");
+    s->log_count = 0;
+    s->log[0] = '\0';
+}
+
+static void testPendingConnectionRefusesSecondClient(void) {
+    printf("[test] net: a second connection must not cut a live client (it gets BUSY)\n");
+    TestNetSession s;
+    testNetInit(&s);
+    s.last_rx_ns = 1000000000ull;          /* a heartbeat was just served */
+
+    testNetAccept(&s, 2000000000ull, "192.168.1.11:40001");
+    CHECK(s.live, "the registered client must stay connected");
+    CHECK(s.busy_refused, "the second connection must be refused with BUSY");
+    CHECK(!s.preempted, "a client that sent 1 s ago must never be preempted");
+    CHECK(s.busy_result == NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
+          "the BUSY payload must carry NXUS_ERR_BUSY (got 0x%08X)", s.busy_result);
+    CHECK(s.busy_reason == NXUS_NET_BUSY_REASON,
+          "the BUSY payload must carry the busy reason (got %u)", s.busy_reason);
+    CHECK(s.log_count == 1, "the refusal must log exactly one line (got %d)", s.log_count);
+    CHECK(strstr(s.log, "busy") != NULL && strstr(s.log, "192.168.1.11:40001") != NULL,
+          "the log must name the refused peer and say busy: %s", s.log);
+    CHECK(strstr(s.log, "preempting") == NULL,
+          "a live client must not produce a preempt log: %s", s.log);
+}
+
+static void testPendingConnectionHeartbeatKeepsSession(void) {
+    printf("[test] net: 4 s heartbeats keep the session alive against new connections\n");
+    TestNetSession s;
+    testNetInit(&s);
+
+    for (u64 beat = 1; beat <= 5; beat++) {
+        const u64 heartbeat_ns = beat * 4000000000ull;
+        s.last_rx_ns = heartbeat_ns;       /* recvExact() stamps every received byte */
+        testNetAccept(&s, heartbeat_ns + 1000000000ull, "192.168.1.12:40002");
+        CHECK(!s.preempted && s.busy_refused,
+              "heartbeat %llu must keep the session and BUSY the newcomer",
+              (unsigned long long)beat);
+    }
+}
+
+static void testPendingConnectionThreshold(void) {
+    printf("[test] net: preempt only after NXUS_NET_PREEMPT_IDLE_NS (8 s) of silence\n");
+    CHECK(NXUS_NET_PREEMPT_IDLE_NS == 8000000000ull,
+          "the default preempt threshold must be 8 s (got %llu)",
+          (unsigned long long)NXUS_NET_PREEMPT_IDLE_NS);
+    CHECK(NXUS_NET_BUSY_REASON == NXUS_REASON_BUSY_STATE,
+          "the BUSY reason must stay the retryable protocol BUSY_STATE code");
+    CHECK(nxusNetPendingConnectionAction(NXUS_NET_PREEMPT_IDLE_NS - 1u) == NxusNetPending_Busy,
+          "one nanosecond under the threshold must keep the client");
+    CHECK(nxusNetPendingConnectionAction(NXUS_NET_PREEMPT_IDLE_NS) == NxusNetPending_Preempt,
+          "exactly at the threshold the stale client may be preempted");
+
+    TestNetSession s;
+    testNetInit(&s);
+    s.last_rx_ns = 0;
+
+    testNetAccept(&s, NXUS_NET_PREEMPT_IDLE_NS - 1u, "peer:1");
+    CHECK(s.busy_refused && !s.preempted,
+          "just under the threshold the live client must be kept");
+    CHECK(strstr(s.log, "busy") != NULL,
+          "the under-threshold log must say busy: %s", s.log);
+
+    testNetAccept(&s, NXUS_NET_PREEMPT_IDLE_NS, "peer:2");
+    CHECK(s.preempted && !s.busy_refused,
+          "at the threshold the stale client must be preempted");
+    CHECK(strstr(s.log, "preempting") != NULL,
+          "the preempt log must say preempting: %s", s.log);
+    CHECK(strstr(s.log, "8000 ms") != NULL,
+          "the preempt log must carry the silence in ms: %s", s.log);
+}
+
+static void testPendingConnectionLongIdle(void) {
+    printf("[test] net: 20 s silence still preempts (the idle reap is unchanged)\n");
+    TestNetSession s;
+    testNetInit(&s);
+    s.last_rx_ns = 0;
+
+    testNetAccept(&s, 20000000000ull /* NXUS_NET_IDLE_TIMEOUT_NS */, "peer:3");
+    CHECK(s.preempted,
+          "a client silent for 20 s must be released to the new connection");
+    CHECK(strstr(s.log, "preempting") != NULL && strstr(s.log, "20000 ms") != NULL,
+          "the preempt log must report the 20 s silence: %s", s.log);
+}
+
+/* ====================================================================== */
 
 int main(void) {
     printf("=== Nxus server/session algorithm tests ===\n");
@@ -1224,6 +1381,11 @@ int main(void) {
 
     testResultClassification();
     testStatusLayoutAndCodePatchPolicy();
+
+    testPendingConnectionRefusesSecondClient();
+    testPendingConnectionHeartbeatKeepsSession();
+    testPendingConnectionThreshold();
+    testPendingConnectionLongIdle();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

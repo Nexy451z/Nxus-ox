@@ -93,6 +93,9 @@ struct CheatRow {
     mode: String,
     live: bool,
     file_on: bool,
+    /// ON, but the file was edited after it was applied: the target still holds
+    /// the old code and nothing re-applies the new code by itself.
+    stale: bool,
     trigger: bool,
     instructions: usize,
     off_instructions: usize,
@@ -122,6 +125,8 @@ struct TargetView {
     patches: usize,
     backups: usize,
     issues: usize,
+    /// ON blocks whose code changed since they were applied.
+    stale: usize,
     last_error: Option<String>,
     /// いまチートを実行している場所（切替の表示に使う）。
     execution: CheatExecution,
@@ -204,6 +209,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
             mode: block.mode.as_str().to_string(),
             live: manager.is_enabled(block.key),
             file_on: block.enabled,
+            stale: manager.is_stale(block.key),
             trigger: block.has_keypad_trigger(),
             instructions: block.on.instructions.len(),
             off_instructions: block
@@ -244,6 +250,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
             patches: snapshot.patches,
             backups: snapshot.backups,
             issues: snapshot.issues,
+            stale: snapshot.stale,
             last_error: snapshot.last_error.clone(),
             execution: manager.execution(),
         },
@@ -1209,17 +1216,20 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                     let _ = tx.send(Ev::Error("not connected".to_string()));
                     continue;
                 };
-                if !current.manager.enabled_keys().is_empty() {
-                    let _ = tx.send(Ev::Error(
-                        "turn every cheat off before reloading the file".to_string(),
-                    ));
-                    continue;
-                }
-                match current.manager.reload() {
-                    Ok(()) => {
+                // Reloading is allowed while cheats are ON: the live blocks are
+                // reconciled with the file instead of being dropped.
+                let mut io = ClientCheatIo {
+                    client: &current.client,
+                };
+                match current.manager.reload(&mut io) {
+                    Ok(report) => {
+                        current.dirty = current.manager.dirty();
                         let view = make_session_view(current);
                         let text = current.manager.document().raw_text.clone();
                         let _ = tx.send(Ev::Opened(view, text));
+                        for line in report.log_lines() {
+                            let _ = tx.send(Ev::Log(line));
+                        }
                     }
                     Err(error) => {
                         let _ = tx.send(Ev::Error(format!("reload: {error}")));
@@ -1491,44 +1501,50 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 }
             },
             Job::Save { path, text } => {
-                // A live manager only owns this file when every cheat is OFF:
-                // writing under an enabled Patch/Loop would replace the document
-                // the manager still holds backups for.
-                if let Some(current) = session.as_ref() {
-                    if current.manager.path() == path
-                        && !current.manager.enabled_keys().is_empty()
-                    {
-                        let _ = tx.send(Ev::Error(
-                            "turn every cheat off before saving the live target's file"
-                                .to_string(),
-                        ));
-                        continue;
-                    }
-                }
-                if let Some(dir) = path.parent() {
-                    if let Err(error) = std::fs::create_dir_all(dir) {
-                        let _ = tx.send(Ev::Error(format!(
-                            "cannot create {}: {error}",
-                            dir.display()
-                        )));
-                        continue;
-                    }
-                }
-                if let Err(error) = save_text_atomic(&path, &text) {
-                    let _ = tx.send(Ev::Error(format!("{}: {error}", path.display())));
-                    continue;
-                }
+                // Saving is always allowed, even with cheats ON.  When the live
+                // manager owns this file the save goes through it, so the blocks
+                // that are ON are reconciled (edited ones become stale, deleted
+                // ones are restored) instead of the manager silently keeping a
+                // document the file no longer describes.
                 let mut reloaded = None;
+                let mut notes: Vec<String> = Vec::new();
+                let mut written = false;
                 if let Some(current) = session.as_mut() {
                     if current.manager.path() == path {
-                        if let Err(error) = current.manager.reload() {
-                            let _ = tx.send(Ev::Error(format!(
-                                "file saved, but reloading the live manager failed: {error}"
-                            )));
-                        } else {
-                            reloaded = Some(make_session_view(current));
+                        let mut io = ClientCheatIo {
+                            client: &current.client,
+                        };
+                        match current.manager.save_raw_text(&text, &mut io) {
+                            Ok(report) => {
+                                current.dirty = current.manager.dirty();
+                                notes = report.log_lines();
+                                reloaded = Some(make_session_view(current));
+                                written = true;
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Ev::Error(format!("{}: {error}", path.display())));
+                                continue;
+                            }
                         }
                     }
+                }
+                if !written {
+                    if let Some(dir) = path.parent() {
+                        if let Err(error) = std::fs::create_dir_all(dir) {
+                            let _ = tx.send(Ev::Error(format!(
+                                "cannot create {}: {error}",
+                                dir.display()
+                            )));
+                            continue;
+                        }
+                    }
+                    if let Err(error) = save_text_atomic(&path, &text) {
+                        let _ = tx.send(Ev::Error(format!("{}: {error}", path.display())));
+                        continue;
+                    }
+                }
+                for note in notes {
+                    let _ = tx.send(Ev::Log(note));
                 }
                 let _ = tx.send(Ev::Saved {
                     path,
@@ -2151,11 +2167,9 @@ impl CheatUi {
     }
 
     fn save(&mut self) {
-        if self.live.as_ref().map(LiveView::any_enabled).unwrap_or(false) {
-            self.message =
-                "turn every cheat off before saving (the live manager keeps backups)".to_string();
-            return;
-        }
+        // No "turn every cheat off" guard: the file is always editable.  Blocks
+        // that are ON and changed end up stale (the applied bytes stay as they
+        // are), which is what the block list shows.
         if self.editor.text.len() as u64 > MAX_CHEAT_FILE_BYTES {
             self.message = format!(
                 "file is {} bytes; the maximum is {} bytes",
@@ -2269,6 +2283,15 @@ impl CheatUi {
                     "{} enabled ({} loop / {} patch), {} backup(s)",
                     view.target.enabled, view.target.loops, view.target.patches, view.target.backups
                 ));
+                if view.target.stale > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} edited (re-toggle to apply)",
+                            view.target.stale
+                        ))
+                        .color(YELLOW),
+                    );
+                }
             } else {
                 ui.label(RichText::new("not connected").color(DIM));
                 ui.label(format!("({host}:{port})"));
@@ -2309,7 +2332,10 @@ impl CheatUi {
                     }
                     if ui
                         .add_enabled(can_queue, egui::Button::new("Reload file"))
-                        .on_hover_text("re-read the file from disk (all cheats must be OFF)")
+                        .on_hover_text(
+                            "re-read the file from disk; cheats that are ON keep their bytes, \
+                             edited ones become stale and deleted ones are restored",
+                        )
                         .clicked()
                     {
                         self.submit(Job::Reload);
@@ -2546,6 +2572,13 @@ impl CheatUi {
             if self.editor.dirty() {
                 ui.label(RichText::new("● unsaved").color(YELLOW));
             }
+            if self.live.as_ref().map(LiveView::any_enabled).unwrap_or(false) {
+                ui.label(RichText::new("cheats ON - saving is allowed").small().color(DIM))
+                    .on_hover_text(
+                        "a block you edit keeps the bytes it already wrote and is marked \
+                         \"edited - re-toggle to apply\"; it is never re-applied by itself",
+                    );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_queue = self.can_queue();
                 if ui.add_enabled(can_queue, egui::Button::new("Save")).clicked() {
@@ -2706,6 +2739,15 @@ impl CheatUi {
                             ));
                             if let Some(error) = &row.error {
                                 ui.label(RichText::new(error).small().color(RED));
+                            } else if row.stale {
+                                // The target still runs the old code; the file no
+                                // longer matches it and nothing re-applies it by
+                                // itself.
+                                ui.label(
+                                    RichText::new("edited - re-toggle to apply")
+                                        .small()
+                                        .color(YELLOW),
+                                );
                             } else if row.issues > 0 {
                                 ui.label(
                                     RichText::new(format!("{} issue(s)", row.issues))

@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <unistd.h>
@@ -91,6 +92,14 @@ static atomic_bool     g_ServerDone = false;
    Written by the server/sender threads and read by the watchdog in main.c; an
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
 static volatile u64    g_LastActivityTick = 0;
+/* armGetSystemTick() of the last byte RECEIVED from the registered client.  This
+   is deliberately per-client and receive-only (g_LastActivityTick also counts our
+   sends and drives main.c's sleep/wake heuristic).  Server thread only: set when a
+   client is registered (accept) and on every successful recv() in recvExact().
+   The pending-connection policy compares it against NXUS_NET_PREEMPT_IDLE_NS:
+   the PC heartbeat is 4 s, so a live session never looks idle, while a half-open
+   socket (console slept, PC vanished without a FIN) is released to a new client. */
+static u64             g_ClientLastRxTick = 0;
 
 /* ---- Result handling ----------------------------------------------------
  *
@@ -376,6 +385,64 @@ static void dropClient(void) {
     mutexUnlock(&g_SendMutex);
 }
 
+/* ---- pending connections ------------------------------------------------ */
+
+/* Defined after recvExact()/serveClient(); used by the BUSY rejection below. */
+static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
+                              const void *payload, u32 length);
+
+/* "a.b.c.d:port" of the connected peer.  getpeername() is authoritative after
+   accept(); `fallback` carries the accept() sockaddr for the (rare) case the
+   stack cannot report it again.  Used so every accept logs WHO connected and a
+   preemption log names both the client that was cut and the newcomer. */
+static void formatPeer(int fd, const struct sockaddr_in *fallback, char *out, size_t cap) {
+    struct sockaddr_in peer;
+    memset(&peer, 0, sizeof(peer));
+    socklen_t len = (socklen_t)sizeof(peer);
+    bool ok = getpeername(fd, (struct sockaddr *)&peer, &len) == 0 &&
+              peer.sin_family == AF_INET;
+    if (!ok && fallback != NULL && fallback->sin_family == AF_INET) {
+        peer = *fallback;
+        ok = true;
+    }
+    if (!ok) {
+        snprintf(out, cap, "?");
+        return;
+    }
+    const u32 ip = ntohl(peer.sin_addr.s_addr);
+    snprintf(out, cap, "%u.%u.%u.%u:%u",
+             (unsigned)((ip >> 24) & 0xFFu), (unsigned)((ip >> 16) & 0xFFu),
+             (unsigned)((ip >> 8) & 0xFFu), (unsigned)(ip & 0xFFu),
+             (unsigned)ntohs(peer.sin_port));
+}
+
+/* Refuse a second connection while the registered client is alive: send the BUSY
+   error frame (s32 Result + u32 reason, as replyErrorReason() does) and close at
+   once.  The newcomer is not registered, so this cannot race a sender. */
+static void sendBusyAndClose(int new_fd, const char *peer_text, int live_fd) {
+    s32 payload[2];
+    nxusNetFillBusyPayload(payload);
+    (void)sendFrameLocked(new_fd, NxusCmd_Nop, NXUS_FLAG_ERROR, 0,
+                          payload, (u32)sizeof(payload));
+
+    /* The shipped PC clients send their first request immediately after connect.
+       close() while those bytes are still unread makes the stack send RST, which
+       can discard the BUSY frame that was just queued (observed on the host: the
+       client saw only a reset).  Drain what has arrived with a short timeout, so
+       the close is a clean FIN and the peer actually reads the refusal. */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;   /* 10 ms: one LAN round trip, then give up */
+    setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    u8 sink[512];
+    for (int i = 0; i < 8; i++) {
+        if (recv(new_fd, sink, (int)sizeof(sink), 0) <= 0) break;
+    }
+
+    NXUS_LOG(NXUS_NET_LOG_BUSY_FMT, peer_text, new_fd, live_fd);
+    close(new_fd);
+}
+
 /* ---- receive ------------------------------------------------------------ */
 
 /* Receive exactly `length` bytes, but never unconditionally:
@@ -389,10 +456,13 @@ static void dropClient(void) {
    Every wait now goes through poll() in 200 ms slices:
 
      - while waiting for the NEXT command header (is_header && got == 0) the
-       LISTEN socket is part of the same poll set.  Incoming traffic there means
-       "a new client, or the reconnect after a sleep" -> return false at once, the
-       caller closes the stale socket and the server loop accepts the new one.
-       This kick-out is what removes the half-open lockout completely.
+       LISTEN socket is part of the same poll set.  Incoming traffic there is a
+       new client / auto-reconnect, resolved by the silence rule: only a client
+       that has RECEIVED nothing for NXUS_NET_PREEMPT_IDLE_NS is preempted (return
+       false; the caller closes it and accepts the new one).  A live client (the
+       PC heartbeats every 4 s) is kept and the newcomer is accepted, answered
+       with BUSY and closed instead.  The old unconditional kick-out cut a
+       healthy session on every second connection, so the PC flapped forever.
      - a reset request or a listener error (POLLERR/POLLHUP/POLLNVAL) also
        returns false immediately.
      - 20 s without a single byte while `got == 0` and 5 s without progress once a
@@ -432,8 +502,38 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
 
         if (watch_listener) {
             if (pfds[1].revents & POLLIN) {
-                NXUS_LOG("recv: new connection pending while fd=%d idles - preempting it", fd);
-                return false;
+                const u64 silent_ns = elapsedNs(g_ClientLastRxTick, armGetSystemTick());
+                /* Bytes already waiting on the registered socket (a heartbeat
+                   that queued up while a long handler ran) prove it is alive even
+                   when the last byte we actually recv()'d is older than 8 s. */
+                const bool current_has_data = pr > 0 && (pfds[0].revents & POLLIN) != 0;
+                if (!current_has_data &&
+                    nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Preempt) {
+                    NXUS_LOG(NXUS_NET_LOG_PREEMPT_FMT, fd,
+                             (unsigned long long)(silent_ns / 1000000ull));
+                    return false;
+                }
+
+                /* The registered client is alive (a heartbeat < 8 s ago, or data
+                   already waiting on its socket): keep it and refuse the newcomer
+                   with BUSY instead of closing a healthy session.  Only one
+                   pending connection is accepted per poll slice; a second one
+                   reports POLLIN again on the next pass and is refused the same
+                   way. */
+                const int listen_fd = peekListenFd();
+                if (listen_fd >= 0) {
+                    struct sockaddr_in peer;
+                    memset(&peer, 0, sizeof(peer));
+                    socklen_t peer_len = (socklen_t)sizeof(peer);
+                    const int new_fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
+                    if (new_fd >= 0) {
+                        char peer_text[32];
+                        formatPeer(new_fd, &peer, peer_text, sizeof(peer_text));
+                        sendBusyAndClose(new_fd, peer_text, fd);
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        NXUS_LOG("recv: accept() for the BUSY refusal failed errno=%d", errno);
+                    }
+                }
             }
             if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 NXUS_LOG("recv: listener error (revents=0x%X) - dropping fd=%d",
@@ -448,8 +548,10 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
                 got += (u32)n;
                 last_progress = armGetSystemTick();
                 /* A byte on the wire is a live PC: the sleep/wake heuristic in
-                   main.c must never reset the network while traffic flows. */
+                   main.c must never reset the network while traffic flows, and
+                   the pending-connection policy must see this client as alive. */
                 g_LastActivityTick = last_progress;
+                g_ClientLastRxTick = last_progress;
             } else if (n == 0) {
                 return false;               /* orderly shutdown by the peer */
             } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -586,8 +688,8 @@ Result nxusNetRespond(u32 seq, const void *payload, u32 length) {
     return nxusNetSend(type, 0, seq, payload, length);
 }
 
-static void serveClient(int fd) {
-    NXUS_LOG("client connected (fd=%d)", fd);
+static void serveClient(int fd, const char *peer_text) {
+    NXUS_LOG("client connected from %s (fd=%d)", peer_text, fd);
 
     /* 1s receive timeout so a recv() that raced with poll() cannot block for good.
        The real wait is poll()'s 200 ms slice, so this only bounds a rare race. */
@@ -779,17 +881,30 @@ static void serverThread(void *arg) {
             continue;
         }
 
-        /* A new connection always wins.  serveClient() already returns as soon as
-           traffic shows up on the listener, so this only fires for a stale
-           registration - but closing it keeps the "one session" invariant without
-           ever refusing a reconnect. */
+        char peer_text[32];
+        formatPeer(fd, &peer, peer_text, sizeof(peer_text));
+
+        /* A new connection may take over only when the registered client has been
+           silent for NXUS_NET_PREEMPT_IDLE_NS: a live session is kept and the
+           newcomer is answered with BUSY (the old code dropped `prev`
+           unconditionally, which is what made the PC flap).  In the normal path
+           serveClient() has already returned before this accept, so `prev` is -1;
+           this guard keeps the same policy if a stale registration ever survives. */
         const int prev = peekClientFd();
         if (prev >= 0) {
-            NXUS_LOG("preempting stale client fd=%d with new fd=%d", prev, fd);
+            const u64 silent_ns = elapsedNs(g_ClientLastRxTick, armGetSystemTick());
+            if (nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Busy) {
+                sendBusyAndClose(fd, peer_text, prev);
+                continue;
+            }
+            NXUS_LOG("accept: preempting stale client fd=%d (silent %llu ms) with new client from %s (fd=%d)",
+                     prev, (unsigned long long)(silent_ns / 1000000ull), peer_text, fd);
             dropClient();
         }
+
+        g_ClientLastRxTick = armGetSystemTick();
         publishClientFd(fd);
-        serveClient(fd);
+        serveClient(fd, peer_text);
         last_health = armGetSystemTick();
     }
 
