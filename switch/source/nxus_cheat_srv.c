@@ -20,6 +20,7 @@
 
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
+#include "nxus_heap.h"
 #include "nxus_hid.h"
 #include "nxus_log.h"
 #include "nxus_net.h"
@@ -1015,6 +1016,30 @@ void nxusCheatSrvExit(void) {
     NXUS_LOG_DEBUG("cheat: service released");
 }
 
+/* One line per refused upload with every value needed to tell a malformed program
+ * from a wrong title: the interpreter rc (or the negative NXUS_CHEATVM_ERROR the
+ * reply carries), the block/instruction counts the client sent, the program id it
+ * was built for and the identity the console is actually running.  The wire reply
+ * is unchanged (BAD_STATE + reason=9); this is the console-side explanation that
+ * used to be missing when a Wi-Fi switch/target change made an upload fail.
+ *
+ * The heap line is the second half of the diagnostic: a reconnect storm is exactly
+ * when "upload failed" and "the module is short of heap" have to be told apart. */
+static void cheatLogUploadRejected(int rc, const NxusCheatProgramHeader *header,
+                                   const CheatTarget *target, const char *why) {
+    NXUS_LOG("cheat: upload rejected rc=%d blocks=%u insns=%u program_id=%016llX "
+             "target_pid=%llu target_program_id=%016llX incarnation=%u (%s)",
+             rc,
+             (header != NULL) ? (unsigned)header->block_count : 0u,
+             (header != NULL) ? (unsigned)header->insn_count : 0u,
+             (unsigned long long)((header != NULL) ? header->program_id : 0ull),
+             (unsigned long long)((target != NULL && target->valid) ? target->pid : 0ull),
+             (unsigned long long)((target != NULL && target->valid) ? target->program_id : 0ull),
+             (unsigned)((target != NULL && target->valid) ? target->incarnation : 0u),
+             (why != NULL) ? why : "?");
+    nxusHeapLog("cheat upload rejected");
+}
+
 bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *reply) {
     NxusCheatUploadReply local_reply;
     NxusCheatProgramHeader header;
@@ -1025,14 +1050,21 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
 
     if (reply == NULL) reply = &local_reply;
     memset(reply, 0, sizeof(*reply));
+    /* The rejection line reports the sampled identity even when the sample failed
+       (`valid` stays false), so never leave the struct uninitialised. */
+    memset(&now, 0, sizeof(now));
 
     if (atomic_load_explicit(&g_Shutdown, memory_order_acquire)) {
         NXUS_LOG("cheat: upload refused - the service is shutting down");
+        cheatLogUploadRejected(NXUS_CHEATVM_ERR_BAD_PROGRAM, NULL, NULL,
+                               (wire == NULL) ? "no payload" : "service shutting down");
         reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
         return false;
     }
     if (wire == NULL || length < sizeof(NxusCheatProgramHeader)) {
         NXUS_LOG("cheat: upload refused - payload shorter than the program header");
+        cheatLogUploadRejected(NXUS_CHEATVM_ERR_BAD_PROGRAM, NULL, NULL,
+                               "payload shorter than the program header");
         reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
         return false;
     }
@@ -1043,6 +1075,8 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
          * address, so this program is meaningless (and running it later, once a
          * title starts, would patch an unrelated process). */
         NXUS_LOG("cheat: upload refused - the session has no target yet");
+        cheatLogUploadRejected(NXUS_CHEATVM_ERR_BAD_PROGRAM, &header, &now,
+                               "the session has no target");
         reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
         return false;
     }
@@ -1051,6 +1085,8 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
         NXUS_LOG("cheat: upload refused - program is for title %016llX but the target is "
                  "%016llX", (unsigned long long)header.program_id,
                  (unsigned long long)now.program_id);
+        cheatLogUploadRejected(NXUS_CHEATVM_ERR_BAD_PROGRAM, &header, &now,
+                               "program id does not match the running title");
         reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
         return false;
     }
@@ -1062,6 +1098,8 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
     if (atomic_load_explicit(&g_Shutdown, memory_order_acquire)) {
         cheatUnlock();
         NXUS_LOG("cheat: upload refused - the service is shutting down");
+        cheatLogUploadRejected(NXUS_CHEATVM_ERR_BAD_PROGRAM, &header, &now,
+                               "service shutting down (under the lock)");
         reply->rejected_reason = (u32)(-(s32)NXUS_CHEATVM_ERR_BAD_PROGRAM);
         return false;
     }
@@ -1080,6 +1118,7 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
         cheatUnlock();
         NXUS_LOG("cheat: upload rejected by the interpreter (rc=%d) - the installed "
                  "program was left untouched", rc);
+        cheatLogUploadRejected(rc, &header, &now, "interpreter validation");
         reply->rejected_reason = (u32)(-rc);
         return false;
     }
@@ -1126,6 +1165,8 @@ bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *repl
                 NXUS_LOG("cheat: patch program failed while running (err=%d) - %u block(s) "
                          "were not applied, %u address(es) stay journalled for PanicOff",
                          run_rc, (unsigned)accepted_blocks, (unsigned)journalled);
+                cheatLogUploadRejected(run_rc, &header, &now,
+                                       "patch program failed while running");
                 reply->rejected_reason = (u32)(-run_rc);
                 return false;
             }

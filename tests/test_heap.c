@@ -92,6 +92,40 @@ static void testTransportSizes(void) {
 }
 
 /* ====================================================================== */
+/* (a2) stale-slot watchdog sizes                                          */
+/* ====================================================================== */
+
+/* The transport's self-recovery deadline is a resident-size/policy number too: a
+ * 30 s I/O deadline is what lets a reconnect after a Wi-Fi switch be served
+ * without a sysmodule restart, while still being many heartbeat intervals so an
+ * idle (but healthy) client is never cut.  The 1 s shutdown wait has to fit
+ * inside the 2 s exit budget and be long enough for a thread parked in a 200 ms
+ * poll() slice. */
+static void testSlotWatchdogConstants(void) {
+    printf("- transport: stale-slot watchdog uses a 30 s I/O deadline and a 1 s wait\n");
+
+    CHECK(NXUS_NET_SLOT_STALE_NS == 30ull * 1000ull * 1000ull * 1000ull,
+          "the stale I/O deadline is 30 s (%llu ns)",
+          (unsigned long long)NXUS_NET_SLOT_STALE_NS);
+    CHECK(NXUS_NET_SLOT_STALE_WAIT_MS == 1000u,
+          "a stale thread gets 1 s to leave after shutdown (%u ms)",
+          (unsigned)NXUS_NET_SLOT_STALE_WAIT_MS);
+    CHECK(NXUS_NET_SLOT_STALE_POLL_NS > 0 &&
+              NXUS_NET_SLOT_STALE_POLL_NS <
+                  (uint64_t)NXUS_NET_SLOT_STALE_WAIT_MS * 1000000ull,
+          "the bounded wait is polled in sub-second steps");
+    CHECK((uint64_t)NXUS_NET_SLOT_STALE_WAIT_MS * 1000000ull == 1000000000ull,
+          "the shutdown wait is exactly 1 s");
+    CHECK((uint64_t)NXUS_NET_SLOT_STALE_WAIT_MS < 2000u,
+          "one stale-slot wait fits inside the 2 s exit budget");
+
+    /* A healthy PC client heartbeats every 4 s: the deadline must be several
+       heartbeats, not one, or an idle-but-live session would be cut. */
+    CHECK(NXUS_NET_SLOT_STALE_NS >= 4ull * 1000000000ull,
+          "the deadline covers at least one 4 s heartbeat interval");
+}
+
+/* ====================================================================== */
 /* (b) RAM baseline budget                                                 */
 /* ====================================================================== */
 
@@ -206,6 +240,7 @@ static void testHostFallback(void) {
 int main(void) {
     printf("== Nxus heap accounting / resident sizes ==\n");
     testTransportSizes();
+    testSlotWatchdogConstants();
     testBaselineBudget();
     testBootThreshold();
     testHostFallback();

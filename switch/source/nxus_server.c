@@ -4480,7 +4480,25 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
             if (!nxusCheatSrvUpload(payload, length, &up)) {
                 /* A rejected program, or one uploaded for another title than the
                    target the session is on: the payload was well formed, so the
-                   argument (the program's target) is what is refused. */
+                   argument (the program's target) is what is refused.
+                   The reply itself is unchanged (BAD_STATE + reason=9); the log
+                   line adds the diagnostics the wire cannot carry, so an upload
+                   that fails after a Wi-Fi switch can be separated from a client
+                   that is simply pointed at the wrong title.  `up.rejected_reason`
+                   is the positive form of the interpreter rc. */
+                NxusTargetIdentity id;
+                memset(&id, 0, sizeof(id));
+                const bool have_id = nxusSessionTargetIdentity(&id);
+                NXUS_LOG("cheat: upload rejected rc=%d blocks=%u insns=%u "
+                         "program_id=%016llX target_pid=%llu target_program_id=%016llX "
+                         "incarnation=%u (BAD_STATE/BAD_ARG reason=%u)",
+                         -(s32)up.rejected_reason, (unsigned)ch.block_count,
+                         (unsigned)ch.insn_count, (unsigned long long)ch.program_id,
+                         (unsigned long long)(have_id ? id.pid : 0ull),
+                         (unsigned long long)(have_id ? id.program_id : 0ull),
+                         (unsigned)nxusDmntTargetIncarnation(),
+                         (unsigned)NXUS_REASON_BAD_ARG);
+                nxusHeapLog("cheat upload rejected");
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
                                  NXUS_REASON_BAD_ARG);
                 break;

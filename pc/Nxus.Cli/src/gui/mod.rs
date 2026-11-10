@@ -1445,6 +1445,29 @@ fn progress_prefix(text: &str) -> Option<&str> {
     }
 }
 
+// ---------------------------------------------------------------- busy spinner
+
+/// How long a job has to run before the status bar shows that it is running.
+///
+/// `busy` is set by every [`App::send`] and by the hex view and the cheat tab, so
+/// a spinner tied to the flag alone was on screen almost permanently - and, being
+/// drawn before the status text, it pushed that text sideways on every click.
+/// Below this delay a job is over before the user could read the spinner anyway.
+pub const SPINNER_DELAY: Duration = Duration::from_millis(400);
+
+/// Should the status bar draw its spinner?
+///
+/// Pure on purpose: the frame writes `busy_since` (see [`State::note_busy`]) and
+/// this decides from two instants, so the 400 ms rule is testable without a UI or
+/// a wall clock.  No job means no spinner, and a job younger than
+/// [`SPINNER_DELAY`] is not worth one.
+pub fn should_show_spinner(busy_since: Option<Instant>, now: Instant) -> bool {
+    match busy_since {
+        Some(since) => now.saturating_duration_since(since) >= SPINNER_DELAY,
+        None => false,
+    }
+}
+
 /// One open inline editor in the Results list.
 pub struct HitEdit {
     pub hit_index: usize,
@@ -1457,6 +1480,12 @@ pub struct HitEdit {
 pub struct State {
     pub connected: bool,
     pub busy: bool,
+    /// When `busy` last became true; `None` while idle.
+    ///
+    /// Kept by [`State::note_busy`] once per frame instead of at every assignment:
+    /// `busy` is written from the command dispatch, the hex view and the cheat tab,
+    /// and the status bar only needs the edge (see [`should_show_spinner`]).
+    pub busy_since: Option<Instant>,
     pub status: Option<Status>,
     pub metadata: Option<Metadata>,
     /// The process every cached address below belongs to.  `None` = the console
@@ -1557,6 +1586,7 @@ impl State {
         State {
             connected: false,
             busy: false,
+            busy_since: None,
             status: None,
             metadata: None,
             target: None,
@@ -1922,6 +1952,26 @@ impl State {
     /// A queued line is on screen, as opposed to the dimmed last line.
     pub fn has_toast(&self) -> bool {
         !self.toasts.is_empty()
+    }
+
+    /// Keep [`State::busy_since`] in step with [`State::busy`].
+    ///
+    /// Called once per frame, before anything is drawn, because the flag itself is
+    /// written from several modules (the command dispatch, `hexview`, `cheats`) and
+    /// a setter could be bypassed.  The edge is what matters: a job that starts and
+    /// ends between two frames never gets a timestamp, which is exactly the
+    /// "almost always blinking" spinner this rules out.
+    pub fn note_busy(&mut self, now: Instant) {
+        if !self.busy {
+            self.busy_since = None;
+        } else if self.busy_since.is_none() {
+            self.busy_since = Some(now);
+        }
+    }
+
+    /// Whether the status bar should draw the busy spinner this frame.
+    pub fn spinner_visible(&self) -> bool {
+        should_show_spinner(self.busy_since, Instant::now())
     }
 
     /// How long until the line on screen may be replaced.
@@ -2795,6 +2845,85 @@ mod toast_tests {
     }
 }
 
+/// The status bar's spinner: a job that is over in a blink must not flash one, and
+/// the rule has to be a plain function so it can be tested without a UI.
+#[cfg(test)]
+mod spinner_tests {
+    use super::{should_show_spinner, State, SPINNER_DELAY};
+    use std::time::{Duration, Instant};
+
+    /// A clock reading `offset` after `base` (an `Instant` is a monotonic number;
+    /// the function only ever subtracts two of them).
+    fn at(base: Instant, offset: Duration) -> Instant {
+        base + offset
+    }
+
+    #[test]
+    fn the_threshold_is_400_ms() {
+        assert_eq!(SPINNER_DELAY, Duration::from_millis(400));
+    }
+
+    /// No job at all: no spinner, however long the frame has been open.
+    #[test]
+    fn no_job_means_no_spinner() {
+        let base = Instant::now();
+        assert!(!should_show_spinner(None, at(base, Duration::from_secs(3600))));
+    }
+
+    /// The click that finishes before the next frame: no spinner.
+    #[test]
+    fn a_hundred_ms_is_too_short() {
+        let base = Instant::now();
+        assert!(!should_show_spinner(Some(base), at(base, Duration::from_millis(100))));
+    }
+
+    /// The threshold itself shows it, one millisecond earlier does not (the
+    /// comparison is inclusive, so the spinner cannot appear at 399 ms).
+    #[test]
+    fn four_hundred_ms_shows_and_three_ninety_nine_does_not() {
+        let base = Instant::now();
+        assert!(!should_show_spinner(
+            Some(base),
+            at(base, SPINNER_DELAY - Duration::from_millis(1))
+        ));
+        assert!(should_show_spinner(Some(base), at(base, SPINNER_DELAY)));
+    }
+
+    /// A scan runs for seconds: the spinner stays.
+    #[test]
+    fn ten_seconds_is_still_shown() {
+        let base = Instant::now();
+        assert!(should_show_spinner(Some(base), at(base, Duration::from_secs(10))));
+    }
+
+    /// `busy` is set from several modules; the edge is recorded once per job and
+    /// cleared when the job ends, or the 400 ms would be counted from the wrong
+    /// moment.
+    #[test]
+    fn the_busy_edge_is_recorded_once_and_cleared_when_idle() {
+        let mut st = State::new();
+        let base = Instant::now();
+        assert!(st.busy_since.is_none(), "a fresh state is idle");
+        st.busy = true;
+        st.note_busy(base);
+        assert_eq!(st.busy_since, Some(base), "the first busy frame starts the clock");
+        st.note_busy(at(base, Duration::from_millis(200)));
+        assert_eq!(st.busy_since, Some(base), "a later frame must not restart it");
+        st.note_busy(at(base, Duration::from_secs(5)));
+        assert_eq!(st.busy_since, Some(base), "nor must the job look younger later on");
+        st.busy = false;
+        st.note_busy(at(base, Duration::from_secs(6)));
+        assert!(st.busy_since.is_none(), "idle clears the clock");
+        st.busy = true;
+        st.note_busy(at(base, Duration::from_secs(7)));
+        assert_eq!(
+            st.busy_since,
+            Some(at(base, Duration::from_secs(7))),
+            "the next job starts a new clock"
+        );
+    }
+}
+
 /// Japanese text (Windows error strings, module paths, cheat names) has no glyphs in
 /// egui's default Latin fonts and used to render as a row of boxes.  M PLUS 1p is a
 /// readable OFL font that covers JIS level 1+2 for ~1.7 MB.
@@ -3452,6 +3581,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        // The busy flag is written all over the place; take its rising edge here,
+        // before the status bar asks whether a spinner belongs on screen.
+        self.st.note_busy(Instant::now());
         // Retire the status lines whose dwell is over before drawing them.
         self.st.advance_toasts();
         // The console's frozen table changes without telling us (another dmnt

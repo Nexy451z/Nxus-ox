@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <unistd.h>
@@ -99,24 +100,49 @@ static atomic_bool g_RebuildPending = false;
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
 static volatile u64    g_LastActivityTick = 0;
 
-/* One served connection.  The published part (fd/in_use/done) lives in the slot
-   table the header defines, because that policy is host-tested; everything below
-   is transport-private and only touched by the connection's own thread (rx,
-   last_rx_tick) or by the reaper after the thread has been joined (stack). */
+/* One served connection.  The published part (fd/in_use/done/generation) lives in
+   the slot table the header defines, because that policy is host-tested;
+   everything below is transport-private and only touched by the connection's own
+   thread (rx, last_rx_tick) or by the reaper after the thread has been joined
+   (stack).
+ *
+ * A state object is NOT tied to a slot index for life.  When the stale watchdog
+ * force-releases a slot whose thread is still alive, the state object is detached
+ * (zombie = true, retired_fd = the descriptor it still owns) and the slot can be
+ * claimed again with a fresh state object.  That separation is what lets the
+ * stale path be "leak, never UAF": the old thread keeps writing to its own state
+ * object, while the new owner uses a different one.  A retired state is reclaimed
+ * (thread joined, stack/rx freed, descriptor closed) once `finished` is published. */
 typedef struct {
-    NxusNetSlot *slot;      /* always &g_Slots[index]                   */
-    Mutex        send_lock; /* serialises frame writes and fd teardown  */
+    atomic_bool  reserved;  /* this state object belongs to a served connection  */
+    atomic_bool  zombie;    /* detached from its slot; the thread may still run  */
+    atomic_bool  finished;  /* the serving thread's last statement              */
+    /* Atomic for the same reason as generation: a send path may have snapshotted
+       this state and load the pointer after it was released and reused (see
+       clientStateRelease()). */
+    atomic_uintptr_t slot;  /* &g_Slots[index] while serving                    */
+    atomic_uint  generation;/* slot generation this state was claimed for       */
+    int          retired_fd;/* zombie only: descriptor this state still owns    */
+    Mutex        send_lock; /* serialises frame writes and fd teardown          */
     Thread       thread;
-    u8          *rx;        /* receive buffer (owned by the client thread) */
+    u8          *rx;        /* receive buffer (owned by the client thread)      */
     u32          rx_cap;
-    u8          *stack;     /* heap thread stack (freed by the reaper)  */
+    u8          *stack;     /* heap thread stack (freed by the reaper)          */
     u64          last_rx_tick;
     u64          rx_big_tick;   /* last frame that needed > NXUS_NET_RX_IDLE_SIZE */
     char         peer[32];
 } NxusNetClient;
 
+/* There are as many connection state objects as client slots plus spares for the
+ * force-released ones.  A zombie is reclaimed as soon as its thread exits, so the
+ * spare count only has to cover the threads that are simultaneously stuck. */
+#define NXUS_NET_CLIENT_STATE_MAX (NXUS_NET_MAX_CLIENTS + 4)
+
 static NxusNetSlot   g_Slots[NXUS_NET_MAX_CLIENTS];
-static NxusNetClient g_Clients[NXUS_NET_MAX_CLIENTS];
+static NxusNetClient g_ClientStates[NXUS_NET_CLIENT_STATE_MAX];
+/* Slot -> connection state currently serving it (NULL when free/reaped).  Atomic
+ * because the send paths read it without the accept thread's involvement. */
+static atomic_uintptr_t g_SlotClient[NXUS_NET_MAX_CLIENTS];
 /* True between the mutex/table setup in nxusNetInit() and the start of
    nxusNetExit().  The slot array is zero-initialised statically (fd == 0, which
    is a perfectly valid descriptor number), so every path that may run before Init
@@ -138,6 +164,14 @@ u64 nxusNetLastActivityTick(void) {
    deadlines must treat as "this connection is dead". */
 static u64 elapsedNs(u64 from, u64 now) {
     return armTicksToNs(now - from);
+}
+
+/* Monotonic nanoseconds for the per-slot I/O clock.  armGetSystemTick() keeps
+ * counting across a sleep, so a suspend shows up as one large gap - exactly what
+ * the stale watchdog must treat as "this connection is dead".  A 0 stamp means
+ * "never stamped" and is never considered stale. */
+static u64 ioNowNs(void) {
+    return armTicksToNs(armGetSystemTick());
 }
 
 /* Sleep in short slices instead of one long svcSleepThread(), returning early on
@@ -369,14 +403,49 @@ static void rebuildListener(bool full_bsd_reset) {
 
 /* ---- connection table helpers ------------------------------------------- */
 
+/* Connection state currently published for a slot (NULL when free/reaped). */
+static NxusNetClient *slotClient(int index) {
+    if (index < 0 || index >= NXUS_NET_MAX_CLIENTS) return NULL;
+    return (NxusNetClient *)(uintptr_t)atomic_load_explicit(&g_SlotClient[index],
+                                                           memory_order_acquire);
+}
+
+static void slotSetClient(int index, NxusNetClient *client) {
+    if (index < 0 || index >= NXUS_NET_MAX_CLIENTS) return;
+    atomic_store_explicit(&g_SlotClient[index], (uintptr_t)client, memory_order_release);
+}
+
 /* The client whose slot currently holds `fd`, or NULL.  A snapshot only: the
-   caller must re-check the slot after taking its send lock. */
+   caller must re-check the slot (and its generation) after taking its send lock. */
 static NxusNetClient *clientForFd(int fd) {
     if (fd < 0 || !atomic_load_explicit(&g_TableReady, memory_order_acquire)) return NULL;
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
-        if (nxusNetSlotFd(&g_Slots[i]) == fd) return &g_Clients[i];
+        if (nxusNetSlotFd(&g_Slots[i]) == fd) return slotClient(i);
     }
     return NULL;
+}
+
+/* The slot generation a state object was claimed for.  Atomic so a stale send path
+   that snapshotted the object just before it was released reads a defined value
+   (0 after release, which no claimed slot ever has) instead of racing a reuse. */
+static u32 clientGeneration(const NxusNetClient *client) {
+    return atomic_load_explicit(&client->generation, memory_order_acquire);
+}
+
+static void clientSetGeneration(NxusNetClient *client, u32 generation) {
+    atomic_store_explicit(&client->generation, generation, memory_order_release);
+}
+
+/* The slot a state object currently serves.  Never NULL by construction: Init
+ * seeds every object with a valid table entry and startClient() repoints it before
+ * the object is published, so a stale send path cannot dereference NULL. */
+static NxusNetSlot *clientSlot(const NxusNetClient *client) {
+    return (NxusNetSlot *)(uintptr_t)atomic_load_explicit(&client->slot,
+                                                          memory_order_acquire);
+}
+
+static void clientSetSlot(NxusNetClient *client, NxusNetSlot *slot) {
+    atomic_store_explicit(&client->slot, (uintptr_t)slot, memory_order_release);
 }
 
 int nxusNetClientFd(void) {
@@ -399,25 +468,106 @@ int nxusNetClientCount(void) {
 
 /* Shut the connection's socket down (not close): wakes its poll()/recv() without
    handing the descriptor back to the kernel, so the owning thread is still the
-   only one that closes it. */
+   only one that closes it.  The generation check is the force-release guard: if
+   this state object was detached and its slot reused, shutdown() must not land on
+   the new owner's descriptor. */
 static void clientShutdown(NxusNetClient *client) {
     mutexLock(&client->send_lock);
-    const int fd = nxusNetSlotFd(client->slot);
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    if (nxusNetSlotGeneration(clientSlot(client)) == clientGeneration(client)) {
+        const int fd = nxusNetSlotFd(clientSlot(client));
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
     mutexUnlock(&client->send_lock);
 }
 
 /* Unregister the connection's descriptor under its send lock.  Returns the
    descriptor when this call owned it (and the caller must close it), -1 when it
-   was already taken by the exit path.  Unregistering before close() is what makes
-   the close handler's fd unambiguous: the number cannot be recycled while the
-   socket is still open, and no sender can reach it any more. */
+   was already taken by the exit path/stale watchdog or when the slot now belongs
+   to another generation.  Unregistering before close() is what makes the close
+   handler's fd unambiguous: the number cannot be recycled while the socket is
+   still open, and no sender can reach it any more.
+ *
+ * nxusNetSlotTakeFd() is a generation-checked CAS, so a force-released old thread
+ * that wakes up late returns -1 instead of clearing a descriptor its slot no
+ * longer owns. */
 static int clientTakeFd(NxusNetClient *client) {
     mutexLock(&client->send_lock);
-    const int fd = nxusNetSlotFd(client->slot);
-    if (fd >= 0) nxusNetSlotClearFd(client->slot);
+    const int fd = nxusNetSlotTakeFd(clientSlot(client), clientGeneration(client));
     mutexUnlock(&client->send_lock);
     return fd;
+}
+
+/* ---- connection state objects ------------------------------------------- */
+
+/* Reserve a state object for a new connection, or NULL when every object is in
+ * use (a pathological run of force-released threads that never exit).  The
+ * send_lock is initialised once per process by nxusNetInit(); re-initialising a
+ * mutex another thread could still hold is undefined behaviour. */
+static NxusNetClient *clientStateAcquire(void) {
+    for (int i = 0; i < NXUS_NET_CLIENT_STATE_MAX; i++) {
+        NxusNetClient *client = &g_ClientStates[i];
+        bool expected = false;
+        if (!atomic_compare_exchange_strong_explicit(&client->reserved, &expected, true,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            continue;
+        }
+        /* slot/generation are set by startClient() before the object is published
+           in g_SlotClient; leaving the previous (valid) slot pointer here keeps a
+           stale sender's late check safe instead of dereferencing NULL. */
+        clientSetGeneration(client, 0);
+        client->retired_fd = -1;
+        client->rx = NULL;
+        client->rx_cap = 0;
+        client->stack = NULL;
+        client->last_rx_tick = 0;
+        client->rx_big_tick = 0;
+        client->peer[0] = '\0';
+        atomic_store_explicit(&client->zombie, false, memory_order_relaxed);
+        atomic_store_explicit(&client->finished, false, memory_order_relaxed);
+        return client;
+    }
+    return NULL;
+}
+
+/* Give a state object back after its thread was joined and its stack freed.  A
+ * zombie is never released here until it has finished (see reapRetiredClients).
+ *
+ * `slot` is deliberately left pointing at the slot table: a send path may have
+ * snapshotted this object just before it was released and still be waiting for its
+ * send lock.  Clearing the pointer would turn that race into a NULL dereference;
+ * leaving it means the late check (fd + generation) simply refuses, because the
+ * slot has been retired (generation bumped) or reused for another connection. */
+static void clientStateRelease(NxusNetClient *client) {
+    clientSetGeneration(client, 0);
+    client->retired_fd = -1;
+    client->rx = NULL;
+    client->rx_cap = 0;
+    client->stack = NULL;
+    atomic_store_explicit(&client->zombie, false, memory_order_relaxed);
+    atomic_store_explicit(&client->finished, false, memory_order_relaxed);
+    atomic_store_explicit(&client->reserved, false, memory_order_release);
+}
+
+static bool clientFinished(const NxusNetClient *client) {
+    return atomic_load_explicit(&client->finished, memory_order_acquire);
+}
+
+/* Publish `finished` as the serving thread's very last statement.  Order matters:
+ * slot state (done/fd) and the rx buffer are already released by then, so a
+ * reaper that sees this flag may join the Thread and free the stack safely. */
+static void clientPublishFinished(NxusNetClient *client) {
+    atomic_store_explicit(&client->finished, true, memory_order_release);
+}
+
+/* Wait (bounded) for one connection's serving thread to publish `finished`. */
+static bool waitClientFinished(NxusNetClient *client, u64 deadline) {
+    while (!clientFinished(client)) {
+        if (!nxusNetRunning()) return false;
+        if (armGetSystemTick() >= deadline) return false;
+        svcSleepThread(NXUS_NET_SLOT_STALE_POLL_NS);
+    }
+    return true;
 }
 
 /* ---- BUSY refusal ------------------------------------------------------- */
@@ -508,12 +658,12 @@ static bool clientRxEnsure(NxusNetClient *client, u32 need) {
            drops the connection (see serveClient): say how much heap was left, so a
            stream of "does not fit" lines can be told apart from a protocol error. */
         NXUS_LOG("recv: fd=%d receive buffer grow %u -> %u B failed (free=%u KiB)",
-                 nxusNetSlotFd(client->slot), (unsigned)client->rx_cap, (unsigned)need,
+                 nxusNetSlotFd(clientSlot(client)), (unsigned)client->rx_cap, (unsigned)need,
                  (unsigned)nxusHeapFreeKiB());
         return false;
     }
     NXUS_LOG("recv: fd=%d grew the receive buffer %u -> %u B",
-             nxusNetSlotFd(client->slot), (unsigned)client->rx_cap, (unsigned)need);
+             nxusNetSlotFd(clientSlot(client)), (unsigned)client->rx_cap, (unsigned)need);
     client->rx = bigger;
     client->rx_cap = need;
     nxusHeapLogDebug("net rx grow");
@@ -534,7 +684,7 @@ static void clientRxShrinkIfIdle(NxusNetClient *client, u64 now) {
     if (smaller == NULL) return;   /* keep the larger block: harmless, still bounded */
     NXUS_LOG("recv: fd=%d has had no large frame for %llu ms - shrunk the receive "
              "buffer %u -> %u B",
-             nxusNetSlotFd(client->slot),
+             nxusNetSlotFd(clientSlot(client)),
              (unsigned long long)(idle_ns / 1000000ull),
              (unsigned)client->rx_cap, (unsigned)NXUS_NET_RX_IDLE_SIZE);
     client->rx = smaller;
@@ -592,6 +742,7 @@ static bool recvExact(NxusNetClient *client, int fd, void *buffer, u32 length, b
                    main.c must never reset the network while traffic flows. */
                 g_LastActivityTick = last_progress;
                 client->last_rx_tick = last_progress;
+                nxusNetSlotTouch(clientSlot(client), armTicksToNs(last_progress));
             } else if (n == 0) {
                 return false;               /* orderly shutdown by the peer */
             } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -685,6 +836,12 @@ static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
         rc = MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen);
     } else {
         g_LastActivityTick = armGetSystemTick();
+        /* A completed write is I/O activity for the stale watchdog.  Resolving the
+         * client from `fd` is cheap (four atomic reads) and covers every caller,
+         * including replies sent from worker threads.  A descriptor that is not
+         * registered (the BUSY refusal) simply has no slot to stamp. */
+        NxusNetClient *client = clientForFd(fd);
+        if (client != NULL) nxusNetSlotTouch(clientSlot(client), armTicksToNs(g_LastActivityTick));
     }
 
     return rc;
@@ -701,9 +858,11 @@ Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, 
 
     mutexLock(&client->send_lock);
     Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    /* Only a registered connection is writable; a descriptor a handler kept
-       across a disconnect is stale and must not be reused either. */
-    if (nxusNetSlotFd(client->slot) == fd) {
+    /* Only a registered connection of the generation this state was claimed for is
+       writable; a descriptor a handler kept across a disconnect (or across a force
+       release and slot reuse) is stale and must not be reused either. */
+    if (nxusNetSlotFd(clientSlot(client)) == fd &&
+        nxusNetSlotGeneration(clientSlot(client)) == clientGeneration(client)) {
         rc = sendFrameLocked(fd, type, flags, seq, payload, length);
     }
     mutexUnlock(&client->send_lock);
@@ -719,12 +878,14 @@ Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length
     bool any = false;
     Result first_error = 0;
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
-        NxusNetClient *client = &g_Clients[i];
-        const int fd = nxusNetSlotFd(client->slot);
+        NxusNetClient *client = slotClient(i);
+        if (client == NULL) continue;
+        const int fd = nxusNetSlotFd(clientSlot(client));
         if (fd < 0) continue;
 
         mutexLock(&client->send_lock);
-        if (nxusNetSlotFd(client->slot) == fd) {
+        if (nxusNetSlotFd(clientSlot(client)) == fd &&
+            nxusNetSlotGeneration(clientSlot(client)) == clientGeneration(client)) {
             const Result rc = sendFrameLocked(fd, type, flags, seq, payload, length);
             if (rc == 0) any = true;
             else if (first_error == 0) first_error = rc;
@@ -761,8 +922,11 @@ void nxusNetSetCloseHandler(NxusNetCloseHandler handler, void *user) {
 static void serveClient(NxusNetClient *client, int fd) {
     NXUS_LOG("client connected from %s (fd=%d, slot %d, %d/%d busy)",
              client->peer, fd,
-             (int)(client->slot - &g_Slots[0]),
+             (int)(clientSlot(client) - &g_Slots[0]),
              nxusNetClientCount(), NXUS_NET_MAX_CLIENTS);
+    /* The heap line for the one allocation point a user can trigger repeatedly:
+     * a reconnect storm after a Wi-Fi switch is exactly when "free" matters. */
+    nxusHeapLog("net client connected");
 
     /* 1s receive timeout so a recv() that raced with poll() cannot block for good.
        The real wait is poll()'s 200 ms slice, so this only bounds a rare race. */
@@ -794,7 +958,9 @@ static void serveClient(NxusNetClient *client, int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keep_cnt,   sizeof(keep_cnt));
 #endif
 
-    while (nxusNetRunning() && nxusNetSlotFd(client->slot) == fd) {
+    while (nxusNetRunning() &&
+           nxusNetSlotGeneration(clientSlot(client)) == clientGeneration(client) &&
+           nxusNetSlotFd(clientSlot(client)) == fd) {
         NxusPacketHeader header;
         if (!recvExact(client, fd, &header, sizeof(header), true)) break;
 
@@ -822,7 +988,7 @@ static void serveClient(NxusNetClient *client, int fd) {
                 payload[0] = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
                 payload[1] = (s32)NXUS_REASON_BAD_LENGTH;
                 mutexLock(&client->send_lock);
-                if (nxusNetSlotFd(client->slot) == fd) {
+                if (nxusNetSlotFd(clientSlot(client)) == fd) {
                     (void)sendFrameLocked(fd, header.type, NXUS_FLAG_ERROR, header.seq,
                                           payload, (u32)sizeof(payload));
                 }
@@ -842,7 +1008,10 @@ static void serveClient(NxusNetClient *client, int fd) {
 
     /* Unregister FIRST: from here on no sender can reach this descriptor, while
        it is still open, so the number is unique and the close hook can name this
-       connection by fd without hitting a recycled descriptor. */
+       connection by fd without hitting a recycled descriptor.  After a force-
+       release the generation no longer matches, so clientTakeFd() returns -1 and
+       neither the close hook nor close() touches a descriptor this thread does not
+       own any more. */
     const bool owned = (clientTakeFd(client) == fd);
     if (owned) {
         if (g_CloseHandler != NULL) g_CloseHandler(fd, g_CloseUser);
@@ -854,13 +1023,15 @@ static void serveClient(NxusNetClient *client, int fd) {
     client->rx_cap = 0;
     nxusHeapLogDebug("net client close");
 
-    /* Last statement: the reaper may now join this thread and free its stack. */
-    nxusNetSlotFinish(client->slot);
+    /* Publish the slot state for this generation first (the reaper keys on it),
+       then tell the zombie reaper this state object is safe to join. */
+    (void)nxusNetSlotFinishGeneration(clientSlot(client), clientGeneration(client));
+    clientPublishFinished(client);
 }
 
 static void clientThread(void *arg) {
     NxusNetClient *client = (NxusNetClient *)arg;
-    const int fd = nxusNetSlotFd(client->slot);
+    const int fd = nxusNetSlotFd(clientSlot(client));
     if (fd >= 0) {
         serveClient(client, fd);
         return;
@@ -872,7 +1043,8 @@ static void clientThread(void *arg) {
     free(client->rx);
     client->rx = NULL;
     client->rx_cap = 0;
-    nxusNetSlotFinish(client->slot);
+    (void)nxusNetSlotFinishGeneration(clientSlot(client), clientGeneration(client));
+    clientPublishFinished(client);
 }
 
 /* Join and release every slot whose serving thread has finished.  Only the accept
@@ -882,7 +1054,14 @@ static void clientThread(void *arg) {
 static void reapFinishedClients(void) {
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
         if (!nxusNetSlotReapable(&g_Slots[i])) continue;
-        NxusNetClient *client = &g_Clients[i];
+        NxusNetClient *client = slotClient(i);
+        if (client == NULL) {
+            /* A slot that finished without a published state object: nothing to
+               join, just release the claim. */
+            nxusNetSlotReaped(&g_Slots[i]);
+            NXUS_LOG("client slot %d released (no connection state)", i);
+            continue;
+        }
 
         threadWaitForExit(&client->thread);
         threadClose(&client->thread);
@@ -893,11 +1072,48 @@ static void reapFinishedClients(void) {
         client->rx = NULL;
         client->rx_cap = 0;
 
+        slotSetClient(i, NULL);
         nxusNetSlotReaped(&g_Slots[i]);
+        clientStateRelease(client);
         NXUS_LOG("client slot %d released (thread joined)", i);
         /* The connection's whole resident cost (rx buffer + 24/32 KiB stack) is back
            in the heap now; the close line above is only the buffer half. */
         nxusHeapLogDebug("net slot released");
+    }
+}
+
+/* Reclaim state objects the stale watchdog detached from their slots.  The
+ * serving thread may still have been inside a long handler when the slot was
+ * force-released; once it publishes `finished` (its last statement) the Thread can
+ * be joined, the leaked stack freed, and the descriptor - which the watchdog took
+ * out of the slot and recorded in retired_fd - closed.  Until then everything is
+ * left allocated: freeing a stack or a receive buffer under a live thread is the
+ * use-after-free this design exists to avoid. */
+static void reapRetiredClients(void) {
+    for (int i = 0; i < NXUS_NET_CLIENT_STATE_MAX; i++) {
+        NxusNetClient *client = &g_ClientStates[i];
+        if (!atomic_load_explicit(&client->reserved, memory_order_acquire)) continue;
+        if (!atomic_load_explicit(&client->zombie, memory_order_acquire)) continue;
+        if (!clientFinished(client)) continue;
+
+        threadWaitForExit(&client->thread);
+        threadClose(&client->thread);
+        free(client->stack);
+        client->stack = NULL;
+        free(client->rx);
+        client->rx = NULL;
+        client->rx_cap = 0;
+        if (client->retired_fd >= 0) {
+            /* Unregistered by the watchdog and never touched by the old thread
+               (it lost the generation race), so this close cannot hit a live
+               connection. */
+            close(client->retired_fd);
+            client->retired_fd = -1;
+        }
+        const int state = i;
+        clientStateRelease(client);
+        NXUS_LOG("net: retired connection state %d reclaimed (thread joined)", state);
+        nxusHeapLogDebug("net retired state released");
     }
 }
 
@@ -907,8 +1123,81 @@ static void shutdownAllClients(const char *why) {
         if (!nxusNetSlotInUse(&g_Slots[i])) continue;
         const int fd = nxusNetSlotFd(&g_Slots[i]);
         if (fd < 0) continue;
+        NxusNetClient *client = slotClient(i);
+        if (client == NULL) continue;
         NXUS_LOG("dropping client fd=%d (%s)", fd, why);
-        clientShutdown(&g_Clients[i]);
+        clientShutdown(client);
+    }
+}
+
+/* Detach a still-published connection state from its slot when the slot is being
+ * force-released.  The descriptor is taken out of the slot under the same send
+ * lock the serving thread uses for its own take/close, so exactly one party owns
+ * the close: if the thread won the race, this returns -1 and the thread closes it;
+ * otherwise the descriptor is recorded in retired_fd and reapRetiredClients()
+ * closes it after the thread has been joined.
+ *
+ * The state object stays reserved and becomes a zombie: its thread may still be
+ * running (parked in a long handler), so neither its stack nor its receive buffer
+ * may be freed here. */
+static int detachClientState(NxusNetSlot *slot, NxusNetClient *client) {
+    if (client == NULL) return -1;
+
+    mutexLock(&client->send_lock);
+    int fd = -1;
+    if (nxusNetSlotGeneration(slot) == clientGeneration(client)) {
+        fd = nxusNetSlotTakeFd(slot, clientGeneration(client));
+    }
+    client->retired_fd = fd;
+    atomic_store_explicit(&client->zombie, true, memory_order_release);
+    mutexUnlock(&client->send_lock);
+    return fd;
+}
+
+/* Force-release one slot whose thread ignored a shutdown() for the whole stale
+ * deadline.  The force log is the one line an operator greps for when a Wi-Fi
+ * switch left the sysmodule wedged. */
+static void forceReleaseStaleSlot(int index, u64 idle_ms) {
+    NxusNetSlot *slot = &g_Slots[index];
+    NxusNetClient *client = slotClient(index);
+
+    (void)detachClientState(slot, client);
+    if (client != NULL) slotSetClient(index, NULL);
+
+    NXUS_LOG(NXUS_NET_LOG_SLOT_STALE_FMT, index, (unsigned long long)idle_ms);
+    nxusNetSlotForceReap(slot);
+}
+
+/* The accept loop's stale watchdog: shut a slot down when it has completed no I/O
+ * for NXUS_NET_SLOT_STALE_NS, wait (bounded) for its thread to leave, and force-
+ * release it when it does not.  Runs on the accept thread only, so the slot table
+ * cannot change underneath the scan except through a claim from this same thread. */
+static void watchStaleSlots(void) {
+    const u64 now = ioNowNs();
+
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        NxusNetSlot *slot = &g_Slots[i];
+        if (!nxusNetSlotIsStale(slot, now)) continue;
+
+        const u64 idle_ms = nxusNetSlotIdleNs(slot, now) / 1000000ull;
+        NxusNetClient *client = slotClient(i);
+
+        NXUS_LOG_DEBUG("net: slot %d has had no I/O for %llu ms - shutting it down",
+                       i, (unsigned long long)idle_ms);
+        if (client != NULL) {
+            clientShutdown(client);
+
+            const u64 deadline = armGetSystemTick() +
+                                 armNsToTicks((u64)NXUS_NET_SLOT_STALE_WAIT_MS * 1000000ull);
+            if (waitClientFinished(client, deadline)) {
+                /* The thread left on its own; the normal reaper joins it on the
+                 * next pass.  No force release, no leaked state. */
+                NXUS_LOG("net: slot %d left after the shutdown - reaping it normally", i);
+                continue;
+            }
+        }
+
+        forceReleaseStaleSlot(i, idle_ms);
     }
 }
 
@@ -919,6 +1208,30 @@ static bool clientThreadsActive(void) {
         if (nxusNetSlotInUse(&g_Slots[i])) return true;
     }
     return false;
+}
+
+/* A rebuild replaces the bsd session (socketExit() + socketInitializeDefault()),
+ * so every descriptor the old session handed out is invalid afterwards.  The
+ * deferred path already waits for the serving threads, which makes this normally a
+ * no-op; it is the explicit "the session changed, trust nothing in the slot table"
+ * step the rebind requires, and it doubles as a safety net if a slot was claimed
+ * between the drain check and here. */
+static void clearSlotTableAfterRebuild(void) {
+    int cleared = 0;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        NxusNetClient *client = slotClient(i);
+        if (client != NULL) {
+            (void)detachClientState(&g_Slots[i], client);
+            slotSetClient(i, NULL);
+        }
+        nxusNetSlotForceReap(&g_Slots[i]);
+        cleared++;
+    }
+    if (cleared > 0) {
+        NXUS_LOG("net: cleared %d slot(s) after the listener rebuild (the old bsd "
+                 "session's descriptors are invalid)", cleared);
+    }
 }
 
 /* Rebuild the listener, but not while a connection thread may still be inside
@@ -935,14 +1248,29 @@ static bool clientThreadsActive(void) {
  * long handler (a pointer scan), which may take longer but must not have its
  * session pulled from under it. */
 static void rebuildOrDefer(bool full_bsd_reset) {
+    /* Every old connection belongs to the bsd session that is about to be replaced:
+     * wake all of them before the listener is touched, so the deferred path can
+     * drain instead of waiting for a 20 s idle deadline. */
+    shutdownAllClients("listener rebuild");
+
     if (clientThreadsActive()) {
         NXUS_LOG("listener: rebuild deferred until the client threads have drained (%s)",
                  full_bsd_reset ? "full bsd reset" : "reopen");
-        shutdownAllClients("listener rebuild");
         atomic_store_explicit(&g_RebuildPending, true, memory_order_release);
         return;
     }
+
+    const u64 started = armGetSystemTick();
     rebuildListener(full_bsd_reset);
+    if (peekListenFd() < 0) {
+        NXUS_LOG("net: bsd session rebuild did not produce a listener - keeping the "
+                 "client slots for the next attempt");
+        return;
+    }
+
+    clearSlotTableAfterRebuild();
+    NXUS_LOG("net: rebuilt the bsd session after %llu ms",
+             (unsigned long long)(elapsedNs(started, armGetSystemTick()) / 1000000ull));
 }
 
 /* ---- accept loop -------------------------------------------------------- */
@@ -968,8 +1296,12 @@ static bool nxusNetPeerIsPrivate(const struct sockaddr_in *peer) {
    is going to, and the two frames - each header+payload as two sends - would
    interleave on the wire. */
 static void rejectClaimedClient(int slot, int fd, const char *peer_text,
-                               const char *why) {
+                               const char *why, NxusNetClient *client) {
+    /* No thread was started for this state object, so releasing it (and the slot)
+     * here cannot race a serving thread. */
+    slotSetClient(slot, NULL);
     nxusNetSlotReaped(&g_Slots[slot]);
+    if (client != NULL) clientStateRelease(client);
     sendBusyAndClose(fd, peer_text, why);
 }
 
@@ -983,14 +1315,28 @@ static void startClient(int fd, const char *peer_text) {
         return;
     }
 
-    NxusNetClient *client = &g_Clients[slot];
-    client->slot = &g_Slots[slot];
-    client->rx = NULL;
-    client->rx_cap = 0;
-    client->stack = NULL;
+    /* A spare state object is what makes a force-released slot reusable while its
+     * old thread still exists; refusing BUSY when every object is out is honest
+     * (the previous stale threads have not left yet). */
+    NxusNetClient *client = clientStateAcquire();
+    if (client == NULL) {
+        NXUS_LOG("net: no free connection state (every %d object is reserved)",
+                 NXUS_NET_CLIENT_STATE_MAX);
+        char why[96];
+        snprintf(why, sizeof(why), "no free connection state (%d/%d reserved)",
+                 NXUS_NET_CLIENT_STATE_MAX, NXUS_NET_CLIENT_STATE_MAX);
+        rejectClaimedClient(slot, fd, peer_text, why, NULL);
+        return;
+    }
+
+    clientSetSlot(client, &g_Slots[slot]);
+    clientSetGeneration(client, nxusNetSlotGeneration(clientSlot(client)));
     client->last_rx_tick = armGetSystemTick();
     client->rx_big_tick = 0;
     snprintf(client->peer, sizeof(client->peer), "%s", peer_text);
+    /* Accept is I/O: a connection that never sends a byte still gets the full
+     * stale window before the watchdog considers it dead. */
+    nxusNetSlotTouch(clientSlot(client), ioNowNs());
 
     /* The stack must be page-aligned for libnx's threadCreate(), hence the
        aligned allocation instead of a plain malloc.  24 KiB is the ship size; the
@@ -1021,7 +1367,7 @@ static void startClient(int fd, const char *peer_text) {
                  (unsigned)stack_size, (unsigned)NXUS_NET_RX_IDLE_SIZE);
         free(stack);
         free(rx);
-        rejectClaimedClient(slot, fd, peer_text, why);
+        rejectClaimedClient(slot, fd, peer_text, why, client);
         return;
     }
     nxusHeapLogDebug("net accept");
@@ -1038,13 +1384,17 @@ static void startClient(int fd, const char *peer_text) {
                  (unsigned)rc, peer_text, fd);
         free(stack);
         free(rx);
-        rejectClaimedClient(slot, fd, peer_text, "thread creation failed");
+        rejectClaimedClient(slot, fd, peer_text, "thread creation failed", client);
         return;
     }
 
     client->stack = stack;
     client->rx = rx;
     client->rx_cap = NXUS_NET_RX_IDLE_SIZE;
+
+    /* Publish the state BEFORE threadStart(): the serving thread may answer its
+     * first request immediately, and the send lookup has to find it. */
+    slotSetClient(slot, client);
 
     rc = threadStart(&client->thread);
     if (R_FAILED(rc)) {
@@ -1058,7 +1408,7 @@ static void startClient(int fd, const char *peer_text) {
         free(rx);
         client->rx = NULL;
         client->rx_cap = 0;
-        rejectClaimedClient(slot, fd, peer_text, "thread start failed");
+        rejectClaimedClient(slot, fd, peer_text, "thread start failed", client);
     }
 }
 
@@ -1071,8 +1421,15 @@ static void serverThread(void *arg) {
               here (and not from the serving thread) is what makes the stack free
               safe: the thread has been joined by now. */
         reapFinishedClients();
+        reapRetiredClients();
 
-        /* 0b. A rebuild that was deferred because a connection thread still used
+        /* 0b. The stale-slot watchdog.  A Wi-Fi switch can leave a connection
+               thread parked in recv()/poll() for ever, owning its slot, so every
+               later connection would be refused BUSY.  Runs on every accept-loop
+               pass (at most one poll slice apart); see watchStaleSlots(). */
+        watchStaleSlots();
+
+        /* 0c. A rebuild that was deferred because a connection thread still used
                the bsd session: run it as soon as the last slot is drained.  Only
                this loop rebuilds the listener, so there is no second caller that
                could slip in between the check and the rebuild. */
@@ -1083,7 +1440,7 @@ static void serverThread(void *arg) {
             }
             atomic_store_explicit(&g_RebuildPending, false, memory_order_release);
             NXUS_LOG("listener: client threads drained - rebuilding the bsd session now");
-            rebuildListener(true);
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
         }
@@ -1094,7 +1451,6 @@ static void serverThread(void *arg) {
               their threads have left - see rebuildOrDefer). */
         if (takeResetRequest()) {
             NXUS_LOG("network reset requested - dropping clients and rebuilding listener");
-            shutdownAllClients("network reset");
             rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
@@ -1226,14 +1582,25 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     mutexInit(&g_ListenMutex);
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
         nxusNetSlotReset(&g_Slots[i]);
-        g_Clients[i].slot = &g_Slots[i];
-        g_Clients[i].rx = NULL;
-        g_Clients[i].rx_cap = 0;
-        g_Clients[i].stack = NULL;
-        g_Clients[i].last_rx_tick = 0;
-        g_Clients[i].rx_big_tick = 0;
-        g_Clients[i].peer[0] = '\0';
-        mutexInit(&g_Clients[i].send_lock);
+        slotSetClient(i, NULL);
+    }
+    for (int i = 0; i < NXUS_NET_CLIENT_STATE_MAX; i++) {
+        NxusNetClient *client = &g_ClientStates[i];
+        /* Never NULL: a stale send path may still hold this pointer (see
+           clientStateRelease()).  startClient() repoints it to the claimed slot. */
+        clientSetSlot(client, &g_Slots[i % NXUS_NET_MAX_CLIENTS]);
+        clientSetGeneration(client, 0);
+        client->retired_fd = -1;
+        client->rx = NULL;
+        client->rx_cap = 0;
+        client->stack = NULL;
+        client->last_rx_tick = 0;
+        client->rx_big_tick = 0;
+        client->peer[0] = '\0';
+        atomic_store_explicit(&client->reserved, false, memory_order_relaxed);
+        atomic_store_explicit(&client->zombie, false, memory_order_relaxed);
+        atomic_store_explicit(&client->finished, false, memory_order_relaxed);
+        mutexInit(&client->send_lock);
     }
     atomic_store_explicit(&g_TableReady, true, memory_order_release);
     /* No rebuild can be pending in a fresh lifetime (the previous Exit joined or
@@ -1311,11 +1678,16 @@ void nxusNetRequestReset(const char *reason) {
        missed shutdown only costs one 200 ms poll slice, since the atomic flag
        above is what actually drives the reset. */
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
-        NxusNetClient *client = &g_Clients[i];
         if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        NxusNetClient *client = slotClient(i);
+        if (client == NULL) continue;
         if (!mutexTryLock(&client->send_lock)) continue;
-        const int fd = nxusNetSlotFd(client->slot);
-        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        /* Generation-checked: a state object detached by the stale watchdog must
+         * not shut down the descriptor of the connection that reused its slot. */
+        if (nxusNetSlotGeneration(clientSlot(client)) == clientGeneration(client)) {
+            const int fd = nxusNetSlotFd(clientSlot(client));
+            if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        }
         mutexUnlock(&client->send_lock);
     }
 }
@@ -1335,13 +1707,11 @@ static bool waitServerThreadDone(u64 deadline) {
     return true;
 }
 
-/* Wait (bounded) for one connection's serving thread to publish `done`. */
+/* Wait (bounded) for one connection's serving thread to publish that it is done.
+ * `finished` is the thread's last statement, so a successful wait means the
+ * Thread can be joined and its stack freed without racing the handler. */
 static bool waitClientDone(NxusNetClient *client, u64 deadline) {
-    while (!nxusNetSlotDone(client->slot)) {
-        if (armGetSystemTick() >= deadline) return false;
-        svcSleepThread(NXUS_NET_EXIT_POLL_NS);
-    }
-    return true;
+    return waitClientFinished(client, deadline);
 }
 
 /* ---- teardown ------------------------------------------------------------
@@ -1408,7 +1778,8 @@ void nxusNetExit(void) {
        phase 4 closing the descriptors. */
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
         if (!nxusNetSlotInUse(&g_Slots[i])) continue;
-        clientShutdown(&g_Clients[i]);
+        NxusNetClient *client = slotClient(i);
+        if (client != NULL) clientShutdown(client);
     }
     mutexLock(&g_ListenMutex);
     const int listen_fd = peekListenFd();
@@ -1434,13 +1805,17 @@ void nxusNetExit(void) {
     if (server_joined) {
         for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
             if (!nxusNetSlotInUse(&g_Slots[i])) continue;
-            NxusNetClient *client = &g_Clients[i];
+            NxusNetClient *client = slotClient(i);
+            if (client == NULL) {
+                nxusNetSlotReaped(&g_Slots[i]);
+                continue;
+            }
 
             if (!waitClientDone(client, deadline)) {
                 all_clients_joined = false;
                 NXUS_LOG_ERROR("net exit: client fd=%d still busy - abandoning its thread "
                                "(stack=%p rx=%p left to process exit)",
-                               nxusNetSlotFd(client->slot), (void *)client->stack,
+                               nxusNetSlotFd(clientSlot(client)), (void *)client->stack,
                                (void *)client->rx);
                 continue;
             }
@@ -1452,7 +1827,39 @@ void nxusNetExit(void) {
             free(client->rx);
             client->rx = NULL;
             client->rx_cap = 0;
+            slotSetClient(i, NULL);
             nxusNetSlotReaped(&g_Slots[i]);
+            clientStateRelease(client);
+        }
+
+        /* Force-released state objects live outside the slot table.  Join the ones
+           whose thread has left (and close the descriptor the watchdog took out of
+           the slot); a thread that is still running keeps everything - including
+           its descriptor - to process exit. */
+        for (int i = 0; i < NXUS_NET_CLIENT_STATE_MAX; i++) {
+            NxusNetClient *client = &g_ClientStates[i];
+            if (!atomic_load_explicit(&client->reserved, memory_order_acquire)) continue;
+            if (!atomic_load_explicit(&client->zombie, memory_order_acquire)) continue;
+
+            if (!waitClientDone(client, deadline)) {
+                all_clients_joined = false;
+                NXUS_LOG_ERROR("net exit: retired connection state %d still busy - "
+                               "leaving it (and fd=%d) to process exit",
+                               i, client->retired_fd);
+                continue;
+            }
+            threadWaitForExit(&client->thread);
+            threadClose(&client->thread);
+            free(client->stack);
+            client->stack = NULL;
+            free(client->rx);
+            client->rx = NULL;
+            client->rx_cap = 0;
+            if (client->retired_fd >= 0) {
+                close(client->retired_fd);
+                client->retired_fd = -1;
+            }
+            clientStateRelease(client);
         }
     } else {
         /* The accept thread may still be reaping a slot; leave every client
@@ -1466,7 +1873,14 @@ void nxusNetExit(void) {
        land on a live socket. */
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
         if (!nxusNetSlotInUse(&g_Slots[i])) continue;
-        const int fd = clientTakeFd(&g_Clients[i]);
+        NxusNetClient *client = slotClient(i);
+        int fd = -1;
+        if (client != NULL) {
+            fd = clientTakeFd(client);
+        } else {
+            fd = nxusNetSlotFd(&g_Slots[i]);
+            if (fd >= 0) nxusNetSlotClearFd(&g_Slots[i]);
+        }
         if (fd >= 0) close(fd);
     }
     mutexLock(&g_ListenMutex);

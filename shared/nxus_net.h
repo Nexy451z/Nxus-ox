@@ -120,6 +120,30 @@ typedef u32 Result;
    short enough that four normally-active clients cost 128 KiB, not 4 MiB. */
 #define NXUS_NET_RX_SHRINK_IDLE_NS 30000000000ull
 
+/* A connection that has completed no read AND no write for this long is treated
+ * as dead.  A healthy PC client heartbeats every 4 s, so this only fires on the
+ * situations that used to leave a slot stuck forever: the Wi-Fi link changed
+ * under the sysmodule, the peer vanished without a FIN, or a connection thread
+ * is parked in recv()/poll() on a descriptor the old bsd session will never
+ * signal again.  The value is deliberately short enough that a reconnect after a
+ * network switch is served within half a minute, and long enough that an idle
+ * client (which still heartbeats) is never touched. */
+#define NXUS_NET_SLOT_STALE_NS 30000000000ull
+
+/* After shutdown() of a stale slot, how long the accept loop waits for its
+ * serving thread to publish `finished` before force-releasing the slot.  One
+ * second is far more than a thread parked in a 200 ms poll() slice needs and
+ * still bounds the accept loop's own stall. */
+#define NXUS_NET_SLOT_STALE_WAIT_MS 1000u
+
+/* Granularity of that bounded wait.  Matches the exit path's poll interval. */
+#define NXUS_NET_SLOT_STALE_POLL_NS 10000000ull
+
+/* Pinned log wording for a slot the watchdog had to force-release.  Exposed so
+ * the host test can assert the exact line an operator greps for. */
+#define NXUS_NET_LOG_SLOT_STALE_FMT \
+    "net: slot %d stale after %llu ms - force-releasing it"
+
 /* Reason word appended to the BUSY reply sent to a refused connection.
    core/nxus_protocol.h has no dedicated "all client slots are in use" code (the
    protocol header is the wire single source of truth and is not changed here), so
@@ -158,48 +182,181 @@ static inline void nxusNetFillBusyPayload(s32 out[2]) {
  * owned until the reaper has joined it.  That is what nxusNetSlotReapable() and
  * the in_use/done split express, and it is the property the host test pins.
  *
+ * STALE WATCHDOG
+ * --------------
+ * A Wi-Fi switch or a half-open link can leave a serving thread parked in
+ * recv()/poll() for ever: the thread owns its slot, so every later connection is
+ * answered BUSY and the module only recovers with a restart.  Every slot
+ * therefore carries the monotonic nanosecond stamp of its last completed I/O
+ * (updated on accept, recv and send).  The accept loop treats a slot with no I/O
+ * for NXUS_NET_SLOT_STALE_NS as dead, shuts its socket down, waits at most
+ * NXUS_NET_SLOT_STALE_WAIT_MS for the thread to leave and otherwise force-releases
+ * the slot so a reconnect can be served (see nxusNetSlotForceReap()).
+ *
+ * A force-released thread may still be alive (parked in a long handler, or not
+ * yet scheduled), so its stack, receive buffer, Thread handle and descriptor are
+ * deliberately leaked rather than freed under it.  Every claim bumps the slot's
+ * 31-bit generation, and finish()/take are CAS operations against the generation
+ * the thread was given: a late action from the old thread therefore cannot clear
+ * the new owner's descriptor or mark it done.  That is the property that makes
+ * "force-release and reuse" safe instead of a use-after-free.
+ *
  * The helpers are static inline so tests/test_server_logic.c exercises the
  * shipped policy instead of a copy.  They are lock-free atomic because the send
  * path reads `fd` without the table lock and the exit path reads the table while
  * the accept thread may still be running.
  */
+/* All per-slot mutable state lives in one 64-bit token plus two atomics:
+ *
+ *   bits 63..33  generation (31 bits, bumped by every claim/reap)
+ *   bit  32      done flag  (published by the serving thread)
+ *   bits 31..0   descriptor, 0xFFFFFFFF when unregistered
+ *
+ * `in_use` is the claim ownership bit, and `last_io_ns` is the monotonic
+ * nanosecond stamp of the last completed read/write (or the accept).  Keeping
+ * generation + done + fd in ONE atomic word is what makes a force-release safe:
+ * the old serving thread's finish() is a CAS against its own generation, so it
+ * either publishes "done" before the slot is reused or fails and leaves the new
+ * owner's descriptor alone.  A separate done flag had a window where a late
+ * finish from the old generation could mark the new connection finished. */
 typedef struct {
-    atomic_int  fd;      /* -1 = free, else the connected client descriptor      */
-    atomic_bool in_use;  /* a serving thread owns (or is starting in) this slot  */
-    atomic_bool done;    /* the serving thread has finished; reapable once in_use */
+    atomic_bool          in_use;
+    atomic_uint_fast64_t token;
+    atomic_uint_fast64_t last_io_ns;
 } NxusNetSlot;
 
+#define NXUS_NET_SLOT_NO_FD          ((u32)0xFFFFFFFFu)
+#define NXUS_NET_SLOT_DONE_FLAG      (1ull << 32)
+#define NXUS_NET_SLOT_GENERATION_MASK 0x7FFFFFFFu
+
+/* Pack a token.  `done` is cleared by every claim, so the only way it becomes
+   true is nxusNetSlotFinishGeneration() for the current generation. */
+static inline u64 nxusNetSlotMakeToken(u32 generation, bool done, int fd) {
+    return ((u64)(generation & NXUS_NET_SLOT_GENERATION_MASK) << 33) |
+           (done ? NXUS_NET_SLOT_DONE_FLAG : 0ull) |
+           (u64)(u32)(s32)fd;
+}
+
+static inline u64 nxusNetSlotToken(const NxusNetSlot *slot) {
+    return atomic_load_explicit(&slot->token, memory_order_acquire);
+}
+
 static inline void nxusNetSlotReset(NxusNetSlot *slot) {
-    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
     atomic_store_explicit(&slot->in_use, false, memory_order_relaxed);
-    atomic_store_explicit(&slot->done, false, memory_order_relaxed);
+    atomic_store_explicit(&slot->token, nxusNetSlotMakeToken(0, false, -1),
+                          memory_order_relaxed);
+    atomic_store_explicit(&slot->last_io_ns, 0, memory_order_relaxed);
 }
 
 static inline int nxusNetSlotFd(const NxusNetSlot *slot) {
-    return atomic_load_explicit(&slot->fd, memory_order_acquire);
+    return (int)(s32)(u32)(nxusNetSlotToken(slot) & 0xFFFFFFFFull);
 }
 
-/* Unregister the descriptor without closing it: every sender that looks the
-   connection up afterwards refuses, while the number stays unique (it is not
-   closed yet), so the close handler can still name this connection by fd. */
-static inline void nxusNetSlotClearFd(NxusNetSlot *slot) {
-    atomic_store_explicit(&slot->fd, -1, memory_order_release);
+static inline u32 nxusNetSlotGeneration(const NxusNetSlot *slot) {
+    return (u32)(nxusNetSlotToken(slot) >> 33);
 }
 
-/* The serving thread's last action.  fd goes to -1 first (no more sends), then
-   done is published: this is the release store the reaper's acquire sees, so
-   "done == true" also means "rx buffer already released, thread about to exit". */
-static inline void nxusNetSlotFinish(NxusNetSlot *slot) {
-    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
-    atomic_store_explicit(&slot->done, true, memory_order_release);
+static inline bool nxusNetSlotDone(const NxusNetSlot *slot) {
+    return (nxusNetSlotToken(slot) & NXUS_NET_SLOT_DONE_FLAG) != 0ull;
 }
 
 static inline bool nxusNetSlotInUse(const NxusNetSlot *slot) {
     return atomic_load_explicit(&slot->in_use, memory_order_acquire);
 }
 
-static inline bool nxusNetSlotDone(const NxusNetSlot *slot) {
-    return atomic_load_explicit(&slot->done, memory_order_acquire);
+/* ---- I/O clock / stale policy ------------------------------------------ */
+
+/* Stamp a completed read/write or the accept.  `now_ns` is a monotonic
+   nanosecond value (armTicksToNs(armGetSystemTick()) on the console); 0 means
+   "not stamped yet" and is never considered stale. */
+static inline void nxusNetSlotTouch(NxusNetSlot *slot, u64 now_ns) {
+    atomic_store_explicit(&slot->last_io_ns, now_ns, memory_order_relaxed);
+}
+
+static inline u64 nxusNetSlotLastIoNs(const NxusNetSlot *slot) {
+    return atomic_load_explicit(&slot->last_io_ns, memory_order_acquire);
+}
+
+/* Nanoseconds since the last stamped I/O, clamped to 0 for a slot that has no
+   stamp yet or for a clock that went backwards. */
+static inline u64 nxusNetSlotIdleNs(const NxusNetSlot *slot, u64 now_ns) {
+    const u64 last = nxusNetSlotLastIoNs(slot);
+    if (last == 0 || now_ns <= last) return 0;
+    return now_ns - last;
+}
+
+/* A claimed, unfinished slot with no I/O for NXUS_NET_SLOT_STALE_NS (at least;
+   the deadline itself counts as stale).  A free slot, a finished slot (waiting
+   for its reap) and a freshly claimed slot without a stamp are never stale. */
+static inline bool nxusNetSlotIsStale(const NxusNetSlot *slot, u64 now_ns) {
+    if (!nxusNetSlotInUse(slot)) return false;
+    if (nxusNetSlotDone(slot)) return false;
+    if (nxusNetSlotFd(slot) < 0) return false;
+    if (nxusNetSlotLastIoNs(slot) == 0) return false;
+    return nxusNetSlotIdleNs(slot, now_ns) >= NXUS_NET_SLOT_STALE_NS;
+}
+
+/* ---- descriptor ownership ---------------------------------------------- */
+
+/* Unregister the descriptor without closing it, preserving the generation and
+   done bit.  Kept for the simple "no more sends" step; the generation-aware
+   executor is nxusNetSlotTakeFd() below. */
+static inline void nxusNetSlotClearFd(NxusNetSlot *slot) {
+    u64 token = nxusNetSlotToken(slot);
+    for (;;) {
+        const u64 desired = (token & ~0xFFFFFFFFull) | (u64)NXUS_NET_SLOT_NO_FD;
+        if (atomic_compare_exchange_strong_explicit(&slot->token, &token, desired,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+/* Atomically unregister `fd` when this generation still owns it; returns the
+ * descriptor the caller now owns (and must close), or -1 when the slot already
+ * belongs to another generation (force-released and reused) or is empty. */
+static inline int nxusNetSlotTakeFd(NxusNetSlot *slot, u32 generation) {
+    u64 token = nxusNetSlotToken(slot);
+    for (;;) {
+        if ((u32)(token >> 33) != (generation & NXUS_NET_SLOT_GENERATION_MASK))
+            return -1;
+        const int fd = (int)(s32)(u32)(token & 0xFFFFFFFFull);
+        if (fd < 0) return -1;
+        const u64 desired = (token & ~0xFFFFFFFFull) | (u64)NXUS_NET_SLOT_NO_FD;
+        if (atomic_compare_exchange_strong_explicit(&slot->token, &token, desired,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            return fd;
+        }
+    }
+}
+
+/* The serving thread's last published action for its generation: sets done and
+ * drops the descriptor in one CAS.  Returns false (and changes nothing) when the
+ * slot was already reused for another generation, so an old thread can never
+ * clobber the new owner's state after a force-release.
+ *
+ * The 31-bit wrap is intentional: it is far beyond any connection count a
+ * console lifetime reaches, and a wrapped generation is still different from the
+ * generation of every thread that can still be alive. */
+static inline bool nxusNetSlotFinishGeneration(NxusNetSlot *slot, u32 generation) {
+    u64 expected = nxusNetSlotToken(slot);
+    if ((u32)(expected >> 33) != (generation & NXUS_NET_SLOT_GENERATION_MASK))
+        return false;
+    const u64 desired = ((u64)(generation & NXUS_NET_SLOT_GENERATION_MASK) << 33) |
+                        NXUS_NET_SLOT_DONE_FLAG |
+                        (u64)NXUS_NET_SLOT_NO_FD;
+    return atomic_compare_exchange_strong_explicit(&slot->token, &expected, desired,
+                                                   memory_order_acq_rel,
+                                                   memory_order_acquire);
+}
+
+/* Historical helper: publish done for the slot's current generation.  The slot
+ * helpers are single-threaded in the host test; production always names the
+ * generation it owns (serveClient/clientThread call the variant above). */
+static inline void nxusNetSlotFinish(NxusNetSlot *slot) {
+    (void)nxusNetSlotFinishGeneration(slot, nxusNetSlotGeneration(slot));
 }
 
 /* Finished AND still owned: the reaper may join this slot. */
@@ -209,8 +366,9 @@ static inline bool nxusNetSlotReapable(const NxusNetSlot *slot) {
 
 /* Claim a free slot for `fd` and return its index, or -1 when every slot is in
  * use (or merely waiting to be reaped).  The CAS on in_use is the claim; the
- * fields are written after it, and a slot is only ever claimable in the clean
- * state nxusNetSlotReset()/nxusNetSlotReaped() leave behind (fd -1, done false). */
+ * generation is bumped (which also clears done) and the descriptor published
+ * after it, and a slot is only ever claimable in the clean state
+ * nxusNetSlotReset()/nxusNetSlotReaped() leave behind. */
 static inline int nxusNetSlotClaim(NxusNetSlot *slots, int count, int fd) {
     for (int i = 0; i < count; i++) {
         NxusNetSlot *slot = &slots[i];
@@ -220,19 +378,54 @@ static inline int nxusNetSlotClaim(NxusNetSlot *slots, int count, int fd) {
                                                      memory_order_acquire)) {
             continue;
         }
-        atomic_store_explicit(&slot->done, false, memory_order_relaxed);
-        atomic_store_explicit(&slot->fd, fd, memory_order_release);
+        u32 generation = nxusNetSlotGeneration(slot);
+        generation = (generation + 1u) & NXUS_NET_SLOT_GENERATION_MASK;
+        atomic_store_explicit(&slot->token,
+                              nxusNetSlotMakeToken(generation, false, fd),
+                              memory_order_release);
+        atomic_store_explicit(&slot->last_io_ns, 0, memory_order_relaxed);
         return i;
     }
     return -1;
 }
 
+/* Internal: retire a slot without joining its thread.  The generation is bumped,
+ * so a late finish()/take from the previous owner can no longer touch it. */
+static inline void nxusNetSlotRetire(NxusNetSlot *slot) {
+    const u32 generation = (nxusNetSlotGeneration(slot) + 1u) &
+                           NXUS_NET_SLOT_GENERATION_MASK;
+    atomic_store_explicit(&slot->token,
+                          nxusNetSlotMakeToken(generation, false, -1),
+                          memory_order_release);
+    atomic_store_explicit(&slot->last_io_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&slot->in_use, false, memory_order_release);
+}
+
 /* The reaper's last action: release the slot for a later connection.  Only valid
    once the thread has been joined and its stack freed (see nxusNetSlotReapable). */
 static inline void nxusNetSlotReaped(NxusNetSlot *slot) {
-    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
-    atomic_store_explicit(&slot->done, false, memory_order_relaxed);
-    atomic_store_explicit(&slot->in_use, false, memory_order_release);
+    nxusNetSlotRetire(slot);
+}
+
+/* The stale watchdog's last action: make the slot claimable again even though its
+ * serving thread has not been joined.  The caller keeps the old thread's state
+ * (stack/rx buffer/Thread handle/descriptor) on the leak side of the "leak, never
+ * UAF" rule; the bumped generation protects the next owner from it. */
+static inline void nxusNetSlotForceReap(NxusNetSlot *slot) {
+    nxusNetSlotRetire(slot);
+}
+
+/* Drop every live slot after a listener rebuild: the bsd session the old
+ * descriptors belonged to is gone, so none of them is valid any more.  Returns
+ * the number of slots that still had to be cleared (for the log line). */
+static inline int nxusNetSlotClearAll(NxusNetSlot *slots, int count) {
+    int cleared = 0;
+    for (int i = 0; i < count; i++) {
+        if (!nxusNetSlotInUse(&slots[i])) continue;
+        nxusNetSlotRetire(&slots[i]);
+        cleared++;
+    }
+    return cleared;
 }
 
 /* Slots that could accept a new connection right now.  Used for the BUSY log and

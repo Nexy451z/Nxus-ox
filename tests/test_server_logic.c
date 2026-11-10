@@ -1422,6 +1422,213 @@ static void testNetFinishedSlotWaitsForReap(void) {
           "a drained table must serve the first slot again");
 }
 
+/* ---- stale-slot watchdog policy ---------------------------------------- */
+
+/* Contract: a slot that has completed no I/O for NXUS_NET_SLOT_STALE_NS (30 s) is
+   dead even though its thread may still be parked in recv(); the accept thread
+   shuts it down, waits at most NXUS_NET_SLOT_STALE_WAIT_MS and then force-releases
+   it.  The deadline is a >= comparison, a free/finished/never-stamped slot is never
+   stale, and a completed recv/send stamp revives the slot.  The helpers below are
+   the SHIPPED ones from shared/nxus_net.h. */
+
+static void testNetSlotStalePolicy(void) {
+    printf("[test] net: a slot with no I/O for 30 s is stale, new I/O revives it\n");
+    TestNetServer s;
+    testNetServerInit(&s);
+
+    CHECK(NXUS_NET_SLOT_STALE_NS == 30000000000ull,
+          "the stale deadline is 30 s (got %llu ns)",
+          (unsigned long long)NXUS_NET_SLOT_STALE_NS);
+    CHECK(NXUS_NET_SLOT_STALE_WAIT_MS == 1000u,
+          "a stale thread gets 1 s to leave after shutdown (got %u ms)",
+          (unsigned)NXUS_NET_SLOT_STALE_WAIT_MS);
+    CHECK(NXUS_NET_SLOT_STALE_POLL_NS > 0 &&
+              NXUS_NET_SLOT_STALE_POLL_NS <
+                  (u64)NXUS_NET_SLOT_STALE_WAIT_MS * 1000000ull,
+          "the wait is polled at a finer granularity than its deadline");
+
+    int fd = -1;
+    const int slot = testNetAccept(&s, "192.168.1.10:40000", &fd);
+    CHECK(slot == 0, "the first connection must take slot 0 (got %d)", slot);
+    CHECK(nxusNetSlotLastIoNs(&s.slots[0]) == 0,
+          "a fresh claim must start without an I/O stamp");
+
+    const u64 t0 = 1000000000ull;   /* arbitrary monotonic base (1 s) */
+    CHECK(!nxusNetSlotIsStale(&s.slots[0], t0 + NXUS_NET_SLOT_STALE_NS),
+          "a slot without a stamp is never stale");
+
+    /* Accept/recv/send stamp. */
+    nxusNetSlotTouch(&s.slots[0], t0);
+    CHECK(nxusNetSlotLastIoNs(&s.slots[0]) == t0,
+          "the I/O stamp must be stored (got %llu)",
+          (unsigned long long)nxusNetSlotLastIoNs(&s.slots[0]));
+    CHECK(nxusNetSlotIdleNs(&s.slots[0], t0) == 0,
+          "the slot is not idle at the moment of its last I/O");
+
+    /* The 30 s boundary: 29.999999999 s alive, exactly 30 s stale. */
+    CHECK(!nxusNetSlotIsStale(&s.slots[0], t0 + 29999999999ull),
+          "29.999999999 s without I/O must still be alive");
+    CHECK(nxusNetSlotIdleNs(&s.slots[0], t0 + 29999999999ull) == 29999999999ull,
+          "the idle time must be the exact time difference");
+    CHECK(nxusNetSlotIsStale(&s.slots[0], t0 + NXUS_NET_SLOT_STALE_NS),
+          "exactly 30 s without I/O must be stale");
+    CHECK(nxusNetSlotIsStale(&s.slots[0], t0 + 60000000000ull),
+          "a minute without I/O must be stale");
+
+    /* A recv/send after 20 s revives the slot: the deadline moves with the I/O. */
+    nxusNetSlotTouch(&s.slots[0], t0 + 20000000000ull);
+    CHECK(nxusNetSlotIdleNs(&s.slots[0], t0 + 40000000000ull) == 20000000000ull,
+          "the idle clock restarts at the last I/O");
+    CHECK(!nxusNetSlotIsStale(&s.slots[0], t0 + 49999999999ull),
+          "a slot refreshed 20 s ago is still alive at 29.999999999 s");
+    CHECK(nxusNetSlotIsStale(&s.slots[0], t0 + 50000000000ull),
+          "a slot refreshed 20 s ago is stale at 30 s");
+
+    /* A clock that appears to go backwards (or no stamp) reports 0 idle, never a
+       huge unsigned difference. */
+    CHECK(nxusNetSlotIdleNs(&s.slots[0], t0) == 0,
+          "a time before the stamp must clamp to 0, not wrap");
+    CHECK(!nxusNetSlotIsStale(&s.slots[0], t0),
+          "a clock behind the stamp must not make the slot stale");
+
+    /* Free slots and finished slots are never stale: the watchdog only targets a
+       claimed, still-running connection. */
+    nxusNetSlotTouch(&s.slots[1], t0);
+    CHECK(!nxusNetSlotIsStale(&s.slots[1], t0 + 60000000000ull),
+          "a free slot must never look stale");
+
+    int fd2 = -1;
+    CHECK(testNetAccept(&s, "192.168.1.11:40001", &fd2) == 1,
+          "the second connection must take slot 1");
+    nxusNetSlotTouch(&s.slots[1], t0);
+    nxusNetSlotFinish(&s.slots[1]);
+    CHECK(nxusNetSlotDone(&s.slots[1]), "the slot must be marked finished");
+    CHECK(!nxusNetSlotIsStale(&s.slots[1], t0 + 60000000000ull),
+          "a finished slot waiting for its reap must never look stale");
+}
+
+/* A force-released slot must be claimable again, and the old serving thread -
+   which may still be alive - must not be able to touch the new owner's slot state.
+   That is what the generation in the slot token is for. */
+static void testNetForceReleasedSlotIsReusable(void) {
+    printf("[test] net: a force-released slot is reusable and ignores the old thread\n");
+    TestNetServer s;
+    testNetServerInit(&s);
+
+    int fds[NXUS_NET_MAX_CLIENTS];
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        CHECK(testNetAccept(&s, "peer:1", &fds[i]) == i,
+              "connection %d must take slot %d", i, i);
+    }
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "a full table must have no free slot");
+
+    const int slot = 1;
+    const int old_fd = nxusNetSlotFd(&s.slots[slot]);
+    const u32 old_generation = nxusNetSlotGeneration(&s.slots[slot]);
+    CHECK(old_fd == fds[slot], "slot %d must publish its descriptor", slot);
+
+    /* What watchStaleSlots() does after shutdown() + a 1 s wait expired. */
+    nxusNetSlotForceReap(&s.slots[slot]);
+    CHECK(!nxusNetSlotInUse(&s.slots[slot]), "a force-released slot must be claimable");
+    CHECK(nxusNetSlotFd(&s.slots[slot]) == -1,
+          "a force-released slot must not publish the old descriptor");
+    CHECK(!nxusNetSlotDone(&s.slots[slot]),
+          "a force-released slot must not look finished for the next owner");
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 1,
+          "exactly the force-released slot must count as free");
+
+    int new_fd = -1;
+    const int reused = testNetAccept(&s, "peer:2", &new_fd);
+    CHECK(reused == slot, "the next connection must reuse slot %d (got %d)", slot, reused);
+    CHECK(nxusNetSlotFd(&s.slots[slot]) == new_fd,
+          "the reused slot must publish the new descriptor (got %d)",
+          nxusNetSlotFd(&s.slots[slot]));
+    CHECK(nxusNetSlotGeneration(&s.slots[slot]) != old_generation,
+          "reusing a slot must bump its generation");
+
+    /* The old thread's late finish() is a CAS against its old generation: it must
+       fail instead of marking the NEW connection finished or clearing its fd. */
+    CHECK(!nxusNetSlotFinishGeneration(&s.slots[slot], old_generation),
+          "an old generation's finish must be refused");
+    CHECK(!nxusNetSlotDone(&s.slots[slot]),
+          "an old thread must not mark the new owner finished");
+    CHECK(nxusNetSlotFd(&s.slots[slot]) == new_fd,
+          "an old thread must not clear the new owner's descriptor");
+    CHECK(nxusNetSlotTakeFd(&s.slots[slot], old_generation) == -1,
+          "an old generation must not take the new owner's descriptor");
+    CHECK(nxusNetSlotFd(&s.slots[slot]) == new_fd,
+          "a refused take must leave the new descriptor published");
+
+    /* The current generation owns both operations. */
+    const u32 new_generation = nxusNetSlotGeneration(&s.slots[slot]);
+    CHECK(nxusNetSlotTakeFd(&s.slots[slot], new_generation) == new_fd,
+          "the current owner must be able to take its descriptor");
+    CHECK(nxusNetSlotFd(&s.slots[slot]) == -1,
+          "taking the descriptor must unregister it");
+    CHECK(nxusNetSlotFinishGeneration(&s.slots[slot], new_generation),
+          "the current generation must be able to finish");
+    CHECK(nxusNetSlotDone(&s.slots[slot]),
+          "the current generation's finish must publish done");
+    CHECK(nxusNetSlotReapable(&s.slots[slot]),
+          "the finished slot must be reapable");
+}
+
+/* What the listener rebuild does after socketExit()/socketInitializeDefault(): the
+   bsd session changed, so every descriptor in the slot table is invalid and the
+   table is cleared.  A late action from an old generation is still ignored. */
+static void testNetSlotTableClearedAfterRebuild(void) {
+    printf("[test] net: a listener rebuild clears every slot in the table\n");
+    TestNetServer s;
+    testNetServerInit(&s);
+
+    u32 generations[NXUS_NET_MAX_CLIENTS];
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        CHECK(testNetAccept(&s, "peer:1", NULL) == i,
+              "connection %d must take slot %d", i, i);
+        generations[i] = nxusNetSlotGeneration(&s.slots[i]);
+    }
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "all slots must be claimed before the rebuild");
+
+    CHECK(nxusNetSlotClearAll(s.slots, NXUS_NET_MAX_CLIENTS) == NXUS_NET_MAX_CLIENTS,
+          "the rebuild must clear every claimed slot");
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        CHECK(!nxusNetSlotInUse(&s.slots[i]), "slot %d must be free after the rebuild", i);
+        CHECK(nxusNetSlotFd(&s.slots[i]) == -1,
+              "slot %d must not keep an old descriptor", i);
+        CHECK(!nxusNetSlotDone(&s.slots[i]),
+              "slot %d must not look finished after the rebuild", i);
+        CHECK(!nxusNetSlotFinishGeneration(&s.slots[i], generations[i]),
+              "slot %d must ignore the old generation's finish after the rebuild", i);
+        CHECK(!nxusNetSlotDone(&s.slots[i]),
+              "slot %d must stay un-finished after the ignored finish", i);
+    }
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == NXUS_NET_MAX_CLIENTS,
+          "every slot must be claimable after the rebuild");
+
+    /* Clearing an already empty table is a no-op, not an error. */
+    CHECK(nxusNetSlotClearAll(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "clearing an empty table must clear nothing");
+
+    int fd = -1;
+    CHECK(testNetAccept(&s, "peer:2", &fd) == 0,
+          "the table must serve the first connection after the rebuild");
+    CHECK(nxusNetSlotFd(&s.slots[0]) == fd,
+          "the rebuilt table must publish the new descriptor");
+}
+
+/* The log line is the one an operator greps for after a Wi-Fi switch. */
+static void testNetStaleLogWording(void) {
+    printf("[test] net: the force-release log names the slot, the idle time and the action\n");
+    char line[160];
+    snprintf(line, sizeof(line), NXUS_NET_LOG_SLOT_STALE_FMT, 2, 31250ull);
+    CHECK(strstr(line, "net: slot 2") != NULL, "the log must name the slot: %s", line);
+    CHECK(strstr(line, "31250 ms") != NULL, "the log must carry the idle time: %s", line);
+    CHECK(strstr(line, "force-releasing it") != NULL,
+          "the log must say the slot was force-released: %s", line);
+}
+
 /* ====================================================================== */
 /* (f) command classification (switch/include/nxus_server.h)              */
 /* ====================================================================== */
@@ -1653,6 +1860,10 @@ int main(void) {
     testNetFourClientsAreServed();
     testNetFifthConnectionGetsBusy();
     testNetFinishedSlotWaitsForReap();
+    testNetSlotStalePolicy();
+    testNetForceReleasedSlotIsReusable();
+    testNetSlotTableClearedAfterRebuild();
+    testNetStaleLogWording();
 
     testCommandClassificationTable();
     testCommandClassificationFamilies();

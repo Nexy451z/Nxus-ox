@@ -137,12 +137,35 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- status bar
 
+/// Width of the status bar's spinner slot, in points.
+///
+/// The slot is allocated whether or not the spinner is painted, so the status text
+/// next to it keeps its exact x position: a spinner that appears for 400 ms and
+/// hides again used to shove that text right and left, which is what made the bar
+/// hard to read.
+const SPINNER_SLOT: f32 = 22.0;
+
+/// Reserve the spinner slot, and paint the spinner in it when `show`.
+///
+/// Painting through [`egui::Spinner::paint_at`] (instead of `ui.spinner()`) is what
+/// lets the slot and the spinner be sized apart from the widget: the space is taken
+/// on every frame, only the paint is conditional.
+fn spinner_slot(ui: &mut egui::Ui, show: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(SPINNER_SLOT, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    if show {
+        egui::Spinner::new().size(SPINNER_SLOT).paint_at(ui, rect);
+    }
+}
+
 pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.horizontal(|ui| {
-            if app.st.busy {
-                ui.spinner();
-            }
+            // Only a job that has been running for SPINNER_DELAY gets a spinner
+            // (see `should_show_spinner`); the slot is reserved either way.
+            spinner_slot(ui, app.st.spinner_visible());
             // The toast queue decides the line: a queued message is live, an
             // empty queue leaves the last one dimmed instead of blanking the bar.
             let live = app.st.has_toast();
@@ -166,6 +189,35 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------- log
+
+/// Draw one log line, and make it copyable on its own.
+///
+/// The label stays `selectable(true)` (drag-select still works), but a double-click
+/// copies the whole line: before this, getting one line out of the panel meant
+/// selecting it by hand or pressing `copy` for the entire log.  The right-click menu
+/// offers the same thing for people who would rather not double-click a log line.
+///
+/// Returns `true` when this frame copied a line, so the caller can say so.
+fn copyable_log_line(ui: &mut egui::Ui, line: &str, color: Color32, size: f32) -> bool {
+    let response = ui
+        .add(
+            egui::Label::new(RichText::new(line).monospace().size(size).color(color))
+                .selectable(true),
+        )
+        .on_hover_text("double-click to copy this line");
+    let mut copied = response.double_clicked();
+    if copied {
+        ui.ctx().copy_text(line.to_string());
+    }
+    response.context_menu(|ui| {
+        if ui.button("Copy line").clicked() {
+            ui.ctx().copy_text(line.to_string());
+            ui.close();
+            copied = true;
+        }
+    });
+    copied
+}
 
 pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
     egui::Panel::bottom("log")
@@ -210,6 +262,9 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             });
+            // A line was copied with a double-click (or the right-click menu): the
+            // status bar says so, because the clipboard itself is invisible.
+            let mut copied = false;
             if !app.console_log.is_empty() {
                 ui.label(RichText::new("console").strong().size(12.0));
                 egui::ScrollArea::vertical().id_salt("console_log").max_height(90.0)
@@ -217,10 +272,7 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                     for line in &app.console_log {
                         let color = if line.contains("dropped") || line.contains("retr") { YELLOW }
                                     else { DIM };
-                        ui.add(
-                            egui::Label::new(RichText::new(line).monospace().size(11.0).color(color))
-                                .selectable(true),
-                        );
+                        copied |= copyable_log_line(ui, line, color, 11.0);
                     }
                 });
                 ui.separator();
@@ -231,12 +283,12 @@ pub fn log_panel(app: &mut App, ui: &mut egui::Ui) {
                                 else if line.contains("STOPPED") { RED }
                                 else if line.contains("watch hit") || line.contains("hotkey") { YELLOW }
                                 else { DIM };
-                    ui.add(
-                        egui::Label::new(RichText::new(line).monospace().size(12.0).color(color))
-                            .selectable(true),
-                    );
+                    copied |= copyable_log_line(ui, line, color, 12.0);
                 }
             });
+            if copied {
+                app.st.toast("copied");
+            }
         });
 }
 

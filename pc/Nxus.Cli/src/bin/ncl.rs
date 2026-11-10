@@ -75,6 +75,16 @@ const BUSY_WATCHDOG: Duration = Duration::from_secs(10);
 /// window "busy forever" again - that was the original hang.
 const BUSY_HARD_LIMIT: Duration = Duration::from_secs(60);
 
+/// How long a job has to run before the status bar shows a spinner.
+///
+/// The flag is set by every queued job, so a spinner tied to it alone blinked on
+/// every click and pushed the status text sideways.  Same 400 ms rule as nxus.
+const SPINNER_DELAY: Duration = Duration::from_millis(400);
+
+/// Width of the status bar's spinner slot (reserved whether or not it is painted,
+/// so the status text never moves).
+const SPINNER_SLOT: f32 = 22.0;
+
 const ACCENT: Color32 = Color32::from_rgb(96, 174, 255);
 const GREEN: Color32 = Color32::from_rgb(104, 208, 128);
 const RED: Color32 = Color32::from_rgb(244, 112, 112);
@@ -372,6 +382,31 @@ impl BusyJob {
 
     fn elapsed(&self) -> Duration {
         self.since.elapsed()
+    }
+}
+
+/// Should the status bar draw its spinner?
+///
+/// Pure, like the nxus copy: the frame hands over two instants, so "a job under
+/// 400 ms gets no spinner" is a rule, not a timing accident.
+fn should_show_spinner(busy_since: Option<Instant>, now: Instant) -> bool {
+    match busy_since {
+        Some(since) => now.saturating_duration_since(since) >= SPINNER_DELAY,
+        None => false,
+    }
+}
+
+/// Reserve the spinner slot, and paint the spinner in it when `show`.
+///
+/// The space is taken on every frame - only the paint is conditional - so the
+/// status text keeps one x position whether a job is running or not.
+fn spinner_slot(ui: &mut egui::Ui, show: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(SPINNER_SLOT, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    if show {
+        egui::Spinner::new().size(SPINNER_SLOT).paint_at(ui, rect);
     }
 }
 
@@ -2650,9 +2685,12 @@ impl NclApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("ncl-status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if self.busy.is_some() {
-                    ui.spinner();
-                }
+                // Only a job that has run for 400 ms gets a spinner; the slot is
+                // reserved either way so the text below does not move.
+                spinner_slot(
+                    ui,
+                    should_show_spinner(self.busy.map(|busy| busy.since), Instant::now()),
+                );
                 // "busy since N s": the watchdog state is visible, not just a
                 // message that never changes while a job hangs.
                 let stuck = self.stuck_for();
@@ -3273,14 +3311,36 @@ impl NclApp {
             }
         });
         ui.separator();
+        let mut copied = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for line in &self.log {
-                    ui.label(RichText::new(line).monospace().color(DIM));
+                    // Same rule as the nxus LOG panel: the line stays selectable,
+                    // a double-click copies it (and the right-click menu says so).
+                    let response = ui
+                        .add(
+                            egui::Label::new(RichText::new(line).monospace().color(DIM))
+                                .selectable(true),
+                        )
+                        .on_hover_text("double-click to copy this line");
+                    if response.double_clicked() {
+                        ui.ctx().copy_text(line.clone());
+                        copied = true;
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("Copy line").clicked() {
+                            ui.ctx().copy_text(line.clone());
+                            ui.close();
+                            copied = true;
+                        }
+                    });
                 }
             });
+        if copied {
+            self.toast("copied");
+        }
     }
 
     fn modals(&mut self, ctx: &egui::Context) {
