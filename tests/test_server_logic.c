@@ -1286,18 +1286,18 @@ static void testNetConstants(void) {
           NXUS_NET_MAX_CLIENTS);
     CHECK(NXUS_NET_BUF_SIZE == 1024u * 1024u,
           "the largest frame stays 1 MiB (got %u)", (unsigned)NXUS_NET_BUF_SIZE);
-    CHECK(NXUS_NET_RX_IDLE_SIZE == 128u * 1024u,
-          "every connection starts with a 128 KiB receive buffer (got %u)",
+    CHECK(NXUS_NET_RX_IDLE_SIZE == 32u * 1024u,
+          "every connection starts with a 32 KiB receive buffer (got %u)",
           (unsigned)NXUS_NET_RX_IDLE_SIZE);
     CHECK(NXUS_NET_RX_IDLE_SIZE < NXUS_NET_BUF_SIZE,
           "the idle buffer must be smaller than the frame ceiling");
-    CHECK(NXUS_NET_CLIENT_STACK_SIZE == 32u * 1024u,
-          "a connection thread gets a 32 KiB stack (got %u)",
+    CHECK(NXUS_NET_CLIENT_STACK_SIZE == 24u * 1024u,
+          "a connection thread gets a 24 KiB stack (got %u)",
           (unsigned)NXUS_NET_CLIENT_STACK_SIZE);
     CHECK((u64)NXUS_NET_MAX_CLIENTS * NXUS_NET_BUF_SIZE == 4ull * 1024 * 1024,
           "the worst-case receive buffers stay at 4 MiB");
-    CHECK((u64)NXUS_NET_MAX_CLIENTS * NXUS_NET_RX_IDLE_SIZE == 512ull * 1024,
-          "idle connections cost 512 KiB, not 4 MiB");
+    CHECK((u64)NXUS_NET_MAX_CLIENTS * NXUS_NET_RX_IDLE_SIZE == 128ull * 1024,
+          "idle connections cost 128 KiB, not 4 MiB");
     CHECK(NXUS_NET_RX_SHRINK_IDLE_NS > 0,
           "an enlarged buffer must have a shrink deadline");
     CHECK(NXUS_NET_BUSY_REASON == NXUS_REASON_BUSY_STATE,

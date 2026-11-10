@@ -21,20 +21,29 @@
  * MEMORY
  * ------
  * A receive buffer is allocated when the connection is accepted:
- * NXUS_NET_RX_IDLE_SIZE (128 KiB) up front.  It grows on demand - and only up to
+ * NXUS_NET_RX_IDLE_SIZE (32 KiB) up front.  It grows on demand - and only up to
  * the frame being received - to at most NXUS_NET_BUF_SIZE (1 MiB, the protocol's
  * largest allowed payload).  A connection that has not needed a frame larger than
- * the idle size for NXUS_NET_RX_SHRINK_IDLE_NS is shrunk back to 128 KiB again
+ * the idle size for NXUS_NET_RX_SHRINK_IDLE_NS is shrunk back to 32 KiB again
  * (heartbeats count as activity, but they do not keep a large buffer alive).
  * The transport therefore never holds more
  * than NXUS_NET_MAX_CLIENTS * NXUS_NET_BUF_SIZE = 4 MiB of receive buffers (plus
- * NXUS_NET_MAX_CLIENTS * NXUS_NET_CLIENT_STACK_SIZE = 128 KiB of thread stacks),
- * and normally holds 4 * 128 KiB = 512 KiB.  A frame whose payload cannot be
- * accommodated (allocation failed, or above NXUS_NET_BUF_SIZE) is refused with
- * BAD_STATE + NXUS_REASON_BAD_LENGTH and the connection is dropped, because the
- * unread payload would desync the stream; the failure is logged.  This keeps the
- * shared 8 MiB heap bounded and makes an allocation failure a clean refusal
- * rather than an out-of-memory abort.
+ * NXUS_NET_MAX_CLIENTS * NXUS_NET_CLIENT_STACK_SIZE = 96 KiB of thread stacks),
+ * and normally holds 4 * 32 KiB = 128 KiB.  The idle buffer used to be 128 KiB and
+ * the stack 32 KiB - 160 KiB resident per connection against a shared 8 MiB heap
+ * (see nxus_heap.h).  Nothing in a session needs a large buffer until a large
+ * frame actually arrives, so the idle size is now 32 KiB, and the connection stack
+ * is 24 KiB (page aligned, as threadCreate() requires) with the historic 32 KiB
+ * kept as the retry when the smaller allocation is refused.
+ *
+ * A frame whose payload cannot be accommodated (allocation failed, or above
+ * NXUS_NET_BUF_SIZE) is refused with BAD_STATE + NXUS_REASON_BAD_LENGTH and the
+ * connection is dropped, because the unread payload would desync the stream; the
+ * failure is logged with the free heap.  A connection whose stack or receive
+ * buffer cannot be allocated at all is answered BUSY (NXUS_REASON_BUSY_STATE) and
+ * logged as "net: out of memory for a connection (free=... KiB)" instead of
+ * failing silently.  This keeps the shared 8 MiB heap bounded and makes an
+ * allocation failure a clean, visible refusal rather than an out-of-memory abort.
  *
  * THREADING CONTRACT FOR THE HANDLER
  * ----------------------------------
@@ -87,24 +96,39 @@ typedef u32 Result;
 #define NXUS_NET_MAX_CLIENTS 4
 
 /* Per-connection thread stack (heap, page-aligned: libnx threadCreate() requires
-   page-aligned memory).  32 KiB is what the old single connection thread used. */
-#define NXUS_NET_CLIENT_STACK_SIZE (32u * 1024u)
+   page-aligned memory).  24 KiB is enough for the deepest handler (the old single
+   connection thread ran on 32 KiB and the per-connection call path did not get
+   deeper with multi-client), and it is the first allocation attempted for a new
+   connection because it is the one a nearly full heap refuses first. */
+#define NXUS_NET_CLIENT_STACK_SIZE (24u * 1024u)
+
+/* Retry size when the 24 KiB stack cannot be allocated.  The historic 32 KiB is
+   used then, so a future deeper handler degrades the heap by 8 KiB per connection
+   instead of refusing the client outright. */
+#define NXUS_NET_CLIENT_STACK_FALLBACK_SIZE (32u * 1024u)
 
 /* Every accepted connection starts with this receive buffer and is shrunk back
-   to it once idle; a frame that needs more grows it on demand. */
-#define NXUS_NET_RX_IDLE_SIZE (128u * 1024u)
+   to it once idle; a frame that needs more grows it on demand.  32 KiB instead of
+   the previous 128 KiB: the first big frame (a cheat upload, a hit page) grows the
+   buffer exactly when it is needed, while four idle clients cost 128 KiB instead
+   of 512 KiB of the shared heap. */
+#define NXUS_NET_RX_IDLE_SIZE (32u * 1024u)
 
 /* How long a connection may go without needing a frame larger than
    NXUS_NET_RX_IDLE_SIZE before its enlarged receive buffer is shrunk back to the
    idle size.  Long enough not to churn on a client that is merely thinking,
-   short enough that four normally-active clients cost 512 KiB, not 4 MiB. */
+   short enough that four normally-active clients cost 128 KiB, not 4 MiB. */
 #define NXUS_NET_RX_SHRINK_IDLE_NS 30000000000ull
 
 /* Reason word appended to the BUSY reply sent to a refused connection.
    core/nxus_protocol.h has no dedicated "all client slots are in use" code (the
    protocol header is the wire single source of truth and is not changed here), so
    reuse BUSY_STATE - the retryable "the session is busy" reason that every
-   existing client already understands. */
+   existing client already understands.  The same reason answers a connection whose
+   thread stack / receive buffer cannot be allocated: "busy, retry" is right from
+   the client's side in both cases, and the log line names which of the two it was
+   (NXUS_NET_LOG_BUSY_FMT for a full server, the "out of memory for a connection"
+   line for an allocation failure). */
 #define NXUS_NET_BUSY_REASON NXUS_REASON_BUSY_STATE
 
 /* Log wording for a refused connection.  Exposed so the host test can pin the

@@ -1,4 +1,5 @@
 #include "nxus_net.h"
+#include "nxus_heap.h"
 #include "nxus_log.h"
 
 #include <string.h>
@@ -452,8 +453,13 @@ static void formatPeer(int fd, const struct sockaddr_in *fallback, char *out, si
 /* Refuse a connection that cannot be served (every slot in use, or no memory for
    its thread stack / receive buffer): send the BUSY error frame (s32 Result +
    u32 reason, as replyErrorReason() does) and close at once.  The descriptor is
-   not registered in any slot, so this cannot race a sender. */
-static void sendBusyAndClose(int new_fd, const char *peer_text) {
+   not registered in any slot, so this cannot race a sender.
+ *
+ * `why` names a non-slot reason (allocation/thread failure) for the log.  Passing
+ * NULL keeps the pinned "all N client slots are in use" line, so a reader can still
+ * tell a truly full server from one that merely ran out of heap - the two used to be
+ * indistinguishable in the log. */
+static void sendBusyAndClose(int new_fd, const char *peer_text, const char *why) {
     s32 payload[2];
     nxusNetFillBusyPayload(payload);
     (void)sendFrameLocked(new_fd, NxusCmd_Nop, NXUS_FLAG_ERROR, 0,
@@ -473,7 +479,13 @@ static void sendBusyAndClose(int new_fd, const char *peer_text) {
         if (recv(new_fd, sink, (int)sizeof(sink), 0) <= 0) break;
     }
 
-    NXUS_LOG(NXUS_NET_LOG_BUSY_FMT, peer_text, new_fd, NXUS_NET_MAX_CLIENTS);
+    if (why == NULL) {
+        NXUS_LOG(NXUS_NET_LOG_BUSY_FMT, peer_text, new_fd, NXUS_NET_MAX_CLIENTS);
+    } else {
+        NXUS_LOG("client busy: refused new connection from %s (fd=%d) - %s "
+                 "(free=%u KiB)",
+                 peer_text, new_fd, why, (unsigned)nxusHeapFreeKiB());
+    }
     close(new_fd);
 }
 
@@ -491,11 +503,20 @@ static bool clientRxEnsure(NxusNetClient *client, u32 need) {
     if (need > NXUS_NET_RX_IDLE_SIZE) client->rx_big_tick = armGetSystemTick();
     if (need <= client->rx_cap) return true;
     u8 *bigger = (u8 *)realloc(client->rx, need);
-    if (bigger == NULL) return false;
+    if (bigger == NULL) {
+        /* The frame is already queued, so the caller refuses it with BAD_LENGTH and
+           drops the connection (see serveClient): say how much heap was left, so a
+           stream of "does not fit" lines can be told apart from a protocol error. */
+        NXUS_LOG("recv: fd=%d receive buffer grow %u -> %u B failed (free=%u KiB)",
+                 nxusNetSlotFd(client->slot), (unsigned)client->rx_cap, (unsigned)need,
+                 (unsigned)nxusHeapFreeKiB());
+        return false;
+    }
     NXUS_LOG("recv: fd=%d grew the receive buffer %u -> %u B",
              nxusNetSlotFd(client->slot), (unsigned)client->rx_cap, (unsigned)need);
     client->rx = bigger;
     client->rx_cap = need;
+    nxusHeapLogDebug("net rx grow");
     return true;
 }
 
@@ -518,6 +539,7 @@ static void clientRxShrinkIfIdle(NxusNetClient *client, u64 now) {
              (unsigned)client->rx_cap, (unsigned)NXUS_NET_RX_IDLE_SIZE);
     client->rx = smaller;
     client->rx_cap = NXUS_NET_RX_IDLE_SIZE;
+    nxusHeapLogDebug("net rx shrink");
 }
 
 /* Receive exactly `length` bytes, but never unconditionally:
@@ -830,6 +852,7 @@ static void serveClient(NxusNetClient *client, int fd) {
     free(client->rx);
     client->rx = NULL;
     client->rx_cap = 0;
+    nxusHeapLogDebug("net client close");
 
     /* Last statement: the reaper may now join this thread and free its stack. */
     nxusNetSlotFinish(client->slot);
@@ -872,6 +895,9 @@ static void reapFinishedClients(void) {
 
         nxusNetSlotReaped(&g_Slots[i]);
         NXUS_LOG("client slot %d released (thread joined)", i);
+        /* The connection's whole resident cost (rx buffer + 24/32 KiB stack) is back
+           in the heap now; the close line above is only the buffer half. */
+        nxusHeapLogDebug("net slot released");
     }
 }
 
@@ -941,9 +967,10 @@ static bool nxusNetPeerIsPrivate(const struct sockaddr_in *peer) {
    a broadcast (nxusNetSend) could try to write to the same socket the BUSY frame
    is going to, and the two frames - each header+payload as two sends - would
    interleave on the wire. */
-static void rejectClaimedClient(int slot, int fd, const char *peer_text) {
+static void rejectClaimedClient(int slot, int fd, const char *peer_text,
+                               const char *why) {
     nxusNetSlotReaped(&g_Slots[slot]);
-    sendBusyAndClose(fd, peer_text);
+    sendBusyAndClose(fd, peer_text, why);
 }
 
 /* Claim a slot for `fd`, allocate the thread's stack and receive buffer, and
@@ -952,7 +979,7 @@ static void rejectClaimedClient(int slot, int fd, const char *peer_text) {
 static void startClient(int fd, const char *peer_text) {
     const int slot = nxusNetSlotClaim(g_Slots, NXUS_NET_MAX_CLIENTS, fd);
     if (slot < 0) {
-        sendBusyAndClose(fd, peer_text);
+        sendBusyAndClose(fd, peer_text, NULL);   /* every slot really is in use */
         return;
     }
 
@@ -966,33 +993,52 @@ static void startClient(int fd, const char *peer_text) {
     snprintf(client->peer, sizeof(client->peer), "%s", peer_text);
 
     /* The stack must be page-aligned for libnx's threadCreate(), hence the
-       aligned allocation instead of a plain malloc. */
-    u8 *stack = (u8 *)aligned_alloc(0x1000u, NXUS_NET_CLIENT_STACK_SIZE);
+       aligned allocation instead of a plain malloc.  24 KiB is the ship size; the
+       historic 32 KiB is retried when the smaller block is refused, so a heap that
+       is 8 KiB short still serves the client instead of answering BUSY. */
+    u32 stack_size = NXUS_NET_CLIENT_STACK_SIZE;
+    u8 *stack = (u8 *)aligned_alloc(0x1000u, stack_size);
+    if (stack == NULL) {
+        stack_size = NXUS_NET_CLIENT_STACK_FALLBACK_SIZE;
+        stack = (u8 *)aligned_alloc(0x1000u, stack_size);
+        if (stack != NULL) {
+            NXUS_LOG("client: %u KiB thread stack refused - retried with %u KiB "
+                     "(free=%u KiB)",
+                     (unsigned)(NXUS_NET_CLIENT_STACK_SIZE / 1024u),
+                     (unsigned)(stack_size / 1024u), (unsigned)nxusHeapFreeKiB());
+        }
+    }
     u8 *rx = (u8 *)malloc(NXUS_NET_RX_IDLE_SIZE);
     if (stack == NULL || rx == NULL) {
-        NXUS_LOG("client: out of memory for a %u B stack / %u B receive buffer - "
-                 "refusing %s (fd=%d) with BUSY",
-                 (unsigned)NXUS_NET_CLIENT_STACK_SIZE, (unsigned)NXUS_NET_RX_IDLE_SIZE,
-                 peer_text, fd);
+        /* One greppable line for the symptom this module exists for, then one line
+           with the context (peer, which allocation, free heap) from the refusal
+           helper.  The newcomer is answered BUSY (NXUS_NET_BUSY_REASON), which every
+           shipped client already treats as retryable. */
+        NXUS_LOG("net: out of memory for a connection (free=%u KiB)",
+                 (unsigned)nxusHeapFreeKiB());
+        char why[96];
+        snprintf(why, sizeof(why), "no memory for the %u B stack / %u B receive buffer",
+                 (unsigned)stack_size, (unsigned)NXUS_NET_RX_IDLE_SIZE);
         free(stack);
         free(rx);
-        rejectClaimedClient(slot, fd, peer_text);
+        rejectClaimedClient(slot, fd, peer_text, why);
         return;
     }
+    nxusHeapLogDebug("net accept");
 
     Result rc = threadCreate(&client->thread, clientThread, client, stack,
-                             NXUS_NET_CLIENT_STACK_SIZE, 0x2C, -2);
+                             stack_size, 0x2C, -2);
     if (R_FAILED(rc)) {
         /* libnx wants -2 (default) or 0..3; anything else is an invalid core id. */
         rc = threadCreate(&client->thread, clientThread, client, stack,
-                          NXUS_NET_CLIENT_STACK_SIZE, 0x2C, 3);
+                          stack_size, 0x2C, 3);
     }
     if (R_FAILED(rc)) {
         NXUS_LOG("client: threadCreate failed rc=0x%08X - refusing %s (fd=%d)",
                  (unsigned)rc, peer_text, fd);
         free(stack);
         free(rx);
-        rejectClaimedClient(slot, fd, peer_text);
+        rejectClaimedClient(slot, fd, peer_text, "thread creation failed");
         return;
     }
 
@@ -1012,7 +1058,7 @@ static void startClient(int fd, const char *peer_text) {
         free(rx);
         client->rx = NULL;
         client->rx_cap = 0;
-        rejectClaimedClient(slot, fd, peer_text);
+        rejectClaimedClient(slot, fd, peer_text, "thread start failed");
     }
 }
 
@@ -1172,6 +1218,10 @@ static void serverThread(void *arg) {
 
 Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     if (nxusNetRunning()) return 0;
+
+    /* Boot-time transport measurement point: the listener, the accept thread and
+       every later connection allocate from the shared 8 MiB heap (nxus_heap.h). */
+    nxusHeapLogDebug("net init");
 
     mutexInit(&g_ListenMutex);
     for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
@@ -1340,6 +1390,7 @@ static bool waitClientDone(NxusNetClient *client, u64 deadline) {
  */
 void nxusNetExit(void) {
     if (!nxusNetRunning()) return;
+    nxusHeapLogDebug("net exit");
     atomic_store_explicit(&g_Running, false, memory_order_release);
     /* No new frame may be queued from here on: nxusNetSend()/SendFd() refuse
        before they touch a slot or take a send lock the teardown is about to

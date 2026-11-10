@@ -2,6 +2,7 @@
 #include "nxus_cheat_srv.h"
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
+#include "nxus_heap.h"
 #include "nxus_hid.h"
 
 #include <malloc.h>
@@ -1004,6 +1005,12 @@ static void serverExitGateReset(void);
 static void onNetClientClosed(int fd, void *user);
 
 void nxusServerInit(void) {
+    /* Measurement point (nxus_heap.h): the dispatcher itself allocates nothing at
+       boot, but every handler below runs on the heap it describes, and the boot
+       line from nxusSessionInit() is only comparable if the server is measured at
+       the same stage of the init chain. */
+    nxusHeapLogDebug("server init");
+
     memset(&g_Config, 0, sizeof(g_Config));
     g_Config.hotkey_enabled = 0;
     g_Config.chunk_size = NXUS_SESSION_DEFAULT_CHUNK;
@@ -1406,9 +1413,14 @@ static void fillStatus(NxusStatus *st) {
        four times the necessary round trips. */
     st->max_read = NXUS_NET_BUF_SIZE - (u32)sizeof(NxusPacketHeader);
     {
-        struct mallinfo mi = mallinfo();
-        st->heap_used = (u32)mi.uordblks;
-        st->heap_total = (u32)mi.arena;
+        /* mallinfo().arena is the sbrk-reserved arena, not the 8 MiB inner heap, so
+           reporting it as "total" made an idle sysmodule look 80% full (and sent the
+           user chasing a heap-exhaustion that was only a wrong denominator). */
+        st->heap_used = (u32)nxusHeapUsedBytes();
+        /* The 8 MiB inner heap from main.c (`INNER_HEAP_SIZE`).  Keeping the number
+           here rather than including main.c's private define: only the denominator
+           matters for the display, and the measured `used` comes from nxus_heap. */
+        st->heap_total = 8u * 1024u * 1024u;
     }
     /* Live held-button mask for opcode 8.  The HID worker publishes it even when
        the pause hotkey is disabled; 0 while no worker/pad is available. */
@@ -3748,6 +3760,10 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
                release that freed the arrays. */
             NxusSnapshotSummary summary;
             memset(&summary, 0, sizeof(summary));
+            /* Measurement point: the first capture allocates the slot arrays
+               (2 x NXUS_SNAPSHOT_MAX_BLOCKS * 8 B) plus its 256 KiB chunk, which is
+               the largest single hit the heap can take from one command. */
+            nxusHeapLogDebug("snapshot capture");
             rc = nxusSnapshotTake(req.slot, req.scope, req.range_begin, req.range_end,
                                   req.block_size, &summary);
             g_HeldSnapshotSlots = nxusSnapshotResidentSlots();
@@ -3755,8 +3771,16 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
                            "%llu B resident)",
                            (unsigned)g_HeldSnapshotSlots,
                            (unsigned long long)nxusSnapshotResidentBytes());
-            if (R_FAILED(rc)) replyError(fd, type, seq, rc);
-            else reply(fd, type, seq, &summary, sizeof(summary));
+            if (R_FAILED(rc)) {
+                /* One line for a refused capture (out of memory for the slot arrays
+                   or the capture chunk, or no target): the client's error reply alone
+                   does not say how much heap was left. */
+                NXUS_LOG("snapshot: slot %u capture failed rc=0x%08X (free=%u KiB)",
+                         (unsigned)req.slot, (unsigned)rc, (unsigned)nxusHeapFreeKiB());
+                replyError(fd, type, seq, rc);
+            } else {
+                reply(fd, type, seq, &summary, sizeof(summary));
+            }
             break;
         }
 
@@ -3828,6 +3852,9 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
             NxusChangedBlockWire *blocks =
                 (NxusChangedBlockWire *)calloc(count, sizeof(NxusChangedBlockWire));
             if (blocks == NULL) {
+                NXUS_LOG("snapshot changed: %u-record reply buffer failed (out of memory, "
+                         "free=%u KiB)",
+                         (unsigned)count, (unsigned)nxusHeapFreeKiB());
                 replyError(fd, type, seq, MAKERESULT(Module_Libnx, LibnxError_OutOfMemory));
                 break;
             }

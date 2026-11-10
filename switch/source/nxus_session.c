@@ -1,6 +1,7 @@
 #include "nxus_session.h"
 #include "nxus_debug.h"
 #include "nxus_dmntcht.h"
+#include "nxus_heap.h"
 #include "nxus_log.h"
 
 #include <errno.h>
@@ -1153,12 +1154,16 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
  *     cursor with ftruncate() (libnx's devoptab implements it; posix_fallocate
  *     is not available) so the card allocates a whole 16 MiB run at a time.
  *   - RAM: a single malloc of the scoped byte count, used when the scoped range
- *     is small enough that writing a file would cost more than the memory
- *     (<= 4 MiB), when the card cannot be opened (no SD inserted, read-only
- *     card, ...), or when statvfs proves the card cannot hold the stream with
- *     1.5x headroom (a store that fills up mid-scan loses blocks silently).
- *     Below the threshold the card is not touched at all; if the sysmodule
- *     heap refuses the malloc, the SD store is tried instead.
+ *     fits the live RAM budget: min(NXUS_BASELINE_RAM_MAX, nxusHeapFreeBytes()/3)
+ *     (nxus_heap.h).  The static 4 MiB ceiling alone let a baseline take half of
+ *     the 8 MiB heap and starve the hit list, the scan buffers and the next client
+ *     connection, which is exactly the "heap ran out" report this module answers;
+ *     taking at most a third of what is free keeps the rest of the session alive.
+ *     A scope inside the budget never touches the card; if the sysmodule heap
+ *     refuses the malloc, the SD store is tried instead, and a scope above the
+ *     budget streams to the card.  When both stores are refused the session keeps
+ *     the classic all-hits first pass and stays marked degraded (see
+ *     nxusSessionScanBegin()), never a silent 0-hit scan.
  *
  * Offsets are absolute positions in the store; the engine hands each block the
  * offset it was assigned, so a jump in the sparse layout still seeks.
@@ -1168,7 +1173,9 @@ static void regionListPublish(NxusScanRegion *regions, u32 count) {
  * nxusSessionBaselineWriteFailed() / nxusSessionBaselineDegraded(), so a short
  * candidate list caused by the store is distinguishable from an empty target.
  */
-#define NXUS_BASELINE_RAM_MAX   (4u * 1024u * 1024u)
+/* The historic ceiling, now only the upper bound of the live budget - the constant
+   itself lives in nxus_heap.h next to the policy helper (tests pin both). */
+#define NXUS_BASELINE_RAM_MAX NXUS_HEAP_BASELINE_RAM_MAX
 #define NXUS_BASELINE_FILE_BUF  (256u * 1024u)
 /* Refine buffers: at least one whole block, and never below 64 KB so a future
    smaller block size still gets a decent read size. */
@@ -1423,6 +1430,7 @@ static bool baselineStoreOpenRam(u64 region_bytes) {
     if (g_BaseRam == NULL) return false;
     g_BaseRamSize = region_bytes;
     NXUS_LOG("baseline: RAM store open (%llu bytes)", (unsigned long long)region_bytes);
+    nxusHeapLogDebug("baseline ram store");
     return true;
 }
 
@@ -1479,26 +1487,46 @@ static bool baselineStoreOpen(void) {
     const u64 region_bytes = baselineRegionBytes();
     if (region_bytes == 0) return false;
 
-    if (region_bytes <= NXUS_BASELINE_RAM_MAX) {
-        /* Small scope: a file would cost more than the memory.  The sysmodule
-           heap is shared with hits/snapshots and a 4 MiB allocation can fail,
-           so a refused malloc falls back to the SD stream instead of losing
-           the baseline (which would force the classic first pass). */
+    /* The live RAM budget: a third of the heap that is free right now, never more
+       than the historic 4 MiB ceiling.  The baseline is a convenience (it avoids a
+       full first pass), the hit list / scan buffers / connections need the same
+       heap, and the card can always take the stream instead. */
+    const u64 heap_free = nxusHeapFreeBytes();
+    const u64 ram_budget = nxusHeapBaselineRamLimit(heap_free);
+
+    if (nxusHeapBaselineFitsRam(heap_free, region_bytes)) {
+        /* Small scope: a file would cost more than the memory.  A refused malloc
+           still falls back to the SD stream instead of losing the baseline (which
+           would force the classic first pass). */
         if (baselineStoreOpenRam(region_bytes)) return true;
-        NXUS_LOG("baseline: %llu-byte RAM store allocation failed - falling back to the SD store",
-                 (unsigned long long)region_bytes);
+        NXUS_LOG("baseline: %llu-byte RAM store allocation failed (RAM budget %u KiB, "
+                 "free=%u KiB) - falling back to the SD store",
+                 (unsigned long long)region_bytes, (unsigned)(ram_budget / 1024u),
+                 (unsigned)nxusHeapFreeKiB());
         return baselineStoreOpenSd(region_bytes);
     }
 
+    NXUS_LOG("baseline: %llu-byte scope exceeds the RAM budget (%u KiB, free=%u KiB) - "
+             "streaming to the SD card",
+             (unsigned long long)region_bytes, (unsigned)(ram_budget / 1024u),
+             (unsigned)nxusHeapFreeKiB());
     if (baselineStoreOpenSd(region_bytes)) return true;
 
-    /* SD refused (no card / no room): last resort is one malloc of the whole
-       scoped range, exactly as before. */
-    NXUS_LOG("baseline: falling back to the RAM store for %llu bytes",
-             (unsigned long long)region_bytes);
-    if (baselineStoreOpenRam(region_bytes)) return true;
-    NXUS_LOG("baseline: %llu-byte RAM store allocation failed",
-             (unsigned long long)region_bytes);
+    /* SD refused (no card / no room).  With no heap measurement at all (a host
+       build, or a port whose libc cannot report free memory) the historic ceiling is
+       the only number available, so the old RAM fallback stays reachable there.  A
+       measured heap is not second-guessed: a range above free/3 must not be forced
+       into RAM - that allocation is what used to leave the heap too small for the
+       next connection or scan. */
+    if (heap_free == 0 && region_bytes <= NXUS_BASELINE_RAM_MAX) {
+        NXUS_LOG("baseline: no heap measurement - falling back to the RAM store for "
+                 "%llu bytes", (unsigned long long)region_bytes);
+        if (baselineStoreOpenRam(region_bytes)) return true;
+    }
+    NXUS_LOG("baseline: no store for %llu bytes (SD refused, RAM budget %u KiB, "
+             "free=%u KiB) - the unknown scan falls back to the classic first pass",
+             (unsigned long long)region_bytes, (unsigned)(ram_budget / 1024u),
+             (unsigned)nxusHeapFreeKiB());
     return false;
 }
 
@@ -1586,6 +1614,13 @@ static void scanThreadRelease(void) {
 }
 
 void nxusSessionInit(u32 chunk_size, u32 max_hits) {
+    /* The boot measurement line (and the <512 KiB warning) goes out before anything
+       is allocated, so it describes the heap the module really starts with.  Every
+       later allocation of the session/server/transport chain is measured against
+       it.  Done before the re-init guard: a second Init is rare, but the number it
+       prints then is the post-teardown state, which is worth having as well. */
+    nxusHeapBootReport();
+
     if (g_Inited) return;      /* already initialised: keep the live session */
     mutexInit(&g_SessionMutex);
     mutexInit(&g_ViewRetireMutex);
@@ -2670,7 +2705,14 @@ static void buildRegions(const NxusScanRequest *req) {
     u32 capacity = g_Session.maps.count * (g_Session.range_count ? g_Session.range_count : 1) + 1;
     if (capacity > 4096u) capacity = 4096u;
     NxusScanRegion *regions = (NxusScanRegion *)calloc(capacity, sizeof(NxusScanRegion));
-    if (regions == NULL) return;
+    if (regions == NULL) {
+        /* ScanBegin() only sees an empty region list and answers BadInput, which
+           blames the request; name the real cause here (with the heap left). */
+        NXUS_LOG("scan: %u-entry region list allocation failed (out of memory, "
+                 "free=%u KiB)",
+                 (unsigned)capacity, (unsigned)nxusHeapFreeKiB());
+        return;
+    }
 
     /* Fill the block privately and publish pointer+count together at the end:
        the new list is not reachable from another thread until it is complete.
@@ -2743,8 +2785,9 @@ static void scanThread(void *arg) {
             scanWorkerRelease(true, chunk, NULL, NULL, NULL);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
-            NXUS_LOG("scan abort: %u-byte chunk allocation failed (out of memory)",
-                     (unsigned)chunk_size);
+            NXUS_LOG("scan abort: %u-byte chunk allocation failed (out of memory, "
+                     "free=%u KiB)",
+                     (unsigned)chunk_size, (unsigned)nxusHeapFreeKiB());
             return;
         }
         if (g_Session.baseline.active) {
@@ -2812,8 +2855,9 @@ static void scanThread(void *arg) {
             scanWorkerRelease(true, chunk, NULL, cur_buf, prev_buf);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
-            NXUS_LOG("scan abort: %u-byte baseline buffers failed (out of memory)",
-                     (unsigned)buf_size);
+            NXUS_LOG("scan abort: %u-byte baseline buffers failed (out of memory, "
+                     "free=%u KiB)",
+                     (unsigned)buf_size, (unsigned)nxusHeapFreeKiB());
             return;
         }
         rc = nxusScanNextFromBaseline(&g_Session.baseline,
@@ -2841,8 +2885,9 @@ static void scanThread(void *arg) {
             scanWorkerRelease(true, chunk, window, NULL, NULL);
             g_Session.last_result = (s32)MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
             sessionStateStore(NxusScanState_Error);
-            NXUS_LOG("scan abort: %u-byte window allocation failed (out of memory)",
-                     (unsigned)g_Session.window_size);
+            NXUS_LOG("scan abort: %u-byte window allocation failed (out of memory, "
+                     "free=%u KiB)",
+                     (unsigned)g_Session.window_size, (unsigned)nxusHeapFreeKiB());
             return;
         }
         rc = nxusScanNextEx(&g_Session.hits, &g_Session.job_req, &g_Session.job_pattern,
@@ -3068,6 +3113,10 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
        below. */
     (void)scanThreadJoinLocked();
 
+    /* Measurement point: the previous worker's buffers are gone, so this is the
+       heap the new pass starts with (debug level - a healthy scan needs no line). */
+    nxusHeapLogDebug("scan begin");
+
     g_Session.job_req = *req;
     setPattern(value_type, epsilon_decimals, pattern, pattern_len, mask);
     g_Session.job_pattern.flags = req->flags;
@@ -3099,13 +3148,27 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
                                       hit_value_size, value_type) == NXUS_SCAN_OK;
         if (ready) ready = baselineStoreOpen();
         if (ready) {
-            NXUS_LOG("unknown scan: dense baseline armed (%u regions, %u-byte values)",
-                     (unsigned)g_Session.region_count, (unsigned)hit_value_size);
+            NXUS_LOG("unknown scan: dense baseline armed (%u regions, %u-byte values, "
+                     "RAM budget %u KiB, free=%u KiB)",
+                     (unsigned)g_Session.region_count, (unsigned)hit_value_size,
+                     (unsigned)(nxusHeapBaselineRamLimit(nxusHeapFreeBytes()) / 1024u),
+                     (unsigned)nxusHeapFreeKiB());
         } else {
-            /* No store (card refused / out of memory) or no block arrays: keep the
-               classic all-hits first pass so the scan still works up to max_hits. */
+            /* No store (card refused / beyond the heap budget / out of memory) or no
+               block arrays: keep the classic all-hits first pass so the scan still
+               works up to max_hits.  The fallback is NOT silent: baselineDiscard()
+               clears the health flags, so mark the pass degraded again - the
+               completion line and nxusSessionBaselineDegraded() then say that the
+               candidate list came from a degraded baseline, not from an empty
+               target. */
             baselineDiscard();
-            NXUS_LOG("unknown scan: baseline unavailable, using the classic first pass");
+            g_Session.baseline_degraded = true;
+            NXUS_LOG("unknown scan: baseline unavailable (RAM budget %u KiB) - using "
+                     "the classic first pass, degraded=1",
+                     (unsigned)(nxusHeapBaselineRamLimit(nxusHeapFreeBytes()) / 1024u));
+            /* Full accounting at info level: this is a degraded pass the user should
+               see, not one of the per-operation debug measurements. */
+            nxusHeapLog("scan baseline unavailable");
         }
     }
 
@@ -3124,6 +3187,15 @@ Result nxusSessionScanBegin(const NxusScanRequest *req, u32 value_type, u32 epsi
     rc = nxusHitListInit(&g_Session.hits, initial, max_hits, hit_value_size);
     if (R_FAILED(rc)) {
         baselineDiscard();
+        /* A refused hit array must never look like "the target has no matches": the
+           client gets the OOM Result, and the degraded flag is kept (after
+           baselineDiscard() cleared it) so the refusal is also visible in the status
+           and in the line below. */
+        g_Session.baseline_degraded = true;
+        NXUS_LOG("scan: hit list init failed (%u initial / %u max hits, %u-byte values, "
+                 "free=%u KiB) - refusing the scan",
+                 (unsigned)initial, (unsigned)max_hits, (unsigned)hit_value_size,
+                 (unsigned)nxusHeapFreeKiB());
         scanThreadRelease();
         return rc;
     }

@@ -76,6 +76,15 @@ run_test test_cheatvm test_cheatvm.c ../core/nxus_cheatvm.c
 TEST_INCS="-I./stubs -I../switch/include -I../shared -pthread" \
     run_test test_cheat_srv test_cheat_srv.c ./stubs/nxus_cheat_stub.c ../core/nxus_cheatvm.c
 
+# Heap accounting + the resident sizes the transport and the Unknown-scan baseline
+# budget are built on.  The SHIPPED headers (shared/nxus_heap.h, shared/nxus_net.h)
+# are included directly, so a drift in the per-connection stack/idle-rx sizes, in
+# the 1 MiB frame ceiling or in the RAM budget min(4 MiB, free/3) fails here.  The
+# test is host-safe by design: outside __SWITCH__ the console measurement is an
+# inline 0 fallback and the log helpers are no-ops, which is also what lets a Switch
+# translation unit that calls them still build in the other host tests.
+run_test test_heap test_heap.c
+
 echo
 if [ $fail -eq 0 ]; then echo "ALL HOST TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit $fail

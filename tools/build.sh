@@ -9,7 +9,7 @@ BLDPFS0=/opt/devkitpro/tools/bin/build_pfs0
 
 # Shown in the per-folder README.txt / metadata.json so DBI, file managers and
 # other agents can tell what 4200000000004E58 actually is.
-NXUS_VERSION=0.1.14-alpha
+NXUS_VERSION=0.1.15-alpha
 
 # The probe/boot2 rule, printed identically in the probe's README.txt and in
 # DO_NOT_BOOT_TOGETHER.txt.  These two generated files used to disagree: README.txt
