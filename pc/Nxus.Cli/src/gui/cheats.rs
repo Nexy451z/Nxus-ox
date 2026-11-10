@@ -55,12 +55,15 @@ const RED: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 const DIM: Color32 = Color32::from_rgb(0x9A, 0xA3, 0xB0);
 
 /// New-file skeleton.  The header doubles as a reminder of the two pieces of
-/// syntax that are easy to get wrong (the `:OFF` suffix and the mode hint).
+/// syntax that are easy to get wrong (the `[Name:OFF]` restore section and the
+/// mode hint).  It also says the one rule a cheat file cannot express: a
+/// session always starts with every block OFF.
 fn template(build_id: &str) -> String {
     format!(
         "; Nxus cheat file for {build_id}\n\
-         ; A [Name] line starts a cheat. Append :OFF to leave it off initially.\n\
-         ; Patch = write once and restore on OFF; Loop = re-run every 250 ms.\n\
+         ; A [Name] line starts a cheat. Every block is saved as OFF and a\n\
+         ; session always starts with every cheat OFF.\n\
+         ; [Name:OFF] adds restore code; Patch = write once, Loop = every 250 ms.\n\
          ; Code lines are Atmosphere cheat opcodes; ';', '#' and '//' start a comment.\n\
          ;\n\
          ; Example:\n\

@@ -1074,8 +1074,9 @@ impl CheatBlock {
 
 /// In-memory representation of `<BuildID>.txt`.
 ///
-/// `lines` are kept verbatim so loading and saving an untouched file is
-/// lossless apart from newline normalisation and mode/state directives.
+/// `raw_text` keeps the file exactly as it was loaded, so a reload never loses
+/// a comment or a line.  Saving normalises newlines, mode directives and the
+/// OFF spelling, and writes every block as OFF — the state is never stored.
 #[derive(Clone, Debug)]
 pub struct CheatDocument {
     pub build_id: String,

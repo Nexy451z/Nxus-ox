@@ -88,7 +88,8 @@ const JP_FONT: &[u8] = include_bytes!("../../assets/fonts/MPLUS1p-Regular.ttf");
 
 const TEMPLATE: &str = "\
 ; NCL cheat file
-; A [Name] line starts a cheat. Append :OFF to leave it off initially.
+; A [Name] line starts a cheat; every cheat starts OFF and is saved as OFF.
+; [Name:OFF] (or --off) adds restore code to run when the cheat is turned off.
 ; Code lines are Atmosphere cheat opcodes; ';', '#' and '//' start a comment.
 ;
 ; [Nxus example]
