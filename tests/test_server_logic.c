@@ -24,9 +24,13 @@
  *   (d) result classification: a libnx MAKERESULT(345, n) has no bit 31, native
  *       errors do, and NXUS' own `0x8003C8xx` codes put 484 in the libnx
  *       DESCRIPTION field - the trap that made resultIsNxusError() always false;
- *   (e) the TCP pending-connection policy: a live (heartbeating) client keeps its
- *       session and a second connection gets BUSY, only a client silent for 8 s
- *       is preempted, and the preempt/busy log wording is pinned.
+ *   (e) the multi-client TCP slot policy: NXUS_NET_MAX_CLIENTS connections are
+ *       served, a finished-but-not-yet-reaped slot is NOT reusable, and a
+ *       newcomer is refused with BUSY (and the pinned log wording) only when
+ *       every slot is in use;
+ *   (f) the dispatcher's command classification: every NxusCmd value is pinned as
+ *       read-only or mutating (the concurrency contract of server + client
+ *       threads) and every id that is not one of them defaults to mutating.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -36,10 +40,12 @@
 
 #include "nxus_protocol.h"
 #include "nxus_ptrscan.h"
-/* The real transitive header is only included for the pending-connection policy
-   and its log wording (section (e)); the rest of the harness stays independent of
-   the libnx translation units, exactly like the sections above. */
+/* The real transitive headers are only included for the transport/dispatch
+   policy (sections (e) and (f)); the rest of the harness stays independent of the
+   libnx translation units, exactly like the sections above.  Neither header
+   needs <switch.h> on the host (both carry a host-side Result typedef). */
 #include "../shared/nxus_net.h"
+#include "../switch/include/nxus_server.h"
 
 static int g_checks;
 static int g_failures;
@@ -1207,85 +1213,142 @@ static void testStatusLayoutAndCodePatchPolicy(void) {
 }
 
 /* ====================================================================== */
-/* (e) pending-connection policy (shared/nxus_net.c)                      */
+/* (e) multi-client slot policy (shared/nxus_net.h)                      */
 /* ====================================================================== */
 
-/* Contract: while a client is registered, a pending accept is either a PREEMPT
-   (the registered client has been silent for NXUS_NET_PREEMPT_IDLE_NS) or a BUSY
-   refusal of the newcomer.  The decision below calls the SHIPPED helper from
-   shared/nxus_net.h and uses the SHIPPED log format strings, so the threshold,
-   the BUSY wire values and the grep-able wording are all the production ones;
-   only the socket bookkeeping (accept/close) is modelled. */
-#define TEST_NET_REGISTERED_FD 4
-#define TEST_NET_NEWCOMER_FD   5
+/* Contract: the accept thread serves up to NXUS_NET_MAX_CLIENTS connections, one
+   slot each.  A slot is claimed BEFORE the connection's thread is created; the
+   serving thread marks it finished as its very last action; only the reaper (the
+   accept thread, or nxusNetExit()) joins the thread, frees the stack and makes the
+   slot claimable again.  So a finished-but-not-yet-reaped slot still counts as
+   busy, and a newcomer is refused with the BUSY frame only when no slot is
+   claimable at all.
+
+   The model below calls the SHIPPED slot helpers, the BUSY payload helper and the
+   SHIPPED log wording from shared/nxus_net.h; only the accept/close/join
+   bookkeeping (which needs real sockets) is local. */
 
 typedef struct {
-    bool live;
-    u64  last_rx_ns;
-    bool busy_refused;
-    bool preempted;
+    NxusNetSlot slots[NXUS_NET_MAX_CLIENTS];
+    int  next_fd;
+    int  accepted;         /* connections served so far              */
+    bool busy_refused;     /* the last accept was refused with BUSY  */
     u32  busy_result;
     u32  busy_reason;
+    bool closed;           /* the refused/new fd was closed          */
     int  log_count;
     char log[192];
-} TestNetSession;
+} TestNetServer;
 
-static void testNetAccept(TestNetSession *s, u64 now_ns, const char *peer) {
-    s->log_count = 0;
-    s->log[0] = '\0';
-
-    if (!s->live) {
-        /* No registered client: the newcomer is simply served. */
-        s->live = true;
-        s->last_rx_ns = now_ns;
-        snprintf(s->log, sizeof(s->log), "client connected from %s (fd=%d)", peer,
-                 TEST_NET_NEWCOMER_FD);
-        s->log_count = 1;
-        return;
-    }
-
-    const u64 silent_ns = now_ns - s->last_rx_ns;
-    if (nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Preempt) {
-        /* The registration is stale: drop it and let the newcomer take over. */
-        s->preempted = true;
-        s->busy_refused = false;
-        s->last_rx_ns = now_ns;
-        snprintf(s->log, sizeof(s->log), NXUS_NET_LOG_PREEMPT_FMT,
-                 TEST_NET_REGISTERED_FD, (unsigned long long)(silent_ns / 1000000ull));
-        s->log_count = 1;
-        return;
-    }
-
-    s32 payload[2];
-    nxusNetFillBusyPayload(payload);
-    s->busy_refused = true;
-    s->preempted = false;
-    s->busy_result = (u32)payload[0];
-    s->busy_reason = (u32)payload[1];
-    snprintf(s->log, sizeof(s->log), NXUS_NET_LOG_BUSY_FMT, peer,
-             TEST_NET_NEWCOMER_FD, TEST_NET_REGISTERED_FD);
-    s->log_count = 1;
-}
-
-/* First connection: nobody is registered, so it is accepted.  The session then
-   starts with a clean log so each assertion looks at one outcome only. */
-static void testNetInit(TestNetSession *s) {
+static void testNetServerInit(TestNetServer *s) {
     memset(s, 0, sizeof(*s));
-    testNetAccept(s, 0, "192.168.1.10:40000");
-    s->log_count = 0;
-    s->log[0] = '\0';
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) nxusNetSlotReset(&s->slots[i]);
+    s->next_fd = 10;
 }
 
-static void testPendingConnectionRefusesSecondClient(void) {
-    printf("[test] net: a second connection must not cut a live client (it gets BUSY)\n");
-    TestNetSession s;
-    testNetInit(&s);
-    s.last_rx_ns = 1000000000ull;          /* a heartbeat was just served */
+/* mirrors nxus_net.c:startClient()'s slot decision and its BUSY refusal */
+static int testNetAccept(TestNetServer *s, const char *peer, int *out_fd) {
+    const int fd = s->next_fd++;
+    if (out_fd != NULL) *out_fd = fd;
 
-    testNetAccept(&s, 2000000000ull, "192.168.1.11:40001");
-    CHECK(s.live, "the registered client must stay connected");
-    CHECK(s.busy_refused, "the second connection must be refused with BUSY");
-    CHECK(!s.preempted, "a client that sent 1 s ago must never be preempted");
+    s->busy_refused = false;
+    s->closed = false;
+    s->log_count = 0;
+    s->log[0] = '\0';
+
+    const int slot = nxusNetSlotClaim(s->slots, NXUS_NET_MAX_CLIENTS, fd);
+    if (slot < 0) {
+        s32 payload[2];
+        nxusNetFillBusyPayload(payload);
+        s->busy_refused = true;
+        s->busy_result = (u32)payload[0];
+        s->busy_reason = (u32)payload[1];
+        s->closed = true;   /* sendBusyAndClose() closes the refused fd */
+        snprintf(s->log, sizeof(s->log), NXUS_NET_LOG_BUSY_FMT, peer, fd,
+                 NXUS_NET_MAX_CLIENTS);
+        s->log_count = 1;
+        return -1;
+    }
+    s->accepted++;
+    return slot;
+}
+
+static int testNetFindFd(const TestNetServer *s, int fd) {
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (nxusNetSlotFd(&s->slots[i]) == fd) return i;
+    }
+    return -1;
+}
+
+static void testNetConstants(void) {
+    printf("[test] net: connection count and memory ceilings\n");
+    CHECK(NXUS_NET_MAX_CLIENTS == 4, "four clients must be served (got %d)",
+          NXUS_NET_MAX_CLIENTS);
+    CHECK(NXUS_NET_BUF_SIZE == 1024u * 1024u,
+          "the largest frame stays 1 MiB (got %u)", (unsigned)NXUS_NET_BUF_SIZE);
+    CHECK(NXUS_NET_RX_IDLE_SIZE == 128u * 1024u,
+          "every connection starts with a 128 KiB receive buffer (got %u)",
+          (unsigned)NXUS_NET_RX_IDLE_SIZE);
+    CHECK(NXUS_NET_RX_IDLE_SIZE < NXUS_NET_BUF_SIZE,
+          "the idle buffer must be smaller than the frame ceiling");
+    CHECK(NXUS_NET_CLIENT_STACK_SIZE == 32u * 1024u,
+          "a connection thread gets a 32 KiB stack (got %u)",
+          (unsigned)NXUS_NET_CLIENT_STACK_SIZE);
+    CHECK((u64)NXUS_NET_MAX_CLIENTS * NXUS_NET_BUF_SIZE == 4ull * 1024 * 1024,
+          "the worst-case receive buffers stay at 4 MiB");
+    CHECK((u64)NXUS_NET_MAX_CLIENTS * NXUS_NET_RX_IDLE_SIZE == 512ull * 1024,
+          "idle connections cost 512 KiB, not 4 MiB");
+    CHECK(NXUS_NET_RX_SHRINK_IDLE_NS > 0,
+          "an enlarged buffer must have a shrink deadline");
+    CHECK(NXUS_NET_BUSY_REASON == NXUS_REASON_BUSY_STATE,
+          "the BUSY reason must stay the retryable protocol BUSY_STATE code");
+}
+
+static void testNetFourClientsAreServed(void) {
+    printf("[test] net: four connections are served at the same time\n");
+    TestNetServer s;
+    testNetServerInit(&s);
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == NXUS_NET_MAX_CLIENTS,
+          "a fresh table must have every slot free (got %d)",
+          nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS));
+
+    int fds[NXUS_NET_MAX_CLIENTS];
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        const int slot = testNetAccept(&s, "192.168.1.10:40000", &fds[i]);
+        CHECK(slot == i, "connection %d must take slot %d (got %d)", i, i, slot);
+        CHECK(!s.busy_refused, "connection %d must not be refused", i);
+        CHECK(nxusNetSlotFd(&s.slots[i]) == fds[i],
+              "slot %d must be registered with fd=%d (got %d)", i, fds[i],
+              nxusNetSlotFd(&s.slots[i]));
+        CHECK(!nxusNetSlotDone(&s.slots[i]), "slot %d must not look finished", i);
+    }
+    CHECK(s.accepted == NXUS_NET_MAX_CLIENTS, "all four slots must be served (got %d)",
+          s.accepted);
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "no slot may be free while four clients are connected");
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        CHECK(testNetFindFd(&s, fds[i]) == i, "fd=%d must be found in slot %d", fds[i], i);
+    }
+    CHECK(testNetFindFd(&s, 99) < 0, "an unknown fd must not resolve to a slot");
+}
+
+static void testNetFifthConnectionGetsBusy(void) {
+    printf("[test] net: a fifth connection is refused with BUSY (not preempted)\n");
+    TestNetServer s;
+    testNetServerInit(&s);
+
+    int first_fd = -1;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        int fd = -1;
+        (void)testNetAccept(&s, "192.168.1.10:40000", &fd);
+        if (i == 0) first_fd = fd;
+    }
+
+    int fifth_fd = -1;
+    const int slot = testNetAccept(&s, "192.168.1.11:40001", &fifth_fd);
+    CHECK(slot < 0, "the fifth connection must not get a slot (got %d)", slot);
+    CHECK(s.busy_refused, "the fifth connection must be refused with BUSY");
+    CHECK(s.closed, "the refused connection must be closed");
     CHECK(s.busy_result == NXUS_MAKE_RESULT(NXUS_ERR_BUSY),
           "the BUSY payload must carry NXUS_ERR_BUSY (got 0x%08X)", s.busy_result);
     CHECK(s.busy_reason == NXUS_NET_BUSY_REASON,
@@ -1293,67 +1356,271 @@ static void testPendingConnectionRefusesSecondClient(void) {
     CHECK(s.log_count == 1, "the refusal must log exactly one line (got %d)", s.log_count);
     CHECK(strstr(s.log, "busy") != NULL && strstr(s.log, "192.168.1.11:40001") != NULL,
           "the log must name the refused peer and say busy: %s", s.log);
-    CHECK(strstr(s.log, "preempting") == NULL,
-          "a live client must not produce a preempt log: %s", s.log);
+    CHECK(strstr(s.log, "all 4 client slots") != NULL,
+          "the log must say every slot is in use: %s", s.log);
+    CHECK(strstr(s.log, "preempt") == NULL,
+          "a full table must not produce a preempt log: %s", s.log);
+
+    /* The four live sessions are untouched by the refusal. */
+    CHECK(nxusNetSlotFd(&s.slots[0]) == first_fd,
+          "the first connection must survive the refused newcomer");
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "the refusal must not free a slot");
+    CHECK(testNetFindFd(&s, fifth_fd) < 0, "the refused fd must not be registered");
 }
 
-static void testPendingConnectionHeartbeatKeepsSession(void) {
-    printf("[test] net: 4 s heartbeats keep the session alive against new connections\n");
-    TestNetSession s;
-    testNetInit(&s);
+static void testNetFinishedSlotWaitsForReap(void) {
+    printf("[test] net: a finished slot is only reusable after its thread was reaped\n");
+    TestNetServer s;
+    testNetServerInit(&s);
 
-    for (u64 beat = 1; beat <= 5; beat++) {
-        const u64 heartbeat_ns = beat * 4000000000ull;
-        s.last_rx_ns = heartbeat_ns;       /* recvExact() stamps every received byte */
-        testNetAccept(&s, heartbeat_ns + 1000000000ull, "192.168.1.12:40002");
-        CHECK(!s.preempted && s.busy_refused,
-              "heartbeat %llu must keep the session and BUSY the newcomer",
-              (unsigned long long)beat);
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        int fd = -1;
+        (void)testNetAccept(&s, "peer:1", &fd);
     }
+
+    /* The serving thread of slot 1 ends (nxus_net.c:serveClient's last act). */
+    nxusNetSlotFinish(&s.slots[1]);
+    CHECK(nxusNetSlotFd(&s.slots[1]) == -1, "a finished slot must be unregistered");
+    CHECK(nxusNetSlotDone(&s.slots[1]), "a finished slot must be marked done");
+    CHECK(nxusNetSlotInUse(&s.slots[1]), "a finished slot is still owned by its thread");
+    CHECK(nxusNetSlotReapable(&s.slots[1]), "a finished slot must be reapable");
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 0,
+          "a finished-but-unreaped slot must not count as free");
+
+    const int slot = testNetAccept(&s, "peer:2", NULL);
+    CHECK(slot < 0 && s.busy_refused,
+          "a newcomer must be refused while the finished slot waits for its join");
+
+    /* The reaper joined the thread and freed its stack: now it is reusable. */
+    nxusNetSlotReaped(&s.slots[1]);
+    CHECK(!nxusNetSlotInUse(&s.slots[1]), "a reaped slot must be free again");
+    CHECK(!nxusNetSlotDone(&s.slots[1]), "a reaped slot must not keep the done flag");
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == 1,
+          "exactly the reaped slot must be claimable");
+
+    int fd = -1;
+    const int reused = testNetAccept(&s, "peer:3", &fd);
+    CHECK(reused == 1, "the next connection must reuse slot 1 (got %d)", reused);
+    CHECK(!s.busy_refused, "the newcomer must be served after the reap");
+    CHECK(nxusNetSlotFd(&s.slots[1]) == fd,
+          "the reused slot must be registered with the new fd (got %d)",
+          nxusNetSlotFd(&s.slots[1]));
+    CHECK(!nxusNetSlotDone(&s.slots[1]),
+          "a freshly claimed slot must not inherit the previous done flag");
+
+    /* Drain every slot the way the exit path does and check the table resets. */
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        nxusNetSlotFinish(&s.slots[i]);
+        CHECK(nxusNetSlotReapable(&s.slots[i]), "slot %d must be reapable when finished", i);
+        nxusNetSlotReaped(&s.slots[i]);
+    }
+    CHECK(nxusNetSlotFreeCount(s.slots, NXUS_NET_MAX_CLIENTS) == NXUS_NET_MAX_CLIENTS,
+          "every reaped slot must be free again");
+    int fourth_fd = -1;
+    CHECK(testNetAccept(&s, "peer:4", &fourth_fd) == 0,
+          "a drained table must serve the first slot again");
 }
 
-static void testPendingConnectionThreshold(void) {
-    printf("[test] net: preempt only after NXUS_NET_PREEMPT_IDLE_NS (8 s) of silence\n");
-    CHECK(NXUS_NET_PREEMPT_IDLE_NS == 8000000000ull,
-          "the default preempt threshold must be 8 s (got %llu)",
-          (unsigned long long)NXUS_NET_PREEMPT_IDLE_NS);
-    CHECK(NXUS_NET_BUSY_REASON == NXUS_REASON_BUSY_STATE,
-          "the BUSY reason must stay the retryable protocol BUSY_STATE code");
-    CHECK(nxusNetPendingConnectionAction(NXUS_NET_PREEMPT_IDLE_NS - 1u) == NxusNetPending_Busy,
-          "one nanosecond under the threshold must keep the client");
-    CHECK(nxusNetPendingConnectionAction(NXUS_NET_PREEMPT_IDLE_NS) == NxusNetPending_Preempt,
-          "exactly at the threshold the stale client may be preempted");
+/* ====================================================================== */
+/* (f) command classification (switch/include/nxus_server.h)              */
+/* ====================================================================== */
 
-    TestNetSession s;
-    testNetInit(&s);
-    s.last_rx_ns = 0;
+/* Every value of NxusCmd, with the classification the dispatcher must apply:
+   read-only commands may run concurrently on several connection threads,
+   mutating ones are serialised by the global command mutex, and the scan family
+   is additionally owned by the connection that started the scan.  A new NxusCmd
+   must be added here (and to the production switch) or the default test below
+   will treat it as mutating. */
+typedef struct {
+    u16 id;
+    bool read_only;
+    bool scan_family;
+    const char *name;
+} TestCommandClass;
 
-    testNetAccept(&s, NXUS_NET_PREEMPT_IDLE_NS - 1u, "peer:1");
-    CHECK(s.busy_refused && !s.preempted,
-          "just under the threshold the live client must be kept");
-    CHECK(strstr(s.log, "busy") != NULL,
-          "the under-threshold log must say busy: %s", s.log);
+static const TestCommandClass kCommandClasses[] = {
+    { NxusCmd_Nop,             true,  false, "Nop" },
+    { NxusCmd_Pause,           false, false, "Pause" },
+    { NxusCmd_Resume,          false, false, "Resume" },
+    { NxusCmd_Heartbeat,       true,  false, "Heartbeat" },
+    { NxusCmd_GetStatus,       true,  false, "GetStatus" },
+    { NxusCmd_GetMetadata,     true,  false, "GetMetadata" },
+    { NxusCmd_ForceOpen,       false, false, "ForceOpen" },
+    { NxusCmd_ForceClose,      false, false, "ForceClose" },
+    { NxusCmd_GetModules,      true,  false, "GetModules" },
+    { NxusCmd_GetProcesses,    true,  false, "GetProcesses" },
+    { NxusCmd_GetMappingCount, true,  false, "GetMappingCount" },
+    { NxusCmd_GetMappings,     true,  false, "GetMappings" },
+    { NxusCmd_Query,           true,  false, "Query" },
+    { NxusCmd_Read,            true,  false, "Read" },
+    { NxusCmd_Write,           false, false, "Write" },
+    { NxusCmd_ScanBegin,       false, true,  "ScanBegin" },
+    { NxusCmd_ScanNext,        false, true,  "ScanNext" },
+    { NxusCmd_ScanStatus,      true,  true,  "ScanStatus" },
+    { NxusCmd_ScanCancel,      false, true,  "ScanCancel" },
+    { NxusCmd_ScanGetHits,     true,  true,  "ScanGetHits" },
+    { NxusCmd_ScanReset,       false, true,  "ScanReset" },
+    { NxusCmd_SnapshotCapture, false, false, "SnapshotCapture" },
+    { NxusCmd_SnapshotDiff,    false, false, "SnapshotDiff" },
+    { NxusCmd_SnapshotChanged, false, false, "SnapshotChanged" },
+    { NxusCmd_ScanUndo,        false, true,  "ScanUndo" },
+    { NxusCmd_PtrScanBegin,    false, false, "PtrScanBegin" },
+    { NxusCmd_PtrScanGet,      false, false, "PtrScanGet" },
+    { NxusCmd_CheatExport,     false, false, "CheatExport" },
+    { NxusCmd_FrozenList,      true,  false, "FrozenList" },
+    { NxusCmd_FrozenEnable,    false, false, "FrozenEnable" },
+    { NxusCmd_FrozenDisable,   false, false, "FrozenDisable" },
+    { NxusCmd_CheatList,       true,  false, "CheatList" },
+    { NxusCmd_CheatToggle,     false, false, "CheatToggle" },
+    { NxusCmd_DebugAttach,     false, false, "DebugAttach" },
+    { NxusCmd_DebugDetach,     false, false, "DebugDetach" },
+    { NxusCmd_DebugStatus,     true,  false, "DebugStatus" },
+    { NxusCmd_BreakSet,        false, false, "BreakSet" },
+    { NxusCmd_BreakClear,      false, false, "BreakClear" },
+    { NxusCmd_BreakList,       true,  false, "BreakList" },
+    { NxusCmd_DebugContinue,   false, false, "DebugContinue" },
+    { NxusCmd_ThreadList,      true,  false, "ThreadList" },
+    { NxusCmd_RegsGet,         true,  false, "RegsGet" },
+    { NxusCmd_RegsSet,         false, false, "RegsSet" },
+    { NxusCmd_HitGet,          true,  false, "HitGet" },
+    { NxusCmd_HitClear,        false, false, "HitClear" },
+    { NxusCmd_DebugStep,       false, false, "DebugStep" },
+    { NxusCmd_Config,          false, false, "Config" },
+    { NxusCmd_LogGet,          true,  false, "LogGet" },
+    { NxusCmd_ProbeRun,        false, false, "ProbeRun" },
+    { NxusCmd_ProbeGet,        true,  false, "ProbeGet" },
+    { NxusCmd_SnapshotRelease, false, false, "SnapshotRelease" },
+    { NxusCmd_CheatUpload,     false, false, "CheatUpload" },
+    { NxusCmd_CheatEnable,     false, false, "CheatEnable" },
+    { NxusCmd_CheatStatus,     true,  false, "CheatStatus" },
+    { NxusCmd_CheatPanicOff,   false, false, "CheatPanicOff" },
+    { NxusCmd_CheatClear,      false, false, "CheatClear" },
+};
 
-    testNetAccept(&s, NXUS_NET_PREEMPT_IDLE_NS, "peer:2");
-    CHECK(s.preempted && !s.busy_refused,
-          "at the threshold the stale client must be preempted");
-    CHECK(strstr(s.log, "preempting") != NULL,
-          "the preempt log must say preempting: %s", s.log);
-    CHECK(strstr(s.log, "8000 ms") != NULL,
-          "the preempt log must carry the silence in ms: %s", s.log);
+static const TestCommandClass *testCommandClass(u16 id) {
+    for (size_t i = 0; i < ARRAY_LEN(kCommandClasses); i++) {
+        if (kCommandClasses[i].id == id) return &kCommandClasses[i];
+    }
+    return NULL;
 }
 
-static void testPendingConnectionLongIdle(void) {
-    printf("[test] net: 20 s silence still preempts (the idle reap is unchanged)\n");
-    TestNetSession s;
-    testNetInit(&s);
-    s.last_rx_ns = 0;
+static void testCommandClassificationTable(void) {
+    printf("[test] dispatch: every command id is classified (read-only vs serialised)\n");
+    CHECK(ARRAY_LEN(kCommandClasses) == 56,
+          "the table must list every NxusCmd value (got %u)",
+          (unsigned)ARRAY_LEN(kCommandClasses));
 
-    testNetAccept(&s, 20000000000ull /* NXUS_NET_IDLE_TIMEOUT_NS */, "peer:3");
-    CHECK(s.preempted,
-          "a client silent for 20 s must be released to the new connection");
-    CHECK(strstr(s.log, "preempting") != NULL && strstr(s.log, "20000 ms") != NULL,
-          "the preempt log must report the 20 s silence: %s", s.log);
+    int mismatches = 0;
+    int duplicates = 0;
+    for (size_t i = 0; i < ARRAY_LEN(kCommandClasses); i++) {
+        const TestCommandClass *c = &kCommandClasses[i];
+        for (size_t j = i + 1; j < ARRAY_LEN(kCommandClasses); j++) {
+            if (kCommandClasses[j].id == c->id) duplicates++;
+        }
+        const bool ro = nxusServerCommandIsReadOnly(c->id);
+        const bool scan = nxusServerCommandIsScanFamily(c->id);
+        if (ro != c->read_only || scan != c->scan_family) {
+            mismatches++;
+            printf("  MISMATCH %s (0x%04X): expected read_only=%d scan=%d, got %d/%d\n",
+                   c->name, (unsigned)c->id, c->read_only ? 1 : 0,
+                   c->scan_family ? 1 : 0, ro ? 1 : 0, scan ? 1 : 0);
+        }
+    }
+    CHECK(duplicates == 0, "the classification table has %d duplicate id(s)", duplicates);
+    CHECK(mismatches == 0, "%d command(s) are classified differently than the table says",
+          mismatches);
+}
+
+static void testCommandClassificationFamilies(void) {
+    printf("[test] dispatch: the families the spec names are classified correctly\n");
+    /* Mutating side named by the request. */
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_Pause), "Pause must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_Resume), "Resume must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_Write), "Write must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_SnapshotCapture) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_SnapshotRelease),
+          "snapshot capture/release must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_PtrScanBegin),
+          "PtrScanBegin must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_FrozenEnable) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_FrozenDisable),
+          "freeze/unfreeze must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_DebugAttach) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_DebugDetach) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_DebugContinue) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_DebugStep),
+          "debug attach/detach/continue/step must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_Config), "Config must be serialised");
+    CHECK(!nxusServerCommandIsReadOnly(NxusCmd_CheatUpload) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_CheatEnable) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_CheatToggle) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_CheatPanicOff) &&
+          !nxusServerCommandIsReadOnly(NxusCmd_CheatClear),
+          "the cheat mutations must be serialised");
+
+    /* Read-only side named by the request. */
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_GetStatus), "GetStatus must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_GetMetadata), "GetMetadata must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_LogGet), "LogGet must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_GetMappingCount) &&
+          nxusServerCommandIsReadOnly(NxusCmd_GetMappings),
+          "mapping reads must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_GetModules), "module reads must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_Read) &&
+          nxusServerCommandIsReadOnly(NxusCmd_Query),
+          "memory reads must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_RegsGet), "RegsGet must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_ThreadList), "ThreadList must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_GetProcesses), "pid list must stay concurrent");
+    CHECK(nxusServerCommandIsReadOnly(NxusCmd_Nop) &&
+          nxusServerCommandIsReadOnly(NxusCmd_Heartbeat),
+          "Nop/Heartbeat are the liveness pair and must not queue behind a scan");
+
+    /* Scan family: exactly the seven search-session commands. */
+    CHECK(nxusServerCommandIsScanFamily(NxusCmd_ScanBegin) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanNext) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanStatus) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanCancel) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanGetHits) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanReset) &&
+          nxusServerCommandIsScanFamily(NxusCmd_ScanUndo),
+          "the seven scan-session commands must be scan-family");
+    CHECK(!nxusServerCommandIsScanFamily(NxusCmd_SnapshotCapture) &&
+          !nxusServerCommandIsScanFamily(NxusCmd_PtrScanBegin) &&
+          !nxusServerCommandIsScanFamily(NxusCmd_CheatExport) &&
+          !nxusServerCommandIsScanFamily(NxusCmd_Read) &&
+          !nxusServerCommandIsScanFamily(NxusCmd_Write),
+          "snapshot/ptrscan/read/write must not be gated by scan ownership");
+    int scan_read_only = 0;
+    for (size_t i = 0; i < ARRAY_LEN(kCommandClasses); i++) {
+        if (kCommandClasses[i].scan_family && kCommandClasses[i].read_only) scan_read_only++;
+    }
+    CHECK(scan_read_only == 2,
+          "only ScanStatus/ScanGetHits may be read-only scan commands (got %d)",
+          scan_read_only);
+}
+
+static void testCommandClassificationDefaultsToMutating(void) {
+    printf("[test] dispatch: unlisted command ids default to serialised\n");
+    int unlisted_read_only = 0;
+    int unlisted_scan = 0;
+    for (u32 id = 0; id <= 0xFFFFu; id++) {
+        if (testCommandClass((u16)id) != NULL) continue;
+        if (nxusServerCommandIsReadOnly((u16)id)) unlisted_read_only++;
+        if (nxusServerCommandIsScanFamily((u16)id)) unlisted_scan++;
+    }
+    CHECK(unlisted_read_only == 0,
+          "%d unlisted command id(s) would run concurrently", unlisted_read_only);
+    CHECK(unlisted_scan == 0,
+          "%d unlisted command id(s) would be treated as scan commands", unlisted_scan);
+
+    /* Async events share the u16 type field but are not commands; the default
+       must not mistake one for a read-only request either. */
+    CHECK(!nxusServerCommandIsReadOnly(NxusEvent_HotkeyPaused) &&
+          !nxusServerCommandIsReadOnly(NxusEvent_DebugStopped) &&
+          !nxusServerCommandIsReadOnly(0xFFFFu),
+          "event ids must not classify as read-only commands");
 }
 
 /* ====================================================================== */
@@ -1382,10 +1649,14 @@ int main(void) {
     testResultClassification();
     testStatusLayoutAndCodePatchPolicy();
 
-    testPendingConnectionRefusesSecondClient();
-    testPendingConnectionHeartbeatKeepsSession();
-    testPendingConnectionThreshold();
-    testPendingConnectionLongIdle();
+    testNetConstants();
+    testNetFourClientsAreServed();
+    testNetFifthConnectionGetsBusy();
+    testNetFinishedSlotWaitsForReap();
+
+    testCommandClassificationTable();
+    testCommandClassificationFamilies();
+    testCommandClassificationDefaultsToMutating();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

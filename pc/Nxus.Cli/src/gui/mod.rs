@@ -8,6 +8,7 @@ pub mod cheats;
 pub mod hexview;
 pub mod panels;
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1343,6 +1344,107 @@ impl ChainOwner {
     }
 }
 
+// ---------------------------------------------------------------- toasts
+
+/// How long one queued status line stays on screen before the next one takes
+/// over.
+///
+/// The bottom bar used to be a single `last_message` that every `log()` and
+/// every [`App::send`] overwrote.  A connect that retried, a job start and its
+/// reply land within a few hundred milliseconds, so the line was replaced
+/// faster than it could be read - "the text flickers: it appears, is replaced
+/// by something else, is replaced again".  A queue with a minimum dwell makes
+/// every line readable, and a line repeated in a burst is folded into a
+/// counter instead of being re-shown.
+pub const TOAST_DWELL: Duration = Duration::from_millis(1200);
+
+/// A priority line (an error, a lost link, a busy refusal) jumps the queue and
+/// stays longer: those are the ones the user must not miss.
+pub const TOAST_PRIORITY_DWELL: Duration = Duration::from_millis(2500);
+
+/// Lines waiting for their turn.  Past this the oldest are dropped: a burst of
+/// a thousand retries must not become a thousand-second replay.
+pub const TOAST_QUEUE_MAX: usize = 32;
+
+/// `Toast::priority` of a line that interrupts whatever is on screen.
+pub const TOAST_PRIORITY: u8 = 2;
+
+/// Words that make a status line important (case-insensitive).  "lost" covers
+/// "link lost", "busy" the refusal of a click while a job is in flight,
+/// "failed" the failed write/save, "stopped" the GDB-style stop banner.
+pub const TOAST_PRIORITY_WORDS: [&str; 5] = ["error", "lost", "busy", "failed", "stopped"];
+
+/// One line of the bottom status bar, waiting for (or getting) its turn.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub text: String,
+    /// When this line took the screen (or was last refreshed by a repeat).
+    pub shown_at: Instant,
+    /// How often the same message arrived in a row: shown as `(x3)`.
+    pub repeats: u32,
+    /// 0 = normal, [`TOAST_PRIORITY`] = interrupts and stays longer.
+    pub priority: u8,
+}
+
+impl Toast {
+    /// How long this line is guaranteed to stay on screen.
+    pub fn dwell(&self) -> Duration {
+        if self.priority >= TOAST_PRIORITY { TOAST_PRIORITY_DWELL } else { TOAST_DWELL }
+    }
+
+    /// What the status bar draws: the line, how often it was repeated, and
+    /// whether another one is already waiting behind it.
+    pub fn render(&self, more_waiting: bool) -> String {
+        let mut text = self.text.clone();
+        if self.repeats > 1 {
+            text.push_str(&format!(" (x{})", self.repeats));
+        }
+        if more_waiting {
+            text.push_str(" …");
+        }
+        text
+    }
+}
+
+/// Priority of a status line, from its wording alone.
+pub fn toast_priority(text: &str) -> u8 {
+    let lower = text.to_ascii_lowercase();
+    if TOAST_PRIORITY_WORDS.iter().any(|word| lower.contains(word)) {
+        TOAST_PRIORITY
+    } else {
+        0
+    }
+}
+
+/// The message part of a status line.
+///
+/// `log()` prefixes every line with `[  12.3s]`; that stamp is not part of the
+/// message, so the same message logged twice is still "the same message" and
+/// becomes `(x2)` instead of two lines.
+fn toast_key(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix('[') else { return text };
+    let Some(end) = rest.find(']') else { return text };
+    // The stamp is "12.3s" (or "  12.3s"): only then is this really a stamp.
+    if rest[..end].trim_end().ends_with('s') {
+        rest[end + 1..].trim_start()
+    } else {
+        text
+    }
+}
+
+/// The prefix two progress lines share: `"scanning - 12 / 512 MB"` and
+/// `"scanning - 13 / 512 MB"` are one live counter, not two lines.  `None` for
+/// a line that is not a progress line at all.
+fn progress_prefix(text: &str) -> Option<&str> {
+    let (prefix, tail) = toast_key(text).split_once(" - ")?;
+    let tail = tail.trim();
+    if tail.contains(" / ") && tail.ends_with("MB") {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
 /// One open inline editor in the Results list.
 pub struct HitEdit {
     pub hit_index: usize,
@@ -1416,6 +1518,15 @@ pub struct State {
     pub log: Vec<String>,
     pub started: Instant,
     pub scan_progress: f32,
+    /// The bottom status bar's queue (see [`Toast`]).  `log()`/`send()` push
+    /// here instead of overwriting one string.
+    pub toasts: VecDeque<Toast>,
+    /// The line the bar shows while the queue is empty: the last one that was
+    /// displayed, kept (dimmed) instead of blanking the bar.
+    ///
+    /// [`State::log`] writes it when it queues a line, [`State::advance_toasts_at`]
+    /// writes it when a line retires, and `gui/hexview.rs` writes it directly for
+    /// freeze/unfreeze (it predates the queue and is not part of this change).
     pub last_message: String,
     pub scan_range_begin: String,
     pub scan_range_end: String,
@@ -1476,7 +1587,8 @@ impl State {
             log: vec!["Nxus ready - set the console IP and press Connect".into()],
             started: Instant::now(),
             scan_progress: 0.0,
-            last_message: String::new(),
+            toasts: VecDeque::new(),
+            last_message: "Nxus ready - set the console IP and press Connect".into(),
             scan_range_begin: String::new(),
             scan_range_end: String::new(),
             watch_label_input: "Bookmark".into(),
@@ -1668,14 +1780,157 @@ impl State {
         self.metadata.as_ref().map(|m| m.heap_base).unwrap_or(0)
     }
 
+    /// Append a line to the log AND queue it for the status bar.
+    ///
+    /// The signature is unchanged on purpose: every caller keeps working, but
+    /// the status line is no longer overwritten - the line waits its turn (see
+    /// [`Toast`]), so a burst of connection events stays readable.
     pub fn log(&mut self, line: impl Into<String>) {
         let stamp = self.started.elapsed().as_secs_f32();
         let line = format!("[{:7.1}s] {}", stamp, line.into());
         self.last_message = line.clone();
+        self.toast(line.clone());
         self.log.push(line);
         if self.log.len() > 500 {
             self.log.remove(0);
         }
+    }
+
+    /// Queue a status line without adding it to the log list.
+    ///
+    /// This is what [`App::send`] uses: the label ("scanning", "refreshing")
+    /// describes a command, not an event worth a log entry.
+    pub fn toast(&mut self, line: impl Into<String>) {
+        self.push_toast(line.into());
+    }
+
+    /// A scan counter: `"<label> - <done> / <total> MB"`.
+    ///
+    /// Progress arrives once per chunk, so it REPLACES the counter already on
+    /// screen instead of queueing behind it - otherwise the bar would replay
+    /// hundreds of stale percentages (and show `(x1000)`).
+    pub fn progress(&mut self, label: &str, done: u64, total: u64) {
+        self.push_toast(format!(
+            "{} - {} / {} MB",
+            label,
+            done / (1024 * 1024),
+            total / (1024 * 1024)
+        ));
+    }
+
+    fn push_toast(&mut self, text: String) {
+        let now = Instant::now();
+        let priority = toast_priority(&text);
+        // A progress line updates the counter it already has.
+        if let Some(prefix) = progress_prefix(&text) {
+            if let Some(index) = self
+                .toasts
+                .iter()
+                .position(|queued| progress_prefix(&queued.text) == Some(prefix))
+            {
+                let toast = &mut self.toasts[index];
+                toast.text = text;
+                if index == 0 {
+                    // still on screen: keep it there, no `repeats` bump
+                    toast.shown_at = now;
+                }
+                return;
+            }
+        }
+        // The same line again is one line with a counter.
+        if let Some(index) = self.repeat_of(&text, priority) {
+            let toast = &mut self.toasts[index];
+            toast.repeats = toast.repeats.saturating_add(1);
+            toast.text = text;
+            toast.shown_at = now;      // give the "(x2)" time to be read
+            return;
+        }
+        let toast = Toast { text, shown_at: now, repeats: 1, priority };
+        if priority >= TOAST_PRIORITY {
+            // Interrupt: whatever is on screen goes back to the front of the
+            // queue, so the user still gets to read it after the error.
+            self.toasts.push_front(toast);
+        } else {
+            self.toasts.push_back(toast);
+        }
+        self.trim_toasts(priority >= TOAST_PRIORITY);
+    }
+
+    /// The queued line `text` repeats, if any.
+    ///
+    /// A normal line repeats the newest entry; a priority line lands at the
+    /// FRONT, so that is where a repeat of it must be looked for - otherwise an
+    /// error that repeats while other lines are waiting would be queued twice.
+    fn repeat_of(&self, text: &str, priority: u8) -> Option<usize> {
+        let key = toast_key(text);
+        let last = self.toasts.len().checked_sub(1)?;
+        let candidates: [usize; 2] = if priority >= TOAST_PRIORITY { [0, last] } else { [last, last] };
+        candidates.into_iter().find(|&index| {
+            self.toasts
+                .get(index)
+                .map(|queued| toast_key(&queued.text) == key)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Drop the oldest waiting line past [`TOAST_QUEUE_MAX`].  The line that
+    /// was just queued - in particular an interrupting one - is never the one
+    /// that goes.
+    fn trim_toasts(&mut self, at_front: bool) {
+        while self.toasts.len() > TOAST_QUEUE_MAX && self.toasts.len() > 1 {
+            if at_front {
+                self.toasts.remove(1);
+            } else {
+                self.toasts.pop_front();
+            }
+        }
+    }
+
+    /// Retire the lines whose dwell is over.  Called once per frame.
+    pub fn advance_toasts(&mut self) {
+        self.advance_toasts_at(Instant::now());
+    }
+
+    /// [`State::advance_toasts`] with an explicit clock, so a test can prove
+    /// the dwell without sleeping for 1.2 s.
+    pub fn advance_toasts_at(&mut self, now: Instant) {
+        loop {
+            let Some(front) = self.toasts.front() else { break };
+            if now.duration_since(front.shown_at) < front.dwell() {
+                break;
+            }
+            let shown = self.toasts.pop_front().expect("the front was just read");
+            // The retired line becomes the idle line: an empty queue keeps the
+            // last message on screen instead of blanking the bar.
+            self.last_message = shown.text;
+            if let Some(next) = self.toasts.front_mut() {
+                // Its dwell starts now, not when it was queued.
+                next.shown_at = now;
+            }
+        }
+    }
+
+    /// What the bottom status bar shows: the current toast (with its repeat
+    /// counter and a "…" when more is waiting), else the last line.
+    pub fn current_status(&self) -> String {
+        if let Some(front) = self.toasts.front() {
+            return front.render(self.toasts.len() > 1);
+        }
+        self.last_message.clone()
+    }
+
+    /// A queued line is on screen, as opposed to the dimmed last line.
+    pub fn has_toast(&self) -> bool {
+        !self.toasts.is_empty()
+    }
+
+    /// How long until the line on screen may be replaced.
+    ///
+    /// The frame clock has to be asked for this, or the queue would only
+    /// advance while the user moved the mouse.
+    pub fn toast_wait(&self) -> Option<Duration> {
+        let front = self.toasts.front()?;
+        Some(front.dwell().saturating_sub(front.shown_at.elapsed()))
     }
 
     pub fn module_offset(&self, address: u64) -> u64 {
@@ -2298,6 +2553,248 @@ mod target_switch_tests {
     }
 }
 
+/// The bottom status bar used to be one `last_message` that every event
+/// overwrote, so a burst of connection events was unreadable.  These tests pin
+/// the queue that replaced it: one line at a time, a minimum dwell, a counter
+/// for repeats, priority interrupts, a cap, and progress as a live counter.
+#[cfg(test)]
+mod toast_tests {
+    use super::*;
+
+    const MB: u64 = 1024 * 1024;
+
+    fn text_of(toast: &Toast) -> &str {
+        &toast.text
+    }
+
+    /// Three identical lines are one line with `(x3)`, not three lines.
+    #[test]
+    fn the_same_line_three_times_is_one_toast_with_a_counter() {
+        let mut st = State::new();
+        for _ in 0..3 {
+            st.toast("reconnecting");
+        }
+        assert_eq!(st.toasts.len(), 1, "the same message must not queue up");
+        assert_eq!(st.toasts.front().unwrap().repeats, 3);
+        assert_eq!(st.current_status(), "reconnecting (x3)");
+        // Both markers at once: the counter and the line waiting behind it.
+        st.toast("scanning");
+        assert_eq!(st.current_status(), "reconnecting (x3) …");
+    }
+
+    /// `log()` stamps every line with its elapsed time.  The stamp is not part
+    /// of the message, so the same message logged at two different times is
+    /// still "the same message" - otherwise deduplication would never fire in
+    /// the real GUI, where every line carries a stamp.
+    #[test]
+    fn the_log_stamp_is_not_part_of_the_message() {
+        let mut st = State::new();
+        st.started = Instant::now() - Duration::from_secs(10);
+        st.log("link up");
+        st.started = Instant::now() - Duration::from_secs(5);
+        st.log("link up");
+        assert_eq!(st.toasts.len(), 1, "two stamps of one message are one line");
+        assert_eq!(st.toasts.front().unwrap().repeats, 2);
+        assert!(text_of(st.toasts.front().unwrap()).ends_with("] link up"));
+    }
+
+    /// A second line waits for the dwell, then takes over.
+    #[test]
+    fn a_second_line_waits_for_the_dwell() {
+        let mut st = State::new();
+        st.toast("first");
+        st.toast("second");
+        assert_eq!(st.toasts.len(), 2);
+        assert_eq!(st.current_status(), "first …", "the backlog is announced");
+
+        st.advance_toasts_at(Instant::now() + TOAST_DWELL / 2);
+        assert_eq!(st.current_status(), "first …", "still inside the dwell");
+
+        st.advance_toasts_at(Instant::now() + TOAST_DWELL + Duration::from_millis(1));
+        assert_eq!(st.current_status(), "second");
+        assert_eq!(st.toasts.len(), 1);
+    }
+
+    /// A repeat keeps the line up for another dwell, so `(x2)` can be read
+    /// instead of flashing past.
+    #[test]
+    fn a_repeat_restarts_the_dwell() {
+        let mut st = State::new();
+        st.toast("tick");
+        let first = st.toasts.front().unwrap().shown_at;
+        std::thread::sleep(Duration::from_millis(2));
+        st.toast("tick");
+        let refreshed = st.toasts.front().unwrap().shown_at;
+        assert!(refreshed > first, "the repeat did not refresh the clock");
+
+        st.advance_toasts_at(refreshed + Duration::from_millis(1000));
+        assert!(st.has_toast(), "the repeat must restart the dwell");
+        st.advance_toasts_at(refreshed + TOAST_DWELL + Duration::from_millis(1));
+        assert!(!st.has_toast());
+    }
+
+    /// A priority line interrupts: it is on screen at once, it stays longer,
+    /// and the line it pushed aside is still waiting behind it.
+    #[test]
+    fn an_error_line_interrupts_without_waiting() {
+        let mut st = State::new();
+        st.toast("scanning");
+        st.toast("reading");
+        st.log("error: link lost");
+
+        assert_eq!(st.toasts.len(), 3);
+        let front = st.toasts.front().unwrap();
+        assert!(text_of(front).ends_with("error: link lost"), "not on screen at once");
+        assert_eq!(front.priority, TOAST_PRIORITY);
+        assert_eq!(front.dwell(), TOAST_PRIORITY_DWELL);
+        assert!(st.current_status().contains("error: link lost"));
+        assert_eq!(st.toasts[1].text, "scanning", "the interrupted line was lost");
+    }
+
+    /// An error that repeats while other lines are waiting is still one line:
+    /// it lands at the front, so that is where the repeat has to be found.
+    #[test]
+    fn a_repeating_error_is_not_queued_twice_behind_a_backlog() {
+        let mut st = State::new();
+        st.toast("scanning");
+        st.toast("reading");
+        st.log("error: link lost");
+        st.started = Instant::now() - Duration::from_secs(3);
+        st.log("error: link lost");
+
+        assert_eq!(st.toasts.len(), 3, "the second error was queued again");
+        assert_eq!(st.toasts.front().unwrap().repeats, 2);
+        assert_eq!(st.toasts[1].text, "scanning", "the backlog was reordered");
+    }
+
+    #[test]
+    fn priority_is_taken_from_the_wording() {
+        for important in [
+            "error: the console refused the scan",
+            "link lost",
+            "busy: scanning for 12 s - press Disconnect to abort it",
+            "save failed: access denied",
+            "■ STOPPED: thread 4097 at pc=main+0x12340",
+        ] {
+            assert_eq!(toast_priority(important), TOAST_PRIORITY, "{important}");
+        }
+        for normal in [
+            "connected",
+            "scan done: 41 hit(s)",
+            "refreshing",
+            "frozen 42CA1DC4 (current value 6440)",
+            "1 module(s)",
+        ] {
+            assert_eq!(toast_priority(normal), 0, "{normal}");
+        }
+    }
+
+    /// The queue is bounded: a retry storm must not turn into a minute of
+    /// stale lines.  The oldest ones go first.
+    #[test]
+    fn the_queue_is_capped_and_the_oldest_lines_go() {
+        let mut st = State::new();
+        for i in 0..(TOAST_QUEUE_MAX + 8) {
+            st.toast(format!("line {i}"));
+        }
+        assert_eq!(st.toasts.len(), TOAST_QUEUE_MAX);
+        assert_eq!(st.toasts.front().unwrap().text, "line 8");
+        assert_eq!(st.toasts.back().unwrap().text, "line 39");
+    }
+
+    /// A progress line is a live counter, not a queue entry: the new value
+    /// replaces the one on screen and the repeat counter is not touched.
+    #[test]
+    fn a_progress_line_replaces_the_counter_it_already_has() {
+        let mut st = State::new();
+        st.progress("scanning", 1 * MB, 512 * MB);
+        st.progress("scanning", 2 * MB, 512 * MB);
+        st.progress("scanning", 3 * MB, 512 * MB);
+        assert_eq!(st.toasts.len(), 1);
+        assert_eq!(st.toasts.front().unwrap().repeats, 1, "progress is not a repeat");
+        assert_eq!(st.toasts.front().unwrap().text, "scanning - 3 / 512 MB");
+        assert!(!st.current_status().contains("(x"));
+
+        // The same rule applies to a progress line that arrives through `toast`.
+        st.toast("scanning - 4 / 512 MB");
+        assert_eq!(st.toasts.len(), 1);
+        assert_eq!(st.toasts.front().unwrap().text, "scanning - 4 / 512 MB");
+
+        // A different label is a different counter.
+        st.progress("dumping", 1 * MB, 512 * MB);
+        assert_eq!(st.toasts.len(), 2);
+        assert!(st.current_status().starts_with("scanning"), "the new counter must wait");
+    }
+
+    /// The bug the spec names: a scan emits one progress line per chunk, and
+    /// replaying them - or counting them - made the bar unreadable.
+    #[test]
+    fn a_thousand_progress_updates_stay_one_line() {
+        let mut st = State::new();
+        for done in 0..1000u64 {
+            st.progress("scanning", done * MB, 1000 * MB);
+        }
+        assert_eq!(st.toasts.len(), 1);
+        assert_eq!(st.toasts.front().unwrap().repeats, 1);
+        assert!(!st.current_status().contains("(x"), "progress must not count up");
+        assert_eq!(st.current_status(), "scanning - 999 / 1000 MB");
+    }
+
+    /// An empty queue keeps the last line (dimmed) instead of blanking the bar.
+    #[test]
+    fn an_empty_queue_keeps_the_last_line_on_screen() {
+        let mut st = State::new();
+        st.toast("connected");
+        st.advance_toasts_at(Instant::now() + TOAST_DWELL + Duration::from_millis(1));
+        assert!(!st.has_toast());
+        assert_eq!(st.current_status(), "connected");
+        assert_eq!(st.last_message, "connected");
+    }
+
+    /// The LOG panel is the archive: it keeps every line, whatever the status
+    /// bar does with it.
+    #[test]
+    fn the_log_list_still_keeps_every_line() {
+        let mut st = State::new();
+        for i in 0..600 {
+            st.log(format!("line {i}"));
+        }
+        assert_eq!(st.log.len(), 500, "the log keeps its own (unchanged) cap");
+        assert!(st.log.last().unwrap().ends_with("line 599"));
+        assert_eq!(st.toasts.len(), TOAST_QUEUE_MAX, "the status queue is capped too");
+    }
+
+    /// `log()` keeps its signature: `&str`, `String` and anything `Into<String>`
+    /// all still compile, and `send()` is untouched (`&mut self, Cmd, &str`).
+    #[test]
+    fn log_keeps_its_signature() {
+        let mut st = State::new();
+        st.log("a literal");
+        st.log(String::from("an owned string"));
+        st.log(format!("a formatted {}", 1));
+        assert_eq!(st.log.len(), 4, "the seeded line plus three");
+        // The item type is still `String`, which is what the LOG panel draws.
+        let lines: &Vec<String> = &st.log;
+        assert!(lines[1..].iter().all(|line| line.starts_with('[')));
+    }
+
+    /// The frame clock has to be told when the next line is due, or the queue
+    /// would only advance while the user moved the mouse.
+    #[test]
+    fn toast_wait_reports_when_the_next_line_is_due() {
+        let mut st = State::new();
+        assert_eq!(st.toast_wait(), None, "nothing queued, nothing to wait for");
+        st.toast("scanning");
+        let wait = st.toast_wait().expect("a queued line has a due time");
+        assert!(wait <= TOAST_DWELL, "the wait must not exceed the dwell");
+        assert!(wait > Duration::ZERO);
+        st.log("error: boom");
+        let wait = st.toast_wait().expect("a queued line has a due time");
+        assert!(wait > TOAST_DWELL, "an error stays longer than a normal line");
+        assert!(wait <= TOAST_PRIORITY_DWELL);
+    }
+}
+
 /// Japanese text (Windows error strings, module paths, cheat names) has no glyphs in
 /// egui's default Latin fonts and used to render as a row of boxes.  M PLUS 1p is a
 /// readable OFL font that covers JIS level 1+2 for ~1.7 MB.
@@ -2364,7 +2861,7 @@ impl App {
             if !host.trim().is_empty() {
                 let _ = app.cmd_tx.send(Cmd::Connect { host, port });
                 app.st.busy = true;
-                app.st.last_message = "connecting...".into();
+                app.st.toast("connecting...");
             }
         }
         app
@@ -2379,7 +2876,7 @@ impl App {
         // The worker processes this after the cancel, so the game is not left
         // frozen by the "pause while scanning" checkbox.
         self.end_scan_pause();
-        self.st.last_message = label.to_string();
+        self.st.toast(label);
     }
 
     pub fn send(&mut self, cmd: Cmd, label: &str) {
@@ -2388,7 +2885,9 @@ impl App {
             return;
         }
         self.st.busy = true;
-        self.st.last_message = label.to_string();
+        // Queued, not written over the line on screen: a click that starts a job
+        // must not erase the reply the user is still reading.
+        self.st.toast(label);
         let _ = self.cmd_tx.send(cmd);
     }
 
@@ -2809,7 +3308,8 @@ impl App {
                 // a PC-side scan reports bytes, not hits: the console's live hit
                 // count from a previous scan is not this scan's answer
                 self.st.scan_hits = 0;
-                self.st.last_message = format!("{} - {} / {} MB", label, done / (1024 * 1024), total / (1024 * 1024));
+                // One live counter, not one toast per chunk.
+                self.st.progress(&label, done, total);
             }
             Ev::PcHits { hits, value_size, message, truncated } => {
                 self.st.busy = false;
@@ -2939,6 +3439,9 @@ impl App {
             "[    2.0s] watchpoint armed at 42CA1DC4 (slot 16) - stop on hit".into(),
             "[    2.6s] STOPPED: thread 4097 at pc=main+0x12340 (00712340) - write hit on 42CA1DC4 (slot 0x10)".into(),
         ];
+        // --screenshot: the status bar shows the demo's last line instead of the
+        // "set the console IP" startup text.
+        self.st.last_message = "[    2.6s] Nxus demo data (no console attached)".into();
     }
 }
 
@@ -2949,6 +3452,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        // Retire the status lines whose dwell is over before drawing them.
+        self.st.advance_toasts();
         // The console's frozen table changes without telling us (another dmnt
         // user, or the console's own release of a vanished client's addresses).
         self.poll_frozen();
@@ -2980,6 +3485,12 @@ impl eframe::App for App {
             // only redraws when something asks for it, so without this the poll
             // would fire only when the user happened to move the mouse.
             ctx.request_repaint_after(FROZEN_POLL);
+        }
+        // The toast queue runs on a wall clock too: without this the next line
+        // would appear only when the user moved the mouse.  `request_repaint_after`
+        // keeps the earliest request, so this never delays the polls above.
+        if let Some(wait) = self.st.toast_wait() {
+            ctx.request_repaint_after(wait);
         }
 
         // --screenshot: render a few frames, save one, then close.

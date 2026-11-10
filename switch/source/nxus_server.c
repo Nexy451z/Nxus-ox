@@ -17,9 +17,15 @@
 #include <string.h>
 
 static NxusConfig g_Config;
-/* Set while the connection thread is inside a handler (see nxusServerTick).
-   Atomic, not `volatile bool`: the connection thread stores it while the tick
-   (main thread) and the HID thread's hotkey callback load it. */
+/* Set while a MUTATING command is inside a handler (see nxusServerTick).
+   Atomic, not `volatile bool`: the connection threads store it while the tick
+   (main thread) and the HID thread's hotkey callback load it.
+
+   With one thread per client (shared/nxus_net.h) several handlers run at once,
+   but the mutating ones are serialised by g_CommandMutex, so this flag still has
+   exactly one owner at a time.  Read-only commands deliberately do not set it:
+   they never hold the target paused for long, and a client must be able to keep
+   polling status/heartbeats while another client runs a scan. */
 static atomic_bool g_CommandActive;
 /* When the current command started, so a handler that never returns (blocked dmnt
    call, stalled send) cannot suppress the watchdog and reaper for the whole boot.
@@ -28,6 +34,27 @@ static atomic_bool g_CommandActive;
    never pair it with the previous command's timestamp (see dispatchCommand). */
 static atomic_ullong g_CommandStartedMs;
 #define NXUS_COMMAND_GRACE_MS 120000u
+
+/* Serialises every MUTATING command across connections.  Read-only commands skip
+   it (and run concurrently); the classification is nxusServerCommandIsReadOnly()
+   in nxus_server.h, where the reason for each command's side is documented.  A
+   command that changes the shared session state - scan lifecycle, snapshots,
+   freeze table, debug handle, cheat engine, config - still runs alone, which is
+   the invariant the old single-connection dispatcher gave for free.  Lock order:
+   g_CommandMutex is always taken BEFORE any session/dmnt/debug lock, never while
+   holding one (the read-only paths that need to serialise a state change take it
+   around that change only; see refreshMappingsAfterTargetChange). */
+static Mutex g_CommandMutex;
+static bool  g_CommandMutexReady;
+
+/* The connection that owns the scan session, or -1.  The first connection to
+   START a scan owns the hit list until it disconnects; a ScanBegin/Next/Status/
+   Cancel/Reset/Undo/GetHits from any other connection is refused with
+   NXUS_REASON_BUSY_STATE (nxusServerCommandIsScanFamily).  When the owner goes
+   away, nxus_server.c cancels its scan and releases the freezes it owned (see
+   onNetClientClosed).  Atomic because the read-only scan commands check it
+   without the command mutex; every change happens under g_CommandMutex. */
+static atomic_int g_ScanOwnerFd = -1;
 
 /* Break-list reply size.  The debugger tracks every hardware slot now (ten: six
    instruction + four watch, NXUS_DEBUG_MAX_BREAKS), and nxus_server.h still carries
@@ -973,6 +1000,8 @@ static void onHotkeyFired(void *user) {
 static void ptrScanInit(void);
 /* Defined with the terminal shutdown (next to g_ServerExited), further down. */
 static void serverExitGateReset(void);
+/* Defined with the multi-client command serialisation, before nxusServerHandle(). */
+static void onNetClientClosed(int fd, void *user);
 
 void nxusServerInit(void) {
     memset(&g_Config, 0, sizeof(g_Config));
@@ -981,6 +1010,25 @@ void nxusServerInit(void) {
     g_Config.watchdog_timeout_ms = 15000;
     g_Config.heartbeat_interval_ms = 5000;
     g_Config.log_level = 1;
+
+    /* The command mutex serialises mutating commands across client connections.
+       Like the other locks it is initialised once per process: Init may run again
+       after an Exit in the test harness, and re-initialising a mutex another
+       thread could hold is undefined behaviour. */
+    if (!g_CommandMutexReady) {
+        mutexInit(&g_CommandMutex);
+        g_CommandMutexReady = true;
+    }
+    /* A new lifetime starts with no scan owner.  No handler can be in flight here
+       (the listener does not exist yet and the previous Exit drained what it
+       could), and a scan of the previous round has been cancelled by that Exit. */
+    atomic_store_explicit(&g_ScanOwnerFd, -1, memory_order_release);
+
+    /* The transport reports every disconnected client, so the scan/freeze state
+       its connection owned is released immediately instead of when the "no client
+       connected" timers in nxusServerTick() eventually fire - a second client that
+       stays connected would keep those timers from ever firing. */
+    nxusNetSetCloseHandler(onNetClientClosed, NULL);
 
     /* Before the HID thread can exist: nxusHidStart() is only called from the
        config handler, long after this. */
@@ -1145,9 +1193,27 @@ static void discardHitsOfEarlierTarget(bool compare_mapping_generation,
     nxusSessionInvalidateHitsEx(drop_tables);
 }
 
-/* Connection-thread entry point: identity AND mapping generation. */
+/* Connection-thread entry point: identity AND mapping generation, for callers
+   that hold the command mutex (mutating handlers, refreshMappingsAfterTargetChange). */
 static void discardResultsOfEarlierTarget(void) {
     discardHitsOfEarlierTarget(true, true);
+}
+
+/* Same discard, for a READ-ONLY handler (Status, ScanGetHits) that does NOT hold
+   the command mutex.  Selecting the generation comparison is not enough on its
+   own any more: a ScanBegin publishes its new mapping table before it stamps the
+   hit owner, and a concurrent Status poll could see that transient as "the table
+   was rebuilt" and discard the very table (and the hit list) the scan is starting
+   with - a sporadic BAD_STATE that the old single-threaded server could not hit.
+   Take the command mutex around the check+discard and re-check under it, so the
+   only mismatch that survives is a real one.  The common case (same target, same
+   table) stays lock-free: the mutex is taken only after a mismatch was observed. */
+static void discardResultsOfEarlierTargetConcurrent(void) {
+    if (nxusSessionHitsMatchTarget()) return;
+    const bool serialize = g_CommandMutexReady;
+    if (serialize) mutexLock(&g_CommandMutex);
+    if (!nxusSessionHitsMatchTarget()) discardHitsOfEarlierTarget(true, true);
+    if (serialize) mutexUnlock(&g_CommandMutex);
 }
 
 /* Same rule for the mapping snapshot: the PC resolves every address it received
@@ -1158,14 +1224,32 @@ static void discardResultsOfEarlierTarget(void) {
  * this path did before the ownership check existed. */
 static void refreshMappingsAfterTargetChange(void) {
     if (nxusSessionHitsMatchTarget()) return;
-    discardResultsOfEarlierTarget();
-    /* Never rebuild the table under a running pass: the worker walks it (and the
-       region list) without a pin, and this page can be answered from the cache. */
-    if (nxusSessionScanState() == NxusScanState_Running) return;
-    Result rc = nxusSessionRefreshMappings();
-    if (R_FAILED(rc)) {
-        NXUS_RESULT("mappings: refresh after the target changed", rc);
+
+    /* Read-only handlers on different client threads reach this, so the "not while
+       a scan runs" check and the rebuild it protects have to be atomic with the
+       scan lifecycle: hold g_CommandMutex, which ScanBegin/ScanNext hold for their
+       whole handler.  It is taken INSIDE this helper (the callers do not hold it)
+       and released before the caller pins the table, so a page read keeps its
+       usual view-pin lifetime.  This is the only place a read-only command takes
+       the command mutex - it is not a plain read: it discards the old hit list and
+       publishes a new mapping table. */
+    const bool serialize = g_CommandMutexReady;
+    if (serialize) mutexLock(&g_CommandMutex);
+
+    if (!nxusSessionHitsMatchTarget()) {
+        discardResultsOfEarlierTarget();
+        /* Never rebuild the table under a running pass: the worker walks it (and
+           the region list) without a pin, and this page can be answered from the
+           cache. */
+        if (nxusSessionScanState() != NxusScanState_Running) {
+            Result rc = nxusSessionRefreshMappings();
+            if (R_FAILED(rc)) {
+                NXUS_RESULT("mappings: refresh after the target changed", rc);
+            }
+        }
     }
+
+    if (serialize) mutexUnlock(&g_CommandMutex);
 }
 
 /* How long the console waits for a command before it assumes the PC is gone. */
@@ -1211,11 +1295,16 @@ static void refreshMappingsAfterTargetChange(void) {
  * the honest answer (no target open).
  */
 static bool statusFillIdentityFromDmnt(void) {
-    static u64 last_ms = 0;
-    static u64 interval_ms = 1000ull;   /* 1 Hz while it works, 5 s after a miss */
+    /* GetStatus is a READ-ONLY command, so several connection threads may run
+       this at once; the throttle state is atomic (relaxed: it is a heuristic, and
+       a lost update only costs one extra 1 Hz dmnt peek). */
+    static atomic_ullong last_ms;       /* zero-initialised = "never probed" */
+    static atomic_ullong interval_ms = 1000ull;   /* 1 Hz while it works, 5 s after a miss */
     const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
-    if (last_ms != 0 && now_ms - last_ms < interval_ms) return false;
-    last_ms = now_ms;
+    const u64 last = atomic_load_explicit(&last_ms, memory_order_relaxed);
+    const u64 interval = atomic_load_explicit(&interval_ms, memory_order_relaxed);
+    if (last != 0 && now_ms - last < interval) return false;
+    atomic_store_explicit(&last_ms, now_ms, memory_order_relaxed);
 
     if (nxusDebugIsAttached() || nxusDebugIsHandoff()) return false;
 
@@ -1224,13 +1313,13 @@ static bool statusFillIdentityFromDmnt(void) {
     const Result rc = nxusDmntPeekMetadata(&md);
     /* A zero pid is dmnt's "no cheat process" answer, not an identity. */
     if (R_FAILED(rc) || md.process_id == 0) {
-        interval_ms = 5000ull;
+        atomic_store_explicit(&interval_ms, 5000ull, memory_order_relaxed);
         NXUS_LOG_DEBUG("status: dmnt has no target (rc=0x%08X, pid=%llu) - "
                        "reporting no target (dmnt left closed)",
                        (unsigned)rc, (unsigned long long)md.process_id);
         return false;
     }
-    interval_ms = 1000ull;
+    atomic_store_explicit(&interval_ms, 1000ull, memory_order_relaxed);
 
     nxusSessionSetProcessIdentityEx(md.process_id, md.program_id,
                                     md.main_nso_base, md.main_nso_size);
@@ -1257,8 +1346,10 @@ static void fillStatus(NxusStatus *st) {
     /* Results are keyed to the target that produced them.  The identity is now
        current, so the first status poll after a title switch sees the mismatch here
        and drops the previous title's list - instead of reporting its hit count as if
-       it described the process the client now sees. */
-    discardResultsOfEarlierTarget();
+       it described the process the client now sees.  GetStatus is read-only and can
+       run concurrently with a ScanBegin, so the discard is serialised against it
+       (see discardResultsOfEarlierTargetConcurrent). */
+    discardResultsOfEarlierTargetConcurrent();
     st->proto_version = NXUS_PROTO_VERSION;
     /* Which read path the console is serving, not a build-time constant: while
        Nxus owns the kernel debug handle dmnt:cht is closed and nxusSessionReadMemory()
@@ -1335,16 +1426,19 @@ static void fillStatus(NxusStatus *st) {
            Cache the probe for 500 ms: far below the time scale on which a cheat
            process appears or disappears, but 25x fewer IPCs.  The branch above
            already handles the attached case, where dmnt is closed and asking it
-           would fail every time. */
-        static u64  last_check_ms;
-        static bool cached;
+           would fail every time.  Atomic because GetStatus can run on several
+           connection threads at once (a concurrent miss costs one extra probe). */
+        static atomic_ullong last_check_ms;
+        static atomic_bool   cached;
         const u64 now_ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
-        if (last_check_ms == 0 || now_ms - last_check_ms >= 500ull) {
+        const u64 last_check = atomic_load_explicit(&last_check_ms, memory_order_relaxed);
+        if (last_check == 0 || now_ms - last_check >= 500ull) {
             bool has_process = false;
-            cached = R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process;
-            last_check_ms = now_ms;
+            const bool present = R_SUCCEEDED(nxusDmntHasCheatProcess(&has_process)) && has_process;
+            atomic_store_explicit(&cached, present, memory_order_relaxed);
+            atomic_store_explicit(&last_check_ms, now_ms, memory_order_relaxed);
         }
-        if (cached) flags |= NXUS_ST_HAS_PROCESS;
+        if (atomic_load_explicit(&cached, memory_order_relaxed)) flags |= NXUS_ST_HAS_PROCESS;
     }
     /* A pause that went through the debug session keeps the target held with dmnt
        closed, so nxusSessionIsPaused() alone would under-report it.  A debugger
@@ -2757,7 +2851,9 @@ static void sendHits(int fd, u32 seq, const NxusGetHitsRequest *req) {
        problem, so the refusal stays a bare NXUS_ERR_BAD_STATE (the log names the
        cause). */
     if (!nxusSessionHitsMatchTarget()) {
-        discardResultsOfEarlierTarget();
+        /* Read-only caller: serialise the discard against a ScanBegin that may be
+           publishing the table right now (see the helper). */
+        discardResultsOfEarlierTargetConcurrent();
         replyError(fd, NxusCmd_ScanGetHits, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE));
         return;
     }
@@ -2918,6 +3014,80 @@ typedef struct {
 } NxusLogRequest;
 NXUS_STATIC_ASSERT(sizeof(NxusLogRequest) == 8, "NxusLogRequest must be 8 bytes");
 
+/* ---- multi-client command serialisation --------------------------------
+ *
+ * shared/nxus_net.c now serves several connections, one thread each, so two
+ * commands can arrive here at the same time.  The split is done by
+ * nxusServerCommandIsReadOnly() (nxus_server.h): mutating commands run one at a
+ * time under g_CommandMutex, read-only ones run concurrently and only follow the
+ * locks of the state they read.
+ *
+ * The second piece of per-connection state is SCAN OWNERSHIP.  The hit list and
+ * the scan worker are global, so showing another client's results (or letting it
+ * cancel/refine somebody else's scan) would be wrong.  The connection that
+ * successfully starts (or refines) a scan owns the session until it disconnects;
+ * nxusServerCommandIsScanFamily() defines the commands that are gated, and
+ * onNetClientClosed() below releases the state when the owner goes away.
+ */
+
+static int scanOwnerFd(void) {
+    return atomic_load_explicit(&g_ScanOwnerFd, memory_order_acquire);
+}
+
+/* May `fd` run a scan-family command right now? */
+static bool scanOwnerAllows(int fd) {
+    const int owner = scanOwnerFd();
+    return owner < 0 || owner == fd;
+}
+
+/* Record `fd` as the scan owner if nobody owns the session yet.  Called from the
+   success path of ScanBegin/ScanNext, i.e. with g_CommandMutex held, so a
+   disconnect cannot clear the ownership it is about to take.  A claim while
+   somebody else owns the session cannot happen (the gate above refused it). */
+static void scanOwnerClaim(int fd) {
+    int expected = -1;
+    (void)atomic_compare_exchange_strong_explicit(&g_ScanOwnerFd, &expected, fd,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire);
+}
+
+/* The transport calls this once per served connection, on its thread, after the
+   descriptor was unregistered and before it is closed (shared/nxus_net.h).  Only
+   the scan owner owns anything that has to be released here; every other
+   disconnect is just a connection going away and the existing "no client
+   connected" timers in nxusServerTick() still cover the last client. */
+static void onNetClientClosed(int fd, void *user) {
+    (void)user;
+    /* The server may already be gone: nxusNetExit() joins the connection threads
+       after nxusServerExit() released the session, the views and the workers. */
+    if (atomic_load_explicit(&g_ServerExited, memory_order_acquire)) return;
+    if (!nxusNetIsRunning()) return;
+
+    /* Fast path: only the owner has state that dies with its connection. */
+    if (scanOwnerFd() != fd) return;
+
+    /* Serialise the ownership hand-over with the mutating commands: a ScanBegin
+       from another connection must not slip in between the check and the clear.
+       Re-check the terminal gate under the lock: nxusServerExit() may have raised
+       it between the fast check above and this point, and everything this hook
+       would touch (the scan flag, the frozen table) must then be left alone. */
+    mutexLock(&g_CommandMutex);
+    if (scanOwnerFd() == fd && !atomic_load_explicit(&g_ServerExited, memory_order_acquire)) {
+        /* Hand the scan back to "anybody may drive it" instead of killing it.
+           The CLI runs every command in its own process (`nxus scan begin` then
+           `nxus scan status` are two connections), so cancelling on disconnect
+           would make a scan unusable from the command line, and releasing the
+           frozen table here would silently drop `nxus freeze` the moment the
+           command exits.  The "nobody has connected for a while" timers in
+           nxusServerTick() still reap both, exactly as they did before there
+           were connection threads. */
+        atomic_store_explicit(&g_ScanOwnerFd, -1, memory_order_release);
+        NXUS_LOG("scan: owning connection fd=%d disconnected - scan ownership released "
+                 "(the scan and its freezes stay alive for the next client)", fd);
+    }
+    mutexUnlock(&g_CommandMutex);
+}
+
 /* ---- main dispatch ----------------------------------------------------- */
 
 /* One command, with the gate already passed and the handler counted.  Defined
@@ -2962,10 +3132,10 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
             reply(fd, type, seq, NULL, 0);
         } else {
             /* Once per process: a client that keeps polling would otherwise fill the
-               log ring with one line per packet while the console is going down. */
-            static bool gate_logged;
-            if (!gate_logged) {
-                gate_logged = true;
+               log ring with one line per packet while the console is going down.
+               Atomic: several connection threads can be refused at once. */
+            static atomic_bool gate_logged;
+            if (!atomic_exchange_explicit(&gate_logged, true, memory_order_relaxed)) {
                 NXUS_LOG("command 0x%04X arrived after nxusServerExit - refusing "
                          "(BAD_STATE, everything but Nop is gated)", (unsigned)type);
             }
@@ -2999,23 +3169,54 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
     const u32 seq = header->seq;
     Result rc = 0;
 
+    /* A command is either read-only or mutating (nxus_server.h owns the
+       classification and the reason for each side).  Mutating commands are
+       serialised across EVERY client connection by g_CommandMutex; read-only ones
+       run concurrently - that is what serving several clients is for - and only
+       follow the locks of the state they read (dmnt's, the session's, the debug
+       handle's).  Heartbeat/Nop are read-only on purpose: a client must be able to
+       keep the session alive while another client is inside a long scan. */
+    const bool read_only = nxusServerCommandIsReadOnly(type);
+    if (!read_only) {
+        mutexLock(&g_CommandMutex);
+
+        /* Snapshots still run synchronously here, and a pointer scan does too when
+           its worker thread could not be created, so while they work the
+           connection thread cannot read the client's heartbeats either.  Tell the
+           watchdog to stay quiet instead of resuming the target mid-operation.  A
+           pointer scan that DID get a worker answers at once, so this flag only
+           covers its setup: the polled PtrScanGet then feeds the watchdog like any
+           other traffic.  Only mutating commands need the exemption (and the mutex
+           means there is at most one), so the flag is set and cleared here rather
+           than around every handler; the tick keeps its NXUS_COMMAND_GRACE_MS
+           escape hatch for one that never returns. */
+        /* Timestamp first: a tick between the two stores must not see the new
+           "active" with the previous command's timestamp and clear a live
+           handler. */
+        atomic_store_explicit(&g_CommandStartedMs,
+                              armTicksToNs(armGetSystemTick()) / 1000000ull,
+                              memory_order_relaxed);
+        atomic_store_explicit(&g_CommandActive, true, memory_order_release);
+    }
+
     /* Any traffic counts as "the PC is still here": without this the pause
        watchdog would resume the target during a long scan or a hex-edit session,
        which only sends polls. */
     nxusSessionHeartbeat();
 
-    /* Snapshots still run synchronously here, and a pointer scan does too when its
-       worker thread could not be created, so while they work the connection thread
-       cannot read the client's heartbeats either.  Tell the watchdog to stay quiet
-       instead of resuming the target mid-operation.  A pointer scan that DID get a
-       worker answers at once, so this flag only covers its setup: the polled
-       PtrScanGet then feeds the watchdog like any other traffic. */
-    /* Timestamp first: a tick between the two stores must not see the new
-       "active" with the previous command's timestamp and clear a live handler. */
-    atomic_store_explicit(&g_CommandStartedMs,
-                          armTicksToNs(armGetSystemTick()) / 1000000ull,
-                          memory_order_relaxed);
-    atomic_store_explicit(&g_CommandActive, true, memory_order_release);
+    /* The scan session belongs to the connection that started it: another client
+       asking for its state/results (or trying to change it) is refused with the
+       retryable BUSY reason instead of being shown - or allowed to disturb - the
+       owner's hit list.  For a mutating scan command this runs under the command
+       mutex, so it cannot race the owner's disconnect; for ScanStatus/ScanGetHits
+       the owner can only change under the same mutex, so the atomic read is a
+       stable answer. */
+    if (nxusServerCommandIsScanFamily(type) && !scanOwnerAllows(fd)) {
+        NXUS_LOG("scan: command 0x%04X from fd=%d refused - fd=%d owns the scan session",
+                 (unsigned)type, fd, scanOwnerFd());
+        replyBusyReason(fd, type, seq, NXUS_REASON_BUSY_STATE);
+        goto dispatch_done;
+    }
 
     switch (type) {
         case NxusCmd_Nop:
@@ -3429,6 +3630,12 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
                     : nxusSessionScanNext(&req, value_type, epsilon, pattern, pattern_len, mask);
             if (R_FAILED(rc)) replyError(fd, type, seq, rc);
             else {
+                /* The scan session (hit list + worker) now belongs to this
+                   connection: until it disconnects, any other client's
+                   scan-family command is answered BUSY (see the gate in
+                   dispatchCommand).  Held under g_CommandMutex, so a disconnect of
+                   the previous owner cannot clear a claim made right after it. */
+                scanOwnerClaim(fd);
                 NxusStatus st;
                 fillStatus(&st);
                 reply(fd, type, seq, &st, sizeof(st));
@@ -4300,7 +4507,14 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
             break;
     }
 
-    atomic_store_explicit(&g_CommandActive, false, memory_order_release);
+dispatch_done:
+    if (!read_only) {
+        /* Paired with the store in the prologue: from here on the tick may run the
+           watchdog and the stale-session reapers again (unless the grace timer
+           already declared this handler wedged and cleared the flag itself). */
+        atomic_store_explicit(&g_CommandActive, false, memory_order_release);
+        mutexUnlock(&g_CommandMutex);
+    }
     /* A handler longer than the watchdog timeout leaves the timer expired, so the
        next tick would resume a paused target the moment the command returns.
        Treat the completion as client activity. */
@@ -4336,10 +4550,14 @@ static void reapStaleDebugSession(void) {
    read (no target = no need to refresh, and GetMetadata's auto-reopen must not run
    blind), and a debug session is skipped entirely because dmnt is closed then. */
 static void refreshTargetIdentityThrottled(void) {
-    static u64 last_ms = 0;
+    /* Runs on the main thread (tick) AND on several connection threads (Status is
+       read-only and now concurrent), so the throttle state is atomic; a lost
+       update only costs one extra 1 Hz probe. */
+    static atomic_ullong last_ms;      /* zero-initialised = "never refreshed" */
     const u64 now = armTicksToNs(armGetSystemTick()) / 1000000ull;
-    if (last_ms != 0 && now - last_ms < 1000ull) return;
-    last_ms = now;
+    const u64 last = atomic_load_explicit(&last_ms, memory_order_relaxed);
+    if (last != 0 && now - last < 1000ull) return;
+    atomic_store_explicit(&last_ms, now, memory_order_relaxed);
 
     if (nxusDebugIsAttached()) return;
     bool has_process = false;

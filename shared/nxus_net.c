@@ -15,20 +15,23 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-/* Short enough that a preempting connection, a reset request or the stop flag is
-   noticed within ~200 ms; long enough that the idle sysmodule stays cheap. */
+/* Short enough that a reset request or the stop flag is noticed within ~200 ms;
+   long enough that the idle sysmodule stays cheap. */
 #define NXUS_NET_POLL_SLICE_MS       200
 /* No byte at all for 20 s means the peer is gone: the PC sends a heartbeat every
    4 s, so a live session never reaches this, while a half-open socket (the
-   console slept, the PC vanished without a FIN) is reaped deterministically. */
+   console slept, the PC vanished without a FIN) is reaped deterministically.
+   Every connection is reaped on its own clock, so one stale client never blocks
+   the others. */
 #define NXUS_NET_IDLE_TIMEOUT_NS     20000000000ull
 /* A packet that started but made no progress for 5 s is desynced: drop it rather
-   than block the protocol thread forever on the rest of the frame. */
+   than block that connection's thread forever on the rest of the frame. */
 #define NXUS_NET_PAYLOAD_STALL_NS    5000000000ull
 /* Period of the getsockname() health probe on the listen socket. */
 #define NXUS_NET_HEALTH_INTERVAL_NS  2000000000ull
-/* Connection backlog.  One session is served; the rest queue up so a reconnect is
-   never refused while the previous connection is still being torn down. */
+/* Connection backlog.  Up to NXUS_NET_MAX_CLIENTS are served; the rest queue up
+   so a reconnect is never refused while the previous connection is being torn
+   down. */
 #define NXUS_NET_BACKLOG             8
 /* Wait between bsd session rebuild attempts (Wi-Fi may still be reconnecting). */
 #define NXUS_NET_REBUILD_DELAY_NS    500000000ull
@@ -41,65 +44,123 @@
 /* Pause between two rebuild bursts (see the server loop): without it a console
    with no network at all would run the 60 s burst back to back forever. */
 #define NXUS_NET_REBUILD_RETRY_PAUSE_NS 10000000000ull
-/* Upper bound for waiting on the server thread in nxusNetExit().  libnx has no
-   timed thread join, and the connection thread may be parked inside a long
-   handler (a pointer scan runs ~90 s), so waiting for it unconditionally used to
-   block __appExit() for minutes.  2 s is far more than a normal teardown needs
-   (one 200 ms poll slice plus the socket close), so anything longer means
-   "abandon the thread": the descriptors are still shut down and closed, while the
-   thread handle, g_RxBuffer and the bsd session are left to process exit - see
-   the table above nxusNetExit() for why each one is or is not released. */
+/* Slice of the drain wait when a listener rebuild has to wait for the client
+   threads: short enough that the rebuild happens as soon as the last one leaves,
+   long enough not to spin the accept thread. */
+#define NXUS_NET_REBUILD_DRAIN_NS 50000000ull
+/* Upper bound for the whole teardown in nxusNetExit(): the accept thread, then
+   every client thread.  libnx has no timed thread join and a connection thread
+   may be parked inside a long handler (a pointer scan runs ~90 s), so waiting
+   unconditionally used to block __appExit() for minutes.  2 s is far more than a
+   normal teardown needs (one 200 ms poll slice plus the socket close), so
+   anything longer means "abandon the thread": the descriptors are still shut down
+   and closed, while the Thread handles, stacks and receive buffers are left to
+   process exit - see the table above nxusNetExit() for why each one is or is not
+   released. */
 #define NXUS_NET_EXIT_WAIT_MS           2000u
 /* Granularity of that bounded wait: short enough that the exit returns as soon as
-   the thread raises its done flag, long enough that the poll loop stays free. */
+   the threads raise their done flag, long enough that the poll loop stays free. */
 #define NXUS_NET_EXIT_POLL_NS           10000000ull
 
-/* Both descriptor slots are the registration AND the close token: to close a
-   descriptor, a party first replaces it in its slot with -1 through a
-   compare-exchange, and only the winner of that CAS may call close().  That is
-   what lets the exit path close without a joined thread while the server thread
-   may be closing the same descriptor: the second close() would otherwise hit an
-   unrelated socket once the kernel recycled the number.  They are atomic because
-   they are also read without the send lock (nxusNetClientFd() from the
-   UI/watchdog threads, the listener probe in recvExact()). */
-static atomic_int      g_ListenFd = -1;
-static atomic_int      g_ClientFd = -1;
-static Thread          g_ServerThread;
-static atomic_bool     g_Running = false;   /* read from the server thread, written by init/exit */
+/* ---- per-connection state ----------------------------------------------- */
 
-static bool nxusNetRunning(void) {
-    return atomic_load_explicit(&g_Running, memory_order_acquire);
-}
-static Mutex           g_SendMutex;
+/* The already-joined static half of the transport: the listener slot, the accept
+   thread and the shared handler/close hooks. */
+static atomic_int      g_ListenFd = -1;
+static Thread          g_ServerThread;
+static atomic_bool     g_Running = false;   /* read from every thread, written by init/exit */
+/* Serialises listener publication/close.  Every close of the LISTEN descriptor
+   takes it, so the exit path's shutdown() can never land on a number that was
+   closed and recycled in between. */
+static Mutex           g_ListenMutex;
 static NxusNetHandler  g_Handler = NULL;
 static void           *g_HandlerUser = NULL;
+static NxusNetCloseHandler g_CloseHandler = NULL;
+static void           *g_CloseUser = NULL;
 static u16             g_Port = NXUS_DEFAULT_PORT;
-static u8             *g_RxBuffer = NULL;
-/* Set by nxusNetRequestReset() (any thread) and consumed by the server thread.
+/* Set by nxusNetRequestReset() (any thread) and consumed by the accept thread.
    atomic: the consumer clears it with exchange(), so a request raised while the
-   server thread is between its load and its clear can no longer be swallowed by
+   accept thread is between its load and its clear can no longer be swallowed by
    a plain read-then-store (lost update). */
 static atomic_bool     g_ResetRequested = false;
 /* Raised by serverThread() as its very last statement, polled by nxusNetExit().
    threadWaitForExit() cannot be given a timeout in libnx, so this flag is what
    makes the shutdown bounded: the exit path joins/closes the thread only after
    seeing it, and abandons the handle (reclaimed by process exit) when the
-   deadline expires.  The sockets are closed either way; see the teardown table
-   above nxusNetExit().  atomic: written by the server thread, read by the exit
-   thread. */
+   deadline expires. */
 static atomic_bool     g_ServerDone = false;
+/* Set when a listener rebuild (which may tear the bsd session down) has to wait
+   for the client threads to leave their sockets first.  See rebuildOrDefer(). */
+static atomic_bool g_RebuildPending = false;
+
 /* Last armGetSystemTick() at which a packet was received or sent completely.
-   Written by the server/sender threads and read by the watchdog in main.c; an
+   Written by every connection thread and read by the watchdog in main.c; an
    aligned 64-bit store is atomic on AArch64, so no lock is needed. */
 static volatile u64    g_LastActivityTick = 0;
-/* armGetSystemTick() of the last byte RECEIVED from the registered client.  This
-   is deliberately per-client and receive-only (g_LastActivityTick also counts our
-   sends and drives main.c's sleep/wake heuristic).  Server thread only: set when a
-   client is registered (accept) and on every successful recv() in recvExact().
-   The pending-connection policy compares it against NXUS_NET_PREEMPT_IDLE_NS:
-   the PC heartbeat is 4 s, so a live session never looks idle, while a half-open
-   socket (console slept, PC vanished without a FIN) is released to a new client. */
-static u64             g_ClientLastRxTick = 0;
+
+/* One served connection.  The published part (fd/in_use/done) lives in the slot
+   table the header defines, because that policy is host-tested; everything below
+   is transport-private and only touched by the connection's own thread (rx,
+   last_rx_tick) or by the reaper after the thread has been joined (stack). */
+typedef struct {
+    NxusNetSlot *slot;      /* always &g_Slots[index]                   */
+    Mutex        send_lock; /* serialises frame writes and fd teardown  */
+    Thread       thread;
+    u8          *rx;        /* receive buffer (owned by the client thread) */
+    u32          rx_cap;
+    u8          *stack;     /* heap thread stack (freed by the reaper)  */
+    u64          last_rx_tick;
+    u64          rx_big_tick;   /* last frame that needed > NXUS_NET_RX_IDLE_SIZE */
+    char         peer[32];
+} NxusNetClient;
+
+static NxusNetSlot   g_Slots[NXUS_NET_MAX_CLIENTS];
+static NxusNetClient g_Clients[NXUS_NET_MAX_CLIENTS];
+/* True between the mutex/table setup in nxusNetInit() and the start of
+   nxusNetExit().  The slot array is zero-initialised statically (fd == 0, which
+   is a perfectly valid descriptor number), so every path that may run before Init
+   or during the teardown - nxusNetSendEvent() from the cheat worker, the
+   watchdog's nxusNetClientFd(), a reset request - must refuse to touch it unless
+   this flag is set. */
+static atomic_bool  g_TableReady = false;
+
+static bool nxusNetRunning(void) {
+    return atomic_load_explicit(&g_Running, memory_order_acquire);
+}
+
+u64 nxusNetLastActivityTick(void) {
+    return g_LastActivityTick;
+}
+
+/* Milliseconds elapsed since `from`.  armGetSystemTick() keeps counting across a
+   sleep, so a suspend shows up as one huge delta - exactly what the idle/stall
+   deadlines must treat as "this connection is dead". */
+static u64 elapsedNs(u64 from, u64 now) {
+    return armTicksToNs(now - from);
+}
+
+/* Sleep in short slices instead of one long svcSleepThread(), returning early on
+   shutdown or on a reset request, so a sleep/wake wake-up is never delayed by a
+   backoff that is already running. */
+static void backoffSleep(u64 total_ns) {
+    const u64 slice_ns = 250000000ull;
+    for (u64 slept = 0; slept < total_ns; slept += slice_ns) {
+        if (!nxusNetRunning() || atomic_load_explicit(&g_ResetRequested, memory_order_acquire))
+            return;
+        svcSleepThread(slice_ns);
+    }
+}
+
+/* Consume a pending reset request: exactly one reader wins.  The old
+   read-then-clear pair could lose a request that nxusNetRequestReset() raised
+   between the two steps. */
+static bool takeResetRequest(void) {
+    return atomic_exchange_explicit(&g_ResetRequested, false, memory_order_acq_rel);
+}
+
+static bool resetRequested(void) {
+    return atomic_load_explicit(&g_ResetRequested, memory_order_acquire);
+}
 
 /* ---- Result handling ----------------------------------------------------
  *
@@ -124,45 +185,20 @@ static bool netCallSucceeded(Result rc, const char *what) {
     return true;
 }
 
-/* ---- descriptor slots ----------------------------------------------------
+/* ---- listener descriptor slot -------------------------------------------
  *
- * The slot is both the registration and the close token (see the globals above).
- * Closing a descriptor therefore means: claim it (CAS the slot from `fd` to -1),
- * then close the claimed number.  Readers that never close (the health probe, the
- * poll sets) just load the slot.
- *
- * Every close of a *published* descriptor runs under g_SendMutex, so the exit
- * path's shutdown() can never land on a number that was closed and recycled in
- * between; the CAS is what settles ownership between the exit path and the server
- * thread, which both reach a close on the timeout path.
+ * The listener slot is both the registration and the close token: to close it, a
+ * party first replaces it with -1 through a compare-exchange, and only the
+ * winner of that CAS may call close().  It is atomic because the slot is also
+ * read without the lock (the health probe, the accept poll).
  */
-
-/* The registered client descriptor, or -1.  A snapshot only (see nxus_net.h). */
-static int peekClientFd(void) {
-    return atomic_load_explicit(&g_ClientFd, memory_order_acquire);
-}
-
-static void publishClientFd(int fd) {
-    atomic_store_explicit(&g_ClientFd, fd, memory_order_release);
-}
-
-/* Claim `fd` for a close.  Returns fd when this caller won, -1 when the slot no
-   longer holds it (already closed elsewhere, or replaced by a newer client that
-   this caller does not own and must leave alone). */
-static int claimClientFd(int fd) {
-    if (fd < 0) return -1;
-    int expected = fd;
-    return atomic_compare_exchange_strong_explicit(&g_ClientFd, &expected, -1,
-                                                   memory_order_acq_rel,
-                                                   memory_order_acquire)
-               ? fd : -1;
-}
-
 static int peekListenFd(void) {
     return atomic_load_explicit(&g_ListenFd, memory_order_acquire);
 }
 
-/* Same contract as claimClientFd(), for the listener slot. */
+/* Claim `fd` for a close.  Returns fd when this caller won, -1 when the slot no
+   longer holds it (already closed elsewhere, or replaced by a newer listener that
+   this caller does not own and must leave alone). */
 static int claimListenFd(int fd) {
     if (fd < 0) return -1;
     int expected = fd;
@@ -181,43 +217,6 @@ static int takeListenFd(void) {
         fd = peekListenFd();
     }
     return -1;
-}
-
-int nxusNetClientFd(void) {
-    return peekClientFd();
-}
-
-/* Consume a pending reset request: exactly one reader wins.  The old
-   read-then-clear pair could lose a request that nxusNetRequestReset() raised
-   between the two steps. */
-static bool takeResetRequest(void) {
-    return atomic_exchange_explicit(&g_ResetRequested, false, memory_order_acq_rel);
-}
-
-static bool resetRequested(void) {
-    return atomic_load_explicit(&g_ResetRequested, memory_order_acquire);
-}
-
-/* Sleep in short slices instead of one long svcSleepThread(), returning early on
-   shutdown or on a reset request, so a sleep/wake wake-up is never delayed by a
-   backoff that is already running. */
-static void backoffSleep(u64 total_ns) {
-    const u64 slice_ns = 250000000ull;
-    for (u64 slept = 0; slept < total_ns; slept += slice_ns) {
-        if (!nxusNetRunning() || resetRequested()) return;
-        svcSleepThread(slice_ns);
-    }
-}
-
-u64 nxusNetLastActivityTick(void) {
-    return g_LastActivityTick;
-}
-
-/* Milliseconds elapsed since `from`.  armGetSystemTick() keeps counting across a
-   sleep, so a suspend shows up as one huge delta - exactly what the idle/stall
-   deadlines must treat as "this connection is dead". */
-static u64 elapsedNs(u64 from, u64 now) {
-    return armTicksToNs(now - from);
 }
 
 /* ---- listen socket lifecycle ------------------------------------------- */
@@ -256,14 +255,14 @@ static bool createListenerSocket(void) {
         return false;
     }
 
-    /* Publish under the send lock, which is also the lock every close takes: an
-       exit that already flipped g_Running takes (or has taken) the slot under that
-       lock, so a listener created afterwards is refused here instead of being
+    /* Publish under the listener lock, which is also the lock every close takes:
+       an exit that already flipped g_Running takes (or has taken) the slot under
+       that lock, so a listener created afterwards is refused here instead of being
        published past the teardown snapshot, where nothing would ever close it. */
-    mutexLock(&g_SendMutex);
+    mutexLock(&g_ListenMutex);
     const bool live = nxusNetRunning();
     if (live) atomic_store_explicit(&g_ListenFd, fd, memory_order_release);
-    mutexUnlock(&g_SendMutex);
+    mutexUnlock(&g_ListenMutex);
 
     if (!live) {
         close(fd);
@@ -314,14 +313,14 @@ static bool listenerHealthy(void) {
 static void rebuildListener(bool full_bsd_reset) {
     if (!nxusNetRunning()) return;
 
-    /* Claim the old listener before closing it, under the send lock.  Holding the
-       lock keeps the exit path from shutting the descriptor down between the claim
-       and the close, and the claim keeps a number another party already closed
-       (and the kernel already recycled) from being closed a second time. */
-    mutexLock(&g_SendMutex);
+    /* Claim the old listener before closing it, under the listener lock.  Holding
+       the lock keeps the exit path from shutting the descriptor down between the
+       claim and the close, and the claim keeps a number another party already
+       closed (and the kernel already recycled) from being closed a second time. */
+    mutexLock(&g_ListenMutex);
     const int old_fd = takeListenFd();
     if (old_fd >= 0) close(old_fd);
-    mutexUnlock(&g_SendMutex);
+    mutexUnlock(&g_ListenMutex);
 
     if (!full_bsd_reset && createListenerSocket()) {
         NXUS_LOG("listener rebuilt on 0.0.0.0:%u", (unsigned)g_Port);
@@ -367,34 +366,68 @@ static void rebuildListener(bool full_bsd_reset) {
              (unsigned)(((u64)attempt * NXUS_NET_REBUILD_DELAY_NS) / 1000000000ull));
 }
 
-/* Drop the registered client.  The send mutex is held while the descriptor is
-   read, claimed and closed, so a sender on another thread (debug events) can never
-   write into a descriptor that was just handed back to the kernel - and never into
-   the descriptor number that the kernel hands out to the next client.  The claim
-   (CAS to -1) is what makes the close single-owner; nxusNetExit() claims the same
-   way when it has to close without a joined thread. */
-static void dropClient(void) {
-    mutexLock(&g_SendMutex);
-    const int fd = claimClientFd(peekClientFd());
-    if (fd >= 0) {
-        /* The claim already unregistered the descriptor: any sender that takes the
-           mutex from here on sees -1 and refuses to send. */
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
+/* ---- connection table helpers ------------------------------------------- */
+
+/* The client whose slot currently holds `fd`, or NULL.  A snapshot only: the
+   caller must re-check the slot after taking its send lock. */
+static NxusNetClient *clientForFd(int fd) {
+    if (fd < 0 || !atomic_load_explicit(&g_TableReady, memory_order_acquire)) return NULL;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (nxusNetSlotFd(&g_Slots[i]) == fd) return &g_Clients[i];
     }
-    mutexUnlock(&g_SendMutex);
+    return NULL;
 }
 
-/* ---- pending connections ------------------------------------------------ */
+int nxusNetClientFd(void) {
+    if (!atomic_load_explicit(&g_TableReady, memory_order_acquire)) return -1;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        const int fd = nxusNetSlotFd(&g_Slots[i]);
+        if (fd >= 0) return fd;
+    }
+    return -1;
+}
 
-/* Defined after recvExact()/serveClient(); used by the BUSY rejection below. */
+int nxusNetClientCount(void) {
+    if (!atomic_load_explicit(&g_TableReady, memory_order_acquire)) return 0;
+    int count = 0;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (nxusNetSlotFd(&g_Slots[i]) >= 0) count++;
+    }
+    return count;
+}
+
+/* Shut the connection's socket down (not close): wakes its poll()/recv() without
+   handing the descriptor back to the kernel, so the owning thread is still the
+   only one that closes it. */
+static void clientShutdown(NxusNetClient *client) {
+    mutexLock(&client->send_lock);
+    const int fd = nxusNetSlotFd(client->slot);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    mutexUnlock(&client->send_lock);
+}
+
+/* Unregister the connection's descriptor under its send lock.  Returns the
+   descriptor when this call owned it (and the caller must close it), -1 when it
+   was already taken by the exit path.  Unregistering before close() is what makes
+   the close handler's fd unambiguous: the number cannot be recycled while the
+   socket is still open, and no sender can reach it any more. */
+static int clientTakeFd(NxusNetClient *client) {
+    mutexLock(&client->send_lock);
+    const int fd = nxusNetSlotFd(client->slot);
+    if (fd >= 0) nxusNetSlotClearFd(client->slot);
+    mutexUnlock(&client->send_lock);
+    return fd;
+}
+
+/* ---- BUSY refusal ------------------------------------------------------- */
+
+/* Defined after sendFrameLocked(); used by sendBusyAndClose() below. */
 static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
                               const void *payload, u32 length);
 
 /* "a.b.c.d:port" of the connected peer.  getpeername() is authoritative after
    accept(); `fallback` carries the accept() sockaddr for the (rare) case the
-   stack cannot report it again.  Used so every accept logs WHO connected and a
-   preemption log names both the client that was cut and the newcomer. */
+   stack cannot report it again. */
 static void formatPeer(int fd, const struct sockaddr_in *fallback, char *out, size_t cap) {
     struct sockaddr_in peer;
     memset(&peer, 0, sizeof(peer));
@@ -416,10 +449,11 @@ static void formatPeer(int fd, const struct sockaddr_in *fallback, char *out, si
              (unsigned)ntohs(peer.sin_port));
 }
 
-/* Refuse a second connection while the registered client is alive: send the BUSY
-   error frame (s32 Result + u32 reason, as replyErrorReason() does) and close at
-   once.  The newcomer is not registered, so this cannot race a sender. */
-static void sendBusyAndClose(int new_fd, const char *peer_text, int live_fd) {
+/* Refuse a connection that cannot be served (every slot in use, or no memory for
+   its thread stack / receive buffer): send the BUSY error frame (s32 Result +
+   u32 reason, as replyErrorReason() does) and close at once.  The descriptor is
+   not registered in any slot, so this cannot race a sender. */
+static void sendBusyAndClose(int new_fd, const char *peer_text) {
     s32 payload[2];
     nxusNetFillBusyPayload(payload);
     (void)sendFrameLocked(new_fd, NxusCmd_Nop, NXUS_FLAG_ERROR, 0,
@@ -439,36 +473,71 @@ static void sendBusyAndClose(int new_fd, const char *peer_text, int live_fd) {
         if (recv(new_fd, sink, (int)sizeof(sink), 0) <= 0) break;
     }
 
-    NXUS_LOG(NXUS_NET_LOG_BUSY_FMT, peer_text, new_fd, live_fd);
+    NXUS_LOG(NXUS_NET_LOG_BUSY_FMT, peer_text, new_fd, NXUS_NET_MAX_CLIENTS);
     close(new_fd);
 }
 
 /* ---- receive ------------------------------------------------------------ */
 
+/* Grow the connection's receive buffer to at least `need` bytes.  Never beyond
+   NXUS_NET_BUF_SIZE (the largest protocol payload), so the per-connection ceiling
+   documented in nxus_net.h holds.  A frame larger than the idle size also stamps
+   rx_big_tick: the shrink below is about "this connection has not needed a big
+   buffer for a while", not about the heartbeat traffic that keeps last_rx_tick
+   fresh - otherwise a client that once uploaded a 512 KiB cheat upload would hold
+   that buffer for the rest of the session just because it keeps heartbeating. */
+static bool clientRxEnsure(NxusNetClient *client, u32 need) {
+    if (need > NXUS_NET_BUF_SIZE) return false;
+    if (need > NXUS_NET_RX_IDLE_SIZE) client->rx_big_tick = armGetSystemTick();
+    if (need <= client->rx_cap) return true;
+    u8 *bigger = (u8 *)realloc(client->rx, need);
+    if (bigger == NULL) return false;
+    NXUS_LOG("recv: fd=%d grew the receive buffer %u -> %u B",
+             nxusNetSlotFd(client->slot), (unsigned)client->rx_cap, (unsigned)need);
+    client->rx = bigger;
+    client->rx_cap = need;
+    return true;
+}
+
+/* Give an enlarged buffer back once the connection has not needed a large frame
+   for NXUS_NET_RX_SHRINK_IDLE_NS.  Called only while waiting for the NEXT header,
+   so no caller holds a pointer into the buffer that is being replaced (the header
+   itself lives on the stack). */
+static void clientRxShrinkIfIdle(NxusNetClient *client, u64 now) {
+    if (client->rx == NULL || client->rx_cap <= NXUS_NET_RX_IDLE_SIZE) return;
+    if (client->rx_big_tick == 0) return;
+    const u64 idle_ns = elapsedNs(client->rx_big_tick, now);
+    if (idle_ns < NXUS_NET_RX_SHRINK_IDLE_NS) return;
+
+    u8 *smaller = (u8 *)realloc(client->rx, NXUS_NET_RX_IDLE_SIZE);
+    if (smaller == NULL) return;   /* keep the larger block: harmless, still bounded */
+    NXUS_LOG("recv: fd=%d has had no large frame for %llu ms - shrunk the receive "
+             "buffer %u -> %u B",
+             nxusNetSlotFd(client->slot),
+             (unsigned long long)(idle_ns / 1000000ull),
+             (unsigned)client->rx_cap, (unsigned)NXUS_NET_RX_IDLE_SIZE);
+    client->rx = smaller;
+    client->rx_cap = NXUS_NET_RX_IDLE_SIZE;
+}
+
 /* Receive exactly `length` bytes, but never unconditionally:
 
    The previous implementation looped on recv() alone (SO_RCVTIMEO -> EAGAIN ->
    retry) while SO_RCVTIMEO kept firing.  A half-open connection (the console
-   slept, the PC vanished without a FIN) therefore parked the protocol thread
-   inside recvAll() forever: the listen socket was never serviced again, so every
+   slept, the PC vanished without a FIN) therefore parked the connection thread
+   inside recvAll() forever: the listener was never serviced again, so every
    reconnect was refused or timed out, and only a sysmodule restart helped.
 
-   Every wait now goes through poll() in 200 ms slices:
+   Every wait now goes through poll() in 200 ms slices.  The accept thread is
+   independent, so this function only has to watch its own socket:
 
-     - while waiting for the NEXT command header (is_header && got == 0) the
-       LISTEN socket is part of the same poll set.  Incoming traffic there is a
-       new client / auto-reconnect, resolved by the silence rule: only a client
-       that has RECEIVED nothing for NXUS_NET_PREEMPT_IDLE_NS is preempted (return
-       false; the caller closes it and accepts the new one).  A live client (the
-       PC heartbeats every 4 s) is kept and the newcomer is accepted, answered
-       with BUSY and closed instead.  The old unconditional kick-out cut a
-       healthy session on every second connection, so the PC flapped forever.
-     - a reset request or a listener error (POLLERR/POLLHUP/POLLNVAL) also
-       returns false immediately.
+     - a reset request or a shutdown returns false immediately;
      - 20 s without a single byte while `got == 0` and 5 s without progress once a
        payload has started are fatal, so dead sockets are always reaped
-       (the PC heartbeats every 4 s, so a healthy idle session is never cut). */
-static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
+       (the PC heartbeats every 4 s, so a healthy idle session is never cut);
+     - while waiting for the next header (is_header && got == 0) an enlarged
+       receive buffer is shrunk back after the idle interval. */
+static bool recvExact(NxusNetClient *client, int fd, void *buffer, u32 length, bool is_header) {
     u8 *out = (u8 *)buffer;
     u32 got = 0;
     u64 last_progress = armGetSystemTick();
@@ -480,78 +549,27 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
             return false;
         }
 
-        /* Only a client that is between commands may be preempted: in the middle
-           of a frame the bytes already consumed would be lost. */
-        const bool watch_listener = is_header && got == 0;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
 
-        struct pollfd pfds[2];
-        pfds[0].fd = fd;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-        pfds[1].fd = watch_listener ? peekListenFd() : -1;
-        pfds[1].events = POLLIN;
-        pfds[1].revents = 0;
-
-        const nfds_t nfds = watch_listener ? (nfds_t)2 : (nfds_t)1;
-        const int pr = poll(pfds, nfds, NXUS_NET_POLL_SLICE_MS);
+        const int pr = poll(&pfd, 1, NXUS_NET_POLL_SLICE_MS);
         if (pr < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             NXUS_LOG("recv: poll(fd=%d) failed errno=%d - dropping client", fd, errno);
             return false;
         }
 
-        if (watch_listener) {
-            if (pfds[1].revents & POLLIN) {
-                const u64 silent_ns = elapsedNs(g_ClientLastRxTick, armGetSystemTick());
-                /* Bytes already waiting on the registered socket (a heartbeat
-                   that queued up while a long handler ran) prove it is alive even
-                   when the last byte we actually recv()'d is older than 8 s. */
-                const bool current_has_data = pr > 0 && (pfds[0].revents & POLLIN) != 0;
-                if (!current_has_data &&
-                    nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Preempt) {
-                    NXUS_LOG(NXUS_NET_LOG_PREEMPT_FMT, fd,
-                             (unsigned long long)(silent_ns / 1000000ull));
-                    return false;
-                }
-
-                /* The registered client is alive (a heartbeat < 8 s ago, or data
-                   already waiting on its socket): keep it and refuse the newcomer
-                   with BUSY instead of closing a healthy session.  Only one
-                   pending connection is accepted per poll slice; a second one
-                   reports POLLIN again on the next pass and is refused the same
-                   way. */
-                const int listen_fd = peekListenFd();
-                if (listen_fd >= 0) {
-                    struct sockaddr_in peer;
-                    memset(&peer, 0, sizeof(peer));
-                    socklen_t peer_len = (socklen_t)sizeof(peer);
-                    const int new_fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
-                    if (new_fd >= 0) {
-                        char peer_text[32];
-                        formatPeer(new_fd, &peer, peer_text, sizeof(peer_text));
-                        sendBusyAndClose(new_fd, peer_text, fd);
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        NXUS_LOG("recv: accept() for the BUSY refusal failed errno=%d", errno);
-                    }
-                }
-            }
-            if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                NXUS_LOG("recv: listener error (revents=0x%X) - dropping fd=%d",
-                         (unsigned)pfds[1].revents, fd);
-                return false;
-            }
-        }
-
-        if (pr > 0 && (pfds[0].revents & POLLIN)) {
+        if (pr > 0 && (pfd.revents & POLLIN)) {
             const int n = recv(fd, out + got, (int)(length - got), 0);
             if (n > 0) {
                 got += (u32)n;
                 last_progress = armGetSystemTick();
                 /* A byte on the wire is a live PC: the sleep/wake heuristic in
-                   main.c must never reset the network while traffic flows, and
-                   the pending-connection policy must see this client as alive. */
+                   main.c must never reset the network while traffic flows. */
                 g_LastActivityTick = last_progress;
-                g_ClientLastRxTick = last_progress;
+                client->last_rx_tick = last_progress;
             } else if (n == 0) {
                 return false;               /* orderly shutdown by the peer */
             } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -560,8 +578,8 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
                 NXUS_LOG("recv: fd=%d failed errno=%d - dropping client", fd, errno);
                 return false;
             }
-        } else if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
-            NXUS_LOG("recv: fd=%d error/hangup (revents=0x%X)", fd, (unsigned)pfds[0].revents);
+        } else if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            NXUS_LOG("recv: fd=%d error/hangup (revents=0x%X)", fd, (unsigned)pfd.revents);
             return false;
         }
 
@@ -573,6 +591,7 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
                          (unsigned long long)(idle_ns / 1000000ull));
                 return false;
             }
+            if (is_header) clientRxShrinkIfIdle(client, now);
         } else if (idle_ns > NXUS_NET_PAYLOAD_STALL_NS) {
             NXUS_LOG("recv: fd=%d stalled at %u/%u bytes for %llu ms - dropping client", fd,
                      (unsigned)got, (unsigned)length,
@@ -582,6 +601,8 @@ static bool recvExact(int fd, void *buffer, u32 length, bool is_header) {
     }
     return true;
 }
+
+/* ---- sending ------------------------------------------------------------ */
 
 /* Write exactly `length` bytes. Returns false on a hard error or when the socket's
    SO_SNDTIMEO expires (a PC that stops reading a large reply). `*out_sent` always
@@ -600,10 +621,11 @@ static bool sendAll(int fd, const void *buffer, u32 length, u32 *out_sent) {
     return sent == length;
 }
 
-/* Core writer.  The caller must already hold g_SendMutex: that is the same lock
-   dropClient()/serveClient() take around close(), so the descriptor cannot be
-   closed (and its number recycled into a new client) between the check and the
-   last byte written. */
+/* Core writer.  The caller must already hold the connection's send lock (or own
+   the descriptor exclusively, for the BUSY refusal): that is the same lock the
+   teardown takes around close(), so the descriptor cannot be closed (and its
+   number recycled into a new client) between the check and the last byte
+   written. */
 static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
                               const void *payload, u32 length) {
     if (fd < 0) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
@@ -635,8 +657,8 @@ static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
     if (failed) {
         /* Once part of a packet is on the wire the peer's framing is lost for
            good: it will parse payload bytes as the next header.  Tear the
-           connection down (the server loop then reconnects cleanly) instead of
-           returning an error that leaves the stream permanently desynced. */
+           connection down (the owning thread then closes it) instead of returning
+           an error that leaves the stream permanently desynced. */
         if (sent_total > 0) shutdown(fd, SHUT_RDWR);
         rc = MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen);
     } else {
@@ -647,30 +669,49 @@ static Result sendFrameLocked(int fd, u16 type, u16 flags, u32 seq,
 }
 
 Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length) {
-    /* Lock first, look afterwards.  Resolving the fd through nxusNetClientFd()
-       before taking g_SendMutex was the injection bug: dropClient() could close
-       the descriptor and the kernel hand the very same number to the next client
-       in that window, so the event went to a session that never asked for it. */
-    mutexLock(&g_SendMutex);
+    /* Look the descriptor up, then re-check it under the connection's send lock.
+       Resolving the fd through nxusNetClientFd() before taking the lock was the
+       injection bug: the owner could close the descriptor and the kernel hand the
+       very same number to another client in that window, so the event went to a
+       session that never asked for it. */
+    NxusNetClient *client = clientForFd(fd);
+    if (client == NULL) return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
 
+    mutexLock(&client->send_lock);
     Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
-    /* Only the currently registered client is writable; a descriptor a handler
-       kept across a reconnect is stale and must not be reused either. */
-    if (fd >= 0 && fd == peekClientFd()) {
+    /* Only a registered connection is writable; a descriptor a handler kept
+       across a disconnect is stale and must not be reused either. */
+    if (nxusNetSlotFd(client->slot) == fd) {
         rc = sendFrameLocked(fd, type, flags, seq, payload, length);
     }
-
-    mutexUnlock(&g_SendMutex);
+    mutexUnlock(&client->send_lock);
     return rc;
 }
 
 Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length) {
-    /* Same rule as nxusNetSendFd(): the descriptor is read under g_SendMutex,
-       never through nxusNetClientFd() before taking it. */
-    mutexLock(&g_SendMutex);
-    Result rc = sendFrameLocked(peekClientFd(), type, flags, seq, payload, length);
-    mutexUnlock(&g_SendMutex);
-    return rc;
+    /* Broadcast: asynchronous events are not addressed to one session.  Every
+       connection is written under its own send lock, so one slow client cannot
+       block the replies of the others beyond its own send timeout. */
+    if (!atomic_load_explicit(&g_TableReady, memory_order_acquire))
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    bool any = false;
+    Result first_error = 0;
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        NxusNetClient *client = &g_Clients[i];
+        const int fd = nxusNetSlotFd(client->slot);
+        if (fd < 0) continue;
+
+        mutexLock(&client->send_lock);
+        if (nxusNetSlotFd(client->slot) == fd) {
+            const Result rc = sendFrameLocked(fd, type, flags, seq, payload, length);
+            if (rc == 0) any = true;
+            else if (first_error == 0) first_error = rc;
+        }
+        mutexUnlock(&client->send_lock);
+    }
+    if (any) return 0;
+    return (first_error != 0) ? first_error
+                              : MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
 }
 
 Result nxusNetSendAck(u32 seq)   { return nxusNetSend(seq, 0, seq, NULL, 0); }
@@ -688,8 +729,18 @@ Result nxusNetRespond(u32 seq, const void *payload, u32 length) {
     return nxusNetSend(type, 0, seq, payload, length);
 }
 
-static void serveClient(int fd, const char *peer_text) {
-    NXUS_LOG("client connected from %s (fd=%d)", peer_text, fd);
+/* ---- serving one connection --------------------------------------------- */
+
+void nxusNetSetCloseHandler(NxusNetCloseHandler handler, void *user) {
+    g_CloseHandler = handler;
+    g_CloseUser = user;
+}
+
+static void serveClient(NxusNetClient *client, int fd) {
+    NXUS_LOG("client connected from %s (fd=%d, slot %d, %d/%d busy)",
+             client->peer, fd,
+             (int)(client->slot - &g_Slots[0]),
+             nxusNetClientCount(), NXUS_NET_MAX_CLIENTS);
 
     /* 1s receive timeout so a recv() that raced with poll() cannot block for good.
        The real wait is poll()'s 200 ms slice, so this only bounds a rare race. */
@@ -721,10 +772,9 @@ static void serveClient(int fd, const char *peer_text) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keep_cnt,   sizeof(keep_cnt));
 #endif
 
-    while (nxusNetRunning() && peekClientFd() == fd) {
+    while (nxusNetRunning() && nxusNetSlotFd(client->slot) == fd) {
         NxusPacketHeader header;
-        /* Header: preemptible by a new connection (kick-out path). */
-        if (!recvExact(fd, &header, sizeof(header), true)) break;
+        if (!recvExact(client, fd, &header, sizeof(header), true)) break;
 
         if (header.magic != NXUS_MAGIC) {
             NXUS_LOG("bad magic 0x%08X - closing", (unsigned)header.magic);
@@ -735,29 +785,138 @@ static void serveClient(int fd, const char *peer_text) {
             break;
         }
 
-        u32 length = header.length;
+        const u32 length = header.length;
         if (length > 0) {
-            if (g_RxBuffer == NULL) g_RxBuffer = (u8 *)malloc(NXUS_NET_BUF_SIZE);
+            if (!clientRxEnsure(client, length)) {
+                /* The payload cannot be buffered, and it is still queued: refuse
+                   the request with the protocol's BAD_LENGTH reason and drop the
+                   connection rather than parse the remaining bytes as a header.
+                   The connection keeps whatever buffer it has (nxus_net.h). */
+                NXUS_LOG("recv: fd=%d payload of %u B does not fit the %u B receive "
+                         "buffer (limit %u B) - refusing with BAD_LENGTH",
+                         fd, (unsigned)length, (unsigned)client->rx_cap,
+                         (unsigned)NXUS_NET_BUF_SIZE);
+                s32 payload[2];
+                payload[0] = (s32)NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE);
+                payload[1] = (s32)NXUS_REASON_BAD_LENGTH;
+                mutexLock(&client->send_lock);
+                if (nxusNetSlotFd(client->slot) == fd) {
+                    (void)sendFrameLocked(fd, header.type, NXUS_FLAG_ERROR, header.seq,
+                                          payload, (u32)sizeof(payload));
+                }
+                mutexUnlock(&client->send_lock);
+                break;
+            }
             /* Payload: a started frame must finish, so no listener in the set. */
-            if (g_RxBuffer == NULL || !recvExact(fd, g_RxBuffer, length, false)) break;
+            if (!recvExact(client, fd, client->rx, length, false)) break;
         }
 
         if (g_Handler != NULL) {
-            g_Handler(fd, &header, g_RxBuffer, length, g_HandlerUser);
+            g_Handler(fd, &header, client->rx, length, g_HandlerUser);
         }
     }
 
     NXUS_LOG("client disconnected (fd=%d)", fd);
-    /* Under the same lock as dropClient(): a sender on another thread must not be
-       inside send() on a descriptor that is handed back to the kernel here.  The
-       close is claim-guarded like every other close of a published descriptor:
-       nxusNetExit() may already have claimed and closed this number (it gives up
-       on the thread after 2 s), and a second close() would hit whatever socket the
-       kernel recycled it into. */
-    mutexLock(&g_SendMutex);
-    const int claimed = claimClientFd(fd);
-    if (claimed >= 0) close(claimed);
-    mutexUnlock(&g_SendMutex);
+
+    /* Unregister FIRST: from here on no sender can reach this descriptor, while
+       it is still open, so the number is unique and the close hook can name this
+       connection by fd without hitting a recycled descriptor. */
+    const bool owned = (clientTakeFd(client) == fd);
+    if (owned) {
+        if (g_CloseHandler != NULL) g_CloseHandler(fd, g_CloseUser);
+        close(fd);
+    }
+
+    free(client->rx);
+    client->rx = NULL;
+    client->rx_cap = 0;
+
+    /* Last statement: the reaper may now join this thread and free its stack. */
+    nxusNetSlotFinish(client->slot);
+}
+
+static void clientThread(void *arg) {
+    NxusNetClient *client = (NxusNetClient *)arg;
+    const int fd = nxusNetSlotFd(client->slot);
+    if (fd >= 0) {
+        serveClient(client, fd);
+        return;
+    }
+
+    /* The exit path unregistered the descriptor before this thread got to run.
+       Nothing to serve, nothing to close - just release the buffer and publish
+       the slot as done so the reaper can collect the thread. */
+    free(client->rx);
+    client->rx = NULL;
+    client->rx_cap = 0;
+    nxusNetSlotFinish(client->slot);
+}
+
+/* Join and release every slot whose serving thread has finished.  Only the accept
+   thread and nxusNetExit() call this, and nxusNetExit() only after the accept
+   thread has been joined, so a slot's Thread handle is touched by exactly one
+   reaper. */
+static void reapFinishedClients(void) {
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (!nxusNetSlotReapable(&g_Slots[i])) continue;
+        NxusNetClient *client = &g_Clients[i];
+
+        threadWaitForExit(&client->thread);
+        threadClose(&client->thread);
+        free(client->stack);
+        client->stack = NULL;
+        /* serveClient()/clientThread() already freed it; defensive only. */
+        free(client->rx);
+        client->rx = NULL;
+        client->rx_cap = 0;
+
+        nxusNetSlotReaped(&g_Slots[i]);
+        NXUS_LOG("client slot %d released (thread joined)", i);
+    }
+}
+
+/* Wake every connection so its serving thread notices the shutdown/rebuild. */
+static void shutdownAllClients(const char *why) {
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        const int fd = nxusNetSlotFd(&g_Slots[i]);
+        if (fd < 0) continue;
+        NXUS_LOG("dropping client fd=%d (%s)", fd, why);
+        clientShutdown(&g_Clients[i]);
+    }
+}
+
+/* True while any connection slot still owns a serving thread (including a
+   finished one that has not been reaped yet; the caller reaps first). */
+static bool clientThreadsActive(void) {
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (nxusNetSlotInUse(&g_Slots[i])) return true;
+    }
+    return false;
+}
+
+/* Rebuild the listener, but not while a connection thread may still be inside
+ * recv()/send()/close(): a full rebuild calls socketExit(), which closes the bsd
+ * service session underneath those threads and is undefined behaviour (the old
+ * single-threaded server got this for free because the reset was handled after
+ * serveClient() had returned).
+ *
+ * With clients still active the sockets are shut down (so every recv()/poll()
+ * wakes and every thread exits at its next slice) and the rebuild is remembered:
+ * the accept loop retries it once the last slot has been reaped.  This covers the
+ * sleep/wake reset (dead sockets; the 20 s idle deadline has usually expired by
+ * the time the console wakes, so the threads leave within one poll slice) and a
+ * long handler (a pointer scan), which may take longer but must not have its
+ * session pulled from under it. */
+static void rebuildOrDefer(bool full_bsd_reset) {
+    if (clientThreadsActive()) {
+        NXUS_LOG("listener: rebuild deferred until the client threads have drained (%s)",
+                 full_bsd_reset ? "full bsd reset" : "reopen");
+        shutdownAllClients("listener rebuild");
+        atomic_store_explicit(&g_RebuildPending, true, memory_order_release);
+        return;
+    }
+    rebuildListener(full_bsd_reset);
 }
 
 /* ---- accept loop -------------------------------------------------------- */
@@ -777,16 +936,120 @@ static bool nxusNetPeerIsPrivate(const struct sockaddr_in *peer) {
     return false;
 }
 
+/* Release a slot that was claimed but never got a serving thread, then refuse the
+   connection with BUSY.  The slot is released FIRST: while it is still published,
+   a broadcast (nxusNetSend) could try to write to the same socket the BUSY frame
+   is going to, and the two frames - each header+payload as two sends - would
+   interleave on the wire. */
+static void rejectClaimedClient(int slot, int fd, const char *peer_text) {
+    nxusNetSlotReaped(&g_Slots[slot]);
+    sendBusyAndClose(fd, peer_text);
+}
+
+/* Claim a slot for `fd`, allocate the thread's stack and receive buffer, and
+   start the serving thread.  Every failure path answers the newcomer with BUSY
+   and closes it: no slot is left half-claimed. */
+static void startClient(int fd, const char *peer_text) {
+    const int slot = nxusNetSlotClaim(g_Slots, NXUS_NET_MAX_CLIENTS, fd);
+    if (slot < 0) {
+        sendBusyAndClose(fd, peer_text);
+        return;
+    }
+
+    NxusNetClient *client = &g_Clients[slot];
+    client->slot = &g_Slots[slot];
+    client->rx = NULL;
+    client->rx_cap = 0;
+    client->stack = NULL;
+    client->last_rx_tick = armGetSystemTick();
+    client->rx_big_tick = 0;
+    snprintf(client->peer, sizeof(client->peer), "%s", peer_text);
+
+    /* The stack must be page-aligned for libnx's threadCreate(), hence the
+       aligned allocation instead of a plain malloc. */
+    u8 *stack = (u8 *)aligned_alloc(0x1000u, NXUS_NET_CLIENT_STACK_SIZE);
+    u8 *rx = (u8 *)malloc(NXUS_NET_RX_IDLE_SIZE);
+    if (stack == NULL || rx == NULL) {
+        NXUS_LOG("client: out of memory for a %u B stack / %u B receive buffer - "
+                 "refusing %s (fd=%d) with BUSY",
+                 (unsigned)NXUS_NET_CLIENT_STACK_SIZE, (unsigned)NXUS_NET_RX_IDLE_SIZE,
+                 peer_text, fd);
+        free(stack);
+        free(rx);
+        rejectClaimedClient(slot, fd, peer_text);
+        return;
+    }
+
+    Result rc = threadCreate(&client->thread, clientThread, client, stack,
+                             NXUS_NET_CLIENT_STACK_SIZE, 0x2C, -2);
+    if (R_FAILED(rc)) {
+        /* libnx wants -2 (default) or 0..3; anything else is an invalid core id. */
+        rc = threadCreate(&client->thread, clientThread, client, stack,
+                          NXUS_NET_CLIENT_STACK_SIZE, 0x2C, 3);
+    }
+    if (R_FAILED(rc)) {
+        NXUS_LOG("client: threadCreate failed rc=0x%08X - refusing %s (fd=%d)",
+                 (unsigned)rc, peer_text, fd);
+        free(stack);
+        free(rx);
+        rejectClaimedClient(slot, fd, peer_text);
+        return;
+    }
+
+    client->stack = stack;
+    client->rx = rx;
+    client->rx_cap = NXUS_NET_RX_IDLE_SIZE;
+
+    rc = threadStart(&client->thread);
+    if (R_FAILED(rc)) {
+        NXUS_LOG("client: threadStart failed rc=0x%08X - refusing %s (fd=%d)",
+                 (unsigned)rc, peer_text, fd);
+        /* The thread never ran: close the Thread object (it unmaps the stack
+           mirror; the backing memory is ours), then the connection. */
+        threadClose(&client->thread);
+        free(stack);
+        client->stack = NULL;
+        free(rx);
+        client->rx = NULL;
+        client->rx_cap = 0;
+        rejectClaimedClient(slot, fd, peer_text);
+    }
+}
+
 static void serverThread(void *arg) {
     (void)arg;
     u64 last_health = armGetSystemTick();
 
     while (nxusNetRunning()) {
-        /* 1. explicit reset (sleep/wake from main.c, external request). */
-        if (takeResetRequest()) {
-            NXUS_LOG("network reset requested - dropping client and rebuilding listener");
-            dropClient();
+        /* 0. Collect the connections whose serving thread has finished.  Doing it
+              here (and not from the serving thread) is what makes the stack free
+              safe: the thread has been joined by now. */
+        reapFinishedClients();
+
+        /* 0b. A rebuild that was deferred because a connection thread still used
+               the bsd session: run it as soon as the last slot is drained.  Only
+               this loop rebuilds the listener, so there is no second caller that
+               could slip in between the check and the rebuild. */
+        if (atomic_load_explicit(&g_RebuildPending, memory_order_acquire)) {
+            if (clientThreadsActive()) {
+                svcSleepThread(NXUS_NET_REBUILD_DRAIN_NS);
+                continue;
+            }
+            atomic_store_explicit(&g_RebuildPending, false, memory_order_release);
+            NXUS_LOG("listener: client threads drained - rebuilding the bsd session now");
             rebuildListener(true);
+            last_health = armGetSystemTick();
+            continue;
+        }
+
+        /* 1. explicit reset (sleep/wake from main.c, external request).  Every
+              connection belongs to the old bsd session, so they are all dropped
+              before the listener is rebuilt (or the rebuild is deferred until
+              their threads have left - see rebuildOrDefer). */
+        if (takeResetRequest()) {
+            NXUS_LOG("network reset requested - dropping clients and rebuilding listener");
+            shutdownAllClients("network reset");
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
         }
@@ -800,7 +1063,7 @@ static void serverThread(void *arg) {
         if (peekListenFd() < 0) {
             backoffSleep(NXUS_NET_REBUILD_RETRY_PAUSE_NS);
             if (!nxusNetRunning()) break;
-            rebuildListener(true);
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
         }
@@ -819,20 +1082,20 @@ static void serverThread(void *arg) {
             /* EINTR/EAGAIN are normal; ENETDOWN/EBADF/EPIPE after a sleep are not. */
             if (errno == EINTR || errno == EAGAIN) continue;
             NXUS_LOG("listener: poll failed errno=%d - rebuilding", errno);
-            rebuildListener(true);
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
         }
         if (pfd.revents & (POLLERR | POLLNVAL)) {
             NXUS_LOG("listener: poll reported error (revents=0x%X) - rebuilding",
                      (unsigned)pfd.revents);
-            rebuildListener(true);
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
         }
         if (pfd.revents & POLLHUP) {
             NXUS_LOG("listener: poll reported hangup - rebuilding");
-            rebuildListener(false);
+            rebuildOrDefer(false);
             last_health = armGetSystemTick();
             continue;
         }
@@ -843,7 +1106,7 @@ static void serverThread(void *arg) {
         if (elapsedNs(last_health, now) >= NXUS_NET_HEALTH_INTERVAL_NS) {
             last_health = now;
             if (!listenerHealthy()) {
-                rebuildListener(true);
+                rebuildOrDefer(true);
                 continue;
             }
         }
@@ -860,9 +1123,16 @@ static void serverThread(void *arg) {
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             NXUS_LOG("accept() failed errno=%d - rebuilding listener", errno);
-            rebuildListener(true);
+            rebuildOrDefer(true);
             last_health = armGetSystemTick();
             continue;
+        }
+
+        /* A shutdown that raced the accept: the listener is gone and this
+           connection was never published anywhere.  Close it here. */
+        if (!nxusNetRunning()) {
+            close(fd);
+            break;
         }
 
         /* Nxus speaks an unauthenticated read/write/debug protocol, so it must not
@@ -884,27 +1154,7 @@ static void serverThread(void *arg) {
         char peer_text[32];
         formatPeer(fd, &peer, peer_text, sizeof(peer_text));
 
-        /* A new connection may take over only when the registered client has been
-           silent for NXUS_NET_PREEMPT_IDLE_NS: a live session is kept and the
-           newcomer is answered with BUSY (the old code dropped `prev`
-           unconditionally, which is what made the PC flap).  In the normal path
-           serveClient() has already returned before this accept, so `prev` is -1;
-           this guard keeps the same policy if a stale registration ever survives. */
-        const int prev = peekClientFd();
-        if (prev >= 0) {
-            const u64 silent_ns = elapsedNs(g_ClientLastRxTick, armGetSystemTick());
-            if (nxusNetPendingConnectionAction(silent_ns) == NxusNetPending_Busy) {
-                sendBusyAndClose(fd, peer_text, prev);
-                continue;
-            }
-            NXUS_LOG("accept: preempting stale client fd=%d (silent %llu ms) with new client from %s (fd=%d)",
-                     prev, (unsigned long long)(silent_ns / 1000000ull), peer_text, fd);
-            dropClient();
-        }
-
-        g_ClientLastRxTick = armGetSystemTick();
-        publishClientFd(fd);
-        serveClient(fd, peer_text);
+        startClient(fd, peer_text);
         last_health = armGetSystemTick();
     }
 
@@ -923,7 +1173,22 @@ static void serverThread(void *arg) {
 Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     if (nxusNetRunning()) return 0;
 
-    mutexInit(&g_SendMutex);
+    mutexInit(&g_ListenMutex);
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        nxusNetSlotReset(&g_Slots[i]);
+        g_Clients[i].slot = &g_Slots[i];
+        g_Clients[i].rx = NULL;
+        g_Clients[i].rx_cap = 0;
+        g_Clients[i].stack = NULL;
+        g_Clients[i].last_rx_tick = 0;
+        g_Clients[i].rx_big_tick = 0;
+        g_Clients[i].peer[0] = '\0';
+        mutexInit(&g_Clients[i].send_lock);
+    }
+    atomic_store_explicit(&g_TableReady, true, memory_order_release);
+    /* No rebuild can be pending in a fresh lifetime (the previous Exit joined or
+       abandoned the accept thread that would have performed it). */
+    atomic_store_explicit(&g_RebuildPending, false, memory_order_release);
     g_Handler = handler;
     g_HandlerUser = user;
     g_Port = port;
@@ -940,6 +1205,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     Result rc = socketInitializeDefault();
     if (!netCallSucceeded(rc, "socketInitializeDefault")) {
         NXUS_RESULT("socketInitializeDefault", rc);
+        atomic_store_explicit(&g_TableReady, false, memory_order_release);
         return rc;
     }
     NXUS_LOG("socketInitializeDefault ok");
@@ -947,6 +1213,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     atomic_store_explicit(&g_Running, true, memory_order_release);
     if (!createListenerSocket()) {
         atomic_store_explicit(&g_Running, false, memory_order_release);
+        atomic_store_explicit(&g_TableReady, false, memory_order_release);
         socketExit();
         return MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen);
     }
@@ -961,6 +1228,7 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     }
     if (R_FAILED(rc)) {
         atomic_store_explicit(&g_Running, false, memory_order_release);
+        atomic_store_explicit(&g_TableReady, false, memory_order_release);
         /* No server thread exists yet, so this is a plain claim+close. */
         const int listen_fd = takeListenFd();
         if (listen_fd >= 0) close(listen_fd);
@@ -969,46 +1237,57 @@ Result nxusNetInit(u16 port, NxusNetHandler handler, void *user) {
     }
     threadStart(&g_ServerThread);
 
-    NXUS_LOG("listening on 0.0.0.0:%u", (unsigned)g_Port);
+    NXUS_LOG("listening on 0.0.0.0:%u (up to %d clients)", (unsigned)g_Port,
+             NXUS_NET_MAX_CLIENTS);
     return 0;
 }
 
 void nxusNetRequestReset(const char *reason) {
     NXUS_LOG("network reset requested from outside (%s)", (reason != NULL) ? reason : "?");
 
-    /* Release store: the server thread's exchange() is the only consumer, so the
+    if (!atomic_load_explicit(&g_TableReady, memory_order_acquire)) return;
+
+    /* Release store: the accept thread's exchange() is the only consumer, so the
        request is applied exactly once even if it lands mid-poll. */
     atomic_store_explicit(&g_ResetRequested, true, memory_order_release);
 
-    /* Also wake the protocol thread if it is blocked in recv(): shutdown() makes
-       poll() report the hangup instead of waiting for the next slice.  The server
-       thread stays the owner of the close(), so this only shuts the socket down.
-
-       The shutdown runs under g_SendMutex and reads the descriptor once, with the
-       lock held: every close of a published descriptor (dropClient(), the
-       serveClient() teardown, the exit path) takes the same lock, so the number
-       cannot be closed and recycled into a brand-new client while this runs.  The
-       lock is taken with try-lock so this stays non-blocking for its callers
-       (HID/UI threads) even while a 1 MiB reply is being written; a missed
-       shutdown only costs one 200 ms poll slice, since the atomic flag above is
-       what actually drives the reset. */
-    if (!mutexTryLock(&g_SendMutex)) return;
-
-    const int fd = peekClientFd();
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
-    mutexUnlock(&g_SendMutex);
+    /* Also wake the connection threads if they are blocked in recv(): shutdown()
+       makes poll() report the hangup instead of waiting for the next slice.  Each
+       connection's thread stays the owner of the close(), so this only shuts the
+       sockets down.  The shutdown runs under the connection's send lock, which is
+       also the lock every close takes, so the number cannot be closed and recycled
+       into a new client while this runs.  Try-lock keeps this non-blocking for
+       its callers (HID/UI threads) even while a 1 MiB reply is being written; a
+       missed shutdown only costs one 200 ms poll slice, since the atomic flag
+       above is what actually drives the reset. */
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        NxusNetClient *client = &g_Clients[i];
+        if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        if (!mutexTryLock(&client->send_lock)) continue;
+        const int fd = nxusNetSlotFd(client->slot);
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        mutexUnlock(&client->send_lock);
+    }
 }
 
 /* Wait (bounded) for serverThread() to raise g_ServerDone.
  *
- * libnx's threadWaitForExit() has no timeout parameter, and the connection thread
+ * libnx's threadWaitForExit() has no timeout parameter, and a connection thread
  * may sit inside a long handler (ptrscan is ~90 s), so an unconditional join made
  * __appExit() block for minutes.  Polling the done flag in 10 ms steps caps that
- * at `timeout_ms`: true means the thread already finished (or is finishing, so
+ * at the deadline: true means the thread already finished (or is finishing, so
  * threadWaitForExit() returns immediately), false means the deadline expired. */
-static bool waitServerThreadDone(u32 timeout_ms) {
-    const u64 deadline = armGetSystemTick() + armNsToTicks((u64)timeout_ms * 1000000ull);
+static bool waitServerThreadDone(u64 deadline) {
     while (!atomic_load_explicit(&g_ServerDone, memory_order_acquire)) {
+        if (armGetSystemTick() >= deadline) return false;
+        svcSleepThread(NXUS_NET_EXIT_POLL_NS);
+    }
+    return true;
+}
+
+/* Wait (bounded) for one connection's serving thread to publish `done`. */
+static bool waitClientDone(NxusNetClient *client, u64 deadline) {
+    while (!nxusNetSlotDone(client->slot)) {
         if (armGetSystemTick() >= deadline) return false;
         svcSleepThread(NXUS_NET_EXIT_POLL_NS);
     }
@@ -1018,90 +1297,140 @@ static bool waitServerThreadDone(u32 timeout_ms) {
 /* ---- teardown ------------------------------------------------------------
  *
  * nxusNetExit() runs as __appExit() is about to end the process, but it must not
- * block it: the connection thread can be parked inside a long handler (a pointer
- * scan runs ~90 s) and libnx has no timed join, so the wait is a 2 s poll of
- * g_ServerDone and the thread is *abandoned* past that deadline.
+ * block it: a connection thread can be parked inside a long handler (a pointer
+ * scan runs ~90 s) and libnx has no timed join, so the wait is a 2 s budget - for
+ * the accept thread AND for all connection threads together - and a thread is
+ * *abandoned* past that deadline.
  *
  * What is released therefore depends on whether the thread actually stopped
  * (nxusNetExit() implements exactly this table):
  *
  *   object                   thread joined in time      deadline expired
  *   -----------------------  -------------------------  ---------------------------
- *   server Thread handle     threadClose()              LEFT OPEN - the thread is
- *                                                       still running, so closing its
- *                                                       handle would pull the object
- *                                                       from under it (process exit
+ *   accept Thread handle     threadClose()              LEFT OPEN - the thread is
+ *                                                       still running (process exit
  *                                                       reclaims it)
- *   client socket (fd)       claim -> close             claim -> close (after the
- *                                                       phase-1 shutdown)
+ *   client Thread handles    threadClose() each         LEFT OPEN (same reason)
+ *   client stacks            free()                     LEFT ALLOCATED - the thread
+ *                                                       runs on that stack
+ *   client rx buffers        freed by the thread        LEFT ALLOCATED - the thread
+ *                                                       may still recv() into it
+ *   client sockets (fd)      already closed by thread  claim -> close (after the
+ *                            or claimed/closed here     phase-1 shutdown)
  *   listener socket (fd)     claim -> close             claim -> close (after the
  *                                                       phase-1 shutdown)
- *   g_RxBuffer               free() + NULL              LEFT ALLOCATED - recvExact()
- *                                                       or the handler may still be
- *                                                       writing the frame into it
  *   bsd session (socketExit) socketExit()               LEFT OPEN - socketExit() while
- *                                                       the thread is alive is
+ *                                                       a thread is alive is
  *                                                       undefined behaviour (logged)
  *
- * Closing the two descriptors on the deadline path is safe because both were
- * shutdown() first and because each close is claim-guarded (CAS of the slot to -1):
- * the exit path and the server thread can race, but only one of them ever closes a
- * given number, so the close can never land on a socket that recycled it.
+ * Closing the sockets on the deadline path is safe because all of them were
+ * shutdown() first and because every close is taken under the connection's send
+ * lock (listener: the listener lock): the exit path and the owning thread can
+ * race, but only one of them ever closes a given number, so the close can never
+ * land on a socket that recycled it.
+ *
+ * Reaping a finished connection slot is only done when the accept thread was
+ * joined too: while it may still be running it is the one reaper, and joining the
+ * same Thread from two threads would free its stack twice.
  *
  * This is a one-way door: after an abandoned exit, nxusNetInit() must not be
- * called while the old thread (and its bsd session) is still alive - it would
+ * called while the old threads (and their bsd session) are still alive - it would
  * share g_ServerThread/g_ServerDone and re-initialise a live bsd session.  The
  * single boot-then-exit lifecycle in main.c guarantees that.
  */
 void nxusNetExit(void) {
     if (!nxusNetRunning()) return;
     atomic_store_explicit(&g_Running, false, memory_order_release);
+    /* No new frame may be queued from here on: nxusNetSend()/SendFd() refuse
+       before they touch a slot or take a send lock the teardown is about to
+       use. */
+    atomic_store_explicit(&g_TableReady, false, memory_order_release);
 
-    /* Phase 1 - stop the I/O.  Both descriptors are shut down (never closed) under
-       g_SendMutex, which is also the lock every close of a published descriptor
-       takes: while it is held the numbers cannot be recycled, so both shutdowns
-       hit their own socket and not one that replaced it.  This wakes the server
-       thread out of poll()/recv()/accept() immediately instead of at its next
-       slice, and it is the precondition for phase 3 closing the descriptors. */
-    mutexLock(&g_SendMutex);
-    const int client_fd = peekClientFd();
-    if (client_fd >= 0) shutdown(client_fd, SHUT_RDWR);
+    const u64 deadline = armGetSystemTick() +
+                         armNsToTicks((u64)NXUS_NET_EXIT_WAIT_MS * 1000000ull);
+
+    /* Phase 1 - stop the I/O.  Every descriptor is shut down (never closed) under
+       its own lock, which is also the lock every close takes: while it is held the
+       number cannot be recycled, so the shutdown hits its own socket and not one
+       that replaced it.  This wakes every thread out of poll()/recv()/accept()
+       immediately instead of at its next slice, and it is the precondition for
+       phase 4 closing the descriptors. */
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        clientShutdown(&g_Clients[i]);
+    }
+    mutexLock(&g_ListenMutex);
     const int listen_fd = peekListenFd();
     if (listen_fd >= 0) shutdown(listen_fd, SHUT_RDWR);
-    mutexUnlock(&g_SendMutex);
+    mutexUnlock(&g_ListenMutex);
 
-    /* Phase 2 - bounded join. */
-    const bool joined = waitServerThreadDone(NXUS_NET_EXIT_WAIT_MS);
-    if (joined) {
+    /* Phase 2 - bounded join of the accept thread.  Join it first: it is the
+       reaper, so the client slots must not be touched until it is gone. */
+    const bool server_joined = waitServerThreadDone(deadline);
+    if (server_joined) {
         /* The flag is the thread's last statement, so this cannot block for long. */
         threadWaitForExit(&g_ServerThread);
         threadClose(&g_ServerThread);
     } else {
-        NXUS_LOG_ERROR("net exit: server thread still busy after %u ms - abandoning the join",
+        NXUS_LOG_ERROR("net exit: accept thread still busy after %u ms - abandoning the join",
                        (unsigned)NXUS_NET_EXIT_WAIT_MS);
-        NXUS_LOG("net exit: bsd session left to process exit (socketExit() would run "
-                 "while the thread still uses it); thread handle and rx buffer (ptr=%p) "
-                 "left to process exit as well - the shut-down sockets are still closed",
-                 (void *)g_RxBuffer);
     }
 
-    /* Phase 3 - descriptors, on both paths.  After a joined thread the slots are
-       stable, so claim whatever they hold now (a listener rebuilt between phase 1
-       and the join would otherwise leak).  On the deadline path only the numbers
-       shut down in phase 1 may be closed: anything newer was never shut down and
-       belongs to the thread that is still running. */
-    mutexLock(&g_SendMutex);
-    const int claimed_client = claimClientFd(joined ? peekClientFd() : client_fd);
-    if (claimed_client >= 0) close(claimed_client);
-    const int claimed_listen = claimListenFd(joined ? peekListenFd() : listen_fd);
+    /* Phase 3 - bounded join of every connection thread.  Only after the accept
+       thread is gone: it joins finished slots itself, and a second join of the
+       same Thread would free its stack twice. */
+    bool all_clients_joined = true;
+    if (server_joined) {
+        for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+            if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+            NxusNetClient *client = &g_Clients[i];
+
+            if (!waitClientDone(client, deadline)) {
+                all_clients_joined = false;
+                NXUS_LOG_ERROR("net exit: client fd=%d still busy - abandoning its thread "
+                               "(stack=%p rx=%p left to process exit)",
+                               nxusNetSlotFd(client->slot), (void *)client->stack,
+                               (void *)client->rx);
+                continue;
+            }
+            threadWaitForExit(&client->thread);
+            threadClose(&client->thread);
+            free(client->stack);
+            client->stack = NULL;
+            /* serveClient()/clientThread() already freed it before `done`. */
+            free(client->rx);
+            client->rx = NULL;
+            client->rx_cap = 0;
+            nxusNetSlotReaped(&g_Slots[i]);
+        }
+    } else {
+        /* The accept thread may still be reaping a slot; leave every client
+           resource alone and only shut the sockets down (already done). */
+        all_clients_joined = false;
+    }
+
+    /* Phase 4 - descriptors, on both paths.  After a joined thread the slot is
+       stable and its fd is -1 (the thread closed it); whatever is left belongs to
+       an abandoned thread that was shut down in phase 1, so closing it here cannot
+       land on a live socket. */
+    for (int i = 0; i < NXUS_NET_MAX_CLIENTS; i++) {
+        if (!nxusNetSlotInUse(&g_Slots[i])) continue;
+        const int fd = clientTakeFd(&g_Clients[i]);
+        if (fd >= 0) close(fd);
+    }
+    mutexLock(&g_ListenMutex);
+    const int claimed_listen = claimListenFd(peekListenFd());
     if (claimed_listen >= 0) close(claimed_listen);
-    mutexUnlock(&g_SendMutex);
+    mutexUnlock(&g_ListenMutex);
 
-    /* Phase 4 - only safe once the thread is really gone (see the table above). */
-    if (!joined) return;
+    /* Phase 5 - only safe once every thread is really gone (see the table above). */
+    if (!server_joined || !all_clients_joined) {
+        NXUS_LOG("net exit: bsd session left to process exit (socketExit() would run "
+                 "while a thread still uses it); abandoned thread resources and handles "
+                 "are left to process exit as well");
+        return;
+    }
 
-    free(g_RxBuffer);
-    g_RxBuffer = NULL;
     socketExit();
 }
 

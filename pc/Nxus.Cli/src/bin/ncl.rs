@@ -80,6 +80,9 @@ const GREEN: Color32 = Color32::from_rgb(104, 208, 128);
 const RED: Color32 = Color32::from_rgb(244, 112, 112);
 const YELLOW: Color32 = Color32::from_rgb(238, 200, 96);
 const DIM: Color32 = Color32::from_rgb(150, 156, 166);
+/// The idle status line: the last message, kept on screen but clearly "already
+/// said" (a live toast uses [`DIM`]).
+const FAINT: Color32 = Color32::from_rgb(104, 110, 120);
 
 const JP_FONT: &[u8] = include_bytes!("../../assets/fonts/MPLUS1p-Regular.ttf");
 
@@ -1676,6 +1679,84 @@ fn scan_library(dir: &Path) -> (Vec<LibFile>, Option<String>) {
 }
 
 // ---------------------------------------------------------------------------
+// Status toasts
+// ---------------------------------------------------------------------------
+
+// The bottom status bar used to be a single `message` that every event
+// overwrote, so a burst (connect, retry, job start, its reply) replaced the
+// line faster than it could be read.  NCL is a separate binary and cannot use
+// `gui::mod`'s copy, so the small queue lives here too - same rules, same
+// thresholds as `nxus.exe`'s status bar (see `gui/mod.rs`).
+//
+// Keep the two in step: TOAST_DWELL / TOAST_PRIORITY_DWELL / TOAST_QUEUE_MAX
+// are deliberately identical, so both windows behave the same way.
+
+/// How long one queued line stays on screen before the next one takes over.
+const TOAST_DWELL: Duration = Duration::from_millis(1200);
+/// A priority line (an error, a lost link, a busy refusal) stays longer.
+const TOAST_PRIORITY_DWELL: Duration = Duration::from_millis(2500);
+/// Lines waiting for their turn; the oldest are dropped past this.
+const TOAST_QUEUE_MAX: usize = 32;
+/// `Toast::priority` of a line that interrupts whatever is on screen.
+const TOAST_PRIORITY: u8 = 2;
+/// Words that make a line important (case-insensitive).
+const TOAST_PRIORITY_WORDS: [&str; 5] = ["error", "lost", "busy", "failed", "stopped"];
+
+/// One line of the bottom status bar, waiting for (or getting) its turn.
+struct Toast {
+    text: String,
+    /// When this line took the screen (or was last refreshed by a repeat).
+    shown_at: Instant,
+    /// How often the same message arrived in a row: shown as `(x3)`.
+    repeats: u32,
+    /// 0 = normal, [`TOAST_PRIORITY`] = interrupts and stays longer.
+    priority: u8,
+}
+
+impl Toast {
+    fn dwell(&self) -> Duration {
+        if self.priority >= TOAST_PRIORITY {
+            TOAST_PRIORITY_DWELL
+        } else {
+            TOAST_DWELL
+        }
+    }
+
+    /// The line, how often it was repeated, and whether more is waiting.
+    fn render(&self, more_waiting: bool) -> String {
+        let mut text = self.text.clone();
+        if self.repeats > 1 {
+            text.push_str(&format!(" (x{})", self.repeats));
+        }
+        if more_waiting {
+            text.push_str(" …");
+        }
+        text
+    }
+}
+
+fn toast_priority(text: &str) -> u8 {
+    let lower = text.to_ascii_lowercase();
+    if TOAST_PRIORITY_WORDS.iter().any(|word| lower.contains(word)) {
+        TOAST_PRIORITY
+    } else {
+        0
+    }
+}
+
+/// The message part of a line: `log()`'s `[  12.3s]` stamp is not part of it,
+/// so the same message logged twice is still "the same message".
+fn toast_key(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix('[') else { return text };
+    let Some(end) = rest.find(']') else { return text };
+    if rest[..end].trim_end().ends_with('s') {
+        rest[end + 1..].trim_start()
+    } else {
+        text
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -1722,7 +1803,13 @@ struct NclApp {
     busy: Option<BusyJob>,
     /// The 10 s watchdog warning was already logged for the current job.
     watchdog_warned: bool,
-    message: String,
+    /// The bottom status bar's queue (see [`Toast`]).  Messages are pushed
+    /// here instead of overwriting one string, so a burst of events is
+    /// readable.
+    toasts: VecDeque<Toast>,
+    /// The line the bar shows while the queue is empty: the last one that was
+    /// displayed, kept instead of blanking the bar.
+    last_shown: String,
 
     live: Option<LiveView>,
     live_text: Option<String>,
@@ -1785,7 +1872,8 @@ impl NclApp {
             worker: Worker::spawn(),
             busy: None,
             watchdog_warned: false,
-            message: "ready".to_string(),
+            toasts: VecDeque::new(),
+            last_shown: "ready".to_string(),
             live: None,
             live_text: None,
             editor: EditorState::default(),
@@ -1833,13 +1921,97 @@ impl NclApp {
         app
     }
 
+    /// Append a line to the log AND queue it for the status bar.
+    ///
+    /// The signature is unchanged: every caller keeps working, but the status
+    /// line is no longer overwritten - the line waits its turn (see [`Toast`]).
     fn log(&mut self, message: impl Into<String>) {
         let elapsed = self.started.elapsed().as_secs_f64();
-        self.log
-            .push_back(format!("[{elapsed:6.1}s] {}", message.into()));
+        let line = format!("[{elapsed:6.1}s] {}", message.into());
+        self.toast(line.clone());
+        self.log.push_back(line);
         while self.log.len() > MAX_LOG_LINES {
             self.log.pop_front();
         }
+    }
+
+    /// Queue a status line without adding it to the log list.
+    fn toast(&mut self, message: impl Into<String>) {
+        self.push_toast(message.into());
+    }
+
+    fn push_toast(&mut self, text: String) {
+        let now = Instant::now();
+        let priority = toast_priority(&text);
+        // The same line again is one line with a counter.
+        if let Some(index) = self.repeat_of(&text, priority) {
+            let toast = &mut self.toasts[index];
+            toast.repeats = toast.repeats.saturating_add(1);
+            toast.text = text;
+            toast.shown_at = now;      // give the "(x2)" time to be read
+            return;
+        }
+        let toast = Toast { text, shown_at: now, repeats: 1, priority };
+        if priority >= TOAST_PRIORITY {
+            // Interrupt: what is on screen goes back to the front of the queue.
+            self.toasts.push_front(toast);
+        } else {
+            self.toasts.push_back(toast);
+        }
+        while self.toasts.len() > TOAST_QUEUE_MAX && self.toasts.len() > 1 {
+            if priority >= TOAST_PRIORITY {
+                self.toasts.remove(1);   // the oldest waiting line, never the new one
+            } else {
+                self.toasts.pop_front();
+            }
+        }
+    }
+
+    /// The queued line `text` repeats, if any.  A normal line repeats the newest
+    /// entry; a priority line lands at the FRONT, so that is where a repeat of it
+    /// has to be looked for.
+    fn repeat_of(&self, text: &str, priority: u8) -> Option<usize> {
+        let key = toast_key(text);
+        let last = self.toasts.len().checked_sub(1)?;
+        let candidates: [usize; 2] =
+            if priority >= TOAST_PRIORITY { [0, last] } else { [last, last] };
+        candidates.into_iter().find(|&index| {
+            self.toasts
+                .get(index)
+                .map(|queued| toast_key(&queued.text) == key)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Retire the lines whose dwell is over.  Called once per frame.
+    fn advance_toasts(&mut self) {
+        let now = Instant::now();
+        loop {
+            let Some(front) = self.toasts.front() else { break };
+            if now.duration_since(front.shown_at) < front.dwell() {
+                break;
+            }
+            let shown = self.toasts.pop_front().expect("the front was just read");
+            self.last_shown = shown.text;
+            if let Some(next) = self.toasts.front_mut() {
+                next.shown_at = now;     // its dwell starts now, not when queued
+            }
+        }
+    }
+
+    /// What the status bar shows: the current toast, else the last line.
+    fn current_status(&self) -> String {
+        if let Some(front) = self.toasts.front() {
+            return front.render(self.toasts.len() > 1);
+        }
+        self.last_shown.clone()
+    }
+
+    /// How long until the line on screen may be replaced: the frame clock has to
+    /// be asked, or the queue would only advance on mouse movement.
+    fn toast_wait(&self) -> Option<Duration> {
+        let front = self.toasts.front()?;
+        Some(front.dwell().saturating_sub(front.shown_at.elapsed()))
     }
 
     /// Send a job and start waiting for it.
@@ -1856,15 +2028,15 @@ impl NclApp {
                 // "Tick now" while a tick is in flight: do nothing at all.  It
                 // must not rewrite the state, or the tick that is really
                 // running would never clear it.
-                self.message = "a loop tick is already running".to_string();
+                self.toast("a loop tick is already running");
                 return false;
             }
             if !busy.kind.is_soft() {
-                self.message = format!(
+                self.toast(format!(
                     "busy: {} for {} s - press Disconnect to abort it",
                     busy.kind.label(),
                     busy.elapsed().as_secs()
-                );
+                ));
                 if job.is_priority() {
                     // A priority job that reaches here is a programming error:
                     // the callers use `abort_busy` instead.  Say so instead of
@@ -1886,7 +2058,7 @@ impl NclApp {
         if !self.worker.send(job) {
             self.log("the worker is gone - restarting it");
             self.restart_worker();
-            self.message = "the worker was restarted; try again".to_string();
+            self.toast("the worker was restarted; try again");
             return false;
         }
         self.busy = Some(BusyJob::new(kind));
@@ -1894,7 +2066,7 @@ impl NclApp {
         // A tick must not overwrite the log line the user is reading four times
         // a second.
         if !kind.is_soft() {
-            self.message = kind.label().to_string();
+            self.toast(kind.label());
         }
         true
     }
@@ -1926,11 +2098,11 @@ impl NclApp {
         self.live_text = None;
         self.restart_worker();
         self.last_tick = Instant::now();
-        self.message = format!(
+        self.toast(format!(
             "aborted {} after {seconds} s - the console session was abandoned (patches were not \
              restored here); connect again and press Panic OFF",
             busy.kind.label()
-        );
+        ));
         true
     }
 
@@ -1973,8 +2145,7 @@ impl NclApp {
         self.live = None;
         self.live_text = None;
         self.log("the worker exited unexpectedly - started a fresh one");
-        self.message =
-            "the worker stopped (it crashed); a fresh one is ready - connect again".to_string();
+        self.toast("the worker stopped (it crashed); a fresh one is ready - connect again");
     }
 
     /// 10 s without an answer is already a bug or a dead console: say so.  At
@@ -2030,7 +2201,7 @@ impl NclApp {
                     ""
                 }
             ),
-            _ => self.message.clone(),
+            _ => self.current_status(),
         }
     }
 
@@ -2055,7 +2226,7 @@ impl NclApp {
     fn connect(&mut self) {
         let host = self.host.trim().to_string();
         if host.is_empty() {
-            self.message = "enter the console IP address".to_string();
+            self.toast("enter the console IP address");
             return;
         }
         let port = self.port.trim().parse::<u16>().unwrap_or(DEFAULT_PORT);
@@ -2081,8 +2252,7 @@ impl NclApp {
     fn handle_event(&mut self, event: Ev) {
         match event {
             Ev::Opened(view, text) => {
-                self.message = format!("opened {}", view.target.path.display());
-                self.log(self.message.clone());
+                self.log(format!("opened {}", view.target.path.display()));
                 self.editor.path = view.target.path.clone();
                 self.editor.build_id = view.target.build_id.clone();
                 self.execution = view.target.execution;
@@ -2099,13 +2269,11 @@ impl NclApp {
                 self.refresh_library();
             }
             Ev::Updated(view, message) => {
-                self.message = message.clone();
                 self.log(message);
                 self.execution = view.target.execution;
                 self.live = Some(view);
             }
             Ev::Restored(view, message, complete) => {
-                self.message = message.clone();
                 self.log(message);
                 self.execution = view.target.execution;
                 self.live = Some(view);
@@ -2147,11 +2315,9 @@ impl NclApp {
             Ev::Error(error) => {
                 // No longer clears `busy`: an error that belongs to some other
                 // job must not release the one in flight.
-                self.message = error.clone();
                 self.log(format!("error: {error}"));
             }
             Ev::Disconnected(message) => {
-                self.message = message.clone();
                 self.log(message);
                 self.live = None;
                 self.live_text = None;
@@ -2192,12 +2358,10 @@ impl NclApp {
         match self.editor.load(&path) {
             Ok(()) => {
                 self.tab = Tab::Editor;
-                self.message = format!("loaded {}", path.display());
-                self.log(self.message.clone());
+                self.log(format!("loaded {}", path.display()));
                 self.refresh_parse();
             }
             Err(error) => {
-                self.message = error.clone();
                 self.log(format!("error: {error}"));
             }
         }
@@ -2283,15 +2447,13 @@ impl NclApp {
         let path = match self.editor_path() {
             Ok(path) => path,
             Err(error) => {
-                self.message = error.clone();
                 self.log(format!("error: {error}"));
                 return;
             }
         };
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
-                self.message = format!("cannot create {}: {error}", parent.display());
-                self.log(self.message.clone());
+                self.log(format!("error: cannot create {}: {error}", parent.display()));
                 return;
             }
         }
@@ -2302,8 +2464,7 @@ impl NclApp {
                 self.refresh_parse();
                 // Off the UI thread: this parses every file in `cheats/`.
                 self.refresh_library();
-                self.message = format!("saved {}", path.display());
-                self.log(self.message.clone());
+                self.log(format!("saved {}", path.display()));
                 if let Some(live) = &self.live {
                     if live.target.path == path {
                         self.submit(Job::ReloadFile);
@@ -2311,8 +2472,7 @@ impl NclApp {
                 }
             }
             Err(error) => {
-                self.message = format!("save failed: {error}");
-                self.log(self.message.clone());
+                self.log(format!("error: save failed: {error}"));
             }
         }
     }
@@ -2345,9 +2505,9 @@ impl NclApp {
                 self.editor.build_id = live.target.build_id.clone();
             }
             self.refresh_parse();
-            self.message = "loaded the connected target's cheat file".to_string();
+            self.toast("loaded the connected target's cheat file");
         } else {
-            self.message = "connect first".to_string();
+            self.toast("connect first");
         }
     }
 
@@ -2484,9 +2644,12 @@ impl NclApp {
                 // "busy since N s": the watchdog state is visible, not just a
                 // message that never changes while a job hangs.
                 let stuck = self.stuck_for();
+                // A queued message is live; an empty queue keeps the last line
+                // dimmed instead of blanking the bar.
+                let live = !self.toasts.is_empty() || self.busy.is_some();
                 ui.label(
                     RichText::new(self.busy_text())
-                        .color(if stuck.is_some() { RED } else { DIM }),
+                        .color(if stuck.is_some() { RED } else if live { DIM } else { FAINT }),
                 );
                 if stuck.is_some() {
                     if ui
@@ -2882,7 +3045,7 @@ impl NclApp {
             {
                 let path = self.editor.path.clone();
                 if path.as_os_str().is_empty() {
-                    self.message = "enter a file path first".to_string();
+                    self.toast("enter a file path first");
                 } else {
                     self.open_file(path);
                 }
@@ -3328,6 +3491,8 @@ impl eframe::App for NclApp {
         self.drain_events();
         self.poll_worker();
         self.poll_watchdog();
+        // Retire the status lines whose dwell is over before drawing them.
+        self.advance_toasts();
         if self.pending_close {
             self.pending_close = false;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3382,6 +3547,13 @@ impl eframe::App for NclApp {
             // コンソール実行ではループが無くても tick を回す（状態取得と
             // fault の監視）。フレーム時計を止めると、それも止まる。
             ui.ctx().request_repaint_after(TICK_INTERVAL);
+        }
+        // The toast queue runs on a wall clock too: without this the next line
+        // would appear only when the user moved the mouse.
+        // `request_repaint_after` keeps the earliest request, so this never
+        // delays the polls above.
+        if let Some(wait) = self.toast_wait() {
+            ui.ctx().request_repaint_after(wait);
         }
     }
 }

@@ -12,6 +12,9 @@ const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
 const GREEN: Color32 = Color32::from_rgb(0x5A, 0xD0, 0x8A);
 const YELLOW: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x66);
 const DIM: Color32 = Color32::from_rgb(0x9A, 0xA3, 0xB0);
+/// The idle status line: the last message, kept on screen but clearly "already
+/// said" (the live queue uses [`DIM`]).
+const FAINT: Color32 = Color32::from_rgb(0x6B, 0x72, 0x7C);
 const RED: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 
 /// "The hit list is incomplete" badge, built the same way as the STOPPED badge in
@@ -140,7 +143,12 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
             if app.st.busy {
                 ui.spinner();
             }
-            ui.label(RichText::new(&app.st.last_message).color(DIM));
+            // The toast queue decides the line: a queued message is live, an
+            // empty queue leaves the last one dimmed instead of blanking the bar.
+            let live = app.st.has_toast();
+            ui.label(RichText::new(app.st.current_status())
+                .color(if live { DIM } else { FAINT }))
+                .on_hover_text("every message is also kept in the LOG panel below");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let target = match (&app.st.status, &app.st.metadata) {
                     (Some(status), Some(md)) => format!(

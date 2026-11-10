@@ -1,9 +1,18 @@
 /* Nxus command dispatcher. */
 #pragma once
 
-#include <switch.h>
-
 #include "nxus_protocol.h"
+
+#ifdef __SWITCH__
+#include <switch.h>
+#else
+/* The pure command-classification helpers at the bottom of this header are
+   compiled by the host test (tests/test_server_logic.c), which has no libnx.
+   libnx's Result is a u32 and nothing else here needs the console's <switch.h>;
+   redeclaring an identical typedef is legal C11, so a test that also includes the
+   libnx stub header keeps compiling. */
+typedef u32 Result;
+#endif
 
 #define NXUS_MAX_HITS_PER_BATCH 8192u
 #define NXUS_DEBUG_SERVER_MAX_BREAKS  8u
@@ -71,6 +80,113 @@ void nxusServerHandle(int fd, const NxusPacketHeader *header, const u8 *payload,
 /* Called periodically from the main loop: watchdog + deferred work.  A no-op after
    nxusServerExit() (everything it would maintain has been released). */
 void nxusServerTick(void);
+
+/* ---- which commands may run concurrently --------------------------------
+ *
+ * The TCP transport serves up to NXUS_NET_MAX_CLIENTS connections at once, one
+ * thread per connection (shared/nxus_net.h).  Every command is therefore either
+ * READ-ONLY - several connections may run it at the same time - or MUTATING, in
+ * which case nxus_server.c runs it under one global command mutex, so the session
+ * state (scan/hit list, snapshots, freeze table, debug handle, cheat engine,
+ * config) is still only ever changed by one command at a time.  That is the
+ * invariant the old single-connection server got for free, and it is why the
+ * read-only set is a whitelist: anything not listed here is treated as mutating.
+ *
+ * The split follows what the command does, not which subsystem it belongs to:
+ *
+ *   read-only : observe state - status/metadata, mapping/module/process views,
+ *               memory reads/queries, scan status/hits, frozen/cheat/debug LIST
+ *               and status reads, the log.
+ *   mutating  : change state - start/refine/cancel/reset a scan, capture or
+ *               release snapshots, pointer-scan begin/get and cheat export (they
+ *               read the shared chain list a walk replaces), write memory, enable
+ *               or disable a freeze/cheat, attach/detach/continue/step the
+ *               debugger, set registers/breakpoints/hits, config, pause, resume.
+ *
+ * Deliberate exceptions, all for liveness:
+ *   - Nop is read-only: the protocol's "are you still there?" probe touches no
+ *     state.
+ *   - Heartbeat is read-only: it only refreshes the session's idle clock, and it
+ *     must keep flowing while another client is inside a long mutating command -
+ *     otherwise the pause watchdog would resume the target mid-operation.
+ *   - GetMetadata/GetStatus publish the identity cache they read; they are reads
+ *     for every other purpose and must not wait behind a 90 s scan.
+ *
+ * Snapshot commands and the pointer-scan commands are NOT part of the scan family
+ * below even though they are also scans in the user's sense: they own their own
+ * slots/worker and already refuse each other (and a running search) through the
+ * existing BUSY gates, while the "scan session" this header talks about is the hit
+ * list plus the scan worker.
+ */
+static inline bool nxusServerCommandIsReadOnly(u16 cmd) {
+    switch (cmd) {
+        /* liveness only */
+        case NxusCmd_Nop:
+        case NxusCmd_Heartbeat:
+        /* status / identity */
+        case NxusCmd_GetStatus:
+        case NxusCmd_GetMetadata:
+        /* address-space views and memory reads */
+        case NxusCmd_GetModules:
+        case NxusCmd_GetProcesses:
+        case NxusCmd_GetMappingCount:
+        case NxusCmd_GetMappings:
+        case NxusCmd_Query:
+        case NxusCmd_Read:
+        /* scan results (the scan mutations are listed below) */
+        case NxusCmd_ScanStatus:
+        case NxusCmd_ScanGetHits:
+        /* freeze / cheat list reads */
+        case NxusCmd_FrozenList:
+        case NxusCmd_CheatList:
+        case NxusCmd_CheatStatus:
+        /* debugger reads */
+        case NxusCmd_DebugStatus:
+        case NxusCmd_BreakList:
+        case NxusCmd_ThreadList:
+        case NxusCmd_RegsGet:
+        case NxusCmd_HitGet:
+        /* log */
+        case NxusCmd_LogGet:
+        /* Defined in the protocol but not implemented by this build: classify by
+           intent so a future handler lands on the right side. */
+        case NxusCmd_ProbeGet:
+            return true;
+
+        /* Everything else - including Pause/Resume, ForceOpen/Close, Write, the
+           scan mutations, both snapshot sides, PtrScanBegin/PtrScanGet,
+           CheatExport, FrozenEnable/Disable, CheatToggle, the debug attach/detach/
+           continue/step and register/breakpoint/hit mutations, Config, ProbeRun
+           and the cheat upload/run commands - changes state or reads state a
+           mutating command replaces, and is serialised.  The default is "mutating"
+           so an unknown/future command id can never run concurrently with a
+           command that does something. */
+        default:
+            return false;
+    }
+}
+
+/* Commands that read or drive the shared search session (the hit list and the
+ * scan worker).  The connection that successfully starts or refines a scan owns
+ * that session until it disconnects: another client asking for the status or the
+ * hits, or trying to start/refine/cancel one, is answered with
+ * NXUS_REASON_BUSY_STATE instead of being shown - or allowed to disturb - the
+ * owner's results.  Keep this a subset of the commands dispatchCommand() handles:
+ * the host test walks every NxusCmd value and pins both classifications. */
+static inline bool nxusServerCommandIsScanFamily(u16 cmd) {
+    switch (cmd) {
+        case NxusCmd_ScanBegin:
+        case NxusCmd_ScanNext:
+        case NxusCmd_ScanStatus:
+        case NxusCmd_ScanCancel:
+        case NxusCmd_ScanGetHits:
+        case NxusCmd_ScanReset:
+        case NxusCmd_ScanUndo:
+            return true;
+        default:
+            return false;
+    }
+}
 
 /* True from the moment nxusServerExit() raised the terminal gate (until the next
    nxusServerInit()).  Exposed for the workers this file does not own: a thread that

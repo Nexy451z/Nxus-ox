@@ -1,24 +1,68 @@
 /*
  * Nxus TCP transport.
  *
- * One client at a time (dmnt:cht only allows two debug sessions, so Nxus takes
- * exactly one).  Sends are serialised through a mutex because the response
- * thread, the watchdog and (later) the HID thread all write to the same socket.
+ * CONNECTION MODEL
+ * ----------------
+ * The listener is served by one accept thread; every accepted connection gets
+ * its OWN thread and its OWN receive buffer, up to NXUS_NET_MAX_CLIENTS (4)
+ * concurrent clients.  A fifth connection (or one accepted while no thread can
+ * be created) is answered with the BUSY frame nxusNetFillBusyPayload() describes
+ * and closed immediately, so the PC clients see a retryable refusal instead of a
+ * silent reset.  There is no preemption any more: a live session is never cut by
+ * a newcomer, and a newcomer is never refused just because somebody else is
+ * connected.
  *
- * Reconnects are cooperative: a client waiting for the next command watches the
- * listen socket as well, but a new connection preempts the registered client ONLY
- * when that client has been silent for NXUS_NET_PREEMPT_IDLE_NS (8 s = two missed
- * 4 s heartbeats).  A live session (the normal case) keeps its socket; the
- * newcomer is accepted, answered with BUSY and closed, so an auto-reconnect or a
- * second launcher can no longer knock a healthy NCL/GUI session out.  A half-open
- * session (console slept, PC vanished without a FIN) is still released to the new
- * client after that threshold.  After a sleep/wake cycle (or a dropped link) the
- * bsd session itself is rebuilt on the fly, so the port never stays dead and a
- * reconnect succeeds immediately.
+ * Sends are serialised per connection (one mutex per slot) because the reply
+ * thread, the watchdog, the debug/cheat workers and the HID thread all write to
+ * the sockets.  nxusNetSendFd() writes to the one connection the handler was
+ * called for; nxusNetSend()/nxusNetSendEvent() broadcast to every connected
+ * client (async events are not addressed to one session).
+ *
+ * MEMORY
+ * ------
+ * A receive buffer is allocated when the connection is accepted:
+ * NXUS_NET_RX_IDLE_SIZE (128 KiB) up front.  It grows on demand - and only up to
+ * the frame being received - to at most NXUS_NET_BUF_SIZE (1 MiB, the protocol's
+ * largest allowed payload).  A connection that has not needed a frame larger than
+ * the idle size for NXUS_NET_RX_SHRINK_IDLE_NS is shrunk back to 128 KiB again
+ * (heartbeats count as activity, but they do not keep a large buffer alive).
+ * The transport therefore never holds more
+ * than NXUS_NET_MAX_CLIENTS * NXUS_NET_BUF_SIZE = 4 MiB of receive buffers (plus
+ * NXUS_NET_MAX_CLIENTS * NXUS_NET_CLIENT_STACK_SIZE = 128 KiB of thread stacks),
+ * and normally holds 4 * 128 KiB = 512 KiB.  A frame whose payload cannot be
+ * accommodated (allocation failed, or above NXUS_NET_BUF_SIZE) is refused with
+ * BAD_STATE + NXUS_REASON_BAD_LENGTH and the connection is dropped, because the
+ * unread payload would desync the stream; the failure is logged.  This keeps the
+ * shared 8 MiB heap bounded and makes an allocation failure a clean refusal
+ * rather than an out-of-memory abort.
+ *
+ * THREADING CONTRACT FOR THE HANDLER
+ * ----------------------------------
+ * NxusNetHandler runs on the connection's own thread.  Several handlers may run
+ * concurrently (one per client); the dispatcher serialises the mutating commands
+ * itself (see switch/include/nxus_server.h).  A handler must only use the `fd`
+ * it was given for replies - the session is no longer "the one client".
+ *
+ * NxusNetCloseHandler runs once per served connection after the handler loop
+ * ends, on that connection's thread, after the descriptor has been unregistered
+ * (no sender can reach it any more) but before it is closed, so the number is
+ * still unique.  It must not block for long: nxusNetExit() waits at most
+ * NXUS_NET_EXIT_WAIT_MS for the client threads.
+ *
+ * SHUTDOWN
+ * --------
+ * nxusNetExit() stops accepting, shuts every socket down, then joins the accept
+ * thread and every client thread within NXUS_NET_EXIT_WAIT_MS in total.  A
+ * thread that does not finish in that window (typically one parked in a 90 s
+ * pointer scan) is deliberately abandoned: its stack, rx buffer, Thread handle
+ * and socket are left to process exit.  That is the same "leak, never UAF" rule
+ * the single-session server used, and it is why nxusNetInit() must not be called
+ * again while such a thread may still be alive.
  */
 #pragma once
 
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -26,52 +70,47 @@
 #include "nxus_protocol.h"
 
 #ifndef __SWITCH__
-/* Host tests include this header (tests/test_server_logic.c) to pin the pending-
-   connection policy against the SHIPPED constant/helpers.  libnx's Result is a
-   u32 and nothing else here needs the console's <switch.h>; redeclaring an
-   identical typedef is legal C11, so a test that also includes the libnx stub
-   header keeps compiling. */
+/* Host tests include this header (tests/test_server_logic.c) to pin the
+   connection-slot policy against the SHIPPED helpers.  libnx's Result is a u32
+   and nothing else here needs the console's <switch.h>; redeclaring an identical
+   typedef is legal C11, so a test that also includes the libnx stub header keeps
+   compiling. */
 typedef u32 Result;
 #endif
 
-/* Big enough to carry a large read in one reply: the PC-side scanner reads the
-   target in chunks of (NXUS_NET_BUF_SIZE - header), so this directly divides
-   the number of round trips (the heap cost is one malloc of this size). */
+/* Largest payload a single frame may carry, in either direction.  This is also
+   the ceiling a connection's receive buffer may grow to (see MEMORY above). */
 #define NXUS_NET_BUF_SIZE (1024u * 1024u)
 
-/* How long the registered client may be silent before a pending connection is
-   allowed to take its place.  The PC heartbeat is 4 s, so 8 s is exactly two
-   missed heartbeats: a live session is never preempted (the old code cut at ~1 s
-   whenever the second client appeared), while a half-open socket is released. */
-#ifndef NXUS_NET_PREEMPT_IDLE_NS
-#define NXUS_NET_PREEMPT_IDLE_NS 8000000000ull
-#endif
+/* Concurrent connections the server serves.  Slots beyond this are refused with
+   BUSY; the count is fixed so the memory ceiling above is a compile-time one. */
+#define NXUS_NET_MAX_CLIENTS 4
 
-/* Reason word appended to the BUSY reply sent to a refused second connection.
-   core/nxus_protocol.h has no dedicated "another client owns the session" code
-   (the protocol header is the wire single source of truth and is not changed
-   here), so reuse BUSY_STATE - the retryable "the session is busy" reason that
-   every existing client already understands. */
+/* Per-connection thread stack (heap, page-aligned: libnx threadCreate() requires
+   page-aligned memory).  32 KiB is what the old single connection thread used. */
+#define NXUS_NET_CLIENT_STACK_SIZE (32u * 1024u)
+
+/* Every accepted connection starts with this receive buffer and is shrunk back
+   to it once idle; a frame that needs more grows it on demand. */
+#define NXUS_NET_RX_IDLE_SIZE (128u * 1024u)
+
+/* How long a connection may go without needing a frame larger than
+   NXUS_NET_RX_IDLE_SIZE before its enlarged receive buffer is shrunk back to the
+   idle size.  Long enough not to churn on a client that is merely thinking,
+   short enough that four normally-active clients cost 512 KiB, not 4 MiB. */
+#define NXUS_NET_RX_SHRINK_IDLE_NS 30000000000ull
+
+/* Reason word appended to the BUSY reply sent to a refused connection.
+   core/nxus_protocol.h has no dedicated "all client slots are in use" code (the
+   protocol header is the wire single source of truth and is not changed here), so
+   reuse BUSY_STATE - the retryable "the session is busy" reason that every
+   existing client already understands. */
 #define NXUS_NET_BUSY_REASON NXUS_REASON_BUSY_STATE
 
-/* Log wording for the two preemption outcomes.  Exposed so the host test can pin
-   the exact strings an operator greps for in the console log. */
-#define NXUS_NET_LOG_PREEMPT_FMT \
-    "recv: new connection pending while fd=%d was silent for %llu ms - preempting it"
+/* Log wording for a refused connection.  Exposed so the host test can pin the
+   exact strings an operator greps for in the console log. */
 #define NXUS_NET_LOG_BUSY_FMT \
-    "client busy: refused new connection from %s (fd=%d) - live fd=%d keeps the session"
-
-typedef enum {
-    NxusNetPending_Preempt = 0,   /* old client is stale: close it, serve the new one */
-    NxusNetPending_Busy    = 1,   /* old client is alive: refuse the new one with BUSY */
-} NxusNetPendingAction;
-
-/* The policy, kept pure so the host test pins it.  `idle_ns` is the time since
-   the registered client last had a byte RECEIVED (not since the last send). */
-static inline NxusNetPendingAction nxusNetPendingConnectionAction(u64 idle_ns) {
-    return idle_ns >= NXUS_NET_PREEMPT_IDLE_NS ? NxusNetPending_Preempt
-                                               : NxusNetPending_Busy;
-}
+    "client busy: refused new connection from %s (fd=%d) - all %d client slots are in use"
 
 /* BUSY reply payload: s32 Result followed by one u32 reason, the same shape
    replyErrorReason() in switch/source/nxus_server.c emits.  There is no request
@@ -83,19 +122,129 @@ static inline void nxusNetFillBusyPayload(s32 out[2]) {
     out[1] = (s32)NXUS_NET_BUSY_REASON;
 }
 
+/* ---- connection slots ----------------------------------------------------
+ *
+ * The slot table is the ONE decision point for "may this connection be served?":
+ * the accept thread claims a free slot before it creates the client thread, the
+ * serving thread marks the slot finished as its very last action, and the accept
+ * thread (or nxusNetExit()) reaps finished slots - joins the thread, frees the
+ * stack and only then makes the slot claimable again.
+ *
+ * A finished slot is therefore NOT free: its Thread handle and stack are still
+ * owned until the reaper has joined it.  That is what nxusNetSlotReapable() and
+ * the in_use/done split express, and it is the property the host test pins.
+ *
+ * The helpers are static inline so tests/test_server_logic.c exercises the
+ * shipped policy instead of a copy.  They are lock-free atomic because the send
+ * path reads `fd` without the table lock and the exit path reads the table while
+ * the accept thread may still be running.
+ */
+typedef struct {
+    atomic_int  fd;      /* -1 = free, else the connected client descriptor      */
+    atomic_bool in_use;  /* a serving thread owns (or is starting in) this slot  */
+    atomic_bool done;    /* the serving thread has finished; reapable once in_use */
+} NxusNetSlot;
+
+static inline void nxusNetSlotReset(NxusNetSlot *slot) {
+    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
+    atomic_store_explicit(&slot->in_use, false, memory_order_relaxed);
+    atomic_store_explicit(&slot->done, false, memory_order_relaxed);
+}
+
+static inline int nxusNetSlotFd(const NxusNetSlot *slot) {
+    return atomic_load_explicit(&slot->fd, memory_order_acquire);
+}
+
+/* Unregister the descriptor without closing it: every sender that looks the
+   connection up afterwards refuses, while the number stays unique (it is not
+   closed yet), so the close handler can still name this connection by fd. */
+static inline void nxusNetSlotClearFd(NxusNetSlot *slot) {
+    atomic_store_explicit(&slot->fd, -1, memory_order_release);
+}
+
+/* The serving thread's last action.  fd goes to -1 first (no more sends), then
+   done is published: this is the release store the reaper's acquire sees, so
+   "done == true" also means "rx buffer already released, thread about to exit". */
+static inline void nxusNetSlotFinish(NxusNetSlot *slot) {
+    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
+    atomic_store_explicit(&slot->done, true, memory_order_release);
+}
+
+static inline bool nxusNetSlotInUse(const NxusNetSlot *slot) {
+    return atomic_load_explicit(&slot->in_use, memory_order_acquire);
+}
+
+static inline bool nxusNetSlotDone(const NxusNetSlot *slot) {
+    return atomic_load_explicit(&slot->done, memory_order_acquire);
+}
+
+/* Finished AND still owned: the reaper may join this slot. */
+static inline bool nxusNetSlotReapable(const NxusNetSlot *slot) {
+    return nxusNetSlotInUse(slot) && nxusNetSlotDone(slot);
+}
+
+/* Claim a free slot for `fd` and return its index, or -1 when every slot is in
+ * use (or merely waiting to be reaped).  The CAS on in_use is the claim; the
+ * fields are written after it, and a slot is only ever claimable in the clean
+ * state nxusNetSlotReset()/nxusNetSlotReaped() leave behind (fd -1, done false). */
+static inline int nxusNetSlotClaim(NxusNetSlot *slots, int count, int fd) {
+    for (int i = 0; i < count; i++) {
+        NxusNetSlot *slot = &slots[i];
+        bool expected = false;
+        if (!atomic_compare_exchange_strong_explicit(&slot->in_use, &expected, true,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            continue;
+        }
+        atomic_store_explicit(&slot->done, false, memory_order_relaxed);
+        atomic_store_explicit(&slot->fd, fd, memory_order_release);
+        return i;
+    }
+    return -1;
+}
+
+/* The reaper's last action: release the slot for a later connection.  Only valid
+   once the thread has been joined and its stack freed (see nxusNetSlotReapable). */
+static inline void nxusNetSlotReaped(NxusNetSlot *slot) {
+    atomic_store_explicit(&slot->fd, -1, memory_order_relaxed);
+    atomic_store_explicit(&slot->done, false, memory_order_relaxed);
+    atomic_store_explicit(&slot->in_use, false, memory_order_release);
+}
+
+/* Slots that could accept a new connection right now.  Used for the BUSY log and
+   by the host test; a finished-but-unreaped slot does not count as free. */
+static inline int nxusNetSlotFreeCount(const NxusNetSlot *slots, int count) {
+    int free_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (!nxusNetSlotInUse(&slots[i])) free_count++;
+    }
+    return free_count;
+}
+
 typedef void (*NxusNetHandler)(int fd, const NxusPacketHeader *header,
                                const u8 *payload, u32 length, void *user);
+
+/* Called once per served connection, on its thread, after its descriptor has
+   been unregistered and before it is closed.  Optional. */
+typedef void (*NxusNetCloseHandler)(int fd, void *user);
 
 Result nxusNetInit(u16 port, NxusNetHandler handler, void *user);
 void   nxusNetExit(void);
 bool   nxusNetIsRunning(void);
 
-/* -1 when no client is connected.  Intended for status/logging and the
-   "is this still my session?" loops, NOT as the source of a send target: a value
-   read here can be closed and its descriptor number recycled into a new client
-   before the write starts.  The send helpers take the lock first and read the
-   registered descriptor themselves. */
+/* Install the per-connection close hook (nxusNetInit() can be called before or
+   after this; the hook is transport state, not connection state). */
+void   nxusNetSetCloseHandler(NxusNetCloseHandler handler, void *user);
+
+/* Descriptor of one connected client, or -1 when nobody is connected.  Intended
+   for status/logging and the "is any client connected?" loops, NOT as the source
+   of a send target: a value read here can be closed and its descriptor number
+   recycled into a new client before the write starts.  The send helpers take the
+   lock first and read the registered descriptor themselves. */
 int    nxusNetClientFd(void);
+
+/* Number of connected clients (0..NXUS_NET_MAX_CLIENTS). */
+int    nxusNetClientCount(void);
 
 /* armGetSystemTick() of the last packet byte received or of the last complete
    send.  The main loop uses this to tell a real sleep/wake (no traffic for a long
@@ -104,23 +253,28 @@ u64    nxusNetLastActivityTick(void);
 
 /* Thread-safe.  Returns an error if no client is connected or the write fails.
    `fd` must be the client the packet handler was called for: it is validated
-   against the registered descriptor under the send lock, so a stale (closed and
+   against the registered slot under the send lock, so a stale (closed and
    recycled) number is refused instead of being written to another session. */
 Result nxusNetSendFd(int fd, u16 type, u16 flags, u32 seq, const void *payload, u32 length);
+/* Broadcast: sends to every connected client and succeeds when at least one
+   received the frame.  This is the path for asynchronous events. */
 Result nxusNetSend(u16 type, u16 flags, u32 seq, const void *payload, u32 length);
 
 /* Convenience: empty success response / error response for a request seq. */
 Result nxusNetSendAck(u32 seq);
 Result nxusNetSendError(u32 seq, Result rc);
 
-/* Send an asynchronous event (flags = NXUS_FLAG_ASYNC, seq = 0). */
+/* Send an asynchronous event (flags = NXUS_FLAG_ASYNC, seq = 0) to every client. */
 Result nxusNetSendEvent(u16 type, const void *payload, u32 length);
 
 /* Send a response, splitting large payloads is the caller's problem for now. */
 Result nxusNetRespond(u32 seq, const void *payload, u32 length);
 
-/* Ask the server thread to drop the current client and rebuild the listener from
+/* Ask the server thread to drop every client and rebuild the listener from
  * scratch (sleep/wake, Wi-Fi rejoin, any other stale-bsd situation).  The flag is
- * picked up by the protocol thread within one poll slice (~200 ms), so the call
- * is safe from any thread and never blocks.  `reason` only shows up in the log. */
+ * picked up by the accept thread within one poll slice (~200 ms), so the call is
+ * safe from any thread and never blocks.  The bsd session itself is only torn
+ * down once every connection thread has left its socket, so a thread parked in a
+ * long handler defers the rebuild instead of having its session pulled from under
+ * it.  `reason` only shows up in the log. */
 void   nxusNetRequestReset(const char *reason);
