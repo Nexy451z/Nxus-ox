@@ -107,7 +107,10 @@ struct CheatRow {
     kind: String,
     mode: String,
     live: bool,
-    file_on: bool,
+    /// The file carried an ON marker when it was parsed (`[Name:ON]`).
+    ///
+    /// Display only: nothing is applied from it, and every save writes OFF.
+    saved_on: bool,
     /// ON, but the file was edited after it was applied: the console still runs
     /// (or the target still holds) the old code and nothing re-applies the new
     /// code by itself.
@@ -230,7 +233,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
             kind: block.kind.as_str().to_string(),
             mode: block.mode.as_str().to_string(),
             live: manager.is_enabled(block.key),
-            file_on: block.enabled,
+            saved_on: block.saved_enabled,
             stale: manager.is_stale(block.key),
             restore_only: block.is_restore_only(),
             trigger: block.has_keypad_trigger(),
@@ -2457,10 +2460,18 @@ impl NclApp {
                 return;
             }
         }
-        match save_text_atomic(&path, &self.editor.text) {
+        // A cheat file never records an ON state, so `[Name:ON]` / `@on` are
+        // rewritten to the OFF spelling on the way out.  Everything else is
+        // written exactly as typed.
+        let text = cheat::sanitize_on_markers(&self.editor.text);
+        match save_text_atomic(&path, &text) {
             Ok(()) => {
                 self.editor.path = path.clone();
-                self.editor.last_saved = self.editor.text.clone();
+                if text != self.editor.text {
+                    self.editor.text = text.clone();
+                    self.log("ON markers were removed: a cheat file always stores every block as OFF");
+                }
+                self.editor.last_saved = text;
                 self.refresh_parse();
                 // Off the UI thread: this parses every file in `cheats/`.
                 self.refresh_library();
@@ -2912,11 +2923,11 @@ impl NclApp {
                                 open_editor = true;
                             }
                             name.on_hover_text(format!(
-                                "line {}\nkey {}\nkind {}\nfile state: {}",
+                                "line {}\nkey {}\nkind {}\nsaved: {}",
                                 row.source_line,
                                 row.key,
                                 row.kind,
-                                if row.file_on { "ON" } else { "OFF" }
+                                if row.saved_on { "ON (not applied)" } else { "OFF" }
                             ));
                             ui.label(RichText::new(&row.mode).monospace().color(DIM));
                             let ops = if row.off_instructions > 0 {

@@ -977,8 +977,17 @@ pub struct CheatBlock {
     pub kind: CheatKind,
     pub mode: CheatExecMode,
     pub mode_source: ModeSource,
-    /// The file-level default state (`[Name:OFF]` / `@off`).
+    /// Runtime state: `true` only while the manager has this block applied.
+    ///
+    /// Loading a file always leaves it `false` — a cheat file cannot start a
+    /// cheat — and the writer never turns it into an ON marker on disk.
     pub enabled: bool,
+    /// What the file said when it was parsed (`[Name:ON]` / `@on`).
+    ///
+    /// Display only ("saved: ON").  It is never applied at startup and is
+    /// cleared on every save, because the writer always stores every block as
+    /// OFF.
+    pub saved_enabled: bool,
     pub on: CheatCode,
     pub off: Option<CheatCode>,
     pub explicit_off: bool,
@@ -997,7 +1006,8 @@ impl CheatBlock {
             kind,
             mode: CheatExecMode::Patch,
             mode_source: ModeSource::Auto,
-            enabled: true,
+            enabled: false,
+            saved_enabled: false,
             on: CheatCode::new(),
             off: None,
             explicit_off: false,
@@ -1312,7 +1322,8 @@ impl CheatDocument {
     ///
     /// Comments and blank lines inside bodies are emitted verbatim.  Only
     /// header state, explicit mode directives and the OFF divider style are
-    /// normalised.
+    /// normalised.  The state is always written as OFF: a cheat file never
+    /// records which cheats were on in the previous session.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for line in &self.preamble {
@@ -1331,12 +1342,13 @@ impl CheatDocument {
                 out.push_str(&block.header_extra);
                 out.push('\n');
 
-                // Disabled state is written as the unambiguous `@off`
-                // directive.  `[Name:OFF]` is reserved for a real restore
-                // section, so it can never swallow the ON code on reload.
-                if !block.enabled {
-                    out.push_str("@off\n");
-                }
+                // Every block is written as OFF, even one that is ON in memory.
+                // The state is not persisted: after the title or the console
+                // restarts the applied bytes are gone, so a saved ON would come
+                // back as a lie.  `@off` is the unambiguous OFF spelling;
+                // `[Name:OFF]` is reserved for a real restore section, so it can
+                // never swallow the ON code on reload.
+                out.push_str("@off\n");
                 match block.mode_source {
                     ModeSource::ExplicitLoop => out.push_str("@loop\n"),
                     ModeSource::ExplicitPatch => out.push_str("@patch\n"),
@@ -1371,11 +1383,17 @@ impl CheatDocument {
     }
 
     /// Write the document atomically to `path` (tmp + flush + rename).
+    ///
+    /// Every block is stored as OFF; the in-memory `saved_enabled` markers are
+    /// dropped because they no longer describe the file that was written.
     pub fn save_to(&mut self, path: &Path) -> Result<(), String> {
         let text = self.to_text();
         save_text_atomic(path, &text).map_err(|error| format!("{}: {error}", path.display()))?;
         self.path = Some(path.to_path_buf());
         self.raw_text = text;
+        for block in &mut self.blocks {
+            block.saved_enabled = false;
+        }
         self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
@@ -1465,6 +1483,16 @@ pub fn save_text_atomic(path: &Path, text: &str) -> io::Result<()> {
     }
 }
 
+/// Atomically replace `path` with cheat-file `text`, stripping ON markers.
+///
+/// Use this for text that did not go through [`CheatDocument::to_text`] (the
+/// raw editor, a new file): the store must never say a block is ON, or the next
+/// launch would show cheats that are not applied.  All other formatting is left
+/// exactly as typed — see [`crate::cheat::parser::sanitize_on_markers`].
+pub fn save_cheat_text_atomic(path: &Path, text: &str) -> io::Result<()> {
+    save_text_atomic(path, &crate::cheat::parser::sanitize_on_markers(text))
+}
+
 /// Format decoded instructions as canonical uppercase code lines.
 pub fn instructions_to_lines(instructions: &[Instruction]) -> Vec<String> {
     instructions
@@ -1528,6 +1556,32 @@ mod tests {
             fs::read_to_string(dir.join("ABC.txt.bak")).unwrap(),
             "first\n"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cheat_text_save_strips_on_markers() {
+        let dir = std::env::temp_dir().join(format!(
+            "nxus-model-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ABC.txt");
+        save_cheat_text_atomic(&path, "[A:ON]\n04000000 10000000 00000001\n@on\n").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[A]\n@off\n04000000"), "{text}");
+        assert!(!text.to_ascii_lowercase().contains(":on"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.trim().eq_ignore_ascii_case("@on")),
+            "{text}"
+        );
+        let document = CheatDocument::parse(&text, "0123456789ABCDEF");
+        assert!(document.blocks.iter().all(|block| !block.enabled));
+        assert!(document.blocks.iter().all(|block| !block.saved_enabled));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -22,8 +22,8 @@ use egui::{Color32, RichText};
 
 use crate::cheat::manager::CheatExecution;
 use crate::cheat::{
-    self, normalize_build_id, save_text_atomic, CheatDocument, CheatExecMode, CheatKey, CheatManager,
-    CheatMemoryIo, FailureKind, MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
+    self, normalize_build_id, save_cheat_text_atomic, CheatDocument, CheatExecMode, CheatKey,
+    CheatManager, CheatMemoryIo, FailureKind, MemoryRegions, TargetIdentity, MAX_CHEAT_FILE_BYTES,
 };
 use crate::client::{is_unsupported_command, CheatFault, CheatRestore, CheatStatus, NxusClient};
 use crate::protocol::{Metadata, Status};
@@ -92,7 +92,10 @@ struct CheatRow {
     kind: String,
     mode: String,
     live: bool,
-    file_on: bool,
+    /// The file carried an ON marker when it was parsed (`[Name:ON]`).
+    ///
+    /// Display only: nothing is applied from it, and every save writes OFF.
+    saved_on: bool,
     /// ON, but the file was edited after it was applied: the target still holds
     /// the old code and nothing re-applies the new code by itself.
     stale: bool,
@@ -208,7 +211,7 @@ fn make_view(manager: &CheatManager) -> LiveView {
             kind: block.kind.as_str().to_string(),
             mode: block.mode.as_str().to_string(),
             live: manager.is_enabled(block.key),
-            file_on: block.enabled,
+            saved_on: block.saved_enabled,
             stale: manager.is_stale(block.key),
             trigger: block.has_keypad_trigger(),
             instructions: block.on.instructions.len(),
@@ -1506,18 +1509,30 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 // that are ON are reconciled (edited ones become stale, deleted
                 // ones are restored) instead of the manager silently keeping a
                 // document the file no longer describes.
-                let mut reloaded = None;
+                //
+                // The store never records an ON state: the manager's own save
+                // strips ON markers, and a file no manager owns is written with
+                // them stripped here.  Everything else (comments, spacing, a
+                // half-finished block) is kept exactly as typed.
+                let text_to_write = cheat::sanitize_on_markers(&text);
                 let mut notes: Vec<String> = Vec::new();
+                if text_to_write != text {
+                    notes.push(
+                        "ON markers were removed: a cheat file always stores every block as OFF"
+                            .to_string(),
+                    );
+                }
+                let mut reloaded = None;
                 let mut written = false;
                 if let Some(current) = session.as_mut() {
                     if current.manager.path() == path {
                         let mut io = ClientCheatIo {
                             client: &current.client,
                         };
-                        match current.manager.save_raw_text(&text, &mut io) {
+                        match current.manager.save_raw_text(&text_to_write, &mut io) {
                             Ok(report) => {
                                 current.dirty = current.manager.dirty();
-                                notes = report.log_lines();
+                                notes.extend(report.log_lines());
                                 reloaded = Some(make_session_view(current));
                                 written = true;
                             }
@@ -1538,7 +1553,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                             continue;
                         }
                     }
-                    if let Err(error) = save_text_atomic(&path, &text) {
+                    if let Err(error) = save_cheat_text_atomic(&path, &text) {
                         let _ = tx.send(Ev::Error(format!("{}: {error}", path.display())));
                         continue;
                     }
@@ -1546,6 +1561,9 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Ev>, abort: Arc<AtomicBool>) {
                 for note in notes {
                     let _ = tx.send(Ev::Log(note));
                 }
+                // `text` stays the buffer that was submitted: the UI compares it
+                // with the editor to decide whether it can adopt the sanitized
+                // spelling without overwriting newer typing.
                 let _ = tx.send(Ev::Saved {
                     path,
                     text,
@@ -2008,8 +2026,20 @@ impl CheatUi {
                 }
             }
             Ev::Saved { path, text, view } => {
-                if self.editor.path == path && self.editor.text == text {
-                    self.editor.last_saved = text;
+                if self.editor.path == path {
+                    // The store always writes every block as OFF.  When the
+                    // buffer did not change while the write was in flight, show
+                    // the spelling that really reached the disk; otherwise the
+                    // newer typing wins and the dirty marker stays on.
+                    let written = cheat::sanitize_on_markers(&text);
+                    if self.editor.text == text && written != text {
+                        self.editor.text = written.clone();
+                        self.editor.preview = None;
+                        self.editor.parsed_text.clear();
+                    }
+                    if self.editor.text == written {
+                        self.editor.last_saved = written;
+                    }
                 }
                 if let Some(view) = view {
                     self.live = Some(view);
@@ -2756,8 +2786,15 @@ impl CheatUi {
                                 );
                             } else if row.trigger {
                                 ui.label(RichText::new("keys").small().color(DIM));
-                            } else if row.file_on {
-                                ui.label(RichText::new("file ON").small().color(DIM));
+                            } else if row.saved_on {
+                                // The file was last written with an ON marker.
+                                // It is not applied at startup and the next save
+                                // drops it, so it is a hint, not a state.
+                                ui.label(RichText::new("saved: ON").small().color(DIM))
+                                    .on_hover_text(
+                                        "the file said ON when it was opened; nothing was applied \
+                                         and the next save stores this block as OFF",
+                                    );
                             } else {
                                 ui.label("");
                             }
@@ -3192,6 +3229,38 @@ mod tests {
         };
         let message = apply_cheat_fault(&mut manager, &full);
         assert!(message.contains("restore table is full"), "{message}");
+    }
+
+    /// 起動時の一覧は全部 OFF。`:ON` は「ファイルがそう言っていた」表示だけ。
+    #[test]
+    fn a_saved_on_marker_is_shown_but_never_applied_at_startup() {
+        let (_temp, manager) = manager_for(
+            "saved-on",
+            "[A:ON]\n04000000 00000000 00000001\n[B]\n04000000 00000004 00000002\n",
+        );
+        let view = make_view(&manager);
+        assert_eq!(view.target.enabled, 0, "nothing may be applied on open");
+        assert!(
+            view.rows.iter().all(|row| !row.live),
+            "every row must start OFF"
+        );
+        assert!(view.rows[0].saved_on, "the :ON marker is kept for display");
+        assert!(!view.rows[1].saved_on, "a plain header is not an ON marker");
+    }
+
+    /// 保存は ON を書き戻さない: 次に開いたとき嘘の ON にならない。
+    #[test]
+    fn saving_never_records_the_saved_on_marker() {
+        let (_temp, mut manager) = manager_for("latch", "[A:ON]\n04000000 00000000 00000001\n");
+        let key = manager.find_key("A").unwrap();
+        manager.note_console_toggle(key, true).unwrap();
+
+        let view = make_view(&manager);
+        assert!(view.rows[0].live, "the toggle itself is applied");
+        assert!(!view.rows[0].saved_on, "the save must not write ON back");
+        let text = std::fs::read_to_string(manager.path()).unwrap();
+        assert!(!text.to_ascii_lowercase().contains(":on"), "{text}");
+        assert!(text.contains("@off"), "{text}");
     }
 
     /// panic-off は戻り値の restored / failed を必ず両方見せる。

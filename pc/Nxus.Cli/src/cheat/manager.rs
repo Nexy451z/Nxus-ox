@@ -1193,7 +1193,7 @@ impl CheatManager {
         Ok(self.adopt_document(document, io))
     }
 
-    /// Save the structured document.  Runtime state is written into headers.
+    /// Save the structured document.  Every block is written as OFF.
     pub fn save_document(&mut self) -> Result<(), String> {
         if !self.auto_save {
             return Ok(());
@@ -1209,14 +1209,20 @@ impl CheatManager {
     /// Parse errors only stop a block from being *enabled*; they never block a
     /// save.  What the reparse does to the live blocks is described by
     /// [`ReloadReport`].
+    ///
+    /// ON markers are stripped on the way out ([`parser::sanitize_on_markers`]):
+    /// the file must not claim that a cheat is on, or the next launch would
+    /// show a state that the console has long forgotten.  Everything else is
+    /// written exactly as given.
     pub fn save_raw_text<M: CheatMemoryIo + ?Sized>(
         &mut self,
         text: &str,
         io: &mut M,
     ) -> Result<ReloadReport, String> {
-        super::model::save_text_atomic(&self.path, text)
+        let text = parser::sanitize_on_markers(text);
+        super::model::save_text_atomic(&self.path, &text)
             .map_err(|error| format!("{}: {error}", self.path.display()))?;
-        let mut document = parser::parse_document(text, &self.identity.build_id);
+        let mut document = parser::parse_document(&text, &self.identity.build_id);
         document.path = Some(self.path.clone());
         document.generation = self.document.generation.wrapping_add(1);
         Ok(self.adopt_document(document, io))
@@ -3480,7 +3486,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_text_save_round_trips_and_enable_state_is_written() {
+    fn raw_text_save_round_trips_and_the_file_stays_off() {
         let dir = TempDir::new("raw-save");
         dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
         let mut manager =
@@ -3489,8 +3495,13 @@ mod tests {
         let key = manager.find_key("Value").unwrap();
         let mut io = TestIo::with_u32(ADDRESS, 5);
         manager.enable(key, &mut io).unwrap();
+
+        // Even while the block is applied, the file records it as OFF: the ON
+        // state is runtime-only and a saved ON would be a lie after a restart.
         let text = fs::read_to_string(manager.path()).unwrap();
         assert!(text.contains("[Value]"));
+        assert!(text.contains("@off"), "unexpected file:\n{text}");
+        assert!(!text.to_ascii_lowercase().contains(":on"), "{text}");
 
         manager.disable(key, &mut io).unwrap();
         let text = fs::read_to_string(manager.path()).unwrap();
@@ -3516,6 +3527,110 @@ mod tests {
         );
         reloaded.enable(reloaded_key, &mut io).unwrap();
         assert_eq!(io.value_u32(ADDRESS), 0x63);
+    }
+
+    /// A file that still says ON starts with every cheat OFF; the marker is
+    /// only remembered for the UI, and the user must toggle the block.
+    #[test]
+    fn a_file_with_on_markers_starts_with_every_cheat_off() {
+        let dir = TempDir::new("legacy-on");
+        let text = "\
+[Value:ON]
+04400000 00001234 00000063
+
+[Other]
+@on
+04400000 00001238 00000007
+";
+        dir.write(&format!("{BUILD}.txt"), &text);
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let value = manager.find_key("Value").unwrap();
+        let other = manager.find_key("Other").unwrap();
+
+        assert!(manager.enabled_keys().is_empty(), "nothing may be applied");
+        assert!(manager.blocks().iter().all(|block| !block.enabled));
+        assert_eq!(manager.snapshot().enabled, 0);
+        assert!(manager.document().block(value).unwrap().saved_enabled);
+        assert!(manager.document().block(other).unwrap().saved_enabled);
+        assert_eq!(io.write_count(), 0, "opening a file must not touch memory");
+        assert_eq!(io.value_u32(ADDRESS), 5);
+
+        // The user can still turn it on; the ON came from the user, not the
+        // file.
+        manager.enable(value, &mut io).unwrap();
+        assert!(manager.is_enabled(value));
+        assert_eq!(io.value_u32(ADDRESS), 0x63);
+    }
+
+    /// Enable -> save -> reopen: the file has no ON marker and the block is OFF.
+    #[test]
+    fn enabling_and_saving_leaves_the_file_off_for_the_next_session() {
+        let dir = TempDir::new("enable-save-off");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+        {
+            let mut manager =
+                CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                    .unwrap();
+            let key = manager.find_key("Value").unwrap();
+            manager.enable(key, &mut io).unwrap();
+            assert!(manager.is_enabled(key));
+        }
+
+        let path = dir.path.join("cheats").join(format!("{BUILD}.txt"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[Value]\n@off\n"), "unexpected file:\n{text}");
+        assert!(!text.to_ascii_lowercase().contains(":on"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.trim().eq_ignore_ascii_case("@on")),
+            "{text}"
+        );
+
+        // A fresh PC process (the title restarted) must not think it is ON.
+        let reloaded =
+            CheatManager::open_for_target_in(identity(200, 2), regions(), dir.path.clone())
+                .unwrap();
+        assert!(reloaded.enabled_keys().is_empty());
+        assert!(reloaded.blocks().iter().all(|block| !block.enabled));
+        assert!(reloaded
+            .document()
+            .blocks
+            .iter()
+            .all(|block| !block.saved_enabled));
+    }
+
+    /// The raw editor path strips ON markers too (a typed `[Name:ON]`).
+    #[test]
+    fn raw_text_save_strips_on_markers() {
+        let dir = TempDir::new("raw-save-on");
+        dir.write(&format!("{BUILD}.txt"), &patch_file("Value"));
+        let mut manager =
+            CheatManager::open_for_target_in(identity(100, 1), regions(), dir.path.clone())
+                .unwrap();
+        let mut io = TestIo::with_u32(ADDRESS, 5);
+
+        let typed = "\
+[Value:ON]
+04400000 00001234 00000063
+
+[Other]
+@on
+04400000 00001238 00000007
+";
+        let report = manager.save_raw_text(typed, &mut io).unwrap();
+        let saved = fs::read_to_string(manager.path()).unwrap();
+        assert!(saved.contains("[Value]\n@off\n"), "{saved}");
+        assert!(saved.contains("[Other]\n@off\n"), "{saved}");
+        assert!(!saved.to_ascii_lowercase().contains(":on"), "{saved}");
+        assert!(!saved.lines().any(|line| line.trim().eq_ignore_ascii_case("@on")));
+        assert!(saved.contains("04400000 00001238 00000007"), "code kept");
+        assert!(manager.enabled_keys().is_empty());
+        assert!(manager.blocks().iter().all(|block| !block.enabled));
+        assert!(manager.blocks().iter().all(|block| !block.saved_enabled));
+        assert_eq!(report.kept, 0);
     }
 
     // -- 編集・保存は ON のままでも許可される ------------------------------

@@ -56,7 +56,7 @@ pub fn parse_document(text: &str, build_id: &str) -> CheatDocument {
                 }
                 // A `[Name:OFF]` with no preceding match is a restore-only
                 // section.  It is shown, disabled, and never auto-enabled.
-                let mut pending = PendingBlock::new(header, false);
+                let mut pending = PendingBlock::new(header);
                 pending.explicit_off = true;
                 pending.off_style = OffStyle::SeparateSection;
                 pending.in_off = true;
@@ -65,7 +65,7 @@ pub fn parse_document(text: &str, build_id: &str) -> CheatDocument {
                 continue;
             }
 
-            let mut pending = PendingBlock::new(header, true);
+            let mut pending = PendingBlock::new(header);
             pending.source_line = line_number;
             current = Some(Current::Block(pending));
             continue;
@@ -218,7 +218,11 @@ struct Header {
     name: String,
     kind: CheatKind,
     off_section: bool,
-    enabled: Option<bool>,
+    /// `true` when the header carried an explicit `:ON` marker.
+    ///
+    /// The marker is remembered as "what the file said" (`CheatBlock::
+    /// saved_enabled`) for display only: it never enables the block.
+    on_marker: bool,
     mode: Option<CheatExecMode>,
     extra: String,
 }
@@ -232,7 +236,10 @@ struct PendingBlock {
     header: Header,
     on_lines: Vec<CodeLine>,
     off_lines: Vec<CodeLine>,
-    enabled: bool,
+    /// What the file says about this block's state, starting with the `:ON`
+    /// marker on its header.  This is **not** applied: a cheat file never
+    /// starts a block ON, and the manager is the only thing that can.
+    saved_enabled: bool,
     in_off: bool,
     explicit_off: bool,
     off_style: OffStyle,
@@ -241,9 +248,10 @@ struct PendingBlock {
 }
 
 impl PendingBlock {
-    fn new(header: Header, default_enabled: bool) -> Self {
+    fn new(header: Header) -> Self {
+        let saved_enabled = header.on_marker;
         PendingBlock {
-            enabled: header.enabled.unwrap_or(default_enabled),
+            saved_enabled,
             mode_source: header
                 .mode
                 .map(ModeSource::explicit)
@@ -296,12 +304,15 @@ fn finalize_block(pending: PendingBlock) -> CheatBlock {
 
     let mut block = CheatBlock::new(CheatKey(0), pending.header.name, pending.header.kind);
     block.mode_source = pending.mode_source;
-    block.enabled = if pending.explicit_off && on.instructions.is_empty() {
-        // Orphan `[Name:OFF]` restore-only section.
-        false
-    } else {
-        pending.enabled
-    };
+    // Loading a file never applies anything: the ON state is the manager's to
+    // own, and a marker on disk only survives as `saved_enabled` for display.
+    // Otherwise a restart of the title (the bytes are gone) would still show
+    // every cheat of the last session as ON.
+    block.enabled = false;
+    // An orphan `[Name:OFF]` restore-only section has no runnable ON half, so a
+    // state marker on it means nothing either.
+    let restore_only = pending.explicit_off && on.instructions.is_empty();
+    block.saved_enabled = pending.saved_enabled && !restore_only;
     block.on = on;
     block.off = off;
     block.explicit_off = pending.explicit_off;
@@ -336,14 +347,15 @@ fn apply_body_line(pending: &mut PendingBlock, line: &str, line_number: usize) -
             return true;
         }
         "@on" => {
-            pending.enabled = true;
+            // Remembered for display only; nothing is applied at load time.
+            pending.saved_enabled = true;
             return true;
         }
         "@off" => {
             if !pending.in_off && !pending.has_on_code() {
                 // `@off` at the top of a block is the disabled-by-default
                 // marker, not a divider.
-                pending.enabled = false;
+                pending.saved_enabled = false;
             } else {
                 start_off_block(pending, OffStyle::Inline);
             }
@@ -365,7 +377,7 @@ fn apply_body_line(pending: &mut PendingBlock, line: &str, line_number: usize) -
         pending.mode_source = ModeSource::ExplicitPatch;
     }
     if marker.disabled {
-        pending.enabled = false;
+        pending.saved_enabled = false;
     }
     if marker.off_block {
         start_off_block(pending, OffStyle::Inline);
@@ -446,7 +458,7 @@ fn try_parse_header(
     let mut inner = trimmed[start + 1..end].trim().to_string();
     let extra = trimmed[end + 1..].to_string();
     let mut off_section = false;
-    let mut enabled = None;
+    let mut on_marker = false;
     let mut mode = None;
 
     // Repeatedly peel trailing state/mode annotations.  Names may contain
@@ -460,7 +472,7 @@ fn try_parse_header(
             continue;
         }
         if let Some(stripped) = strip_suffix(&inner, &lower, ":on") {
-            enabled = Some(true);
+            on_marker = true;
             inner = stripped;
             continue;
         }
@@ -513,10 +525,114 @@ fn try_parse_header(
         name,
         kind,
         off_section,
-        enabled,
+        on_marker,
         mode,
         extra,
     })
+}
+
+/// Rewrite every ON marker so a saved cheat file never describes a block as ON.
+///
+/// The structured writer ([`crate::cheat::CheatDocument::to_text`]) always
+/// emits `@off`, but the raw editor stores exactly what the user typed.  A
+/// `[Name:ON]` / `{Name:ON}` header or a standalone `@on` line would come back
+/// as a saved ON state on the next load (while the bytes it described are long
+/// gone), so they are rewritten to the OFF spelling before the file reaches the
+/// disk:
+///
+/// * `[Name:ON]` becomes `[Name]` followed by an explicit `@off`,
+/// * `{Name:ON}` becomes `{Name}` followed by an explicit `@off`,
+/// * a bare `@on` / `:on` directive becomes `@off`.
+///
+/// Everything else — code lines, comments (even ones that mention `@on`),
+/// spacing and line endings — is preserved byte for byte.  The function is
+/// idempotent.
+pub fn sanitize_on_markers(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    for (index, raw) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let (line, carriage_return) = match raw.strip_suffix('\r') {
+            Some(line) => (line, true),
+            None => (*raw, false),
+        };
+        let trimmed = line.trim_start();
+        let leading = &line[..line.len() - trimmed.len()];
+        let compact = trimmed.to_ascii_lowercase().replace(' ', "");
+
+        if compact == "@on" || compact == ":on" {
+            // A bare ON directive becomes the unambiguous OFF directive.
+            out.push_str(leading);
+            out.push_str("@off");
+            if carriage_return {
+                out.push('\r');
+            }
+            continue;
+        }
+
+        if let Some(header) = header_without_on_marker(trimmed) {
+            out.push_str(leading);
+            out.push_str(&header);
+            if carriage_return {
+                out.push('\r');
+            }
+            // An explicit `@off` directly below the header already is the OFF
+            // spelling, so it is not duplicated.
+            if !next_line_is_off_directive(&lines, index + 1) {
+                out.push('\n');
+                out.push_str("@off");
+                if carriage_return {
+                    out.push('\r');
+                }
+            }
+            continue;
+        }
+
+        out.push_str(line);
+        if carriage_return {
+            out.push('\r');
+        }
+    }
+    out
+}
+
+fn next_line_is_off_directive(lines: &[&str], index: usize) -> bool {
+    lines
+        .get(index)
+        .map(|line| line.trim().to_ascii_lowercase().replace(' ', "") == "@off")
+        .unwrap_or(false)
+}
+
+/// `[Name:ON]` / `{Name:ON}` -> `[Name]` / `{Name}`; `None` for every other
+/// line.  Mode tags and trailing text after the closing bracket are kept.
+fn header_without_on_marker(trimmed: &str) -> Option<String> {
+    let mut issues = Vec::new();
+    let header = try_parse_header(trimmed, 0, &mut issues)?;
+    if !header.on_marker {
+        return None;
+    }
+    let (open, close) = match header.kind {
+        CheatKind::Master => ('{', '}'),
+        CheatKind::Regular => ('[', ']'),
+    };
+    // A restore-only `[Name:OFF]` section keeps its OFF spelling; only the
+    // state marker is dropped so the block cannot come back as ON.
+    let mut line = if header.off_section {
+        format!("{open}{}:OFF", header.name)
+    } else {
+        format!("{open}{}", header.name)
+    };
+    if let Some(mode) = header.mode {
+        line.push_str(match mode {
+            CheatExecMode::Loop => " @loop",
+            CheatExecMode::Patch => " @patch",
+        });
+    }
+    line.push(close);
+    line.push_str(&header.extra);
+    Some(line)
 }
 
 fn strip_suffix(text: &str, lower: &str, suffix: &str) -> Option<String> {
@@ -1085,7 +1201,10 @@ mod tests {
         assert_eq!(document.blocks.len(), 2);
         assert_eq!(document.blocks[0].name, "Cheat A");
         assert_eq!(document.blocks[0].kind, CheatKind::Regular);
-        assert!(document.blocks[0].enabled);
+        // A section without a state marker is OFF, and a file never applies
+        // anything on load.
+        assert!(!document.blocks[0].enabled);
+        assert!(!document.blocks[0].saved_enabled);
         assert_eq!(document.blocks[1].name, "Master Code");
         assert_eq!(document.blocks[1].kind, CheatKind::Master);
         assert_eq!(document.preamble, vec!["; header comment"]);
@@ -1097,6 +1216,7 @@ mod tests {
         let document = doc("[Money]\n@off\n04000000 30000000 00000003\n");
         assert_eq!(document.blocks.len(), 1);
         assert!(!document.blocks[0].enabled);
+        assert!(!document.blocks[0].saved_enabled);
         assert_eq!(document.blocks[0].name, "Money");
         assert!(!document.blocks[0].explicit_off);
     }
@@ -1130,7 +1250,9 @@ mod tests {
         let block = &document.blocks[0];
         assert!(block.explicit_off);
         assert_eq!(block.off_style, OffStyle::SeparateSection);
-        assert!(block.enabled);
+        // The restore section does not apply anything either.
+        assert!(!block.enabled);
+        assert!(!block.saved_enabled);
         assert_eq!(block.off.as_ref().unwrap().instructions.len(), 1);
     }
 
@@ -1141,6 +1263,104 @@ mod tests {
         assert!(document.blocks[0].is_restore_only());
         assert!(!document.blocks[0].is_enableable());
         assert!(!document.blocks[0].enabled);
+        assert!(!document.blocks[0].saved_enabled);
+    }
+
+    /// An ON marker on disk is remembered for display, never applied.
+    #[test]
+    fn on_markers_are_remembered_but_never_enable_a_block() {
+        let text = "\
+[A:ON]
+04000000 10000000 00000001
+
+[B]
+04000000 10000000 00000002
+
+[C:OFF]
+04000000 10000000 00000003
+
+[D]
+@on
+04000000 10000000 00000004
+";
+        let document = doc(text);
+        assert_eq!(document.blocks.len(), 4);
+        for block in &document.blocks {
+            assert!(!block.enabled, "{} must start OFF", block.name);
+        }
+        assert!(document.blocks[0].saved_enabled, "the file said ON for A");
+        assert!(!document.blocks[1].saved_enabled);
+        assert!(!document.blocks[2].saved_enabled);
+        assert!(document.blocks[3].saved_enabled, "`@on` is an ON marker");
+    }
+
+    /// Every save path funnels through this: a file must never say ON.
+    #[test]
+    fn sanitizer_rewrites_on_markers_and_keeps_comments() {
+        let text = "\
+; [Commented:ON] and @on mentions must stay
+[A:ON]
+04000000 10000000 00000001
+; @on in a comment stays too
+[B]
+@on
+04000000 10000000 00000002
+{C:ON}
+04000000 10000000 00000003
+";
+        let clean = sanitize_on_markers(text);
+        assert!(
+            !clean.contains("[A:ON]") && !clean.contains("{C:ON}"),
+            "header markers must be removed:\n{clean}"
+        );
+        assert!(
+            !clean.lines().any(|line| line.trim().eq_ignore_ascii_case("@on")),
+            "a bare @on must be rewritten:\n{clean}"
+        );
+        assert!(clean.contains("; [Commented:ON] and @on mentions must stay"));
+        assert!(clean.contains("; @on in a comment stays too"));
+        assert!(clean.contains("[A]\n@off\n04000000"), "{clean}");
+        assert!(clean.contains("[B]\n@off\n04000000"), "{clean}");
+        assert!(clean.contains("{C}\n@off\n04000000"), "{clean}");
+        // The result is the OFF side for every block ...
+        let document = doc(&clean);
+        assert_eq!(document.blocks.len(), 3);
+        for block in &document.blocks {
+            assert!(!block.enabled && !block.saved_enabled, "{} is ON", block.name);
+        }
+        // ... and sanitizing it again changes nothing.
+        assert_eq!(sanitize_on_markers(&clean), clean);
+    }
+
+    /// A header that already has an explicit `@off` below it is not doubled.
+    #[test]
+    fn sanitizer_does_not_duplicate_an_existing_off_directive() {
+        let clean = sanitize_on_markers("[A:ON]\n@off\n04000000 10000000 00000001\n");
+        assert_eq!(clean, "[A]\n@off\n04000000 10000000 00000001\n");
+        // CRLF files keep their line endings.
+        let crlf = sanitize_on_markers("[A:ON]\r\n04000000 10000000 00000001\r\n");
+        assert_eq!(crlf, "[A]\r\n@off\r\n04000000 10000000 00000001\r\n");
+    }
+
+    /// The structured writer emits an OFF marker for every block, even when the
+    /// in-memory state says ON: a save must never write a lie to disk.
+    #[test]
+    fn the_writer_always_saves_every_block_off() {
+        let mut document = doc("[A]\n04000000 10000000 00000001\n");
+        assert_eq!(document.blocks.len(), 1);
+        // Simulate "the block is applied right now".
+        document.blocks[0].enabled = true;
+        document.blocks[0].saved_enabled = true;
+        let text = document.to_text();
+        assert!(text.contains("[A]\n@off\n04000000"), "{text}");
+        assert!(!text.to_ascii_lowercase().contains(":on"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.trim().eq_ignore_ascii_case("@on")),
+            "{text}"
+        );
+        let reparsed = doc(&text);
+        assert!(!reparsed.blocks[0].enabled);
+        assert!(!reparsed.blocks[0].saved_enabled);
     }
 
     #[test]

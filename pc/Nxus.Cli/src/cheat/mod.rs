@@ -44,11 +44,13 @@ pub use manager::{
     TickReport, JOURNAL_MAGIC,
 };
 pub use model::{
-    instructions_to_lines, save_text_atomic, ArithmeticOp, ArithmeticOperand, CheatBlock,
-    CheatCode, CheatDocument, CheatExecMode, CheatKey, CheatKind, CodeLine, Comparison,
-    ConditionalOperand, Instruction, JumpInfo, MemoryRegion, ModeSource, OffStyle, ParseIssue,
-    SaveRestoreOp, StoreOffset, MAX_CHEAT_FILE_BYTES, MAX_PROGRAM_OPCODES, MAX_WORDS_PER_CODE_LINE,
-    VM_STEP_LIMIT,
+    instructions_to_lines, save_cheat_text_atomic, save_text_atomic, ArithmeticOp,
+    ArithmeticOperand, CheatBlock, CheatCode, CheatDocument, CheatExecMode, CheatKey, CheatKind,
+    CodeLine, Comparison, ConditionalOperand, Instruction, JumpInfo, MemoryRegion, ModeSource,
+    OffStyle, ParseIssue, SaveRestoreOp, StoreOffset, MAX_CHEAT_FILE_BYTES, MAX_PROGRAM_OPCODES,
+    MAX_WORDS_PER_CODE_LINE, VM_STEP_LIMIT,
 };
-pub use parser::{parse_code, parse_code_lines, parse_document, parse_file};
+pub use parser::{
+    parse_code, parse_code_lines, parse_document, parse_file, sanitize_on_markers,
+};
 pub use vm::{execute, CheatMemoryIo, FailureKind, MemoryRegions, VmError, VmReport, VmState};
