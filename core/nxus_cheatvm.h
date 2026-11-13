@@ -47,8 +47,16 @@ extern "C" {
 #define NXUS_CHEATVM_MAX_INSNS 20000u
 /** Blocks in one program. */
 #define NXUS_CHEATVM_MAX_BLOCKS 128u
-/** Patched addresses whose original bytes are kept for Panic Restore. */
-#define NXUS_CHEATVM_MAX_JOURNAL 512u
+/** Ceiling for patched addresses whose original bytes are kept for Panic Restore.
+ *
+ *  The table is a HEAP array (see NxusCheatJournal): it starts at whatever
+ *  capacity the service asks for (512 slots, 12 KiB) and doubles on demand, so a
+ *  cheat file that rewrites a few hundred addresses costs a few KiB, while the
+ *  real-world "one block writes 112 addresses, 858 addresses in total" case still
+ *  fits.  16384 entries x 24 B = 384 KiB, which is the most this table may ever
+ *  take from the sysmodule's 8 MiB heap.  A fixed 512-entry array used to make
+ *  every write after the 512th address fail until the console was rebooted. */
+#define NXUS_CHEATVM_MAX_JOURNAL 16384u
 /** Interpreter steps for one block execution (a runaway loop must not wedge us). */
 #define NXUS_CHEATVM_STEP_LIMIT 100000u
 
@@ -328,6 +336,13 @@ int nxusCheatRunBlock(NxusCheatProgram *program, u32 index, const NxusCheatIo *i
 #define NXUS_CHEATVM_ERR_BAD_REGISTER (-7)
 #define NXUS_CHEATVM_ERR_BAD_OPCODE (-8)
 #define NXUS_CHEATVM_ERR_NO_MEMORY (-9)
+/** The restore journal is at NXUS_CHEATVM_MAX_JOURNAL and could not grow.
+ *
+ *  Separate from ERR_WRITE on purpose: "the program is wrong / the target refused
+ *  the store" and "the console ran out of journal" need different reactions (fix
+ *  the code vs. free the journal / restart), and the server turns this one into
+ *  NXUS_REASON_JOURNAL_FULL instead of the generic "argument outside range". */
+#define NXUS_CHEATVM_ERR_JOURNAL_FULL (-10)
 
 /* ---- journal (original bytes, for Panic Restore without a PC) ------------ */
 
@@ -335,30 +350,78 @@ typedef struct NxusCheatJournalEntry {
     u64 address;
     u8 original[8];
     u8 width;
-    u8 owners; /**< number of blocks that patched this address */
+    u8 owners; /**< number of blocks that patched this address; 0 = dead slot */
     u8 reserved[2];
 } NxusCheatJournalEntry;
 
+/**
+ * Restore journal: the original bytes of every address the engine patched.
+ *
+ * The entry array is a HEAP array, exactly like NxusCheatProgram.insns: the old
+ * fixed `entries[512]` made the 513th distinct address fail to write, and because
+ * a failed restore kept the journal, the console stayed unable to apply ANY cheat
+ * until it was rebooted.  The array therefore starts at the capacity the service
+ * asks for and doubles on demand, up to NXUS_CHEATVM_MAX_JOURNAL.
+ *
+ * Ownership: nxusCheatJournalInit allocates; nxusCheatJournalReset empties the
+ * journal but KEEPS the array for reuse; nxusCheatJournalRelease is the only
+ * function that frees it.  A zero-initialised journal (entries NULL, capacity 0)
+ * is valid and grows on its first write, so no caller can forget an init and then
+ * silently refuse every write.
+ */
 typedef struct NxusCheatJournal {
-    NxusCheatJournalEntry entries[NXUS_CHEATVM_MAX_JOURNAL];
-    u32 count;
-    u32 capacity; /**< NXUS_CHEATVM_MAX_JOURNAL unless the heap was tight */
+    NxusCheatJournalEntry *entries; /**< heap array of `capacity` entries, or NULL */
+    u32 count;                      /**< live entries at the front of `entries` */
+    u32 capacity;                   /**< slots actually allocated at `entries` */
 } NxusCheatJournal;
 
+/**
+ * Initialise a journal with `capacity` entry slots (clamped to
+ * NXUS_CHEATVM_MAX_JOURNAL).
+ *
+ * Call it on zero-initialised or released storage: it does NOT free a previous
+ * array (that is nxusCheatJournalRelease's job).  Returns NXUS_CHEATVM_OK, or
+ * NXUS_CHEATVM_ERR_NO_MEMORY when the initial allocation failed - the journal is
+ * still usable in that case, because the first successful remember grows it.
+ */
+int nxusCheatJournalInit(NxusCheatJournal *journal, u32 capacity);
+
+/**
+ * Free the heap entry array and return the journal to the empty state.
+ *
+ * Idempotent and safe on a zero-initialised / already-released journal, so it may
+ * be called on every teardown path.
+ */
+void nxusCheatJournalRelease(NxusCheatJournal *journal);
+
+/** Empty the journal (count = 0) but KEEP the allocated array for reuse. */
 void nxusCheatJournalReset(NxusCheatJournal *journal);
 
 /**
  * Remember the original bytes at `address` before the first write.
  *
  * Returns 0 when the address is (already) journalled and a write may proceed, or a
- * negative value when the journal is full - in which case the block must not write,
- * because Panic Restore would no longer be able to undo it.
+ * negative value when the block must NOT write:
+ *   - NXUS_CHEATVM_ERR_JOURNAL_FULL: the journal is at NXUS_CHEATVM_MAX_JOURNAL
+ *     and could not grow (or the allocation failed),
+ *   - -1: invalid argument, or the original bytes could not be read.
+ *
+ * When the journal is full it first compacts entries whose `owners` reached 0
+ * (already restored) and only then doubles the capacity, so a single partially
+ * failed restore cannot wedge the engine.
  */
 int nxusCheatJournalRemember(NxusCheatJournal *journal, const NxusCheatIo *io, u64 address,
                              u32 width, u8 owner);
 
-/** Write every journalled original byte back.  Returns the number restored, or a
- *  negative value when the target is gone (nothing can be restored). */
+/**
+ * Write every journalled original byte back.
+ *
+ * Each entry whose write-back SUCCEEDED is removed (owners = 0, then compacted),
+ * so the journal only ever keeps addresses that still need restoring and a retry
+ * does not rewrite what is already correct.  The array itself is kept for reuse.
+ * Returns the number restored, or a negative value when at least one write failed
+ * (the failed entries stay journalled so a later call can retry them).
+ */
 int nxusCheatJournalRestore(NxusCheatJournal *journal, const NxusCheatIo *io, bool allow_rx);
 
 #ifdef __cplusplus

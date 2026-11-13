@@ -55,6 +55,14 @@
 #define NXUS_REASON_DEBUG_LOCKED   11u   /* dmnt is closed while Nxus holds the debug handle */
 #define NXUS_REASON_SLOT_FULL      12u   /* break table / hardware slot / view-pin table exhausted */
 #define NXUS_REASON_RETRY_LATER    13u   /* the state clears by itself, but is not a running scan */
+/* CheatUpload: the console-side restore journal (core/nxus_cheatvm.h) is at
+   NXUS_CHEATVM_MAX_JOURNAL and could not grow, so the write was refused.  This is
+   NOT a client error and NOT a retry-later: the journal only frees up when the
+   patched addresses are restored (CheatPanicOff) or the title/service restarts, so
+   the PC can say what to do instead of "argument outside the accepted range".
+   Appended at 14 because 11..13 are already on the wire (11 used to be proposed
+   for this; it is NXUS_REASON_DEBUG_LOCKED and must not be reused). */
+#define NXUS_REASON_JOURNAL_FULL   14u   /* cheat restore journal exhausted (NXUS_CHEATVM_ERR_JOURNAL_FULL) */
 
 /* ---- packet header flags ---- */
 #define NXUS_FLAG_ASYNC       0x0001u  /* Switch-initiated event; seq is not a request id */

@@ -227,6 +227,7 @@ static int cheatWriteValue(const NxusCheatIo *io, NxusCheatJournal *journal, u64
                            u32 width, u64 value, u8 owner) {
     u8 bytes[8];
     u32 index;
+    int rc;
 
     if (io == NULL || io->write == NULL) return NXUS_CHEATVM_ERR_WRITE;
     if (!(width == 1 || width == 2 || width == 4 || width == 8)) return NXUS_CHEATVM_ERR_BAD_OPCODE;
@@ -237,9 +238,13 @@ static int cheatWriteValue(const NxusCheatIo *io, NxusCheatJournal *journal, u64
         bytes[index] = (u8)(value >> (8u * index));
     }
 
-    /* 書き込み前に original を確保できなければ、この書き込みは行わない。 */
-    if (nxusCheatJournalRemember(journal, io, address, width, owner) != 0) {
-        return NXUS_CHEATVM_ERR_WRITE;
+    /* 書き込み前に original を確保できなければ、この書き込みは行わない。
+       容量不足（grow も失敗）だけは専用コードで伝播する: サーバが「復元表が
+       満杯」と「その他の書き込み失敗」を区別して PC に返せるようにするため。 */
+    rc = nxusCheatJournalRemember(journal, io, address, width, owner);
+    if (rc != NXUS_CHEATVM_OK) {
+        return (rc == NXUS_CHEATVM_ERR_JOURNAL_FULL) ? NXUS_CHEATVM_ERR_JOURNAL_FULL
+                                                     : NXUS_CHEATVM_ERR_WRITE;
     }
 
     if (io->write(io->user, address, bytes, width, true) != 0) return NXUS_CHEATVM_ERR_WRITE;
@@ -250,17 +255,113 @@ static int cheatWriteValue(const NxusCheatIo *io, NxusCheatJournal *journal, u64
 /* ジャーナル（元バイトの保存・Panic Restore）                              */
 /* ======================================================================== */
 
+/*
+ * 復元表はヒープ配列。旧実装は entries[512] の固定配列で、
+ *   - 513 個目のアドレスで nxusCheatJournalRemember() が失敗し、
+ *   - 呼び出し側（書き込み）は「記録できないなら書かない」を守るので
+ *     以後すべてのチート適用が失敗し、
+ *   - Restore はジャーナルを消さなかったので再起動まで回復しなかった。
+ * 実データは 858 アドレス（1 ブロックで 112 件）を書き換えるため 512 では
+ * まったく足りない。
+ *
+ * ここでは
+ *   - 満杯になったら owners == 0 の死んだエントリ（復元済み）を詰めて再利用、
+ *   - それでも足りなければ容量を 2 倍に grow（上限 16384 = 384 KiB）、
+ *   - 復元に成功したエントリはその場で消す（失敗したものだけ残して再試行可能）
+ * とすることで、「満杯」が恒久的な故障にならないようにする。
+ *
+ * アロケータは malloc/realloc/free。命令配列のフック（nxusCheatSetAllocator）
+ * は「wire プログラムの命令配列」専用なので、サービスが寿命を管理する
+ * ジャーナルとは分けている。
+ */
+
+/** 容量 0（Init 失敗 / 未初期化）から grow するときの最初の大きさ。 */
+#define CHEAT_JOURNAL_MIN_GROW 64u
+
+/** owners == 0 の死んだエントリを詰める（生きている順序は保たれる）。 */
+static void cheatJournalCompact(NxusCheatJournal *journal) {
+    u32 read_index;
+    u32 write_index = 0;
+
+    if (journal->entries == NULL) {
+        journal->count = 0;
+        return;
+    }
+
+    for (read_index = 0; read_index < journal->count; read_index++) {
+        if (journal->entries[read_index].owners == 0) continue;
+        if (write_index != read_index) {
+            journal->entries[write_index] = journal->entries[read_index];
+        }
+        write_index++;
+    }
+    if (write_index < journal->count) {
+        memset(&journal->entries[write_index], 0,
+               (size_t)(journal->count - write_index) * sizeof *journal->entries);
+    }
+    journal->count = write_index;
+}
+
+/**
+ * 容量を 2 倍にする。上限（NXUS_CHEATVM_MAX_JOURNAL）に達しているか、
+ * realloc が失敗したときだけ NXUS_CHEATVM_ERR_JOURNAL_FULL。
+ *
+ * realloc 失敗時は古い配列がそのまま残る（realloc の契約）ので、
+ * journal->entries / capacity は書き換えない = 既存の記録は失われない。
+ */
+static int cheatJournalGrow(NxusCheatJournal *journal) {
+    u32 capacity;
+    NxusCheatJournalEntry *grown;
+
+    if (journal->capacity >= NXUS_CHEATVM_MAX_JOURNAL) return NXUS_CHEATVM_ERR_JOURNAL_FULL;
+
+    capacity = journal->capacity * 2u;
+    /* 0 の 2 倍は 0 のままなので、未確保のジャーナルだけ最小容量から始める。 */
+    if (capacity == 0) capacity = CHEAT_JOURNAL_MIN_GROW;
+    if (capacity > NXUS_CHEATVM_MAX_JOURNAL) capacity = NXUS_CHEATVM_MAX_JOURNAL;
+
+    grown = (NxusCheatJournalEntry *)realloc(journal->entries,
+                                             (size_t)capacity * sizeof *grown);
+    if (grown == NULL) return NXUS_CHEATVM_ERR_JOURNAL_FULL;
+
+    journal->entries = grown;
+    journal->capacity = capacity;
+    return NXUS_CHEATVM_OK;
+}
+
+int nxusCheatJournalInit(NxusCheatJournal *journal, u32 capacity) {
+    if (journal == NULL) return -1;
+
+    /* 未初期化/解放済みの記憶域を前提にする（program init と同じ契約）。 */
+    memset(journal, 0, sizeof *journal);
+    if (capacity > NXUS_CHEATVM_MAX_JOURNAL) capacity = NXUS_CHEATVM_MAX_JOURNAL;
+    if (capacity == 0) return NXUS_CHEATVM_OK;
+
+    journal->entries = (NxusCheatJournalEntry *)malloc((size_t)capacity * sizeof *journal->entries);
+    if (journal->entries == NULL) return NXUS_CHEATVM_ERR_NO_MEMORY;
+    journal->capacity = capacity;
+    return NXUS_CHEATVM_OK;
+}
+
+void nxusCheatJournalRelease(NxusCheatJournal *journal) {
+    if (journal == NULL) return;
+    free(journal->entries);
+    memset(journal, 0, sizeof *journal);
+}
+
 void nxusCheatJournalReset(NxusCheatJournal *journal) {
     if (journal == NULL) return;
-    memset(journal->entries, 0, sizeof journal->entries);
+    /* 配列は解放しない（release の責務）。中身だけ消して再利用する。 */
+    if (journal->entries != NULL && journal->capacity != 0) {
+        memset(journal->entries, 0, (size_t)journal->capacity * sizeof *journal->entries);
+    }
     journal->count = 0;
-    journal->capacity = NXUS_CHEATVM_MAX_JOURNAL;
 }
 
 int nxusCheatJournalRemember(NxusCheatJournal *journal, const NxusCheatIo *io, u64 address,
                              u32 width, u8 owner) {
-    u32 capacity;
     u32 index;
+    int rc;
     NxusCheatJournalEntry *entry;
 
     /* owner は「どのブロックが書いたか」。NxusCheatJournalEntry には
@@ -272,20 +373,24 @@ int nxusCheatJournalRemember(NxusCheatJournal *journal, const NxusCheatIo *io, u
     if (journal == NULL || io == NULL || io->read == NULL) return -1;
     if (width == 0 || width > 8) return -1;
 
-    capacity = journal->capacity;
-    if (capacity > NXUS_CHEATVM_MAX_JOURNAL) capacity = NXUS_CHEATVM_MAX_JOURNAL;
-
     /* すでに記録済みのアドレスなら original は初回のまま維持する。ここで
        読み直すと「すでにパッチされた後の値」を original として保存してしまい、
        Panic Restore が元に戻せなくなる。 */
-    for (index = 0; index < journal->count && index < capacity; index++) {
+    for (index = 0; index < journal->count; index++) {
         if (journal->entries[index].address == address) {
             if (journal->entries[index].owners < 0xFFu) journal->entries[index].owners++;
             return 0;
         }
     }
 
-    if (journal->count >= capacity) return -1; /* 満杯: 呼び出し側は書かない */
+    /* 満杯: まず復元済み（owners == 0）の死んだエントリを詰めて再利用する。 */
+    if (journal->count >= journal->capacity) cheatJournalCompact(journal);
+
+    /* それでも足りなければ grow。上限到達か malloc 失敗だけが「書かない」理由。 */
+    if (journal->count >= journal->capacity) {
+        rc = cheatJournalGrow(journal);
+        if (rc != NXUS_CHEATVM_OK) return rc;
+    }
 
     entry = &journal->entries[journal->count];
     memset(entry, 0, sizeof *entry);
@@ -303,28 +408,34 @@ int nxusCheatJournalRemember(NxusCheatJournal *journal, const NxusCheatIo *io, u
 }
 
 int nxusCheatJournalRestore(NxusCheatJournal *journal, const NxusCheatIo *io, bool allow_rx) {
-    u32 capacity;
     u32 index;
     int restored = 0;
     bool failed = false;
 
     if (journal == NULL || io == NULL || io->write == NULL) return -1;
 
-    capacity = journal->capacity;
-    if (capacity > NXUS_CHEATVM_MAX_JOURNAL) capacity = NXUS_CHEATVM_MAX_JOURNAL;
-
     /* 1 件失敗しても残りは戻す: 戻せるものを戻したほうが被害が小さい。
-       ただし「全部戻せた」とは言えないので戻り値は負にする。ジャーナルは
-       消さない（失敗したぶんを再試行できるようにする）。 */
-    for (index = 0; index < journal->count && index < capacity; index++) {
-        const NxusCheatJournalEntry *entry = &journal->entries[index];
-        if (entry->width == 0 || entry->width > 8) continue;
+       成功したエントリは owners = 0 にして最後に詰めるので、次の Restore は
+       「まだ戻せていないアドレス」だけを再試行する。失敗したエントリは残す。 */
+    for (index = 0; index < journal->count; index++) {
+        NxusCheatJournalEntry *entry = &journal->entries[index];
+
+        if (entry->owners == 0) continue;   /* 復元済み（詰め直し待ち） */
+        if (entry->width == 0 || entry->width > 8) {
+            /* 壊れたエントリは復元できないので捨てる（書かない）。 */
+            entry->owners = 0;
+            continue;
+        }
         if (io->write(io->user, entry->address, entry->original, entry->width, allow_rx) != 0) {
             failed = true;
             continue;
         }
+        entry->owners = 0;
         restored++;
     }
+
+    /* 成功分を詰める。entries 自体は保持して再利用する。 */
+    cheatJournalCompact(journal);
 
     if (failed) return -1;
     return restored;

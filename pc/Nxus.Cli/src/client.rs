@@ -992,6 +992,10 @@ fn error_reason_text(reason: u32) -> Option<&'static str> {
             Some("a fixed table is full (breakpoint slots or pinned views): clear something first")
         }
         13 => Some("the previous session is still being released: retry in a moment"),
+        14 => Some(
+            "the console's cheat restore table is full: run Panic Restore All (or reboot the \
+             console) before enabling more cheats",
+        ),
         _ => None,
     }
 }

@@ -952,8 +952,13 @@ static void testFreeze(void) {
               (unsigned)cheatTestPauses(), (unsigned)cheatTestResumes());
         CHECK(strstr(cheatTestLastLog(), "freeze") != NULL,
               "the unfrozen restore is logged: \"%s\"", cheatTestLastLog());
-        CHECK(statusNow().journal_count == 1,
-              "the journal is kept for a later, freezable retry");
+        /* The write-back itself succeeded, so the entry is gone: only a FAILED
+         * write-back stays journalled for a retry (see testPanicOff's
+         * writable=false case).  Keeping a restored address would make the next
+         * PanicOff rewrite bytes that are already correct. */
+        CHECK(statusNow().journal_count == 0,
+              "a restored entry is removed even when the freeze failed (%u left)",
+              (unsigned)statusNow().journal_count);
     }
 }
 
@@ -1009,10 +1014,19 @@ static void testLifecycle(void) {
     CHECK(sizeof(NxusCheatProgram) < 8u * 1024u,
           "the program struct no longer embeds the instructions (%u B)",
           (unsigned)sizeof(NxusCheatProgram));
-    CHECK(sizeof(NxusCheatJournal) == 12296u,
-          "the journal is 512 entries x 24 B (%u B)", (unsigned)sizeof(NxusCheatJournal));
+    /* The journal is a heap descriptor now (the old fixed entries[512] array was
+       what wedged the engine at 512 addresses).  The service allocates the entry
+       arrays at Init and the interpreter grows them on demand. */
+    CHECK(sizeof(NxusCheatJournal) <= 64u,
+          "the journal struct is a heap descriptor (%u B)", (unsigned)sizeof(NxusCheatJournal));
+    CHECK(g_Journal.entries != NULL && g_Journal.capacity == NXUS_CHEATSRV_JOURNAL_INITIAL,
+          "init allocated the real journal at %u slots (cap=%u)",
+          (unsigned)NXUS_CHEATSRV_JOURNAL_INITIAL, (unsigned)g_Journal.capacity);
+    CHECK(g_ProbeJournal.entries != NULL &&
+          g_ProbeJournal.capacity == NXUS_CHEATSRV_JOURNAL_INITIAL,
+          "init allocated the plan-pass journal too (cap=%u)", (unsigned)g_ProbeJournal.capacity);
     CHECK(sizeof(g_ProbeJournal) == sizeof(NxusCheatJournal),
-          "the plan journal is one more journal-sized block (%u B)",
+          "the plan journal is one more journal descriptor (%u B)",
           (unsigned)sizeof(g_ProbeJournal));
 
     /* The identity sample may fail (a writer held the seqlock); that must skip the
@@ -1322,6 +1336,96 @@ static void testUploadFailures(void) {
     CHECK(cheatTestPeekU32(addr) == 0xAAAA0001u, "and it keeps running");
 }
 
+/* ---- 15. journal full --------------------------------------------------- */
+
+/*
+ * The reported bug: the restore journal was a fixed 512-entry array, so after 512
+ * distinct addresses every further write was refused - and because a restore kept
+ * the journal, the console stayed unable to apply ANY cheat until it was rebooted.
+ * The journal now grows (up to 16384 entries) and a restore frees what it wrote
+ * back (see test_cheatvm.c for the grow/compaction/restore unit tests).  What is
+ * left is the CEILING, and this test drives it through the shipped service:
+ *
+ *   - the worker disables the block immediately and reports JOURNAL_FULL,
+ *   - the refused write never reaches the target,
+ *   - a patch-only upload reports the positive code 10 (the server maps that to
+ *     NXUS_ERR_BAD_STATE + NXUS_REASON_JOURNAL_FULL instead of reason=9).
+ */
+static void testJournalFull(void) {
+    const u64 addr = CHEAT_TEST_BASE + 0x20000u;
+    Wire w;
+    NxusCheatUploadReply reply;
+    CheatIoState state;
+    NxusCheatIo io;
+    u32 i;
+    bool all_ok;
+
+    printf("[test] journal full: block disabled, nothing written, reason 10 on upload\n");
+    fresh();
+
+    /* The resident program is installed FIRST: a loop upload would restore (and
+     * therefore empty) the previous journal before taking over. */
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 1, 1, addr, 0xDEADBEEFu);
+    CHECK(uploadWire(&w), "the loop program installs before the journal is filled");
+
+    /* Fill the real journal to its ceiling through the service's own IO adapter. */
+    cheatIoInit(&state, &io, false);
+    all_ok = true;
+    for (i = 0; i < NXUS_CHEATVM_MAX_JOURNAL; i++) {
+        if (nxusCheatJournalRemember(&g_Journal, &io, CHEAT_TEST_BASE + (u64)i * 4u, 4, 0) != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    CHECK(all_ok, "the real journal fills to its 16384-entry ceiling (%u)",
+          (unsigned)g_Journal.count);
+    CHECK(g_Journal.count == NXUS_CHEATVM_MAX_JOURNAL &&
+          g_Journal.capacity == NXUS_CHEATVM_MAX_JOURNAL,
+          "the journal is exactly at its ceiling (count=%u cap=%u)",
+          (unsigned)g_Journal.count, (unsigned)g_Journal.capacity);
+
+    cheatSrvWorkerStep();
+    CHECK(statusNow().last_error == (u32)NXUS_CHEATVM_ERR_JOURNAL_FULL,
+          "the worker records ERR_JOURNAL_FULL (%u)", (unsigned)statusNow().last_error);
+    CHECK(statusNow().enabled_count == 0, "the block is disabled immediately");
+    CHECK(cheatTestEventCount() == 1 &&
+          cheatTestLastFault()->reason == NXUS_CHEAT_FAULT_JOURNAL_FULL,
+          "the fault event says JOURNAL_FULL (%u)", (unsigned)cheatTestLastFault()->reason);
+    CHECK(cheatTestWrites() == 0, "the refused write never reached the target (%u writes)",
+          (unsigned)cheatTestWrites());
+    CHECK(cheatTestPeekU32(addr) == 0u, "the target is untouched");
+
+    /* A patch-only upload is refused with the positive code 10. */
+    fresh();
+    cheatIoInit(&state, &io, false);
+    all_ok = true;
+    for (i = 0; i < NXUS_CHEATVM_MAX_JOURNAL; i++) {
+        if (nxusCheatJournalRemember(&g_Journal, &io, CHEAT_TEST_BASE + (u64)i * 4u, 4, 0) != 0) {
+            all_ok = false;
+            break;
+        }
+    }
+    CHECK(all_ok, "the journal is filled again for the upload check");
+
+    makeProgram(&w, CHEAT_TEST_TITLE_A, 0, 1, addr, 0x11223344u);
+    CHECK(!uploadWireReply(&w, &reply), "a patch-only upload that would overflow is refused");
+    CHECK(reply.rejected_reason == (u32)(-NXUS_CHEATVM_ERR_JOURNAL_FULL),
+          "rejected_reason is the positive JOURNAL_FULL code (%u)",
+          (unsigned)reply.rejected_reason);
+    CHECK(reply.rejected_reason == 10u, "the wire code is 10 (%u)",
+          (unsigned)reply.rejected_reason);
+    CHECK(cheatTestPeekU32(addr) == 0u, "the refused patch wrote nothing");
+    CHECK(cheatTestWrites() == 0, "no dmnt write was issued (%u)", (unsigned)cheatTestWrites());
+
+    /* The reason the server appends is distinct from every existing one. */
+    CHECK(NXUS_REASON_JOURNAL_FULL == 14u, "NXUS_REASON_JOURNAL_FULL is the appended code 14");
+    CHECK(NXUS_REASON_JOURNAL_FULL != NXUS_REASON_DEBUG_LOCKED &&
+          NXUS_REASON_JOURNAL_FULL != NXUS_REASON_SLOT_FULL &&
+          NXUS_REASON_JOURNAL_FULL != NXUS_REASON_RETRY_LATER &&
+          NXUS_REASON_JOURNAL_FULL != NXUS_REASON_BAD_ARG,
+          "it does not collide with an existing reason");
+}
+
 int main(void) {
     printf("== Nxus cheat service host tests ==\n");
     testUploadValidation();
@@ -1338,6 +1442,7 @@ int main(void) {
     testPatchOnlyUpload();
     testHeapLifetime();
     testUploadFailures();
+    testJournalFull();
 
     nxusCheatSrvExit();
     printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);

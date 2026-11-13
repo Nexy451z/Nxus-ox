@@ -38,29 +38,38 @@
  * the heap.  g_Program is the resident (loop) program; g_PatchProgram is the
  * scratch program of a patch-only upload, which is installed, run once and
  * released inside nxusCheatSrvUpload() while g_CheatLock is held (see there).
+ * The journals are only DESCRIPTORS here: their entry arrays are heap arrays
+ * allocated by nxusCheatJournalInit() in Init and freed by
+ * nxusCheatJournalRelease() in Exit (512 slots = 12 KiB at boot, doubling on
+ * demand up to NXUS_CHEATVM_MAX_JOURNAL = 16384 slots = 384 KiB).  The old
+ * fixed entries[512] array is what made every cheat fail after 512 addresses,
+ * so the table must be able to grow; the ceiling is what bounds it.
  * The asserts below are deliberately UPPER bounds plus one total: raising a core
  * cap is fine as long as the reservation stays inside the documented budget, and
  * the build stops if it does not.
  *
- * Measured on the shipped caps: two program structs ~11 KiB, real journal 12296 B,
- * plan-pass journal 12296 B, stack 8192 B, total ~44 KiB.  The instruction arrays
- * themselves are heap-allocated to fit the uploaded program (see
- * core/nxus_cheatvm.h).  The plan pass needs its own journal because the
- * interpreter journals before calling write(); see CheatIoState.  The asserts
- * below pin the real footprint instead of a figure the types cannot meet, and
- * they are upper bounds so a future core cap that grows any structure fails the
- * build here rather than silently taking more of the sysmodule's memory. */
+ * Measured on the shipped caps: two program structs ~11 KiB, journal descriptors
+ * ~64 B, stack 8192 B, total ~20 KiB of .bss; the journals' arrays are heap and
+ * bounded by 2 x 384 KiB in the worst case.  The instruction arrays themselves
+ * are heap-allocated to fit the uploaded program (see core/nxus_cheatvm.h).  The
+ * plan pass needs its own journal because the interpreter journals before calling
+ * write(); see CheatIoState.  The asserts below pin the real footprint instead of
+ * a figure the types cannot meet, and they are upper bounds so a future core cap
+ * that grows any structure fails the build here rather than silently taking more
+ * of the sysmodule's memory. */
 static NxusCheatProgram g_Program;
 /* Scratch program for a PATCH-ONLY upload (every block mode == 0).  Uploads are
  * serialised by g_CheatLock, so one scratch slot is enough; it is released before
  * nxusCheatSrvUpload() returns and therefore never holds instructions between
  * calls. */
 static NxusCheatProgram g_PatchProgram;
+/* Restore journal: heap entry array, allocated by Init, grown on demand by the
+ * interpreter (see core/nxus_cheatvm.c) and freed by Exit. */
 static NxusCheatJournal g_Journal;
 /* Journal of the read-only plan pass (see CheatIoState / cheatSrvWorkerStep).  It
  * only exists so the interpreter's journal-full rule can run without polluting the
  * real journal with addresses that were never written; its contents are discarded
- * after every probe. */
+ * after every probe (the array is kept for reuse). */
 static NxusCheatJournal g_ProbeJournal;
 static alignas(0x1000) u8 g_WorkerStack[0x2000];
 
@@ -72,6 +81,13 @@ NXUS_STATIC_ASSERT(sizeof(NxusCheatJournal) <= 16u * 1024u,
 NXUS_STATIC_ASSERT(2u * sizeof(NxusCheatProgram) + 2u * sizeof(NxusCheatJournal) +
                        sizeof(g_WorkerStack) <= CHEATSRV_STATIC_MAX_BYTES,
                    "cheat service static footprint exceeded");
+/* The journal's entry array is heap, but the ceiling is still a budget promise:
+ * 2 journals x NXUS_CHEATVM_MAX_JOURNAL x sizeof(entry) must fit the 8 MiB heap
+ * next to the scan chunk / hit list / snapshots.  At 16384 entries this is
+ * 2 x 384 KiB = 768 KiB. */
+NXUS_STATIC_ASSERT(2u * (u64)NXUS_CHEATVM_MAX_JOURNAL * sizeof(NxusCheatJournalEntry) <=
+                       (u64)1024u * 1024u,
+                   "the two journals must stay inside 1 MiB of heap");
 
 /* Worker thread.  One creator (Init) and one joiner (Exit), both on the boot /
  * exit path, so - unlike the pointer-scan worker - the Thread needs no atomic
@@ -550,6 +566,12 @@ static void cheatBlockSucceededLocked(u32 index) {
  * NXUS_CHEATSRV_FAIL_LIMIT consecutive ones disable the block, and a full journal
  * disables it immediately (waiting would only repeat the refusal).
  *
+ * The interpreter reports the journal exhaustion as its own error code
+ * (NXUS_CHEATVM_ERR_JOURNAL_FULL, -10) instead of a generic write failure, so the
+ * worker no longer has to infer it from "count == capacity": the journal can be
+ * full AND growable (the next block may still succeed), and a write can fail for
+ * an unrelated reason while the journal happens to be full.
+ *
  * nxusCheatRunBlock() does not expose the failing instruction index (only the
  * internal cheatRunBlock() of core does), so error_pc is reported as 0 rather
  * than guessed. */
@@ -561,7 +583,7 @@ static void cheatBlockFailedLocked(u32 index, int rc, NxusCheatFault *fault,
     state->last_error = (u32)rc;
     state->error_pc = 0;
 
-    if (rc == NXUS_CHEATVM_ERR_WRITE && g_Journal.count >= g_Journal.capacity) {
+    if (rc == NXUS_CHEATVM_ERR_JOURNAL_FULL) {
         if (fault != NULL && have_fault != NULL && !*have_fault) {
             memset(fault, 0, sizeof(*fault));
             fault->reason = NXUS_CHEAT_FAULT_JOURNAL_FULL;
@@ -570,7 +592,8 @@ static void cheatBlockFailedLocked(u32 index, int rc, NxusCheatFault *fault,
             *have_fault = true;
         }
         cheatDisableBlockLocked(index);
-        NXUS_LOG("cheat: block %u: journal full - block disabled", (unsigned)index);
+        NXUS_LOG("cheat: block %u: journal full (%u/%u entries) - block disabled",
+                 (unsigned)index, (unsigned)g_Journal.count, (unsigned)g_Journal.capacity);
         return;
     }
 
@@ -904,8 +927,21 @@ void nxusCheatSrvInit(void) {
      * lifetime left one behind; both calls are no-ops on static-zero storage. */
     nxusCheatProgramRelease(&g_Program);
     nxusCheatProgramRelease(&g_PatchProgram);
-    nxusCheatJournalReset(&g_Journal);
-    nxusCheatJournalReset(&g_ProbeJournal);
+    /* The journals own heap entry arrays now: release whatever a previous lifetime
+     * left behind, then allocate the starting capacity.  The interpreter doubles it
+     * on demand up to NXUS_CHEATVM_MAX_JOURNAL, so 512 slots (12 KiB) is the normal
+     * cost and only a file that rewrites thousands of addresses pays more.  A failed
+     * preallocation is NOT fatal: the first successful remember grows the journal. */
+    nxusCheatJournalRelease(&g_Journal);
+    nxusCheatJournalRelease(&g_ProbeJournal);
+    if (nxusCheatJournalInit(&g_Journal, NXUS_CHEATSRV_JOURNAL_INITIAL) != NXUS_CHEATVM_OK) {
+        NXUS_LOG_ERROR("cheat: could not preallocate the journal (%u entries) - it will grow "
+                       "on the first write", (unsigned)NXUS_CHEATSRV_JOURNAL_INITIAL);
+    }
+    if (nxusCheatJournalInit(&g_ProbeJournal, NXUS_CHEATSRV_JOURNAL_INITIAL) != NXUS_CHEATVM_OK) {
+        NXUS_LOG_ERROR("cheat: could not preallocate the plan-pass journal (%u entries) - it "
+                       "will grow on the first probe", (unsigned)NXUS_CHEATSRV_JOURNAL_INITIAL);
+    }
     memset(&g_Owner, 0, sizeof(g_Owner));
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));
     g_ProgramLoaded = false;
@@ -1004,7 +1040,12 @@ void nxusCheatSrvExit(void) {
     (void)cheatDisableAllLocked();
     nxusCheatProgramRelease(&g_Program);
     nxusCheatProgramRelease(&g_PatchProgram);
+    /* Empty then free: the journal's entry array is heap now, and Exit is the only
+     * path that gives it back (Reset/Clear keep it for reuse).  Release is
+     * idempotent, so a second Exit cannot double-free. */
     nxusCheatJournalReset(&g_Journal);
+    nxusCheatJournalRelease(&g_Journal);
+    nxusCheatJournalRelease(&g_ProbeJournal);
     memset(&g_Owner, 0, sizeof(g_Owner));
     memset(g_ConsecutiveFailures, 0, sizeof(g_ConsecutiveFailures));
     g_ProgramLoaded = false;
@@ -1020,8 +1061,10 @@ void nxusCheatSrvExit(void) {
  * from a wrong title: the interpreter rc (or the negative NXUS_CHEATVM_ERROR the
  * reply carries), the block/instruction counts the client sent, the program id it
  * was built for and the identity the console is actually running.  The wire reply
- * is unchanged (BAD_STATE + reason=9); this is the console-side explanation that
- * used to be missing when a Wi-Fi switch/target change made an upload fail.
+ * is BAD_STATE + NXUS_REASON_BAD_ARG (or + NXUS_REASON_JOURNAL_FULL when the
+ * restore journal, not the program, is what refused the write); this is the
+ * console-side explanation that used to be missing when a Wi-Fi switch/target
+ * change made an upload fail.
  *
  * The heap line is the second half of the diagnostic: a reconnect storm is exactly
  * when "upload failed" and "the module is short of heap" have to be told apart. */
@@ -1316,8 +1359,10 @@ void nxusCheatSrvPanicOff(NxusCheatRestore *out) {
     result.blocks_stopped = stopped;
     result.restored = restored.restored;
     result.failed = restored.failed + (restored.freeze_failed ? 1u : 0u);
-    /* Keep the journal when an address failed OR the restore ran unfrozen, so a
-     * later (freezable) PanicOff can retry the whole write-back. */
+    /* Restore removes every entry it wrote back, so a clean run already leaves the
+     * journal empty; the reset is the belt to that brace (and keeps the array for
+     * reuse).  When an address failed, only the failed entries stay journalled, so
+     * a later (freezable) PanicOff retries exactly those. */
     if (restored.failed == 0 && !restored.freeze_failed) nxusCheatJournalReset(&g_Journal);
     cheatPublishStatus();
     cheatUnlock();

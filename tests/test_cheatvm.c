@@ -683,25 +683,11 @@ static void test_journal(void) {
 
     CHECK(nxusCheatJournalRestore(&g_journal, &g_io, true) == 1, "restore writes one address back");
     CHECK(mem_get(0x2200, 4) == 0x11223344ull, "the original value is back");
+    CHECK(g_journal.count == 0, "a successfully restored entry is removed");
 
-    /* 満杯: 513 個目の書き込みは実行せず、そのブロックを ERR_WRITE で止める。 */
-    mock_reset();
-    nxusCheatReset(&program);
-    wire_begin(1, 4);
-    wire_block_set(0, 1, 0, 4, 1);
-    wire_insn_set(0, NxusCheatOp_LoadRegImm, 0, 0, 0, 1, 0, 0, 0, 0, 0x1000);
-    wire_insn_set(1, NxusCheatOp_LoopStart, 0, 0, 0, 0, 0, 0, 2, 0, NXUS_CHEATVM_MAX_JOURNAL + 1u);
-    wire_insn_set(2, NxusCheatOp_StoreStaticToReg, 4, 0, 0, 1, 0, 2, 0, 0, 0xDEADBEEFull);
-    wire_insn_set(3, NxusCheatOp_LoopEnd, 0, 0, 0, 0, 0, 0, 1, 0, 0);
-    CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "journal-overflow program installs");
-    (void)nxusCheatTick(&program, &g_io, 0, &g_journal);
-    CHECK(g_journal.count == NXUS_CHEATVM_MAX_JOURNAL, "the journal fills to its capacity");
-    CHECK(program.state[0].last_error == (u32)NXUS_CHEATVM_ERR_WRITE,
-          "the write that would overflow the journal fails with ERR_WRITE");
-    CHECK(mem_get(0x1000 + (u64)NXUS_CHEATVM_MAX_JOURNAL * 4u, 4) == 0,
-          "that write is refused, not applied");
-    CHECK(writes_at(0x1000 + (u64)NXUS_CHEATVM_MAX_JOURNAL * 4u, 4) == 0,
-          "the refused address never reaches the IO");
+    /* 満杯の扱い（grow / 上限 16384 / 詰め直し）は
+       test_journal_dynamic_capacity() で個別に検証する。旧実装は 512 件で
+       固定され、513 件目以降の書き込みがすべて失敗していた。 */
     nxusCheatProgramRelease(&program);
 }
 
@@ -992,6 +978,189 @@ static void test_large_program_capacity(void) {
 }
 
 /* ======================================================================== */
+/* 復元表の動的容量（512 固定 → 必要に応じて grow、上限 16384）             */
+/* ======================================================================== */
+
+/*
+ * 実機報告の再現: チートを ON にしていくと 512 件で復元表が満杯になり、
+ * 以後「1 行のチートも」適用できなくなり、Switch を再起動するまで直らなかった。
+ * ここでは
+ *   - 512 を超えて記録できる（2000 件・600 ストアの実プログラム）、
+ *   - 上限 16384 では ERR_JOURNAL_FULL を返し、IO へ書き込まない、
+ *   - 復元に成功したエントリは消え、失敗したものだけ残る、
+ *   - owners == 0 の詰め直しで grow せずに再利用できる、
+ *   - 同じアドレスの再記録は original を保持する（既存挙動の回帰）
+ * を確認する。
+ */
+static void test_journal_dynamic_capacity(void) {
+    NxusCheatJournal journal;
+    u32 index;
+    bool all_ok;
+
+    printf("- journal: dynamic capacity, grow, ceiling, compaction, restore release\n");
+
+    CHECK(NXUS_CHEATVM_MAX_JOURNAL == 16384u, "NXUS_CHEATVM_MAX_JOURNAL is 16384");
+    CHECK(NXUS_CHEATVM_ERR_JOURNAL_FULL == -10, "ERR_JOURNAL_FULL is -10");
+    CHECK((u32)(-NXUS_CHEATVM_ERR_JOURNAL_FULL) == 10u,
+          "the positive wire code of a journal-full failure is 10");
+
+    /* ---- Init は指定容量を確保し、超えたら 2 倍に grow する ---- */
+    mock_reset();
+    CHECK(nxusCheatJournalInit(&journal, 4) == 0, "init with 4 slots succeeds");
+    CHECK(journal.entries != NULL && journal.capacity == 4u && journal.count == 0u,
+          "init allocates the requested capacity and starts empty");
+
+    all_ok = true;
+    for (index = 0; index < 4u; index++) {
+        if (nxusCheatJournalRemember(&journal, &g_io, 0x1000u + index, 1, 0) != 0) all_ok = false;
+    }
+    CHECK(all_ok && journal.count == 4u && journal.capacity == 4u,
+          "four addresses fill the initial capacity without growing");
+
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x1010u, 1, 0) == 0,
+          "the fifth address is accepted");
+    CHECK(journal.capacity == 8u && journal.count == 5u,
+          "the journal doubles instead of refusing");
+
+    /* ---- 512 件の壁: 2000 個の異なるアドレスをすべて記録できる ---- */
+    mock_reset();
+    nxusCheatJournalReset(&journal);
+    all_ok = true;
+    for (index = 0; index < 2000u; index++) {
+        if (nxusCheatJournalRemember(&journal, &g_io, 0x2000u + index, 1, 0) != 0) all_ok = false;
+    }
+    CHECK(all_ok, "2000 distinct addresses are all journalled (the old ceiling was 512)");
+    CHECK(journal.count == 2000u, "count tracks the 2000 entries");
+    CHECK(journal.capacity >= 2000u && journal.capacity <= NXUS_CHEATVM_MAX_JOURNAL,
+          "capacity grew to fit them");
+
+    /* ---- 実データ相当: 1 ブロックが 600 アドレスを書き換えても全部通る ---- */
+    mock_reset();
+    nxusCheatJournalReset(&journal);
+    {
+        NxusCheatProgram program;
+        const u32 stores = 600u;
+
+        nxusCheatProgramInit(&program);
+        wire_begin(1, stores);
+        wire_block_set(0, 1, 0, stores, 1);
+        for (index = 0; index < stores; index++) {
+            wire_insn_set(index, NxusCheatOp_StoreStatic, 4, NxusCheatRegion_Absolute, 0, 0, 0, 0,
+                          0, 0x1000u + index * 4u, 0xA5A50000ull + index);
+        }
+        CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "a 600-store program installs");
+        CHECK(nxusCheatTick(&program, &g_io, 0, &journal) == 1, "the 600-store block runs");
+        CHECK(journal.count == stores, "all 600 originals are journalled");
+        CHECK(g_write_log_count == stores, "all 600 writes reached the IO");
+        CHECK(mem_get(0x1000u + (u64)(stores - 1u) * 4u, 4) == 0xA5A50000ull + stores - 1u,
+              "the last store landed");
+        nxusCheatProgramRelease(&program);
+    }
+
+    /* ---- 同じアドレスの再記録は original を保持する（既存挙動の回帰） ---- */
+    mock_reset();
+    nxusCheatJournalReset(&journal);
+    mem_put(0x3000, 0x11, 1);
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x3000, 1, 0) == 0, "first record");
+    mem_put(0x3000, 0x22, 1);   /* ブロックがパッチした後の値 */
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x3000, 1, 0) == 0, "re-record");
+    CHECK(journal.count == 1u && journal.entries[0].original[0] == 0x11,
+          "a second write keeps the FIRST original");
+    CHECK(journal.entries[0].owners == 2u, "the owner count is bumped instead");
+
+    /* ---- 復元に成功したエントリは消える（配列は保持） ---- */
+    CHECK(nxusCheatJournalRestore(&journal, &g_io, true) == 1, "restore writes the address back");
+    CHECK(journal.count == 0u, "a successfully restored entry is removed");
+    CHECK(journal.entries != NULL && journal.capacity != 0u,
+          "the entry array is kept for reuse after a restore");
+    CHECK(mem_get(0x3000, 1) == 0x11, "the original byte is back");
+
+    /* ---- 復元に失敗したエントリだけが残り、再試行できる ---- */
+    mock_reset();
+    nxusCheatJournalReset(&journal);
+    mem_put(0x3100, 0x77, 1);
+    mem_put(0x3104, 0x88, 1);
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x3100, 1, 0) == 0, "record A");
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x3104, 1, 0) == 0, "record B");
+    g_fail_write_on = true;
+    g_fail_write_address = 0x3104;
+    CHECK(nxusCheatJournalRestore(&journal, &g_io, true) == -1,
+          "a partial restore reports failure");
+    CHECK(journal.count == 1u && journal.entries[0].address == 0x3104u,
+          "only the entry whose write-back failed is kept");
+    CHECK(mem_get(0x3100, 1) == 0x77, "the successful address was restored");
+    g_fail_write_on = false;
+    CHECK(nxusCheatJournalRestore(&journal, &g_io, true) == 1, "the retry restores the kept entry");
+    CHECK(journal.count == 0u, "the journal is empty after the retry");
+
+    /* ---- owners == 0 の詰め直し: 満杯でも grow せずに再利用する ---- */
+    mock_reset();
+    nxusCheatJournalRelease(&journal);
+    CHECK(nxusCheatJournalInit(&journal, 4) == 0, "a fresh 4-slot journal for the compaction check");
+    all_ok = true;
+    for (index = 0; index < 4u; index++) {
+        if (nxusCheatJournalRemember(&journal, &g_io, 0x3200u + index, 1, 0) != 0) all_ok = false;
+    }
+    CHECK(all_ok && journal.count == 4u && journal.capacity == 4u,
+          "the journal is full at 4/4 before the compaction check");
+    journal.entries[1].owners = 0;   /* 復元済みの死んだエントリを模す */
+    journal.entries[3].owners = 0;
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x3210u, 1, 0) == 0,
+          "a new address fits after compacting the dead entries");
+    CHECK(journal.capacity == 4u, "the dead entries were reused instead of growing");
+    CHECK(journal.count == 3u, "two dead entries dropped, one added");
+    CHECK(journal.entries[0].address == 0x3200u && journal.entries[1].address == 0x3202u &&
+          journal.entries[2].address == 0x3210u,
+          "compaction keeps the live entries in order");
+
+    /* ---- 上限 16384: それ以上は ERR_JOURNAL_FULL で「書かない」 ---- */
+    mock_reset();
+    nxusCheatJournalRelease(&journal);
+    CHECK(nxusCheatJournalInit(&journal, NXUS_CHEATVM_MAX_JOURNAL) == 0,
+          "init at the ceiling succeeds");
+    all_ok = true;
+    for (index = 0; index < NXUS_CHEATVM_MAX_JOURNAL; index++) {
+        if (nxusCheatJournalRemember(&journal, &g_io, 0x4000u + index, 1, 0) != 0) all_ok = false;
+    }
+    CHECK(all_ok, "all 16384 addresses fit the ceiling");
+    CHECK(journal.count == NXUS_CHEATVM_MAX_JOURNAL &&
+          journal.capacity == NXUS_CHEATVM_MAX_JOURNAL,
+          "the journal is exactly at its ceiling");
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x4000u + NXUS_CHEATVM_MAX_JOURNAL, 1, 0)
+              == NXUS_CHEATVM_ERR_JOURNAL_FULL,
+          "one more address is refused with ERR_JOURNAL_FULL (-10)");
+    CHECK(journal.count == NXUS_CHEATVM_MAX_JOURNAL, "the refused address is not recorded");
+
+    /* ---- VM の書き込みパスが -10 を伝播し、IO へ書き込まない ---- */
+    {
+        NxusCheatProgram program;
+
+        nxusCheatProgramInit(&program);
+        build_single_store(0x8000, 0xAA, 1);
+        CHECK(nxusCheatInstall(&program, g_wire, wire_length()) == 0, "ceiling program installs");
+        CHECK(nxusCheatRunBlock(&program, 0, &g_io, 0, &journal) == NXUS_CHEATVM_ERR_JOURNAL_FULL,
+              "the VM propagates ERR_JOURNAL_FULL from the write path");
+        CHECK(g_write_log_count == 0, "the refused write never reaches the IO");
+        CHECK(mem_get(0x8000, 4) == 0, "the target is untouched");
+        nxusCheatProgramRelease(&program);
+    }
+
+    /* ---- Release と、Init していないジャーナル ---- */
+    nxusCheatJournalRelease(&journal);
+    CHECK(journal.entries == NULL && journal.capacity == 0u && journal.count == 0u,
+          "release frees the entry array");
+    nxusCheatJournalRelease(&journal);
+    CHECK(journal.entries == NULL, "a second release is safe");
+
+    memset(&journal, 0, sizeof journal);
+    CHECK(nxusCheatJournalRemember(&journal, &g_io, 0x9000, 1, 0) == 0,
+          "a zero-initialised journal grows on its first write");
+    CHECK(journal.entries != NULL && journal.capacity >= 1u && journal.count == 1u,
+          "the lazy grow allocated an array");
+    nxusCheatJournalRelease(&journal);
+}
+
+/* ======================================================================== */
 
 int main(void) {
     printf("=== Nxus cheat VM host tests ===\n");
@@ -1001,6 +1170,10 @@ int main(void) {
 
     CHECK(sizeof(NxusCheatInsn) == 24, "NxusCheatInsn stays 24 bytes on the wire");
     CHECK(sizeof(NxusCheatBlockDesc) == 24, "NxusCheatBlockDesc stays 24 bytes on the wire");
+    CHECK(sizeof(NxusCheatJournalEntry) == 24, "NxusCheatJournalEntry stays 24 bytes");
+
+    /* 復元表は Init で確保する（テスト全体で 1 本を使い回す）。 */
+    CHECK(nxusCheatJournalInit(&g_journal, 512) == 0, "the test journal starts at 512 slots");
 
     test_install_validation();
     test_store_static_widths_and_regions();
@@ -1016,6 +1189,9 @@ int main(void) {
     test_program_heap_lifecycle();
     test_program_allocator_hook();
     test_large_program_capacity();
+    test_journal_dynamic_capacity();
+
+    nxusCheatJournalRelease(&g_journal);
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     if (g_failures == 0) printf("ALL CHEAT VM TESTS PASSED\n");

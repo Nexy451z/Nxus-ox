@@ -4446,7 +4446,8 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
            packet that arrives after nxusServerExit() is refused above, before
            dispatchCommand() runs) and none of them touches the session's scan /
            snapshot state, so no extra BUSY gate is needed: the engine has its own
-           static program + journal (about 30 KB, no heap) and its own worker. */
+           static program + journal descriptors and its own worker (the journal's
+           entry array is heap, 512 slots at boot, growing to at most 16384). */
 
         case NxusCmd_CheatUpload: {
             /* Length first, in two steps, because both are client errors and both
@@ -4481,26 +4482,34 @@ static void dispatchCommand(int fd, const NxusPacketHeader *header, const u8 *pa
                 /* A rejected program, or one uploaded for another title than the
                    target the session is on: the payload was well formed, so the
                    argument (the program's target) is what is refused.
-                   The reply itself is unchanged (BAD_STATE + reason=9); the log
-                   line adds the diagnostics the wire cannot carry, so an upload
-                   that fails after a Wi-Fi switch can be separated from a client
-                   that is simply pointed at the wrong title.  `up.rejected_reason`
-                   is the positive form of the interpreter rc. */
+                   The one exception is a full restore journal: the program itself
+                   is fine, the console just cannot remember another original byte,
+                   so that gets its own reason (NXUS_REASON_JOURNAL_FULL) instead of
+                   "argument outside the accepted range".  The log line adds the
+                   diagnostics the wire cannot carry, so an upload that fails after
+                   a Wi-Fi switch can be separated from a client that is simply
+                   pointed at the wrong title.  `up.rejected_reason` is the positive
+                   form of the interpreter rc (10 for journal-full). */
+                const bool journal_full =
+                    up.rejected_reason == (u32)(-NXUS_CHEATVM_ERR_JOURNAL_FULL);
+                const u32 reason = journal_full ? NXUS_REASON_JOURNAL_FULL
+                                                : NXUS_REASON_BAD_ARG;
                 NxusTargetIdentity id;
                 memset(&id, 0, sizeof(id));
                 const bool have_id = nxusSessionTargetIdentity(&id);
                 NXUS_LOG("cheat: upload rejected rc=%d blocks=%u insns=%u "
                          "program_id=%016llX target_pid=%llu target_program_id=%016llX "
-                         "incarnation=%u (BAD_STATE/BAD_ARG reason=%u)",
+                         "incarnation=%u (BAD_STATE reason=%u%s)",
                          -(s32)up.rejected_reason, (unsigned)ch.block_count,
                          (unsigned)ch.insn_count, (unsigned long long)ch.program_id,
                          (unsigned long long)(have_id ? id.pid : 0ull),
                          (unsigned long long)(have_id ? id.program_id : 0ull),
                          (unsigned)nxusDmntTargetIncarnation(),
-                         (unsigned)NXUS_REASON_BAD_ARG);
+                         (unsigned)reason,
+                         journal_full ? " journal-full" : "");
                 nxusHeapLog("cheat upload rejected");
                 replyErrorReason(fd, type, seq, NXUS_MAKE_RESULT(NXUS_ERR_BAD_STATE),
-                                 NXUS_REASON_BAD_ARG);
+                                 reason);
                 break;
             }
             reply(fd, type, seq, &up, sizeof(up));

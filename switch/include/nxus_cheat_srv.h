@@ -57,26 +57,31 @@
  * Memory
  * ------
  * The sysmodule's inner heap is 8 MiB and already holds the scan chunk, the hit
- * list and up to two snapshot slots, so nothing here is allocated up front: the
- * program structures, the journal, the plan-pass journal and the worker stack are
- * .bss / static arrays.  The interpreter caps (core/nxus_cheatvm.h) size them:
+ * list and up to two snapshot slots, so the program structures, the worker stack
+ * and the journal DESCRIPTORS are .bss / static.  The two big variable-size arrays
+ * are heap-allocated and sized to what is actually used:
  *
  *     sizeof(NxusCheatProgram)  ~5.4 KiB each (blocks + states; instructions live
  *                               on the heap, sized to the uploaded program)
  *     resident program          1 x NxusCheatProgram
  *     patch-upload scratch      1 x NxusCheatProgram (released after the upload)
- *     sizeof(NxusCheatJournal)  12296 B   (512 entries x 24 B)
- *     plan-pass journal         12296 B   (same layout; never published)
- *     worker stack               8192 B
+ *     journal                   512 entries at Init (12 KiB), doubling on demand
+ *                               up to NXUS_CHEATVM_MAX_JOURNAL = 16384 entries
+ *                               (384 KiB) - see core/nxus_cheatvm.h
+ *     plan-pass journal         same policy (its own array; never published)
+ *     worker stack              8192 B
  *
- * The instruction arrays themselves are allocated by nxusCheatInstall() and freed
- * by nxusCheatProgramRelease(); a patch-only upload allocates the scratch buffer,
+ * The instruction arrays are allocated by nxusCheatInstall() and freed by
+ * nxusCheatProgramRelease(); a patch-only upload allocates the scratch buffer,
  * runs the blocks once and releases it before returning, so repeated patch
- * uploads do not accumulate memory.  The plan pass needs its own journal because
- * the interpreter journals before it calls write(); reusing the real journal
- * would record ownership of bytes that were never patched.  The exact numbers are
- * asserted in nxus_cheat_srv.c, so lowering/raising a core cap cannot silently
- * grow (or shrink) what the sysmodule reserves.
+ * uploads do not accumulate memory.  The journals are allocated by
+ * nxusCheatJournalInit() in nxusCheatSrvInit() and freed by
+ * nxusCheatJournalRelease() in nxusCheatSrvExit(); Clear/Reset only empty them.
+ * The plan pass needs its own journal because the interpreter journals before it
+ * calls write(); reusing the real journal would record ownership of bytes that
+ * were never patched.  The static numbers are asserted in nxus_cheat_srv.c, so
+ * lowering/raising a core cap cannot silently grow (or shrink) what the sysmodule
+ * reserves.
  *
  * Threading
  * ---------
@@ -125,6 +130,12 @@
  * it (the worker's longest step is bounded by NXUS_CHEATVM_STEP_LIMIT, but a single
  * dmnt IPC inside it is not). */
 #define NXUS_CHEATSRV_EXIT_JOIN_MS 2000u
+
+/* Journal capacity allocated by nxusCheatSrvInit().  The core doubles it on demand
+ * up to NXUS_CHEATVM_MAX_JOURNAL (16384), so a normal cheat file pays 12 KiB while
+ * one that rewrites thousands of addresses (the reported case: 858) still fits
+ * without ever refusing a write. */
+#define NXUS_CHEATSRV_JOURNAL_INITIAL 512u
 
 /*
  * Boot the service: release any leftover program storage, reset the
@@ -183,8 +194,10 @@ void nxusCheatSrvExit(void);
  * *reply is always filled (accepted_blocks / accepted_insns on success,
  * rejected_reason otherwise).  `rejected_reason` encodes an interpreter error the
  * way NxusCheatUploadReply documents: the negative NXUS_CHEATVM_ERR_* as a positive
- * code (0 = accepted).  Returns true only on success, and the caller maps false to
- * NXUS_ERR_BAD_STATE + NXUS_REASON_BAD_ARG.
+ * code (0 = accepted).  NXUS_CHEATVM_ERR_JOURNAL_FULL therefore arrives as 10.
+ * Returns true only on success, and the caller maps false to
+ * NXUS_ERR_BAD_STATE + NXUS_REASON_JOURNAL_FULL when the reason is journal-full,
+ * NXUS_REASON_BAD_ARG otherwise.
  */
 bool nxusCheatSrvUpload(const void *wire, u32 length, NxusCheatUploadReply *reply);
 
@@ -224,13 +237,14 @@ void nxusCheatSrvStatus(NxusCheatStatus *out);
  * The restore is wrapped in Pause/Resume because it rewrites code too.  A failed
  * Pause does NOT cancel it (restoring is the safe direction), but it is counted in
  * `failed` (+1, the journal has no separate field for it and the wire structure is
- * fixed) and logged; the journal is then kept so a later, freezable PanicOff can
- * retry.  With a debug session attached dmnt is detached and a freeze is not
- * attempted; the restore goes through the debug handle instead.
+ * fixed) and logged; the entries that could not be written back are kept so a
+ * later, freezable PanicOff can retry them.  With a debug session attached dmnt is
+ * detached and a freeze is not attempted; the restore goes through the debug
+ * handle instead.
  *
- * The journal is kept when a write-back failed, so a later PanicOff (or the exit
- * path) can retry it; it is cleared once every address was restored (and the
- * restore ran frozen).
+ * The journal only keeps the addresses whose write-back FAILED (the interpreter
+ * removes each entry it restored), so a retry does not rewrite what is already
+ * correct and an exhausted journal frees up as it is restored.
  */
 void nxusCheatSrvPanicOff(NxusCheatRestore *out);
 
